@@ -292,6 +292,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_PF_HASH_GPU` | flag | `0` | 0\|1 | The per-sub-batch residual hash is a splitmix64 sum computed on the GPU instead of an FNV of the rows on the host, which gives a different value. |
 | `GR8_PF_HX` | flag | `1` | 0\|1 | 0 makes the Flash MoE fc1 rotate x per CTA instead of reading rows rotated and scaled once per token by `k_pf_hx`. |
 | `GR8_PF_HXF` | flag | `1` | 0\|1 | 0 runs `k_pf_hx` and `k_pf_hxq` as two passes on GR8_PF_Q8 layers instead of the fused `k_pf_hxqf`. |
+| `GR8_PF_ISGRT_CLEAN` | flag | `0` | 0\|1 | 1 scores the prefill index with index_scores_rg8_clean when built with PF_ISGRT and 2048 < context <= 32768: no per-key id write and the radix selector's pass-0 histogram counted in the score epilogue, so the selector runs passes 1-5 only. Same scores, same selected ids. 0, other contexts and other builds run the stock kernels. |
 | `GR8_PF_ISGRT_RG` | int | `8` | 8.. | Sets the rows per CTA of the prefill index-score kernel, rounded down to a multiple of 8 (below 8 means 8). Same bits. |
 | `GR8_PF_MOE8` | flag | `0` | 0\|1 | 1 runs the Flash prefill MoE on MXFP8 activations instead of the fp16 passes, and turns on the shared expert's FP8 copy unless GR8_PF_SHFP8 says otherwise. |
 | `GR8_PF_OWN` | int | `0` | 0\|1\|2\|3\|4 | Sets row-owner prefill: 1 = owners compute the next layer's projections, 2 = also the indexer, 3 = owners run all heads of their rows (QO pack), 4 = TP4 pair-owner QO. |

@@ -140,6 +140,57 @@ static inline void launch_index_scores_rg(G6Attn a,int start,int n,const half* q
  constexpr int SMEM=isg_rg8_smem<136,64>();static const bool once=cudaFuncSetAttribute(index_scores_rg8<136,64>,cudaFuncAttributeMaxDynamicSharedMemorySize,SMEM)==cudaSuccess;(void)once;
  int RG=isgrt_rg();index_scores_rg8<136,64><<<dim3((a.context+63)/64,(n+RG-1)/RG),256,SMEM,st>>>(a,start,n,RG,q,weight,keys,scales,scores,ids);
 }
+// GR8_PF_ISGRT_CLEAN: index_scores_rg8 with no per-key id write (the context <= 32768 radix path never reads w.ii) and
+// the radix selector's pass-0 histogram counted in the epilogue. Pass 0 has prefix 0 and shift 40, so every (row, key)
+// with key < context counts once in bins[row][key/RADIX_CHUNK][ordered_score(x) >> 24] (a masked score has key 0 and
+// lands in digit 0), the same integer counts radix_histogram(pass 0) writes. A warp's 32 epilogue lanes share one row
+// and one 1024-key chunk, so lanes with equal digits combine (__match_any_sync) into one atomicAdd. bins must be zero.
+// Score arithmetic, its order and the score writes are index_scores_rg8's.
+template<int BL,int OL>
+__global__ void __launch_bounds__(256,2) index_scores_rg8_clean(G6Attn a,int start,int n,int RG,const half* q,const float* weight,const half* keys,const float* scales,float* scores,int* bins){
+ constexpr int Q=4,N=64;
+ using namespace nvcuda;constexpr int THREADS=Q*64;
+ int rbeg=blockIdx.y*RG,rend=min(n,rbeg+RG),t0=blockIdx.x*N,t=threadIdx.x,w=t/32,lane=t&31;
+ const int chunks=(a.context+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK;
+ auto hist=[&](int row,int key,bool valid,float x){   // warp-collective: every lane of the warp calls it
+  const unsigned digit=valid?ga::ordered_score(x)>>24:256u;const unsigned peers=__match_any_sync(0xffffffffu,digit);
+  if(valid&&lane==__ffs(peers)-1)atomicAdd(bins+((int64_t)row*chunks+key/ga::RADIX_CHUNK)*256+digit,__popc(peers));};
+ extern __shared__ __align__(32) unsigned char isg_smem[];half* B=(half*)isg_smem;float* O=(float*)(isg_smem+N*BL*2);
+ for(int i=t;i<N*128/8;i+=THREADS){int key=t0+i/(128/8);*(int4*)(B+(i/(128/8))*BL+(i%(128/8))*8)=key<a.context?*(const int4*)(keys+(int64_t)key*128+(i%(128/8))*8):make_int4(0,0,0,0);}
+ __syncthreads();
+ wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major>A0,A1;
+ wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major>Bfrag;
+ wmma::fragment<wmma::accumulator,16,16,16,float>C0[N/16],C1[N/16];
+ for(int row0=rbeg;row0<rend;row0+=2*Q){
+  int pmax=a.positions[start+row0];for(int r=1;r<2*Q;r++)if(row0+r<n)pmax=max(pmax,a.positions[start+row0+r]);
+  if(t0>pmax){for(int i=t;i<2*Q*N;i+=THREADS){int row=row0+i/N,key=t0+i%N;const bool v=row<n&&key<a.context;if(v)scores[(int64_t)row*a.context+key]=-INFINITY;hist(row,key,v,-INFINITY);}continue;}
+  #pragma unroll
+  for(int j=0;j<N/16;j++){wmma::fill_fragment(C0[j],0.f);wmma::fill_fragment(C1[j],0.f);}
+  int qr=row0+w/2,qr1=qr+Q,hs=(w%2)*16;
+  #pragma unroll 1
+  for(int k=0;k<128;k+=16){if(qr<n)wmma::load_matrix_sync(A0,q+((int64_t)qr*32+hs)*128+k,128);else wmma::fill_fragment(A0,__float2half(0));
+   if(qr1<n)wmma::load_matrix_sync(A1,q+((int64_t)qr1*32+hs)*128+k,128);else wmma::fill_fragment(A1,__float2half(0));
+   #pragma unroll
+   for(int j=0;j<N/16;j++){wmma::load_matrix_sync(Bfrag,B+j*16*BL+k,BL);wmma::mma_sync(C0[j],A0,Bfrag,C0[j]);wmma::mma_sync(C1[j],A1,Bfrag,C1[j]);}}
+  #pragma unroll
+  for(int hf=0;hf<2;hf++){
+   #pragma unroll
+   for(int j=0;j<N/16;j++)wmma::store_matrix_sync(O+w*16*OL+j*16,hf?C1[j]:C0[j],OL,wmma::mem_row_major);
+   __syncthreads();
+   for(int i=t;i<Q*N;i+=THREADS){int row=row0+hf*Q+i/N,key=t0+i%N;const bool v=row<n&&key<a.context;float x=0;
+    if(v){for(int h=0;h<32;h++)x+=fmaxf(O[((i/N)*32+h)*OL+i%N],0.f)*weight[row*32+h];x*=scales[key];if(key>a.positions[start+row])x=-INFINITY;else if(!isfinite(x)){ga::error(a,4);x=-INFINITY;}scores[(int64_t)row*a.context+key]=x;}
+    hist(row,key,v,x);}
+   __syncthreads();
+  }
+ }
+}
+// The clean kernel runs only where the selector is threshold_compact (2048 < context <= 32768) and the knob is on.
+static inline bool isg_clean(const G6Attn& a){static const bool on=knob::pf_isgrt_clean();return on&&a.context>TOP&&a.context<=32768;}
+static inline cudaError_t launch_index_scores_rg_clean(G6Attn a,int start,int n,const half* q,const float* weight,const half* keys,const float* scales,float* scores,int* bins,cudaStream_t st){
+ constexpr int SMEM=isg_rg8_smem<136,64>();static const bool once=cudaFuncSetAttribute(index_scores_rg8_clean<136,64>,cudaFuncAttributeMaxDynamicSharedMemorySize,SMEM)==cudaSuccess;(void)once;
+ const int chunks=(a.context+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK;cudaError_t e=cudaMemsetAsync(bins,0,(size_t)n*chunks*256*4,st);if(e!=cudaSuccess)return e;
+ int RG=isgrt_rg();index_scores_rg8_clean<136,64><<<dim3((a.context+63)/64,(n+RG-1)/RG),256,SMEM,st>>>(a,start,n,RG,q,weight,keys,scales,scores,bins);return cudaSuccess;
+}
 #endif
 // Fixed-size cuBLAS shapes even when the final query tile is short.
 // Reuse q scratch for raw UK input, then absorbed Q, then UV output.
@@ -255,7 +306,9 @@ static int selx_ctx(){
         return x;}();
     return v;
 }
-static cudaError_t select_prefill(const G6Attn& a,ga::Work& w,int start,int n,cudaStream_t st){
+// fused0: the score kernel already wrote pass 0's histogram (index_scores_rg8_clean); only 2048 < context <= 32768.
+static cudaError_t select_prefill(const G6Attn& a,ga::Work& w,int start,int n,cudaStream_t st,bool fused0=false){
+    if(fused0)return ga::select_index(a,a,w,start,n,st,0,true);
     static_assert(selx::TOP==TOP,"selx TOP");
 #ifdef SEL32
     const int c=selx_ctx();
@@ -353,12 +406,14 @@ extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6
         GP_PROFILE();G6_PF_MARK(2,st);if(a.reuse_indices)ga::reuse<<<n,256,0,st>>>(a,start);else{
             ga::prep_index<<<dim3(n,32),128,0,st>>>(a,start,w.iq,w.weights);
 #if defined(PF_ISGRT) && PF_ISGRT
-            G6_PF_MARK(3,st);gp::launch_index_scores_rg(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii,st);
+            const bool clean=gp::isg_clean(a);G6_PF_MARK(3,st);
+            if(clean){auto e=gp::launch_index_scores_rg_clean(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.histogram,st);if(e!=cudaSuccess)return int(e);}
+            else gp::launch_index_scores_rg(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii,st);
 #else
-            G6_PF_MARK(3,st);gp::index_scores_grouped<<<dim3((a.context+63)/64,(n+3)/4),256,0,st>>>(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii);
+            const bool clean=false;G6_PF_MARK(3,st);gp::index_scores_grouped<<<dim3((a.context+63)/64,(n+3)/4),256,0,st>>>(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii);
 #endif
             if(tr.index_scores)cudaMemcpyAsync(tr.index_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);
-            G6_PF_MARK(4,st);auto e=gp::select_prefill(a,w,start,n,st);if(e!=cudaSuccess)return int(e);
+            G6_PF_MARK(4,st);auto e=gp::select_prefill(a,w,start,n,st,clean);if(e!=cudaSuccess)return int(e);
         }
         GP_PROFILE();G6_PF_MARK(5,st);gp::pack_uk_input<<<(H*R*192+255)/256,256,0,st>>>(a,start,n,R,p->q);GP_BLAS(cublasGemmStridedBatchedEx(p->blas,CUBLAS_OP_T,CUBLAS_OP_N,512,R,192,&one,p->uk,CUDA_R_16F,192,512*192,
             p->q,CUDA_R_16F,576,(long long)R*576,&zero,p->qf,CUDA_R_32F,512,(long long)R*512,H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));

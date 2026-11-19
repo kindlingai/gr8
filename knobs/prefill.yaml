@@ -177,6 +177,15 @@ knobs:
     doc: >-
       Sets the rows per CTA of the prefill index-score kernel, rounded down to a multiple of 8 (below 8 means 8). Same
       bits.
+  GR8_PF_ISGRT_CLEAN:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 scores the prefill index with index_scores_rg8_clean when built with PF_ISGRT and 2048 < context <= 32768: no
+      per-key id write and the radix selector's pass-0 histogram counted in the score epilogue, so the selector runs
+      passes 1-5 only. Same scores, same selected ids. 0, other contexts and other builds run the stock kernels.
   GR8_PF_MOE8:
     scope: agree
     kind: flag
