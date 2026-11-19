@@ -226,15 +226,21 @@ not an in-process switch:
    `GR8_KV_REWIDTH`, which rewrites the store for each new rank before it opens: GLM-5.3's persisted SSD store
    (`KV_STORE=ssd:...,persist=on`, sessions with `keep=sessions`) and GLM-5.3-Flash's aligned checkpoints
    (`FLASH_CACHE=aligned` with a persisted SSD store; not with `GR8_CP=1`). A chat's next turn then reads its run from
-   the store instead of prefilling it again. Without such a store the scale works and sessions prefill again.
+   the store instead of prefilling it again. Without such a store the scale works and sessions prefill again. The
+   store must be on each box's local disk: the scale moves rank folders within it.
 4. When the head's API answers, the hold ends and the held requests run on the new width. A box that left exits.
 
 If the new width fails to boot (a refused handshake, an engine that exits, `READY_TMO`), every box of the old list
-puts its store back and boots the old list again, and the held requests run there. A supervisor that dies mid-scale
-is not resumed: `down` and `up` as after any failure.
+puts its store back and boots the old list again, and the held requests run there. The hold lasts the drain plus a
+boot (`READY_TMO` + 120 s, at least 900 s), and a rollback sets it again for the old list's boot: clients need a
+request timeout at least that long. A supervisor that dies mid-scale is not resumed: `down` and `up` as after any
+failure; a box that leaves stops after `JOIN_TIMEOUT` + `READY_TMO` without word from the head.
 
-What the scale keeps the same, so the store's blocks stay valid: the running variant (`--variant`), `SHARE_LIMIT` and
-`REUSE_GRID` are pinned. It refuses `SHAPE=ring`. It changes the running cluster only: it prints the option lines
+What the scale keeps the same, so the store's blocks stay valid: the running variant (`--variant`), the KV format
+(`--kv-format`, also when a TP default chose it, as int4 at GLM-5.3 TP=4), `SHARE_LIMIT` and `REUSE_GRID` are pinned.
+It refuses `SHAPE=ring`, and a variant larger than the new width's default: a GLM-5.3 cluster that will scale to TP=3
+boots TP=4 with `--variant bit260` (bit325, the TP=4 default, does not fit a rank at TP=3), and names no `--drafter`
+(the drafter does not run at TP=3). It changes the running cluster only: it prints the option lines
 (`TP=`, `PEERS=`, the pins) to put into every box's config for later boots, and a mentat cluster runs in peers mode
 after its first scale. Output after a scale is that of a fresh boot at the new width given the same stored state; a
 run that never scaled may give other tokens (another width computes other KV bits).
