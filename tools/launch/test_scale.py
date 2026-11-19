@@ -213,12 +213,19 @@ class Scale(unittest.TestCase):
             os.makedirs(os.path.join(h, 'store', f'r{i}'), exist_ok=True)
             with open(os.path.join(h, 'store', f'r{i}', 'index'), 'w') as f:
                 f.write(f'old index of rank {i}')
+        def set_id():
+            with open(os.path.join(self.homes[2], 'out', 'stub.json')) as f:
+                a = json.load(f)['argv']
+            return a[a.index('--set-id') + 1]
+        old_set = set_id()
         rc, out = self.finish(self.scale(1, 3))
         self.assertEqual(rc, 0, out)
+        self.assertNotEqual(set_id(), old_set)   # the set id names the width: the engine checks the old store by old_set
         token = os.path.join(self.homes[2], 'out', 'scale', 'token')
         with open(os.path.join(self.homes[2], 'out', 'stub.json')) as f:
             env = json.load(f)['env']
-        self.assertEqual(env.get('GR8_KV_REWIDTH'), f'4,2,{token},' + ','.join(f'{a}:{self.port + 3}' for a in LAN),
+        self.assertEqual(env.get('GR8_KV_REWIDTH'),
+                         f'4,2,{token},{old_set},' + ','.join(f'{a}:{self.port + 3}' for a in LAN),
                          read(os.path.join(self.homes[2], 'out', 'supervisor.log'))[-3000:])
         for i in range(3):
             self.assertEqual(sorted(os.listdir(os.path.join(self.homes[i], 'store', f'r{i}'))), ['index'])

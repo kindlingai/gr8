@@ -29,8 +29,10 @@ static FlashLayout layout(int nr) {
     L.state_bytes = size_t(kda::N_KDA) * (s_of(nr) + c_of(nr)) * 4 + RINGS;
     return L;
 }
-static std::string compat(int nr, int rank, size_t state_bytes) {
-    return "flash set t nr " + std::to_string(nr) + " rank " + std::to_string(rank) + " state " + std::to_string(state_bytes) + " engine e";
+// the model set id names the width, as the launcher's does (modelset.py describe_release)
+static std::string set_of(int nr) { return "set-tp" + std::to_string(nr); }
+static std::string compat(int nr, int rank, size_t state_bytes, const std::string& set) {
+    return "flash set " + set + " nr " + std::to_string(nr) + " rank " + std::to_string(rank) + " state " + std::to_string(state_bytes) + " engine e";
 }
 static uint64_t h64(const std::string& s) { return fnv64(s.data(), s.size()); }
 
@@ -93,7 +95,7 @@ static void prev(const std::string& d) {   // what the launcher's store prep doe
 static void write_old(const std::string& d, int nr, int q) {
     std::filesystem::create_directories(d);
     const FlashLayout L = layout(nr);
-    const std::string c = compat(nr, q, L.state_bytes);
+    const std::string c = compat(nr, q, L.state_bytes, set_of(nr));
     FlashIndex ix(BLOCKS);
     for (int k = 1; k <= ENTRIES; ++k) {
         FlashEntry x;
@@ -157,10 +159,11 @@ static void scale(const std::string& bin, const std::string& token, const std::v
     std::vector<std::thread> w;
     for (int r = 0; r < nr; ++r) {
         std::filesystem::create_directories(new_dirs[size_t(r)]);
-        const std::string spec = std::to_string(onr) + "," + (from[size_t(r)] < 0 ? "x" : std::to_string(from[size_t(r)])) + "," + token + list;
+        const std::string spec = std::to_string(onr) + "," + (from[size_t(r)] < 0 ? "x" : std::to_string(from[size_t(r)])) + "," + token +
+                                 "," + set_of(onr) + list;
         w.emplace_back([&, r, spec] {
-            got[size_t(r)] = flash_rewidth(new_dirs[size_t(r)], spec, compat(nr, r, L.state_bytes), compat, L, nr, r, BLOCKS, GRID,
-                                           1 << 20, why[size_t(r)]);
+            got[size_t(r)] = flash_rewidth(new_dirs[size_t(r)], spec, compat(nr, r, L.state_bytes, set_of(nr)), compat, L, nr, r, BLOCKS,
+                                           GRID, 1 << 20, why[size_t(r)]);
         });
     }
     for (auto& t : w) t.join();
@@ -170,7 +173,7 @@ static void scale(const std::string& bin, const std::string& token, const std::v
         if (got[size_t(r)] != ENTRIES) std::fprintf(stderr, "%d -> %d rank %d: %lld (%s)\n", onr, nr, r, (long long)got[size_t(r)], why[size_t(r)].c_str());
         CHECK(got[size_t(r)] == ENTRIES);
         const std::string d = new_dirs[size_t(r)];
-        const uint64_t c = h64(compat(nr, r, L.state_bytes));
+        const uint64_t c = h64(compat(nr, r, L.state_bytes, set_of(nr)));
         FlashIndexImage img;
         uint64_t stale = 0;
         CHECK(FlashIndexFiles(d + "/flash-ckpt.index").load(c, BLOCKS, img, stale) == nullptr);
@@ -226,12 +229,17 @@ int main(int argc, char** argv) {
         const std::string fresh = root + "/fresh";
         std::filesystem::create_directories(fresh);
         const FlashLayout L = layout(2);
-        CHECK(flash_rewidth(fresh, "4,x," + bad + "," + p.addr + "," + p.addr + "," + p.addr + "," + p.addr, compat(2, 0, L.state_bytes), compat, L,
+        const std::string peers4 = "," + p.addr + "," + p.addr + "," + p.addr + "," + p.addr;
+        CHECK(flash_rewidth(fresh, "4,x," + bad + "," + set_of(4) + peers4, compat(2, 0, L.state_bytes, set_of(2)), compat, L,
                             2, 0, BLOCKS, GRID, 1 << 20, why) == -1);
         CHECK(!std::filesystem::exists(fresh + "/flash-ckpt.index") && !std::filesystem::exists(fresh + "/flash-ckpt"));
-        // a store written by another engine: nothing carried
-        CHECK(flash_rewidth(fresh, "4,x," + token + "," + p.addr + "," + p.addr + "," + p.addr + "," + p.addr, compat(2, 0, L.state_bytes),
-                            [](int n, int q, size_t sb) { return compat(n, q, sb) + " other"; }, L, 2, 0, BLOCKS, GRID, 1 << 20, why) == 0);
+        // a store written by another engine, or under another model set than the old width's: nothing carried
+        CHECK(flash_rewidth(fresh, "4,x," + token + "," + set_of(4) + peers4, compat(2, 0, L.state_bytes, set_of(2)),
+                            [](int n, int q, size_t sb, const std::string& s) { return compat(n, q, sb, s) + " other"; }, L, 2, 0,
+                            BLOCKS, GRID, 1 << 20, why) == 0);
+        CHECK(why == "another engine or layout");
+        CHECK(flash_rewidth(fresh, "4,x," + token + ",set-other" + peers4, compat(2, 0, L.state_bytes, set_of(2)), compat, L, 2,
+                            0, BLOCKS, GRID, 1 << 20, why) == 0);
         CHECK(why == "another engine or layout");
         ::kill(p.pid, SIGTERM); ::waitpid(p.pid, nullptr, 0);
     }

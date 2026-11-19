@@ -1447,8 +1447,9 @@ class Supervisor:
         old one serves, the front end holds new requests until the running ones finish (at most s['drain'] seconds),
         then every old member switches (scale_go). Any failure before the switch leaves the cluster as it was."""
         try:
+            # old_set: the running model set id, which names the width; the new ranks check the old store against it
             s['msg'] = {'id': s['id'], 'argv': s['argv'], 'members': s['members'], 'old_members': s['old_members'],
-                        'layout': self.scale_layout(s), 'token': s['token']}
+                        'layout': self.scale_layout(s), 'token': s['token'], 'old_set': self.model_id}
             for a in s['old_members']:
                 if a != self.lan:
                     r = self.call(a, {'t': 'scale_prepare', **s['msg']}, timeout=10)
@@ -1550,7 +1551,7 @@ class Supervisor:
         root = scale_store(self.o)
         if root:
             p['store'] = os.path.join(self.home, root)
-            p['rewidth'] = f'{len(old)},{"x" if old_rank is None else old_rank},{token},' + \
+            p['rewidth'] = f'{len(old)},{"x" if old_rank is None else old_rank},{token},{m["old_set"]},' + \
                 ','.join(f'{a}:{self.port + 3}' for a in old)
         self.scale_go.clear()
         self.scale_abort.clear()

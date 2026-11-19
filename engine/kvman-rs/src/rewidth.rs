@@ -20,29 +20,34 @@ use std::path::Path;
 
 const PAGE: u64 = 64;
 
-/// GR8_KV_REWIDTH: `<old_nr>,<old_rank|x>,<token_file>,<peer0>,...,<peer{old_nr-1}>`. `x`: this box was not a member.
+/// GR8_KV_REWIDTH: `<old_nr>,<old_rank|x>,<token_file>,<old_set>,<peer0>,...,<peer{old_nr-1}>`. `x`: this box was not
+/// a member. `old_set`: the model set id the old width booted with (the launcher's id names the TP too, so the old
+/// store's `set` is checked against it, not against this boot's).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Spec {
     pub old_nr: u32,
     pub old_rank: Option<u32>,
     pub token_file: String,
+    pub old_set: String,
     pub peers: Vec<String>,
 }
 
 impl Spec {
     pub fn parse(s: &str) -> Result<Spec, String> {
         let f: Vec<&str> = s.split(',').map(str::trim).collect();
-        let bad = || format!("GR8_KV_REWIDTH {s:?}: want <old_nr>,<old_rank|x>,<token_file>,<peer0>,...");
-        if f.len() < 4 {
+        let bad = || format!("GR8_KV_REWIDTH {s:?}: want <old_nr>,<old_rank|x>,<token_file>,<old_set>,<peer0>,...");
+        if f.len() < 5 {
             return Err(bad());
         }
         let old_nr: u32 = f[0].parse().map_err(|_| bad())?;
         let old_rank = if f[1] == "x" { None } else { Some(f[1].parse::<u32>().map_err(|_| bad())?) };
-        let peers: Vec<String> = f[3..].iter().map(|p| p.to_string()).collect();
-        if old_nr == 0 || peers.len() != old_nr as usize || old_rank.is_some_and(|r| r >= old_nr) || f[2].is_empty() {
+        let peers: Vec<String> = f[4..].iter().map(|p| p.to_string()).collect();
+        if old_nr == 0 || peers.len() != old_nr as usize || old_rank.is_some_and(|r| r >= old_nr) || f[2].is_empty() ||
+            f[3].is_empty()
+        {
             return Err(bad());
         }
-        Ok(Spec { old_nr, old_rank, token_file: f[2].to_string(), peers })
+        Ok(Spec { old_nr, old_rank, token_file: f[2].to_string(), old_set: f[3].to_string(), peers })
     }
 }
 
@@ -52,8 +57,9 @@ pub fn fields(compat: &str) -> BTreeMap<&str, &str> {
     w.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0], c[1])).collect()
 }
 
-/// What must be equal for the old store's blocks to be this engine's, besides the width.
-const SAME: [&str; 8] = ["set", "below", "grid", "block", "bindings", "format", "engine", "kv"];
+/// What must be equal for the old store's blocks to be this engine's, besides the width and the model set (`set`, which
+/// names the width too: checked against the spec's old_set).
+const SAME: [&str; 7] = ["below", "grid", "block", "bindings", "format", "engine", "kv"];
 
 /// The logical pages past R (from `rp`) rank `rank` of `nr` holds, in order: its own blocks, j-th to j-th.
 fn owned(rp: u64, nr: u64, rank: u64) -> impl Iterator<Item = u64> {
@@ -130,6 +136,9 @@ pub fn rewidth(
     let (old, new) = (fields(&old_compat), fields(compat));
     if let Some(k) = SAME.iter().find(|k| old.get(*k) != new.get(*k)) {
         return Ok(Err(format!("{k} differs")));
+    }
+    if old.get("set") != Some(&spec.old_set.as_str()) {
+        return Ok(Err("set differs from the old width's".into()));
     }
     if old.get("nr").and_then(|v| v.parse::<u32>().ok()) != Some(spec.old_nr) {
         return Ok(Err("nr differs from the old width".into()));
@@ -285,9 +294,10 @@ mod tests {
 
     #[test]
     fn spec_parse() {
-        let s = Spec::parse("4,x,/t,a:1,b:1,c:1,d:1").unwrap();
-        assert_eq!((s.old_nr, s.old_rank, s.peers.len()), (4, None, 4));
-        assert!(Spec::parse("4,1,/t,a:1,b:1").is_err());
-        assert!(Spec::parse("2,2,/t,a:1,b:1").is_err());
+        let s = Spec::parse("4,x,/t,s4,a:1,b:1,c:1,d:1").unwrap();
+        assert_eq!((s.old_nr, s.old_rank, s.old_set.as_str(), s.peers.len()), (4, None, "s4", 4));
+        assert!(Spec::parse("4,1,/t,s4,a:1,b:1").is_err());
+        assert!(Spec::parse("2,2,/t,s4,a:1,b:1").is_err());
+        assert!(Spec::parse("2,0,/t,,a:1,b:1").is_err());
     }
 }

@@ -28,10 +28,11 @@
 #include <unistd.h>
 
 namespace g6s2 {
-// GR8_KV_REWIDTH: <old_nr>,<old_rank|x>,<token_file>,<peer0>,...,<peer{old_nr-1}> (x: this box held no old rank)
+// GR8_KV_REWIDTH: <old_nr>,<old_rank|x>,<token_file>,<old_set>,<peer0>,...,<peer{old_nr-1}> (x: this box held no old
+// rank; old_set: the model set id the old width booted with, which names the width)
 struct FlashRewidthSpec {
     int old_nr = 0, old_rank = -1;
-    std::string token_file;
+    std::string token_file, old_set;
     std::vector<std::string> peers;
 };
 inline const char* flash_rewidth_spec(const std::string& s, FlashRewidthSpec& out) {
@@ -43,18 +44,19 @@ inline const char* flash_rewidth_spec(const std::string& s, FlashRewidthSpec& ou
         if (e == std::string::npos) break;
         a = e + 1;
     }
-    const char* bad = "GR8_KV_REWIDTH: want <old_nr>,<old_rank|x>,<token_file>,<peer0>,...";
-    if (f.size() < 4) return bad;
+    const char* bad = "GR8_KV_REWIDTH: want <old_nr>,<old_rank|x>,<token_file>,<old_set>,<peer0>,...";
+    if (f.size() < 5) return bad;
     char* e = nullptr;
     out.old_nr = int(std::strtol(f[0].c_str(), &e, 10));
-    if (*e || out.old_nr <= 0 || f.size() != size_t(3 + out.old_nr)) return bad;
+    if (*e || out.old_nr <= 0 || f.size() != size_t(4 + out.old_nr)) return bad;
     if (f[1] != "x") {
         out.old_rank = int(std::strtol(f[1].c_str(), &e, 10));
         if (f[1].empty() || *e || out.old_rank < 0 || out.old_rank >= out.old_nr) return bad;
     }
     out.token_file = f[2];
-    out.peers.assign(f.begin() + 3, f.end());
-    return out.token_file.empty() ? bad : nullptr;
+    out.old_set = f[3];
+    out.peers.assign(f.begin() + 4, f.end());
+    return out.token_file.empty() || out.old_set.empty() ? bad : nullptr;
 }
 
 namespace frw {
@@ -126,11 +128,12 @@ inline void pwrite_all(int fd, const uint8_t* p, size_t n, uint64_t off, const s
 } // namespace frw
 
 // Rewrites dir's Flash checkpoint store for rank `rank` of `nr`. compat: this store's compat line; old_compat(old_nr,
-// old_rank, state_bytes): an old rank's. L: this rank's entry layout (FlashCheckpoints::layout_of), store_blocks its
-// store's blocks, grid the cold prefill grid, pool_pages the pages a run may hold. >0: entries carried; 0: nothing
+// old_rank, state_bytes, old_set): an old rank's. L: this rank's entry layout (FlashCheckpoints::layout_of), store_blocks
+// its store's blocks, grid the cold prefill grid, pool_pages the pages a run may hold. >0: entries carried; 0: nothing
 // carried (why); -1: failed (why), and every file it wrote is gone (the store starts empty).
 inline int64_t flash_rewidth(const std::string& dir, const std::string& spec_text, const std::string& compat,
-                             const std::function<std::string(int, int, size_t)>& old_compat, const FlashLayout& L, int nr,
+                             const std::function<std::string(int, int, size_t, const std::string&)>& old_compat,
+                             const FlashLayout& L, int nr,
                              int rank, uint64_t store_blocks, uint32_t grid, uint64_t pool_pages, std::string& why) {
     using namespace kda;
     FlashRewidthSpec spec;
@@ -165,7 +168,7 @@ inline int64_t flash_rewidth(const std::string& dir, const std::string& spec_tex
         if (const char* e = flash_index_decode(ib, img)) { why = std::string("old index: ") + e; return 0; }
         std::vector<uint64_t> old_compats;
         for (int q = 0; q < spec.old_nr; ++q) {
-            const std::string c = old_compat(spec.old_nr, q, old_state);
+            const std::string c = old_compat(spec.old_nr, q, old_state, spec.old_set);
             old_compats.push_back(fnv64(c.data(), c.size()));
         }
         if (img.compat != old_compats[size_t(from)]) { why = "another engine or layout"; return 0; }

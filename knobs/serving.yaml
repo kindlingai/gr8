@@ -137,8 +137,9 @@ knobs:
       Set by `./gr8 <model> scale` for one boot, never by hand: before a persisted --kv-store ssd store (GLM-5.3) or
       the aligned checkpoint store (GLM-5.3-Flash) opens, rewrite the one the old width left (index.prev, *.prev) for
       this rank, reading the other boxes' blocks from their kvman-peer, as
-      <old_nr>,<old_rank|x>,<token_file>,<peer0>,...,<peer old_nr-1>. A store whose model, R, grid, block layout or
-      engine differ, or a failed rewrite, starts empty as without it.
+      <old_nr>,<old_rank|x>,<token_file>,<old_set>,<peer0>,...,<peer old_nr-1> (old_set: the model set id the old width
+      booted with, which names the width). A store whose model, R, grid, block layout or engine differ (on
+      GLM-5.3-Flash also CAP and the prefill rows and lanes), or a failed rewrite, starts empty as without it.
   GR8_KV_SHARE_PAGES:
     scope: agree
     kind: flag

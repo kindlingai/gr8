@@ -1487,13 +1487,13 @@ int main(int argc, char** argv)
             static const std::string exe = g6s2::exe_stamp();
             // the cache mode is not in it: the launcher (tools/launch/options.py) and the check above refuse persist=on
             // with terminal, so a persisted entry is always aligned (cold-exact)
-            const auto flash_compat = [&](int nr, int rank, size_t state_bytes) {
-                return "flash set " + set_id + " nr " + std::to_string(nr) + " rank " + std::to_string(rank) + " cap " +
+            const auto flash_compat = [&](int nr, int rank, size_t state_bytes, const std::string& set) {
+                return "flash set " + set + " nr " + std::to_string(nr) + " rank " + std::to_string(rank) + " cap " +
                     std::to_string(cap) + " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " bindings " +
                     std::to_string(v.bindings.size()) + " state " + std::to_string(state_bytes) + " format " +
                     std::to_string(g6s2::FlashManifest::FORMAT) + " engine " + exe;
             };
-            const std::string compat = flash_compat(g6nr::NR, R, v.state_bytes());
+            const std::string compat = flash_compat(g6nr::NR, R, v.state_bytes(), set_id);
             // ./gr8 glm53f scale: the store the old width left (*.prev) rewritten for this rank before it opens. A CP binding
             // keeps only this rank's pages, which another width does not hold: those start empty
             if (const auto& rw = knob::kv_rewidth(); rw && !index_path.empty())

@@ -40,9 +40,10 @@ fn page(id: u64, lp: u64) -> Vec<u8> {
     block(mix(2, id, lp))
 }
 
+/// the store's compat line at width nr: the set id names the width, as the launcher's does (modelset.py describe_release)
 fn compat(nr: u32, slots: u64, below: u64) -> String {
     format!(
-        "set s1 nr {nr} below {below} place 900 grid 64 block {SB} bindings 4/2 slots {slots} format 3 engine abc kv int4"
+        "set s{nr} nr {nr} below {below} place 900 grid 64 block {SB} bindings 4/2 slots {slots} format 3 engine abc kv int4"
     )
 }
 
@@ -164,6 +165,7 @@ fn scale(old: &[PathBuf], from: &[Option<u32>], new: &[PathBuf], nr: u32, slots:
                 old_nr: old.len() as u32,
                 old_rank: from[r as usize],
                 token_file: sv.token_file.display().to_string(),
+                old_set: format!("s{}", old.len()),
                 peers: sv.addrs.clone(),
             };
             let dir = new[r as usize].clone();
@@ -332,13 +334,18 @@ fn refusals() {
         old_nr: 4,
         old_rank: Some(0),
         token_file: sv.token_file.display().to_string(),
+        old_set: "s4".into(),
         peers: vec![sv.addrs[0].clone(); 4],
     };
     let r = rewidth(&old[0], &compat(3, 64, BELOW * 2), 3, 0, 64, SB, &spec).unwrap();
     assert_eq!(r, Err("below differs".to_string()));
     assert!(!old[0].join("index").exists(), "nothing written");
+    // another model set than the old width's: skipped
+    let other = Spec { old_set: "s9".into(), ..spec.clone() };
+    let r = rewidth(&old[0], &compat(3, 64, BELOW), 3, 0, 64, SB, &other).unwrap();
+    assert_eq!(r, Err("set differs from the old width's".to_string()));
     // a peer that is gone: an error, and the index is untouched
-    let spec = Spec { old_nr: 4, old_rank: None, token_file: spec.token_file.clone(), peers: vec!["127.0.0.1:1".into(); 4] };
+    let spec = Spec { old_rank: None, peers: vec!["127.0.0.1:1".into(); 4], ..spec };
     let fresh = tmp.join("fresh");
     std::fs::create_dir_all(&fresh).unwrap();
     assert!(rewidth(&fresh, &compat(3, 64, BELOW), 3, 0, 64, SB, &spec).is_err());
