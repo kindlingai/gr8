@@ -2026,16 +2026,21 @@ class Either:
         return any(e.is_set() for e in self.events)
 
 
+# what an up command line names per member of its list: a scale gives the new list's own (or none)
+SCALE_DROPS = ('MENTAT', 'IPS', 'IPS2')
+
+
 def scale_argv(argv):
-    """An up command line without its --mentat: a scale names its members (--peers), and the cluster runs in peers
-    mode from then on."""
+    """An up command line without --mentat (a scale names its members with --peers, and the cluster runs in peers mode
+    from then on) and without --ips/--ips2, which list the old members' rails: the scale command gives the new ones."""
+    flags = {opt.flag_of(k) for k in SCALE_DROPS}
     out, i = [], 0
     while i < len(argv):
         a = argv[i]
-        if a == '--mentat':
+        if a in flags:
             i += 2
             continue
-        if not a.startswith(('--mentat=', 'MENTAT=')):
+        if not (a.partition('=')[0] in flags or a.partition('=')[0] in SCALE_DROPS):
             out.append(a)
         i += 1
     return out

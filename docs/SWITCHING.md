@@ -211,7 +211,9 @@ per-rank rows pool two ranks over the same three stops:
 
 `./gr8 glm53 scale --tp N --peers LIST [--drain-timeout S]` (also `glm53f`) moves a serving cluster to another TP or
 set of boxes without failing a request. Run it on any box of the cluster; the head (the first address) must stay first
-in `LIST`. It is an orderly restart of the engines, not an in-process switch:
+in `LIST`. The boot's `--ips`/`--ips2` list the old members' rails and are dropped: give the new list's on the scale
+command when its boxes need them (`--ips A1,B1 --ips2 A2,B2`; none at TP=1). It is an orderly restart of the engines,
+not an in-process switch:
 
 1. The head plans the new layout (GLM-5.3 with `bin/g6layout plan`, so a box keeps the expert halves it holds) and
    every box of the new list makes its rank's files ready and runs its checks while the cluster serves. A box new to

@@ -272,9 +272,10 @@ class StorePrep(unittest.TestCase):
         sv.store_undo(self.t, 3, None, True)
         self.assertEqual(self.tree(), ['r3/flash-ckpt'])
 
-    def test_scale_argv_drops_mentat(self):
-        self.assertEqual(sv.scale_argv(['--mentat', 'h:1', '--tp', '4', '--mentat=x', 'MENTAT=y', '--port', '1']),
-                         ['--tp', '4', '--port', '1'])
+    def test_scale_argv_drops_mentat_and_the_old_rails(self):
+        self.assertEqual(sv.scale_argv(['--mentat', 'h:1', '--tp', '4', '--mentat=x', 'MENTAT=y', '--port', '1',
+                                        '--ips', 'a,b', '--ips2=c,d', 'IPS=e', '--node-ip', '10.0.0.1']),
+                         ['--tp', '4', '--port', '1', '--node-ip', '10.0.0.1'])
 
 
 if __name__ == '__main__':
