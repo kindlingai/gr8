@@ -45,6 +45,7 @@
 #include "../kernels/bind.cuh"
 #include "../kernels/dec_dense_opt.cuh"
 #include "../kernels/dtr_exact_opt.cuh"
+#include "../kernels/moe_rtr_fin_opt.cuh"
 #include "../kernels/l2pf.cuh"
 #include "../kernels/head_i4.cuh"
 #include "../kernels/head2.cuh"
@@ -625,6 +626,7 @@ struct Model
     QSplit qs;                        // GR8_QA_SPLIT (main model only; mode 0 = today's replicated GEMVs)
     dec_dense_opt::State ddo;         // GR8_DEC_DENSE_OPT (default off): bit-exact fused decode dense kernels
     dtr_exact_opt::State dteo;        // GR8_DTR_EXACT_OPT (default off): bit-exact dense trellis o_proj & q_b kernels
+    moe_rtr_fin_opt::State mrfo;      // GR8_MOE_RTR_FIN_OPT (default off): bit-exact fused MoE router+plan & K1 finalize
     bind::K1Ovl ovl;                  // GR8_ROUTE_OVL (route_ovl_init; mode 0 = off): the shared expert's side stream
     bool route_last = false;          // GR8_MTP_LASTROW (MTP draft model only, set before capture): only each session's last row
                                       // of a step takes routed experts (launch_mlp_block, mtp_lastrow_env)
@@ -1125,6 +1127,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.hlog = dmalloc<float>((size_t)MX * m.vn);
     G6RT_CK(dec_dense_opt::setup(m.ddo, m.nl));
     G6RT_CK(dtr_exact_opt::setup(m.dteo));
+    G6RT_CK(moe_rtr_fin_opt::setup(m.mrfo));
 }
 
 // after build, before any launch: the gather fabric (ncoll = m.qs.ncoll(), slots of at least MX rows of the widest wire row);
@@ -1900,7 +1903,6 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
     if (ovl) bind::k1_ovl_fork(b.k1, m.ovl, st);      // GR8_ROUTE_OVL: the shared expert reads only x2, not the plan
     if (y.moe)
     {
-        bind::launch(b.router, st);
         unsigned keep = 0u;                    // GR8_MTP_LASTROW: the rows that take routed experts (0 = all)
         const unsigned* keep_dev = nullptr;
         if (m.route_last)
@@ -1911,11 +1913,16 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
 #endif
             keep = 1u << (M - 1);
         }
-        glue::k_router_plan<<<1, glue::NEXP, 0, st>>>(m.logits, y.router_bias, M, m.plan, keep, keep_dev);
+        if (!moe_rtr_fin_opt::launch_router_plan(m.mrfo, b.router, y.router_bias, M, m.logits, m.plan, keep, keep_dev, st))
+        {
+            bind::launch(b.router, st);
+            glue::k_router_plan<<<1, glue::NEXP, 0, st>>>(m.logits, y.router_bias, M, m.plan, keep, keep_dev);
+        }
         if (m.rlog) G6RT_CK(cudaMemcpyAsync(m.rlog + (size_t)i * RLOG, m.plan, RLOG * sizeof(int), cudaMemcpyDeviceToHost, st));
     }
     dmark(DP_ROUTER, st);
-    bind::launch_mlp(b, st, ovl ? &m.ovl : nullptr);
+    if (!moe_rtr_fin_opt::launch_mlp(m.mrfo, b, ovl ? &m.ovl : nullptr, st))
+        bind::launch_mlp(b, st, ovl ? &m.ovl : nullptr);
     dmark(DP_EXPERTS, st);
 #ifdef DEC_SLOT
     slot_publish(m, 2 * i + 1, st);

@@ -221,6 +221,14 @@ knobs:
     values: "0|1|2"
     doc: >-
       Quality test: rounds mHC residual stream writes to BF16, 1 = after both blocks, 2 = only after the MLP block.
+  GR8_MOE_RTR_FIN_OPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Runs bit-exact fused MoE router+plan and reduced-warp K1 finalize decode kernels on GLM-5.3 under a strict per-(TP,
+      M) table (TP6 M=1,2,4,8,16 and TP4 M=2,4,8,16; TP4 M=1 and all other M fall back to stock). Same output bits;
+      stacks cleanly with GR8_TR3_WIDE4=1 and GR8_ROUTE_OVL.
   GR8_MOE_TOPK:
     scope: agree
     kind: int
