@@ -10,8 +10,11 @@
 //! sends them through each lane's staging buffer as an unregistered caller would. --isolation (RDMA) shows the NIC
 //! refuse another lease's rkey and an address past the lease.
 
+mod glm53;
+
 use g6kvman::remote::{Config, Node, Opts, RemoteStore, Transport, Want};
-use g6kvman::tier::{par_for, AlignedBuf, BlockStore, PAGE_SLOT, ROW_BYTES};
+use g6kvman::tier::{par_for, AlignedBuf, BlockStore};
+use glm53::ROW_BYTES;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -124,17 +127,18 @@ fn pct(lat: &[u64], p: f64) -> f64 {
 }
 
 fn run(o: &Args) -> std::io::Result<()> {
-    let blocks = (o.gb * 1e9) as u64 / PAGE_SLOT as u64;
+    let page_slot = glm53::page_slot(glm53::MLA_ROW);
+    let blocks = (o.gb * 1e9) as u64 / page_slot as u64;
     let lanes = o.threads.iter().chain(&o.qds).copied().max().unwrap_or(1).max(1);
-    let s = RemoteStore::open(&o.server, &Opts { want: o.want, lanes, ..Opts::new(&o.name, PAGE_SLOT, blocks) })?;
+    let s = RemoteStore::open(&o.server, &Opts { want: o.want, lanes, ..Opts::new(&o.name, page_slot, blocks) })?;
     println!(
         "lease {} on {} from {}: {} page blocks of {} B ({:.2} GB), {} lanes, {}{}{}",
         o.name,
         s.server,
         s.local.ip(),
         blocks,
-        PAGE_SLOT,
-        (blocks * PAGE_SLOT as u64) as f64 / 1e9,
+        page_slot,
+        (blocks * page_slot as u64) as f64 / 1e9,
         s.lanes(),
         match s.transport {
             Transport::Rdma => "RDMA",
@@ -146,7 +150,7 @@ fn run(o: &Args) -> std::io::Result<()> {
     if o.isolation {
         isolation(o)?;
     }
-    let mut bufs: Vec<Mutex<AlignedBuf>> = (0..lanes).map(|_| Mutex::new(AlignedBuf::new(PAGE_SLOT))).collect();
+    let mut bufs: Vec<Mutex<AlignedBuf>> = (0..lanes).map(|_| Mutex::new(AlignedBuf::new(page_slot))).collect();
     for (i, b) in bufs.iter_mut().enumerate() {
         let b = b.get_mut().unwrap();
         b.as_mut_slice().iter_mut().enumerate().for_each(|(j, x)| *x = (i * 131 + j) as u8);
@@ -157,9 +161,9 @@ fn run(o: &Args) -> std::io::Result<()> {
     // fill once, so reads see written blocks
     let t0 = Instant::now();
     par_for(lanes.min(8), blocks as usize, |w, i| {
-        s.write_block(i as u64, &bufs[w].lock().unwrap().as_slice()[..PAGE_SLOT])
+        s.write_block(i as u64, &bufs[w].lock().unwrap().as_slice()[..page_slot])
     })?;
-    println!("fill  {:>3} threads  {:>6.2} GB/s", lanes.min(8), gbs(blocks * PAGE_SLOT as u64, t0.elapsed()));
+    println!("fill  {:>3} threads  {:>6.2} GB/s", lanes.min(8), gbs(blocks * page_slot as u64, t0.elapsed()));
     println!("page blocks: GB/s, and ms per block");
     println!("{:>8} {:>9} {:>8} {:>8} {:>9} {:>8} {:>8}", "threads", "write", "p50", "p99", "read", "p50", "p99");
     for &t in &o.threads {
@@ -172,14 +176,14 @@ fn run(o: &Args) -> std::io::Result<()> {
                     let mut b = bufs[w].lock().unwrap();
                     let t1 = Instant::now();
                     if write {
-                        s.write_block(i as u64, &b.as_slice()[..PAGE_SLOT])?;
+                        s.write_block(i as u64, &b.as_slice()[..page_slot])?;
                     } else {
-                        s.read_block(i as u64, &mut b.as_mut_slice()[..PAGE_SLOT])?;
+                        s.read_block(i as u64, &mut b.as_mut_slice()[..page_slot])?;
                     }
                     lat.lock().unwrap().push(t1.elapsed().as_nanos() as u64);
                     Ok(())
                 })?;
-                moved += blocks * PAGE_SLOT as u64;
+                moved += blocks * page_slot as u64;
             }
             let el = t0.elapsed();
             let mut lat = lat.into_inner().unwrap();
@@ -191,7 +195,7 @@ fn run(o: &Args) -> std::io::Result<()> {
             row[0].0, row[0].1, row[0].2, row[1].0, row[1].1, row[1].2
         );
     }
-    let lease = blocks * PAGE_SLOT as u64;
+    let lease = blocks * page_slot as u64;
     for (i, &qd) in o.qds.iter().enumerate() {
         if i == 0 {
             println!("random row reads ({ROW_BYTES} B), one thread per read in flight");

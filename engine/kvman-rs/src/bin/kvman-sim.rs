@@ -17,16 +17,18 @@
 //! --repeat N runs the trace N times over, each copy started --stagger seconds after the last, as N times the agents.
 //! Time model (the engine at TP=4): one prefill at a time (--prefill-tps, new tokens only), and no decode while a prefill
 //! runs. Decode shares a total rate by how many sessions decode (--decode-tps: 1, 2, 4 sessions, 3 interpolated, more than
-//! 4 as 4). The SSD store moves page blocks (src/tier.rs page_slot: --mla-row 656, or 416 for a G6_KV4 engine) at --ssd-write-gbs / --ssd-read-gbs, on the
+//! 4 as 4). The SSD store moves page blocks (GLM 5.3's, src/bin/glm53: --mla-row 656, or 416 for a G6_KV4 engine) at --ssd-write-gbs / --ssd-read-gbs, on the
 //! admitting request's critical path (--spill evict), or writes every retained run at retirement off the critical path
 //! (--spill retire). The pool, its reuse rules and its evictions are the engine's own code (src/pool.rs).
 //! --rowcache W[,W..] adds an estimate for a sparse row cache: per decoded token, the indexer's selected rows that fall
 //! outside a W-token resident window, read from SSD at --row-iops.
 
+mod glm53;
+
 use g6kvman::reuse::{begin, Finished, Rules};
 use g6kvman::stash::{Io, Keep};
-use g6kvman::tier::{page_slot, MLA_ROW};
 use g6kvman::{Pool, Run, PAGE};
+use glm53::{page_slot, MLA_ROW};
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone)]
