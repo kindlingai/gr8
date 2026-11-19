@@ -13,13 +13,16 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const HELLO: &str = "G6PEER1 ";
 const OP_READ: u8 = 1;
 const OP_SIZE: u8 = 2;
 /// the most one read may ask for
 pub const MAX_READ: u64 = 1 << 30;
+/// How long `Peer::open` tries again while a peer refuses or times out: an old rank's box starts its kvman-peer only
+/// after its engine's orderly quit, which a new rank's engine can reach the store open before.
+pub const PEER_WAIT: Duration = Duration::from_secs(60);
 
 /// Whether `name` may be served: one or two path parts of [A-Za-z0-9._-], none of them `.` or `..`.
 pub fn name_ok(name: &str) -> bool {
@@ -129,6 +132,17 @@ fn serve_one(dir: &Path, s: TcpStream, token: &str) -> io::Result<()> {
     }
 }
 
+/// A connect error a peer that is not listening yet gives.
+fn transient(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+    )
+}
+
 /// One connection to a peer's file service.
 pub struct Peer {
     s: TcpStream,
@@ -137,8 +151,20 @@ pub struct Peer {
 
 impl Peer {
     pub fn open(addr: &str, token: &str) -> io::Result<Peer> {
+        Peer::open_wait(addr, token, PEER_WAIT)
+    }
+
+    /// `open`, trying the connection again every 200 ms for up to `wait` while it is refused or times out.
+    pub fn open_wait(addr: &str, token: &str, wait: Duration) -> io::Result<Peer> {
         let sa = addr.to_socket_addrs()?.next().ok_or_else(|| bad(format!("{addr}: no address")))?;
-        let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(10))?;
+        let end = Instant::now() + wait;
+        let mut s = loop {
+            match TcpStream::connect_timeout(&sa, Duration::from_secs(10)) {
+                Ok(s) => break s,
+                Err(e) if transient(&e) && Instant::now() < end => std::thread::sleep(Duration::from_millis(200)),
+                Err(e) => return Err(e),
+            }
+        };
         s.set_read_timeout(Some(Duration::from_secs(120)))?;
         s.set_write_timeout(Some(Duration::from_secs(120)))?;
         s.set_nodelay(true)?;

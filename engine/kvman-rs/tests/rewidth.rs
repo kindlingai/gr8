@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const SB: u64 = 4096;
 const BELOW: u64 = 128; // R: 2 pages
@@ -167,6 +168,7 @@ fn scale(old: &[PathBuf], from: &[Option<u32>], new: &[PathBuf], nr: u32, slots:
                 token_file: sv.token_file.display().to_string(),
                 old_set: format!("s{}", old.len()),
                 peers: sv.addrs.clone(),
+                wait: peer::PEER_WAIT,
             };
             let dir = new[r as usize].clone();
             std::thread::spawn(move || {
@@ -336,6 +338,7 @@ fn refusals() {
         token_file: sv.token_file.display().to_string(),
         old_set: "s4".into(),
         peers: vec![sv.addrs[0].clone(); 4],
+        wait: Duration::ZERO,
     };
     let r = rewidth(&old[0], &compat(3, 64, BELOW * 2), 3, 0, 64, SB, &spec).unwrap();
     assert_eq!(r, Err("below differs".to_string()));
@@ -351,4 +354,23 @@ fn refusals() {
     assert!(rewidth(&fresh, &compat(3, 64, BELOW), 3, 0, 64, SB, &spec).is_err());
     assert!(!fresh.join("index").exists());
     std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn a_peer_that_starts_late_is_waited_for() {
+    // the port of a listener that is gone: refused now, served 400 ms later (an old rank's kvman-peer after its quit)
+    let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    assert!(Peer::open_wait(&addr, "ab", Duration::ZERO).is_err(), "no wait: refused at once");
+    let a = addr.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        let l = std::net::TcpListener::bind(&a).unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(l.accept().unwrap().0), &mut line).unwrap();
+        line
+    });
+    let t0 = std::time::Instant::now();
+    Peer::open_wait(&addr, "ab", Duration::from_secs(10)).unwrap();
+    assert!(t0.elapsed() >= Duration::from_millis(300));
+    assert_eq!(t.join().unwrap(), "G6PEER1 ab\n");
 }

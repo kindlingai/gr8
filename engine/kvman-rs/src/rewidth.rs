@@ -30,6 +30,8 @@ pub struct Spec {
     pub token_file: String,
     pub old_set: String,
     pub peers: Vec<String>,
+    /// How long a peer that refuses is tried again (peer::PEER_WAIT from parse).
+    pub wait: std::time::Duration,
 }
 
 impl Spec {
@@ -47,7 +49,14 @@ impl Spec {
         {
             return Err(bad());
         }
-        Ok(Spec { old_nr, old_rank, token_file: f[2].to_string(), old_set: f[3].to_string(), peers })
+        Ok(Spec {
+            old_nr,
+            old_rank,
+            token_file: f[2].to_string(),
+            old_set: f[3].to_string(),
+            peers,
+            wait: peer::PEER_WAIT,
+        })
     }
 }
 
@@ -82,7 +91,7 @@ impl Src<'_> {
         let p = &mut self.peers[q as usize];
         if p.is_none() {
             let a = &self.spec.peers[q as usize];
-            *p = Some(Peer::open(a, &self.token).map_err(|e| format!("peer {q} ({a}): {e}"))?);
+            *p = Some(Peer::open_wait(a, &self.token, self.spec.wait).map_err(|e| format!("peer {q} ({a}): {e}"))?);
         }
         Ok(p.as_mut().expect("set"))
     }
@@ -126,7 +135,7 @@ pub fn rewidth(
         },
         None => {
             let a = &spec.peers[0];
-            let p = first.insert(Peer::open(a, &token).map_err(|e| format!("peer 0 ({a}): {e}"))?);
+            let p = first.insert(Peer::open_wait(a, &token, spec.wait).map_err(|e| format!("peer 0 ({a}): {e}"))?);
             p.read_all("index.prev").map_err(|e| e.to_string())?
         }
     };
