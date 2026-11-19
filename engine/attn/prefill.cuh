@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include "prefill-index-team-profile.cuh"
 #include "selx.cuh"
+#include "prefill-opt.cuh"
 #ifndef G6_PF_MARK
 #define G6_PF_MARK(stage, stream) ((void)0)
 #endif
@@ -405,15 +406,19 @@ extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6
     for(int start=0;start<a.rows;start+=p->R){int n=std::min(p->R,a.rows-start),R=p->R,H=a.heads;
         GP_PROFILE();G6_PF_MARK(2,st);if(a.reuse_indices)ga::reuse<<<n,256,0,st>>>(a,start);else{
             ga::prep_index<<<dim3(n,32),128,0,st>>>(a,start,w.iq,w.weights);
+            const bool opt=knob::pf_attn_opt();
 #if defined(PF_ISGRT) && PF_ISGRT
-            const bool clean=gp::isg_clean(a);G6_PF_MARK(3,st);
-            if(clean){auto e=gp::launch_index_scores_rg_clean(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.histogram,st);if(e!=cudaSuccess)return int(e);}
+            const bool clean=!opt&&gp::isg_clean(a);G6_PF_MARK(3,st);
+            if(opt){auto e=pf_attn_opt::launch_idx_n64(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,st);if(e!=cudaSuccess)return int(e);}
+            else if(clean){auto e=gp::launch_index_scores_rg_clean(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.histogram,st);if(e!=cudaSuccess)return int(e);}
             else gp::launch_index_scores_rg(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii,st);
 #else
-            const bool clean=false;G6_PF_MARK(3,st);gp::index_scores_grouped<<<dim3((a.context+63)/64,(n+3)/4),256,0,st>>>(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii);
+            const bool clean=false;G6_PF_MARK(3,st);
+            if(opt){auto e=pf_attn_opt::launch_idx_n64(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,st);if(e!=cudaSuccess)return int(e);}
+            else gp::index_scores_grouped<<<dim3((a.context+63)/64,(n+3)/4),256,0,st>>>(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii);
 #endif
             if(tr.index_scores)cudaMemcpyAsync(tr.index_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);
-            G6_PF_MARK(4,st);auto e=gp::select_prefill(a,w,start,n,st,clean);if(e!=cudaSuccess)return int(e);
+            G6_PF_MARK(4,st);auto e=opt?pf_attn_opt::select_prefill(a,w,start,n,st):gp::select_prefill(a,w,start,n,st,clean);if(e!=cudaSuccess)return int(e);
         }
         GP_PROFILE();G6_PF_MARK(5,st);gp::pack_uk_input<<<(H*R*192+255)/256,256,0,st>>>(a,start,n,R,p->q);GP_BLAS(cublasGemmStridedBatchedEx(p->blas,CUBLAS_OP_T,CUBLAS_OP_N,512,R,192,&one,p->uk,CUDA_R_16F,192,512*192,
             p->q,CUDA_R_16F,576,(long long)R*576,&zero,p->qf,CUDA_R_32F,512,(long long)R*512,H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));

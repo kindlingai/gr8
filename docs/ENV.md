@@ -282,6 +282,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_NOWIDE2` | flag | `0` |  | Keeps the MoE fc2 weights in the old order instead of the wide order. Outputs are bit-identical. |
 | `GR8_PF_AOP` | flag | 1 when built with -DPF_AOP | 0\|1 | 0 turns off the prefill fc1 A-operand share, which quantizes the fc1 A operand once into records the fc1 CTAs stage. Byte-exact. Needs the -DPF_AOP build. |
 | `GR8_PF_AOP_MMIN` | int | `3072` |  | Sets the fewest rows a prefill fc1 pass needs to use the A-operand share. Smaller passes run the stock fc1, with the same bytes. |
+| `GR8_PF_ATTN_OPT` | flag | `0` | 0\|1 | 1 runs the bit-exact optimized prefill attention kernels (PTX m16n8k16 N=64 indexer score, FP32 fast-reject top-2048 selector, vectorized E4M3 index-key expand, and vectorized INT4 KV prepass; QO core_b_half untouched). Takes precedence over GR8_PF_ISGRT_CLEAN when both are enabled. 0 runs the stock kernels. |
 | `GR8_PF_ATTN_ROWS` | int | the whole sub-batch (the GLM launcher sets 1024) |  | Prefill attention runs in chunks of this many rows inside a sub-batch. The rest of the layer runs at the sub- batch size. |
 | `GR8_PF_BLAS_ROWS` | int | the whole sub-batch (the GLM launcher sets 1024) | 16.. | Runs the prefill cuBLAS calls in chunks of this many rows, so a row's bits depend on its chunk and not on the sub-batch size. |
 | `GR8_PF_DENSE` | int | `8192` | 0..2147483616 | Sets the context up to which prefill attention takes the dense path. Past it the sparse, indexer-selected path runs. 0 means always sparse. |

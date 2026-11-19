@@ -41,6 +41,15 @@ knobs:
     doc: >-
       Sets the fewest rows a prefill fc1 pass needs to use the A-operand share. Smaller passes run the stock fc1, with
       the same bytes.
+  GR8_PF_ATTN_OPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 runs the bit-exact optimized prefill attention kernels (PTX m16n8k16 N=64 indexer score, FP32 fast-reject
+      top-2048 selector, vectorized E4M3 index-key expand, and vectorized INT4 KV prepass; QO core_b_half untouched).
+      Takes precedence over GR8_PF_ISGRT_CLEAN when both are enabled. 0 runs the stock kernels.
   GR8_PF_ATTN_ROWS:
     scope: agree
     kind: int
