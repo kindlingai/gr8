@@ -52,6 +52,17 @@ pub struct Engine {
     changed: Notify,
     /// requests blocked in `wait_ready`
     waiting: AtomicUsize,
+    /// requests let through (`admit`) whose route is not registered yet: tokenizing, rendering
+    admitted: AtomicUsize,
+}
+
+/// A request `Engine::admit` let through, counted as running until its route is registered or it ends.
+pub struct Admit(Arc<Engine>);
+
+impl Drop for Admit {
+    fn drop(&mut self) {
+        self.0.admitted.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Engine {
@@ -64,6 +75,7 @@ impl Engine {
             hold_until: Mutex::new(None),
             changed: Notify::new(),
             waiting: AtomicUsize::new(0),
+            admitted: AtomicUsize::new(0),
         })
     }
 
@@ -83,10 +95,27 @@ impl Engine {
         self.changed.notify_waiters();
     }
 
-    /// (hold set, requests running on the engine, requests waiting for it)
+    /// (hold set, requests running on the engine or let through to it, requests waiting for it)
     pub fn counts(&self) -> (bool, usize, usize) {
-        let running = self.conn.lock().unwrap().routes.len();
+        let running = self.conn.lock().unwrap().routes.len() + self.admitted.load(Ordering::Acquire);
         (self.held().is_some(), running, self.waiting.load(Ordering::Acquire))
+    }
+
+    /// `wait_ready` for a request, which is counted as running (`counts`) from before it reads the hold until its route
+    /// is registered or the returned guard drops: a drain that sets the hold and then reads no running request cannot
+    /// miss one that is still tokenizing. None: the engine is not connected.
+    pub async fn admit(self: &Arc<Self>) -> Option<Admit> {
+        loop {
+            self.admitted.fetch_add(1, Ordering::AcqRel);
+            let a = Admit(self.clone());
+            if self.held().is_none() {
+                return self.ready().then_some(a);
+            }
+            drop(a);
+            if !self.wait_ready().await {
+                return None;
+            }
+        }
     }
 
     /// Whether a new request may go to the engine. With a hold set it first waits until the hold is cleared or its
@@ -331,5 +360,37 @@ impl Drop for Stream {
             self.engine.conn.lock().unwrap().routes.remove(self.id.as_str());
             let _ = self.engine.send(wire::cancel(&self.id));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_admitted_request_counts_as_running_until_its_route_or_its_end() {
+        let e = Engine::new(String::new());
+        e.ready.store(true, Ordering::Release);
+        let a = e.admit().await.expect("ready");
+        assert_eq!(e.counts(), (false, 1, 0), "admitted, still tokenizing: a drain must wait for it");
+        e.hold(60); // the drain's hold: the admitted request still counts, so running is not 0
+        assert_eq!(e.counts(), (true, 1, 0));
+        drop(a);
+        assert_eq!(e.counts(), (true, 0, 0));
+        // a request during the hold waits, uncounted as running, and is admitted when the hold ends
+        let w = tokio::spawn({
+            let e = e.clone();
+            async move { e.admit().await.is_some() }
+        });
+        while e.counts().2 == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(e.counts(), (true, 0, 1));
+        e.hold(0);
+        assert!(w.await.unwrap());
+        assert_eq!(e.counts(), (false, 0, 0));
+        e.ready.store(false, Ordering::Release);
+        assert!(e.admit().await.is_none());
+        assert_eq!(e.counts(), (false, 0, 0));
     }
 }

@@ -18,6 +18,7 @@ use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 use crate::dialect::{self, AnyParser, Dialect};
+use crate::engine::Admit;
 use crate::gen::{think_open, Budget, Generation, Res, Step, StepStats, StopReason};
 use crate::guard;
 use crate::jsonmode;
@@ -392,11 +393,13 @@ impl State {
     }
 
     /// Waits through a scale's hold (`/internal/hold`); then 503 with Retry-After when the engine is not connected.
-    async fn require_engine(&self) -> Result<(), ApiError> {
-        if self.engine.wait_ready().await {
-            Ok(())
-        } else {
-            Err(ApiError { status: 503, message: "engine not connected".into(), param: None, retry_after: Some(5) })
+    /// The guard counts the request as running for a drain until its route is registered (Generation::start).
+    async fn require_engine(&self) -> Result<Admit, ApiError> {
+        match self.engine.admit().await {
+            Some(a) => Ok(a),
+            None => {
+                Err(ApiError { status: 503, message: "engine not connected".into(), param: None, retry_after: Some(5) })
+            }
         }
     }
 
@@ -530,11 +533,12 @@ struct ChatReq {
     prompt_think_open: bool,
     /// `continue_final_message`: the reply goes on from the prompt's last assistant message
     cfm_on: bool,
+    admit: Admit,
 }
 
 async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8]) -> Result<ChatReq, ApiError> {
     st.check_model(body)?;
-    st.require_engine().await?;
+    let admit = st.require_engine().await?;
     if truthy(body.get("echo")) {
         return Err(ApiError::bad("echo is not supported by the gr8 front end", Some("echo")));
     }
@@ -727,7 +731,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         }
         params.gen.images = std::sync::Arc::new(spans);
     }
-    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf, thinking_off, prompt_think_open, cfm_on })
+    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf, thinking_off, prompt_think_open, cfm_on, admit })
 }
 
 fn image_err(e: crate::vision::VisionError) -> ApiError {
@@ -959,6 +963,7 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let stream = truthy(body.get("stream"));
     // the GLM reasoning parser forces skip_special_tokens=False (vLLM parser_engine.adjust_request)
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);
+    gen.admit = Some(cr.admit);
     if truthy(body.get("return_step_stats")) {
         gen.want_step_stats();
     }
@@ -1565,7 +1570,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
     };
     let prep = async {
         st.check_model(&body)?;
-        st.require_engine().await?;
+        let admit = st.require_engine().await?;
         for k in ["echo", "suffix"] {
             if truthy(body.get(k)) {
                 return Err(ApiError::bad(format!("`{k}` is not supported by the gr8 front end"), Some(k)));
@@ -1591,9 +1596,9 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
         )?;
         (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(&body, st.steering().as_ref())?;
         check_penalties(st, &prompt, &mut params.gen)?;
-        Ok((prompt, params))
+        Ok((prompt, params, admit))
     };
-    let (prompt, params) = match prep.await {
+    let (prompt, params, admit) = match prep.await {
         Ok(x) => x,
         Err(e) => return e.response(),
     };
@@ -1601,6 +1606,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
     let skip_special = body.get("skip_special_tokens").is_none_or(|v| truthy(Some(v)));
     let stream = truthy(body.get("stream"));
     let mut gen = Generation::new(&st.tok, rid, prompt, params, skip_special, !stream);
+    gen.admit = Some(admit);
     if truthy(body.get("return_step_stats")) {
         gen.want_step_stats();
     }
