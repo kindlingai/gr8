@@ -51,6 +51,8 @@ int main()
     expect("exlr8-e4m3-mul1", manifest("[2,2048]", "4096", "8192", "exlr8-e4m3-mul1"), nullptr, 2);
     expect("exlr8-e4m3-pmcgx", manifest("[2,2048]", "4096", "8192", "exlr8-e4m3-pmcgx"), nullptr, 3);
     expect("exlr8-e4m3-unchecked", manifest("[2,2048]", "4096", "8192", "exlr8-e4m3-unchecked"), nullptr, 4);
+    expect("nv4g (NVFP4 records)", manifest("[2,2048]", "4096", "8192", "nv4g"), nullptr, 5);
+    expect("mxfp8 (MXFP8 records)", manifest("[2,2048]", "4096", "8192", "mxfp8"), nullptr, 6);
     expect("an unknown codebook", manifest("[2,2048]", "4096", "8192", "exlr8-e4m3-gauss"), "unknown expert_format");
     std::printf("manifest_test: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

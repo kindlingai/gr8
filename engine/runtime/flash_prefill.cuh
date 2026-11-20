@@ -27,6 +27,7 @@
 #include "flash_dsa_pf.cuh"
 #include "flash_pool_owner.cuh"
 #include "flash_route_split.cuh"
+#include "pf_slots.h"
 
 namespace g6rt
 {
@@ -76,10 +77,6 @@ inline int pf_sp_put_cta()
 {
     return (int)knob::glm53f_pf_sp_put_cta();
 }
-inline size_t pf_sp_slot_bytes(int MP, int nr)
-{
-    return std::max(pf_slot_bytes(MP, true, nr), ((size_t)(MP + nr - 1) / nr * HID * 4 + 8 + 255) & ~size_t(255));
-}
 struct FlashPrefill
 {
     FlashPoolTransport pool_transport;           // set up by g6m4 when the pool owner is on; independent of partial fabrics
@@ -89,6 +86,7 @@ struct FlashPrefill
     u64* stepp = nullptr;
     unsigned* tickets = nullptr;                 // [2]
     int *tok = nullptr, *pos = nullptr, *row_slot = nullptr;   // [MP]
+    int* rsess = nullptr;                        // [MP]: the S2 session of every row (G6AttnStep::raw_sess)
     float* resid4 = nullptr;                     // [MP][HC][HID]
     float *hc_inv = nullptr, *hc_mix = nullptr, *hc_pre = nullptr, *hc_post = nullptr, *hc_comb = nullptr;
     unsigned* hc_done = nullptr;
@@ -113,6 +111,14 @@ struct FlashPrefill
     const char* fin_own = nullptr;               // GR8_GLM53F_PF_SP_FIND: this rank's own rows of that slot (set = layer used it)
     const char* att_own = nullptr;               // GR8_GLM53F_PF_SP_ATTD: this rank's own o_proj rows in the collective-0 slot
     u64 cur_step = 0;                            // host copy of the layer step pf_step_flash set (for the staging copy)
+    void (*dfl_tap)(Model&, FlashPrefill&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, keep the prompt rows the
+                                                                                 //   drafter reads (dflash.cuh dfl_pf_tap_flash)
+    // image input (GR8_GLM53F_VISION, flash_vision_stage.cuh): a launch with image rows (vis_n > 0) embeds row r from
+    // vis_pool[vis_row[r]] (the vision tower's row) where vis_row[r] >= 0, else from the token. With vis_n = 0 the
+    // launch runs the text-only embed.
+    int* vis_row = nullptr;                      // [MP] device
+    const __nv_bfloat16* vis_pool = nullptr;     // [pool rows][HID] device
+    int vis_n = 0;
 };
 inline bool pf_mhc_stage()
 {
@@ -333,7 +339,7 @@ inline void build_flash_prefill(Model& m, FlashPrefill& P, int MP, const g6::Fab
     P.MP = MP; P.f = f; P.stepp = stepp;
     P.tickets = dmalloc<unsigned>(4);
     G6RT_CK(cudaMemset(P.tickets, 0, 4 * sizeof(unsigned)));
-    P.tok = dmalloc<int>(MP); P.pos = dmalloc<int>(MP); P.row_slot = dmalloc<int>(MP);
+    P.tok = dmalloc<int>(MP); P.pos = dmalloc<int>(MP); P.row_slot = dmalloc<int>(MP); P.rsess = dmalloc<int>(MP);
     P.resid4 = dmalloc<float>((size_t)MP * geom::HC * HID);
     P.hc_inv = dmalloc<float>(MP); P.hc_mix = dmalloc<float>((size_t)MP * geom::HC_MIX);
     P.hc_pre = dmalloc<float>((size_t)MP * geom::HC); P.hc_post = dmalloc<float>((size_t)MP * geom::HC);
@@ -432,15 +438,16 @@ inline void pf_prewarm_flash(Model& m, FlashPrefill& P, cudaStream_t st)
 }
 
 // host: tokens and positions of one sub-batch; every row in KDA state slot `slot` (0: one offline session; S2: the
-// session's first slot, FlashSlots::base)
-inline void pf_inputs_flash(FlashPrefill& P, int M, const int* tok, const int* pos, int slot_id = 0)
+// session's first slot, FlashSlots::base) and of S2 session `sess` (its raw index ring)
+inline void pf_inputs_flash(FlashPrefill& P, int M, const int* tok, const int* pos, int slot_id = 0, int sess = 0)
 {
     if (M < 1 || M > P.MP) die("Flash prefill: M outside 1..MP");
     for (int r = 1; r < M; ++r) if (pos[r] != pos[0] + r) die("Flash prefill: rows must be consecutive positions");
     G6RT_CK(g6h2d::copy(P.tok, tok, M * sizeof(int)));
     G6RT_CK(g6h2d::copy(P.pos, pos, M * sizeof(int)));
-    const std::vector<int> slot(M, slot_id);
+    const std::vector<int> slot(M, slot_id), rs(M, sess);
     G6RT_CK(g6h2d::copy(P.row_slot, slot.data(), M * sizeof(int)));
+    G6RT_CK(g6h2d::copy(P.rsess, rs.data(), M * sizeof(int)));
 }
 
 inline bool pf_sp_x16_layer(const Model& m, const FlashPrefill& P, int i, int c, int M);
@@ -728,7 +735,8 @@ inline void pf_kda_block(Model& m, FlashPrefill& P, int i, int M, cudaStream_t s
     flash_pf_prof().mark(2, st);
 }
 
-// DSA: the decode block per MX chunk; o_proj into m.sc.part[0] (decode slot mode off), copied to P.part[0]
+// DSA: the decode block per MX chunk (as launch_dsa_block, with the pre-rotated q_b / o_proj inputs); o_proj into
+// m.sc.part[0] (decode slot mode off), copied to P.part[0]
 inline void pf_dsa_block_p1(Model& m, FlashPrefill& P, int i, int M, int context, cudaStream_t st)
 {
     pf_need_fp32_xn(P, "pf_dsa_block_p1");
@@ -743,10 +751,14 @@ inline void pf_dsa_block_p1(Model& m, FlashPrefill& P, int i, int M, int context
 #endif
         flash_mhc::fragments(P.xn + (size_t)m0 * HID, r, HID, m.sc.xf_x, m.sc.xb_x, st);
         G6RT_CK(cudaMemcpyAsync(m.pos, P.pos + m0, r * sizeof(int), cudaMemcpyDeviceToDevice, st));
+        G6RT_CK(cudaMemcpyAsync(m.rsess, P.rsess + m0, r * sizeof(int), cudaMemcpyDeviceToDevice, st));
         if (b.x_in.n) bind::launch(b.x_in, st);
         else { bind::launch(b.q_a, st); bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); bind::launch(b.idx_g, st); }
+        const bool use_qb_rot = b.q_b_t.on && !b.q_b_t.rot;
         glue::k_rmsnorm_rows<__half><<<r, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, geom::RMS_EPS_FLASH, m.q_a_n, QA,
-                                                        b.xf_qa.on ? b.xf_qa.f16 : nullptr, b.xf_qa.on ? b.xf_qa.bf16 : nullptr);
+                                                        b.xf_qa.on ? b.xf_qa.f16 : nullptr, b.xf_qa.on ? b.xf_qa.bf16 : nullptr,
+                                                        use_qb_rot ? b.q_b_t.a.suh[0] : nullptr,
+                                                        use_qb_rot ? const_cast<u32*>(b.q_b_t.a.xa) : nullptr);
         bind::launch_q_b(b, st);
         bind::launch(b.idx_q, st);
         flash_pf_prof().mark(3, st);
@@ -754,6 +766,8 @@ inline void pf_dsa_block_p1(Model& m, FlashPrefill& P, int i, int M, int context
         const G6AttnStep s = dsa_step(m, r, context - M + m0 + r);
         G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
         flash_pf_prof().mark(4, st);
+        if (b.o_proj_t.on && !b.o_proj_t.rot)
+            dtr::launch_rot(b.o_proj_t.a.x, b.o_proj_t.a.ldx, b.o_proj_t.a.suh[0], const_cast<u32*>(b.o_proj_t.a.xa), b.o_proj_t.a.K, r, st);
         bind::launch(b.xf_attn, st);
         bind::launch_o_proj(b, st);
         G6RT_CK(cudaMemcpyAsync(P.part[0] + (size_t)m0 * HID, m.sc.part[0], (size_t)r * HID * 2, cudaMemcpyDeviceToDevice, st));
@@ -1063,7 +1077,9 @@ inline void pf_sp_own(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream
         __nv_bfloat16* own = slot_own ? reinterpret_cast<__nv_bfloat16*>(const_cast<char*>(slot_own)) : P.part[c] + r * HID;
         MhcFabricPeerBlock blk{MhcFabricBlock{P.f, P.stepp, crs, 0, own}};
         for (int p = 0; p < nr; ++p) blk.peers[p] = P.sp_peer[p];
-        if (pf_sp_agd())   // GR8_GLM53F_PF_SP_AGD: this lane's AG send slot of the current step (glue::send_slot)
+        // GR8_GLM53F_PF_SP_AGD: this lane's AG send slot of the current step (glue::send_slot). Not after the last layer:
+        // the final norm rows must land in xn, which the MTP draft prefill and the head read
+        if (pf_sp_agd() && !(c == 1 && i + 1 >= m.nl))
         {
             char* slot = P.f.send + ((size_t)(P.cur_step & 1) * P.f.ncoll + cag) * P.f.stride;
             if (pf_sp_x16_layer(m, P, i, c, M)) V.agd_x = reinterpret_cast<__half*>(slot);
@@ -1154,6 +1170,48 @@ inline void pf_consume_flash(Model& m, FlashPrefill& P, int i, int c, int M, cud
 
 // one sub-batch: rows P.pos[0..M), layer i is layer-step ls0 + i of the prefill fabric. residual_copy(slot, M), if set,
 // is called at the decode dump slots (0 = after embed, 2i + 1 = after layer i's attention, 2i + 2 = after its MLP)
+#if defined(G6_CP) && G6_CP
+// GR8_CP past R: the staged view (prefill.cuh cp_pf_*) around the DSA layers while m.cp.pf_staged with a CpPfNet. The first
+// DSA layer begins its pool and every one waits for its pool before its first lane's attention, then begins the next
+// DSA layer's (the other pool); after its last lane's attention the lanes' rows go back to this rank's store. start =
+// the first position of the earliest lane: every row below it is in the pool
+inline int pf_cp_next(const Model& m, int i)
+{
+    for (int j = i + 1; j < m.nl; ++j)
+        if (!m.layers[j].kda) return j;
+    return -1;
+}
+inline void pf_cp_pre(Model& m, int i, int start, cudaStream_t st)
+{
+    if (!cp_pf_live(m)) return;
+    if (i == pf_cp_next(m, -1)) cp_pf_begin(m, i, start, st);
+    cp_pf_wait(m, i, start, st);
+}
+inline void pf_cp_prefetch(Model& m, int i, int start, cudaStream_t st)
+{
+    const int j = pf_cp_next(m, i);
+    if (cp_pf_live(m) && j >= 0) cp_pf_begin(m, j, start, st);
+}
+inline void pf_cp_post(Model& m, int i, int a0, int n0, int a1, int n1, cudaStream_t st)
+{
+    if (!cp_pf_live(m)) return;
+    cp_pf_back(m, i, a0, n0, st);
+    cp_pf_back(m, i, a1, n1, st);
+    cp_pf_end(m, i, st);
+}
+#else
+inline void pf_cp_pre(Model&, int, int, cudaStream_t) {}
+inline void pf_cp_prefetch(Model&, int, int, cudaStream_t) {}
+inline void pf_cp_post(Model&, int, int, int, int, int, cudaStream_t) {}
+#endif
+// The prefill embed: each row's embedding into the 4 mHC streams (the vision tower's row on an image row)
+inline void pf_embed_flash(Model& m, FlashPrefill& P, int M, cudaStream_t st)
+{
+    if (P.vis_n > 0)
+        flash_mhc::k_mhc_embed_rows<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH,
+                                                                      P.vis_pool, P.vis_row);
+    else flash_mhc::k_mhc_embed<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH);
+}
 inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0, cudaStream_t st,
                           const std::function<void(int, int)>& residual_copy = {})
 {
@@ -1162,7 +1220,7 @@ inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0
     pr.last = 0;
     pr.mark(-1, st);
     P.sp_agk[1] = P.sp_agk[3] = pf_sp() && pf_sp_agk();   // single lane: every gather directly follows its owner pass
-    flash_mhc::k_mhc_embed<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH);
+    pf_embed_flash(m, P, M, st);
     pf_mhc_input(m, P, 0, false, M, st);
     if (residual_copy) residual_copy(0, M);
     pr.mark(10, st);
@@ -1171,7 +1229,13 @@ inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0
         k_set_step<<<1, 1, 0, st>>>(P.stepp, ls0 + i);
         P.cur_step = ls0 + i;
         if (geom::is_kda(m.layers[i].l)) pf_kda_block(m, P, i, M, st);
-        else pf_dsa_block(m, P, i, M, context, st);
+        else
+        {
+            pf_cp_pre(m, i, context - M, st);
+            pf_dsa_block(m, P, i, M, context, st);
+            pf_cp_prefetch(m, i, context - M, st);
+            pf_cp_post(m, i, context - M, M, 0, 0, st);
+        }
         pf_xt(P, 0, pxt::PX_PROD, M, st);
         pf_put_flash(P, 0, M, st);
         pf_xt(P, 0, pxt::PX_PUT, M, st);
@@ -1186,6 +1250,7 @@ inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0
         pf_xt(P, 1, pxt::PX_PUT, M, st);
         pr.mark(8, st);
         pf_consume_flash(m, P, i, 1, M, st);
+        if (P.dfl_tap) P.dfl_tap(m, P, i, M, st);
         pf_xt(P, 1, pxt::PX_END, M, st);
         if (residual_copy) residual_copy(2 * i + 2, M);
         pr.mark(9, st);
@@ -1205,7 +1270,7 @@ inline void pf_step2_flash(Model& m, FlashPrefill& A, FlashPrefill& B, int MA, i
     pr.last = 0;
     pr.mark(-1, st);
     auto embed = [&](FlashPrefill& P, int M) {
-        flash_mhc::k_mhc_embed<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH);
+        pf_embed_flash(m, P, M, st);
         pf_mhc_input(m, P, 0, false, M, st);
         pr.mark(10, st);
     };
@@ -1217,14 +1282,23 @@ inline void pf_step2_flash(Model& m, FlashPrefill& A, FlashPrefill& B, int MA, i
     };
     auto consume = [&](FlashPrefill& P, int i, int c, int M) {
         pf_consume_flash(m, P, i, c, M, st);
+        if (c == 1 && P.dfl_tap) P.dfl_tap(m, P, i, M, st);
         pf_xt(P, c, pxt::PX_END, M, st);
         pr.mark(9, st);
     };
+    // the staged view (GR8_CP past R): lane A's attention of a DSA layer waits for its pool and begins the next DSA
+    // layer's, lane B's sends both lanes' rows back (pf_cp_*)
     auto attn = [&](FlashPrefill& P, int i, int M, int context, u64 step) {
         k_set_step<<<1, 1, 0, st>>>(P.stepp, step);
         P.cur_step = step;
         if (geom::is_kda(m.layers[i].l)) pf_kda_block(m, P, i, M, st);
-        else pf_dsa_block(m, P, i, M, context, st);
+        else
+        {
+            if (&P == &A) pf_cp_pre(m, i, ctxA - MA, st);
+            pf_dsa_block(m, P, i, M, context, st);
+            if (&P == &A) pf_cp_prefetch(m, i, ctxA - MA, st);
+            else pf_cp_post(m, i, ctxA - MA, MA, ctxB - MB, MB, st);
+        }
         put(P, 0, M);
     };
     embed(A, MA);
@@ -1240,7 +1314,11 @@ inline void pf_step2_flash(Model& m, FlashPrefill& A, FlashPrefill& B, int MA, i
     {
         // each lane: attn -RS-> own0 -AG-> gather0, mlp -RS-> own1 -AG-> gather1, attn ... Every wire hop of one lane
         // is covered by a block of the other: RS by an owner pass, AG by an attention or MLP block.
-        auto own = [&](FlashPrefill& P, int i, int c, int M) { pf_sp_own(m, P, i, c, M, st); pr.mark(9, st); };
+        auto own = [&](FlashPrefill& P, int i, int c, int M) {
+            pf_sp_own(m, P, i, c, M, st);
+            if (c == 1 && P.dfl_tap) P.dfl_tap(m, P, i, M, st);
+            pr.mark(9, st);
+        };
         auto gather = [&](FlashPrefill& P, int c, int M, int i = -1) { pf_sp_gather(P, c, M, st, i >= 0 && pf_sp_x16_layer(m, P, i, c, M)); pr.mark(9, st); };
         for (int i = 0; i < m.nl; ++i)
         {
@@ -1294,7 +1372,7 @@ inline void pf_draft_cache_flash(Draft& D, int M, int context, cudaStream_t st)
     bind::launch(b.idx_k, st);
     bind::launch(b.idx_g, st);
     G6Attn a = y.ab.args;
-    a.rows = M; a.context = context; a.positions = d.pos;
+    a.rows = M; a.context = context; a.positions = d.pos; a.raw_sess = d.rsess;
     a.kv_a = d.kv_a; a.index_k = d.idx_k; a.index_gate = d.idx_g;
     a.reuse_indices = nullptr;
     G6RT_CK(g6_attn_append(&a, st));
@@ -1423,7 +1501,7 @@ inline DraftFull& pf_draft_cache_full(Draft& D, FlashPrefill& P, int M, int pos0
             pf_gv_rg(*gs[k], gs[k]->xfrag == d.sc.xf_x ? F.xf : F.xb, r, o[k], st);
         }
         G6Attn a = y.ab.args;
-        a.rows = r; a.context = pos0 + m0 + r; a.positions = P.pos + m0;
+        a.rows = r; a.context = pos0 + m0 + r; a.positions = P.pos + m0; a.raw_sess = P.rsess + m0;
         a.kv_a = o[0]; a.index_k = o[1]; a.index_gate = o[2];
         a.reuse_indices = nullptr;
         G6RT_CK(g6_attn_append(&a, st));
@@ -1450,17 +1528,19 @@ inline void pf_draft_full_cmp(Draft& D, DraftFull& F, int m0, int r, cudaStream_
 
 // MTP draft prefill (P1): the decode draft step (layer 45: eh_proj, DSA, MoE, single residual) over the sub-batch's
 // rows in MX-row chunks, without graphs. Row r: hidden = main final-norm row r (P.xn), token = the prompt token after
-// it (next[r]), position pos0 + r; it writes the MTP layer's KV rows of the prompt. run(di) enqueues the draft fabric
-// step and launches it with D.main_xn pointing at the chunk's rows (the step's head output is not used).
+// it (next[r]), position pos0 + r, S2 session sess; it writes the MTP layer's KV rows of the prompt. run(di) enqueues
+// the draft fabric step and launches it with D.main_xn pointing at the chunk's rows (the step's head output is not used).
 inline void pf_draft_flash(Draft& D, FlashPrefill& P, int M, int pos0, const int* next, u64& dstep,
-                           const std::function<void(const StepIn&)>& run)
+                           const std::function<void(const StepIn&)>& run, int sess = 0)
 {
     const float* main_xn = D.main_xn;
     for (int m0 = 0; m0 < M; m0 += MX)
     {
         const int r = std::min(MX, M - m0);
         D.main_xn = P.xn + (size_t)m0 * HID;
-        run(draft_inputs(++dstep, r, pos0 + m0, next + m0, 0.f, 0u));
+        StepIn di = draft_inputs(++dstep, r, pos0 + m0, next + m0, 0.f, 0u);
+        for (int i = 0; i < r; ++i) di.sess[i] = sess;
+        run(di);
     }
     D.main_xn = main_xn;
 }

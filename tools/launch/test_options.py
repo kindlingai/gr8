@@ -27,6 +27,20 @@ class FileTests(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
 
+    def test_forced_tool_thinking_defaults_validation_and_config(self):
+        self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], GLM).get('FORCED_TOOL_THINKING'), '0')
+        for value in ('0', '1'):
+            o = opt.parse(['--no-config', '--peers', PEERS, '--forced-tool-thinking', value], GLM)
+            opt.validate(o)
+            self.assertEqual(o.get('FORCED_TOOL_THINKING'), value)
+        with self.assertRaisesRegex(opt.OptionError, '--forced-tool-thinking yes: want 0 or 1'):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--forced-tool-thinking', 'yes'], GLM))
+        with tempfile.TemporaryDirectory() as d:
+            config = write(d, 'cluster.env', 'FORCED_TOOL_THINKING=1\n')
+            o = opt.parse(['@' + config, '--peers', PEERS], GLM)
+            opt.validate(o)
+            self.assertEqual(o.get('FORCED_TOOL_THINKING'), '1')
+
     def test_parse(self):
         p = write(self.d, 'c.env', '# comment\n\nexport CAP=262144\nEXTRA_ENV="A=1 B=2"\nSESS=4   # sessions\n'
                                     "MODEL='/data/x y'\nHOSTS=\"n1 n2\"\n")
@@ -159,16 +173,75 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--ips', 'a,b,c,d'], 'IPS and IPS2 go together')
         self.check(['--peers', PEERS, '--ips', 'a,b', '--ips2', 'a,b'], 'IPS has 2 addresses')
         self.check(['--peers', PEERS, '--default-max-tokens', '4k'], 'want a whole number')
-        self.check(['--peers', PEERS, '--default-reasoning-effort', 'none'], 'cannot turn thinking off')
-        self.check(['--peers', PEERS, '--default-reasoning-effort', 'auto'], 'want minimal, low, medium')
-        self.check(['--peers', PEERS, '--default-thinking-budget', '-1'], 'want a whole number')
+        self.check(['--peers', PEERS, '--default-reasoning-effort', 'auto'], 'want none, minimal, low, medium')
+        for bad in ('-1', '4k', '1.5x', '0.5', '16384|', '16384|0.5', '0.5x|16384', '16384|1.5x', '1|2|0.5x', '0|0.5x'):
+            self.check(['--peers', PEERS, '--default-thinking-budget', bad], '--default-thinking-budget')
+        self.check(['--peers', PEERS, '--default-thinking-budget', '-1'], 'want a token count')
+        self.check(['--peers', PEERS, '--default-thinking-budget', '1.5x'], 'want a fraction from 0x to 1x')
         o = opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', 'medium',
                        '--default-thinking-budget', '4096'], GLM)
         opt.validate(o)
         self.assertEqual((o.get('DEFAULT_REASONING_EFFORT'), o.get('DEFAULT_THINKING_BUDGET')), ('medium', '4096'))
+        for ok in ('0', '0.8x', '32768|0.8x', ' 32768 | 0.8x '):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-thinking-budget', ok], GLM))
+        self.check(['--peers', PEERS, '--default-presence-penalty', '2.5'], 'must be in -2..2')
+        self.check(['--peers', PEERS, '--default-frequency-penalty', 'x'], 'is not a number')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'thinking=0.5,warm=1'], 'want base=')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'greedy=1,greedy=1'], 'given twice')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'greedy=3'], 'must be in -2..2')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'base=1.5,greedy=1'], 'must be in -2..2')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'thinking=2.5*1'], 'must be in -2..2')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'base=1**2'], 'is not a multiplier')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'base=*-1'], 'want a finite number, 0 or more')
+        self.check(['--peers', PEERS, '--default-presence-penalty', '+'], 'is not a number')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'base=1,temperature=*1.5'], 'at temperature 2')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'temperature=+1.5'], 'must be in -2..2')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'base=-1,temperature=+1.5*1'], 'must be in -2..2')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'greedy=0.1,greedy.base=0.1'], 'given twice')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'sampling.thinking=1'], 'want base=')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'base=1,greedy.thinking=1.5'], 'must be in -2..2')
+        for ok in ('greedy=0.2,greedy.thinking=0.5', 'thinking=0.5,nongreedy.thinking=*0', 'greedy.base=0.2,nongreedy.base=0',
+                   '+0.5', '*1.1', '+0.1*1.1', 'thinking=+0.1*1.1,greedy=*2', 'base=-0.1 * 0.5', 'base=1,temperature=*1',
+                   'temperature=+1', 'base=-1,temperature=+0.75*1', 'thinking=0.5,greedy=0.2,nongreedy=0'):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-frequency-penalty', ok], GLM))
+        o = opt.parse(['--no-config', '--peers', PEERS, '--default-presence-penalty', 'thinking=0.5, greedy=0.2,nongreedy=0',
+                       '--default-frequency-penalty', '-0.5'], GLM)
+        opt.validate(o)
+        self.assertEqual((o.get('DEFAULT_PRESENCE_PENALTY'), o.get('DEFAULT_FREQUENCY_PENALTY')),
+                         ('thinking=0.5, greedy=0.2,nongreedy=0', '-0.5'))
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=0.5x,ramp=2,max=10'], 'want start=, per1k= or max=')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=1.5x,per1k=2,max=10'], 'want a fraction from 0x')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=16384|1.5x,per1k=2,max=10'], 'from 0x to 1x')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=0.5x|16384,per1k=2,max=10'], 'want a token count')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=16384|0.5,per1k=2,max=10'], 'want a token count')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=-1,per1k=2,max=10'], 'want a token count')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=1,per1k=2,max=21'], 'want 0 to 20')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=1,per1k=x,max=1'], 'is not a number')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'max=1,max=2'], 'given twice')
+        for ok in ('start=0.5x,per1k=2,max=10', 'start=4096, per1k=0.5, max=1.5', 'per1k=1,max=1',
+                   'start=16384|0.5x,per1k=2,max=10'):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-think-end-boost', ok], GLM))
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'reply=1:1:1:1'], 'want thinking=, answer= or guard=')
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'thinking=1:1:1'], 'want mult:base:min:cap')
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'thinking=1:0.5:1:1'], 'want mult >= 0')
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'answer=1:2:1:21'], 'want mult >= 0')
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'thinking=1:2:1:1,thinking=1:2:1:1'], 'given twice')
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'guard=x:2:1:1'], 'is not a number')
+        for ok in ('thinking=0.8:1.75:4:6,answer=1:1.75:12:6,guard=1:2:1:8', 'guard = 1 : 2 : 1 : 8'):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-sequence-penalty', ok], GLM))
+        self.check(['--peers', PEERS, '--tool-repeat-guard', 'yes'], 'want 0 or 1')
+        self.check(['--peers', PEERS, '--tool-repeat-guard-repeats', '0'], 'want a whole number from 1')
+        self.check(['--peers', PEERS, '--tool-repeat-guard-temperature', '3'], 'want a number from 0 to 2')
+        self.check(['--peers', PEERS, '--tool-repeat-guard-retries', '-1'], 'want a whole number')
+        o = opt.parse(['--no-config', '--peers', PEERS, '--tool-repeat-guard', '1', '--tool-repeat-guard-retries', '3'], GLM)
+        opt.validate(o)
+        self.assertEqual((o.get('TOOL_REPEAT_GUARD'), o.get('TOOL_REPEAT_GUARD_REPEATS'), o.get('TOOL_REPEAT_GUARD_TEMPERATURE'),
+                          o.get('TOOL_REPEAT_GUARD_RETRIES')), ('1', '2', '0.7', '3'))
         self.check(['--peers', PEERS, '--allow-thinking-off', 'yes'], 'want 0 or 1')
+        self.check(['--peers', PEERS, '--clamp-max-tokens', 'on'], '--clamp-max-tokens on: want 0 or 1')
+        self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('CLAMP_MAX_TOKENS'), '0')
         self.check(['--peers', PEERS, '--undeclared-tool-calls', 'on'], 'want text or emit')
-        self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('UNDECLARED_TOOL_CALLS'), 'text')
+        self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('UNDECLARED_TOOL_CALLS'), 'emit')
         self.check(['--peers', PEERS, '--grammar', '2'], 'want 0 or 1')
         self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('GRAMMAR'), '1')
         # a grammar directory reaches the engine as --grammar-dir, a path per box
@@ -191,6 +264,84 @@ class ValidateTests(unittest.TestCase):
         self.assertIn('not ssh aliases', str(e.exception))
 
 
+class NamedModelTests(unittest.TestCase):
+    """./gr8 <model> names the model (--named-model): a GR8_MODEL in the config file or the environment that names
+    another stops up, check, prepare and show-config before anything runs, in one line (#244)."""
+    GR8 = os.path.join(opt.REPO, 'gr8')
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def refused(self, argv, env, where):
+        o = opt.parse(['--named-model', 'glm53f', '--peers', PEERS, *argv], env)
+        self.assertEqual(o.get('GR8_MODEL'), 'glm53f')
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(o)
+        msg = str(e.exception)
+        self.assertEqual(len(msg.splitlines()), 1)
+        self.assertIn(f'./gr8 glm53f names the model, and GR8_MODEL=glm53 {where} names another', msg)
+        return msg
+
+    def test_a_file_that_disagrees(self):
+        f = write(self.d, 'c.env', 'GR8_MODEL=glm53\n')
+        self.refused(['@' + f], {}, f'in the config file {f}')
+        self.refused([], {'GR8_CLUSTER': f}, f'in the config file {f}')       # the default file too
+        self.refused(['@' + f], {'GR8_MODEL': 'glm53f'}, f'in the config file {f}')   # the environment agreeing
+
+    def test_an_environment_that_disagrees(self):
+        self.refused(['--no-config'], {'GR8_MODEL': 'glm53'}, 'in the environment')
+
+    def test_the_command_line_that_disagrees(self):
+        self.refused(['--no-config', '--gr8-model', 'glm53'], {}, 'on the command line')
+
+    def test_one_that_agrees_or_none(self):
+        f = write(self.d, 'c.env', 'GR8_MODEL=glm53f\n')
+        for argv, env in ((['@' + f], {}), (['--no-config'], {'GR8_MODEL': 'glm53f'}), (['--no-config'], {}),
+                          (['--no-config'], {'GR8_MODEL': ''})):
+            o = opt.parse(['--named-model', 'glm53f', '--peers', PEERS, *argv], env)
+            opt.validate(o)
+            self.assertEqual((o.get('GR8_MODEL'), o.get('GROUP'), o.origin['GR8_MODEL']),
+                             ('glm53f', 'gr8-glm53f', './gr8 glm53f'))
+
+    def test_without_a_name_the_old_precedence_holds(self):
+        f = write(self.d, 'c.env', 'GR8_MODEL=glm53\n')
+        o = opt.parse(['@' + f, '--peers', PEERS], {'GR8_MODEL': 'glm53f'})    # the image's GR8_MODEL, no ./gr8
+        opt.validate(o)
+        self.assertEqual((o.get('GR8_MODEL'), o.origin['GR8_MODEL']), ('glm53', '@file'))
+
+    def run_gr8(self, *argv, env=None):
+        e = {k: v for k, v in os.environ.items() if k not in ('GR8_MODEL', 'GR8_CLUSTER', 'G6_CLUSTER')}
+        return subprocess.run([self.GR8, *argv], env={**e, **(env or {})}, capture_output=True, text=True,
+                              timeout=60, cwd=self.d)
+
+    def test_through_gr8(self):
+        f = write(self.d, 'c.env', 'GR8_MODEL=glm53\n')
+        peers = ['--peers', '192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4', '--work-dir', self.d, '--no-check']
+        for cmd in ('up', 'check', 'prepare', 'show-config'):
+            for argv, env, where in ((['@' + f], {}, f'in the config file {f}'),
+                                     (['--no-config'], {'GR8_MODEL': 'glm53'}, 'in the environment')):
+                r = self.run_gr8('glm53f', cmd, *argv, *peers, env=env)
+                self.assertEqual(r.returncode, 2, (cmd, r.stdout, r.stderr))
+                self.assertEqual(r.stderr, f'gr8: ./gr8 glm53f names the model, and GR8_MODEL=glm53 {where} names '
+                                           'another: remove that GR8_MODEL, or run ./gr8 glm53\n')
+                self.assertEqual(r.stdout, '')
+        self.assertFalse(os.path.exists(os.path.join(self.d, 'out', 'supervisor.log')))    # up started nothing
+        r = self.run_gr8('glm53f', 'show-config', '@' + write(self.d, 'ok.env', 'GR8_MODEL=glm53f\n'), *peers)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, r'GR8_MODEL +glm53f +cluster +\(\./gr8 glm53f\)')
+        self.assertRegex(r.stdout, r'GROUP +gr8-glm53f ')
+        r = self.run_gr8('glm53f', 'show-config', '--no-config', *peers, env={'GR8_MODEL': 'glm53f'})
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_last_boot_commands_do_not_check(self):
+        f = write(self.d, 'c.env', 'GR8_MODEL=glm53\n')
+        r = self.run_gr8('glm53f', 'status', '@' + f, '--work-dir', self.d)
+        self.assertNotIn('names the model', r.stdout + r.stderr)
+        r = self.run_gr8('glm53f', 'health', '@' + f, '--work-dir', self.d)
+        self.assertEqual(r.returncode, 1)                               # not serving, and not bad options
+        self.assertNotIn('names the model', r.stdout + r.stderr)
+
+
 class GetTests(unittest.TestCase):
     """launch.py get: TP for ./gr8 glm53 build, PORT for smoke and bench, on a box whose options need not boot."""
     def get(self, *argv):
@@ -206,11 +357,49 @@ class GetTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn('the file is parsed', err)
 
+    def test_kv_format_default_follows_known_tp(self):
+        self.assertEqual(self.get('KV_FORMAT', '--no-config', '--peers', PEERS)[:2], (0, 'int4'))
+        self.assertEqual(self.get('KV_FORMAT', '--no-config', '--peers', PEERS, '--kv-format', 'fp8')[:2], (0, 'fp8'))
+        self.assertEqual(self.get('KV_FORMAT', '--no-config', '--peers', ','.join(PEERS.split(',')[:3]))[:2], (1, ''))
+        self.assertEqual(self.get('KV_FORMAT', '--no-config')[:2], (1, ''))
+
     def test_tp_is_still_validated(self):
         self.assertEqual(self.get('TP', '--no-config', '--peers', PEERS)[:2], (0, '4'))
         rc, _, err = self.get('TP', '--no-config')
         self.assertEqual(rc, 2)
         self.assertIn('--tp is needed', err)
+
+
+class BuildTests(unittest.TestCase):
+    """Exercise the build dispatch only: stub builders do not compile or touch devices."""
+    def test_formats_for_fresh_clone_and_configured_topology(self):
+        for model, env, config, expected in (
+            ('glm53', {}, '', ['glm:fp8', 'glm:int4', 'front']),
+            ('glm53', {'KV_FORMAT': 'fp8'}, '', ['glm:fp8', 'front']),
+            ('glm53', {'TP': '4'}, '', ['glm:fp8', 'glm:int4', 'front']),
+            ('glm53', {'TP': '3'}, '', ['glm:fp8', 'front']),
+            ('glm53', {}, 'PEERS=' + PEERS + '\n', ['glm:fp8', 'glm:int4', 'front']),
+            ('glm53', {}, 'TP=4\nKV_FORMAT=fp8\n', ['glm:fp8', 'front']),
+            ('glm53', {}, 'TP=6\n', ['glm:fp8', 'front']),
+            ('glm53f', {}, '', ['flash:fp8', 'front']),
+            ('glm53f', {'KV_FORMAT': 'int4'}, '', ['flash:fp8', 'flash:int4', 'front']),
+        ):
+            with self.subTest(model=model, env=env, config=config), tempfile.TemporaryDirectory() as d:
+                with open(os.path.join(opt.REPO, 'gr8')) as f:
+                    script = write(d, 'gr8', f.read())
+                os.symlink(os.path.join(opt.REPO, 'tools'), os.path.join(d, 'tools'))
+                scripts = os.path.join(d, 'scripts')
+                os.mkdir(scripts)
+                for name, body in (('build.sh', 'echo "$MODEL:$KV_FORMAT"'), ('build_front.sh', 'echo front')):
+                    os.chmod(write(scripts, name, '#!/bin/bash\n' + body + '\n'), 0o755)
+                if config:
+                    write(d, 'cluster.env', config)
+                r = subprocess.run(['bash', script, model, 'build'], cwd=d,
+                                   env={'PATH': os.environ['PATH'], 'HOME': d, 'CUDA_VISIBLE_DEVICES': '',
+                                        'GR8_KNOBS_LIB': opt.knobs.library(), **env},
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout.splitlines(), expected)
 
 
 class KnobsTests(unittest.TestCase):
@@ -289,10 +478,13 @@ class CanonicalTests(unittest.TestCase):
 
     def test_defaults_resolved_and_equal_to_explicit(self):
         a, text, da = self.digest()
-        self.assertIn('CAP=485376\n', text)
+        self.assertIn('CAP=513536\n', text)
+        self.assertIn('--kv-format int4', text)
         self.assertIn('--s2-sessions 8 ', text)
         self.assertIn(' --reuse-prefix', text)            # prefix reuse is on by default at TP=4
-        self.assertEqual(da, self.digest('--cap', '485376', '--share-limit', '32768', '--sess', '8', '--dflash', '1')[2])
+        self.assertIn(' GR8_REUSE_GRID=64 ', text)        # the 64-row prefix-reuse grid at TP=4 with int4 KV
+        self.assertEqual(da, self.digest('--cap', '513536', '--share-limit', '32768', '--sess', '8', '--dflash', '1',
+                                         '--reuse-grid', '64')[2])
 
     def test_l2pf_reaches_every_rank(self):
         _, text, _ = self.digest()
@@ -313,12 +505,14 @@ class CanonicalTests(unittest.TestCase):
 
     def test_the_share_limit_sets_r_and_an_unset_cap_follows_it(self):
         _, text, _ = self.digest('--share-limit', '32768')
-        self.assertIn('CAP=485376\n', text)              # 2,280 physical pages per rank at TP=4, as at 65536
+        self.assertIn('CAP=513536\n', text)              # 2,390 physical INT4 pages per rank at TP=4
         self.assertIn('GR8_CP_R=32768 ', text)
         _, text, _ = self.digest('--share-limit', '32768', '--cap', '200000')
         self.assertIn('CAP=200000\n', text)
         _, text, _ = self.digest('--share-limit', '98304')
-        self.assertIn('CAP=288768\n', text)              # 98304 + (2280 - 1536) x 64 x 4
+        self.assertIn('CAP=316928\n', text)              # 98304 + (2390 - 1536) x 64 x 4
+        _, fp8, _ = self.digest('--kv-format', 'fp8', '--share-limit', '98304')
+        self.assertIn('CAP=288768\n', fp8)
         self.assertIn('GR8_CP_R=98304 ', text)
         for bad in ('3000', '4095', '4100', '0', 'x'):
             with self.assertRaises(opt.OptionError):
@@ -347,12 +541,20 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotEqual(base, self.digest('--extra-env', 'GR8_DEC_BK=1024')[2])
         self.assertNotEqual(base, self.digest('--port', '8200')[2])
         # a knob set to its default, or one this TP does not read, changes nothing
-        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '485376', '--reuse', '1', '--extra-args', '--top 5')[2])
+        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '513536', '--reuse', '1')[2])
+        # Extra engine arguments now reach TP=4 too and must participate in rank agreement.
+        _, text, extra = self.digest('--extra-args', '--top 5')
+        self.assertIn('--top 5', text)
+        self.assertNotEqual(base, extra)
 
     def test_cp_onechain_reaches_every_rank(self):
         _, text, _ = self.digest()
+        self.assertIn(' GR8_CP_ONECHAIN=1', text)
+        _, text, _ = self.digest('--cp-onechain', '0')
+        self.assertIn(' GR8_CP_ONECHAIN=0', text)
+        _, text, _ = self.digest('--kv-format', 'fp8')
         self.assertNotIn('GR8_CP_ONECHAIN', text)
-        _, text, _ = self.digest('--cp-onechain', '1')
+        _, text, _ = self.digest('--kv-format', 'fp8', '--cp-onechain', '1')
         self.assertIn(' GR8_CP_ONECHAIN=1', text)
 
     def test_template_has_no_paths(self):
@@ -451,7 +653,7 @@ class CanonicalTests(unittest.TestCase):
 
     def test_tp4_serve_options_default_on_and_override(self):
         on = ['GR8_ROUTE_OVL=1', 'GR8_DRAFT_HEAD_I4=1', 'GR8_ATTN_SC2=4', 'GR8_ATTN_SC2_TR=2', 'GR8_ATTN_CTX2=4', 'GR8_ATTN_CTX3=2',
-              'GR8_ATTN_SEL2=16', 'GR8_IDX_GRP=16', 'GR8_ATTN_QT=1', 'GR8_ATTN_FRONT=1', 'GR8_IDX_VEC=1', 'GR8_DEC_BK=512',
+              'GR8_ATTN_SEL2=16', 'GR8_IDX_GRP=16', 'GR8_ATTN_QT=1', 'GR8_ATTN_FRONT=1', 'GR8_IDX_VEC=1', 'GR8_DEC_BK=2048', 'GR8_DEC_BK_MAX=32768',
               'GR8_S2_ADAPT=1', 'GR8_S2_DECODE_PF=4096', 'GR8_S2_ADMIT_HOLD=1', 'GR8_PF_SELX_CTX=53248']
         def env(peers, *argv):
             o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
@@ -471,6 +673,59 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual([a for a in e if a.startswith(('GR8_ROUTE_OVL=', 'GR8_DEC_BK='))], ['GR8_ROUTE_OVL=0', 'GR8_DEC_BK=2048'])
         e = env('10.0.0.1,10.0.0.2,10.0.0.3')   # TP=3 unchanged
         self.assertFalse(any(a.split('=')[0] in [v.split('=')[0] for v in on] for a in e))
+
+    def test_tp4_int4_reuse_grid_default_and_rollback(self):
+        def grid(peers, *argv, environ=None):
+            o = opt.parse(['--no-config', '--peers', peers, *argv], {**GLM, **(environ or {})})
+            opt.validate(o)
+            return [a for a in opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env']
+                    if a.startswith('GR8_REUSE_GRID=')]
+        self.assertEqual(grid(PEERS), ['GR8_REUSE_GRID=64'])                  # TP=4, KV_FORMAT=int4 (the default)
+        self.assertEqual(grid(PEERS, '--reuse-grid', '0'), [])                # the rollback: the --prefill grid
+        self.assertEqual(grid(PEERS, environ={'REUSE_GRID': '0'}), [])
+        self.assertEqual(grid(PEERS, '--reuse-grid', '128'), ['GR8_REUSE_GRID=128'])
+        self.assertEqual(grid(PEERS, '--reuse', '0'), [])
+        self.assertEqual(grid(PEERS, '--extra-env', 'GR8_REUSE_ALIGN=0'), [])
+        self.assertEqual(grid(PEERS, '--extra-env', 'G6_REUSE_ALIGN=0'), [])
+        self.assertEqual(grid(PEERS, '--extra-env', 'GR8_REUSE_GRID=256'), ['GR8_REUSE_GRID=256'])   # no second copy
+        # an explicit option and EXTRA_ENV both: as with DEC_BK and PF_SELX_CTX, both words, the option's last (it wins)
+        self.assertEqual(grid(PEERS, '--reuse-grid', '64', '--extra-env', 'GR8_REUSE_GRID=128'),
+                         ['GR8_REUSE_GRID=128', 'GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, '--kv-format', 'fp8'), [])               # not measured: unchanged
+        # a KV store: the same default grid 64, and the same rollbacks
+        store = ('--kv-store', 'ssd:/x,size=1G')
+        self.assertEqual(grid(PEERS, *store), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, *store, '--kv-keep', 'sessions'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, environ={'KV_STORE': 'ssd:/x,size=1G'}), ['GR8_REUSE_GRID=64'])
+        with tempfile.TemporaryDirectory() as d:
+            cfg = os.path.join(d, 'cluster.env')
+            with open(cfg, 'w') as f:
+                f.write('KV_STORE=ssd:/x,size=1G\n')
+            o = opt.parse(['@' + cfg, '--peers', PEERS], GLM)
+            opt.validate(o)
+            self.assertEqual([a for a in opt.engine_plan(o)['env'] if a.startswith('GR8_REUSE_GRID=')], ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, *store, '--reuse-grid', '64'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, *store, '--reuse-grid', '0'), [])
+        self.assertEqual(grid(PEERS, *store, environ={'REUSE_GRID': '0'}), [])
+        self.assertEqual(grid(PEERS, *store, '--reuse-grid', '4096'), ['GR8_REUSE_GRID=4096'])
+        self.assertEqual(grid(PEERS, *store, '--extra-env', 'GR8_REUSE_GRID=4096'), ['GR8_REUSE_GRID=4096'])
+        with self.assertRaises(opt.OptionError):   # a store needs REUSE: --reuse 0 is refused, not a rollback
+            grid(PEERS, *store, '--reuse', '0')
+        self.assertEqual(grid(PEERS, *store, '--extra-env', 'GR8_REUSE_ALIGN=0'), [])
+        self.assertEqual(grid(','.join(f'10.0.0.{i}' for i in range(1, 7)), '--kv-format', 'int4', *store), [])
+        self.assertEqual(grid(PEERS, '--kv-format', 'fp8', *store), [])
+        self.assertEqual(grid(PEERS, '--kv-store', 'off'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, environ={'KV_STORE': 'off'}), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid('10.0.0.1,10.0.0.2,10.0.0.3'), [])
+        self.assertEqual(grid(','.join(f'10.0.0.{i}' for i in range(1, 6))), [])
+        self.assertEqual(grid(','.join(f'10.0.0.{i}' for i in range(1, 7)), '--kv-format', 'int4'), [])
+        for bad in (('--reuse-grid', '32'), ('--reuse-grid', '100'), ('--reuse-grid', '65600'), ('--reuse-grid', 'x'),
+                    ('--reuse', '0', '--reuse-grid', '64'), ('--extra-env', 'GR8_REUSE_ALIGN=0', '--reuse-grid', '64'),
+                    ('--extra-env', 'G6_REUSE_ALIGN=0', '--reuse-grid', '64')):
+            with self.assertRaises(opt.OptionError):
+                grid(PEERS, *bad)
+        with self.assertRaises(opt.OptionError):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--reuse-grid', '64'], {'GR8_MODEL': 'glm53f'}))
     def test_tp5_prefills_with_pf_own_3(self):
         def env(*argv):
             o = opt.parse(['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 6)), *argv], GLM)
@@ -677,7 +932,7 @@ tiers:                       # tried in order
             ('runs: []\ntiers: []\n', 'the file.runs: not built yet'),
             ('tier: []\n', 'the file.tier: want caches, tiers'),
             (f'tiers:\n- {{keep: all}}\n', 'tiers[0]: no store'),
-            ('tiers:\n- store: {nvme: {path: /x}}\n', 'tiers[0].store: want one of ssd: or remote:'),
+            ('tiers:\n- store: {nvme: {path: /x}}\n', 'tiers[0].store: want one of ssd:, remote: or mem:'),
             ('tiers:\n- store: {ssd: {size_per_rank: 4G}}\n', 'tiers[0].store.ssd: no path'),
             ('tiers:\n- store: {ssd: {path: /x, size: 4G}}\n', 'tiers[0].store.ssd.size: want path, size_per_rank, persist'),
             ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G, persist: on}}\n', None),
@@ -840,7 +1095,8 @@ class KvRowsTests(unittest.TestCase):
         self.assertEqual(self.rt(self.plan('--kv-rows', 'off')[1]), {})
 
     def test_every_part_reaches_the_engine(self):
-        o, p = self.plan('--kv-rows', 'remote:192.0.2.5:7350,size=12G,local=40,pool=49152,place=900,fmt=int4')
+        o, p = self.plan('--kv-format', 'fp8', '--kv-rows',
+                         'remote:192.0.2.5:7350,size=12G,local=40,pool=49152,place=900,fmt=int4')
         self.assertEqual(self.rt(p), {'GR8_RT_STORE': 'remote:192.0.2.5:7350', 'GR8_RT_SIZE': str(12 << 30), 'GR8_RT_LOCAL': '40',
                                       'GR8_RT_POOL': '49152', 'GR8_RT_PLACE': '900', 'GR8_RT_FMT': 'int4'})
         t = opt.kv_rows(o)
@@ -869,6 +1125,7 @@ class KvRowsTests(unittest.TestCase):
                            (['--kv-rows', 'mem:,size=8G,place=900'], 'place= needs local='),
                            (['--kv-rows', 'remote:192.0.2.5,size=8G'], 'names the port'),
                            (['--kv-rows', 'remote:auto,size=8G'], 'name it'),
+                           (['--kv-rows', 'mem:,size=8G,fmt=int4'], 'INT4 already'),
                            (['--kv-rows', 'mem:,size=8G,fmt=int4', '--kv-format', 'int4'], 'INT4 already')):
             v.check(['--peers', PEERS, *argv], want)
 
@@ -880,11 +1137,24 @@ class KvFormatTests(unittest.TestCase):
         opt.validate(o)
         return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
 
-    def test_fp8_is_the_default_and_unchanged(self):
+    def test_tp4_defaults_to_int4_with_fp8_rollback(self):
         o, p = self.plan()
-        _, p8 = self.plan('--kv-format', 'fp8')
-        self.assertNotIn('--kv-format', p['args'])
-        self.assertEqual((p['args'], p['knobs']['CAP']), (p8['args'], '485376'))
+        self.assertEqual(o.get('KV_FORMAT'), 'int4')
+        self.assertEqual(o.origin['KV_FORMAT'], 'glm53 TP=4 default')
+        self.assertEqual(p['args'][-2:], ['--kv-format', 'int4'])
+        self.assertEqual(p['knobs']['CAP'], '513536')
+        o8, p8 = self.plan('--kv-format', 'fp8')
+        self.assertEqual(o8.get('KV_FORMAT'), 'fp8')
+        self.assertNotIn('--kv-format', p8['args'])
+        self.assertEqual(p8['knobs']['CAP'], '485376')
+        self.assertFalse([w for w in p8['env'] if w.startswith(('GR8_KV4_', 'GR8_CP_ONECHAIN='))])
+
+    def test_other_topologies_keep_fp8(self):
+        for tp, cap in (('3', '307136'), ('6', '614400')):
+            o, p = self.plan(tp=tp)
+            self.assertIsNone(o.get('KV_FORMAT'))
+            self.assertNotIn('--kv-format', p['args'])
+            self.assertEqual(p['knobs']['CAP'], cap)
 
     def test_int4_runs_its_own_engine_with_its_own_pool(self):
         o, p = self.plan('--kv-format', 'int4')
@@ -897,6 +1167,47 @@ class KvFormatTests(unittest.TestCase):
     def test_refusal(self):
         ValidateTests().check(['--peers', PEERS, '--kv-format', 'int8'], 'fp8 or int4')
 
+
+
+class DispramTests(unittest.TestCase):
+    def options(self, *args):
+        o = opt.parse(['--no-config', '--tp', '4', '--peers', PEERS, *args], GLM)
+        opt.validate(o)
+        return o
+
+    def test_flag(self):
+        for value in ('0', '1'):
+            self.assertEqual(self.options('--dispram', value).get('DISPRAM'), value)
+        with self.assertRaisesRegex(opt.OptionError, '--dispram 2: want 0 or 1'):
+            self.options('--dispram', '2')
+
+    def test_capacity_and_minimum(self):
+        for fmt, baseline, boosted, minimum in [('int4', '513536', '611328', '1983905792'),
+                                               ('fp8', '485376', '562688', '1986002944')]:
+            o_def = self.options('--kv-format', fmt)
+            for p in (opt.engine_plan(o_def), opt.engine_plan(o_def, dispram_bytes=2145386496)):
+                self.assertEqual(p['knobs']['CAP'], baseline)
+                self.assertFalse(any(v.startswith(('GR8_DISPRAM=', 'GR8_DISPRAM_MIN_BYTES=')) for v in p['env']))
+            o_on = self.options('--kv-format', fmt, '--dispram', '1')
+            old = opt.engine_plan(o_on)
+            self.assertEqual(old['knobs']['CAP'], baseline)
+            self.assertIn('GR8_DISPRAM=1', old['env'])
+            self.assertFalse(any(v.startswith('GR8_DISPRAM_MIN_BYTES=') for v in old['env']))
+            new = opt.engine_plan(o_on, dispram_bytes=2145386496)
+            self.assertEqual(new['knobs']['CAP'], boosted)
+            self.assertIn('GR8_DISPRAM=1', new['env'])
+            self.assertIn('GR8_DISPRAM_MIN_BYTES=' + minimum, new['env'])
+        for args, cap, setting in [(('--cap', '400000', '--dispram', '1'), '400000', '1'),
+                                   (('--dispram', '0'), '513536', '0')]:
+            p = opt.engine_plan(self.options(*args), dispram_bytes=2145386496)
+            self.assertEqual(p['knobs']['CAP'], cap)
+            self.assertIn('GR8_DISPRAM=' + setting, p['env'])
+            self.assertFalse(any(v.startswith('GR8_DISPRAM_MIN_BYTES=') for v in p['env']))
+        o = opt.parse(['--no-config', '--tp', '6', '--kv-format', 'int4', '--share-limit', '131072', '--dispram', '1'], GLM)
+        p = opt.engine_plan(o, dispram_bytes=4294967296)
+        self.assertEqual(p['knobs']['CAP'], '1048448')
+        self.assertIn('GR8_DISPRAM=1', p['env'])
+        self.assertIn('GR8_DISPRAM_MIN_BYTES=3311403008', p['env'])
 
 if __name__ == '__main__':
     unittest.main()

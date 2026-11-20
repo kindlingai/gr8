@@ -2,9 +2,10 @@
 // attention). Every stage is run teacher-forced (fed by the expected output of the stage before it) and compared on its own, then
 // layer_forward runs free and its output and intermediates are compared.
 //
-//   build: nvcc -std=c++17 -O3 -arch=sm_121a -DG6_MODEL_DS41=1 -I engine -o ds41_attn_test engine/attn/tests/ds41_attn_test.cu engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm
+//   build: nvcc -std=c++17 -O3 -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_DS41=1 -I engine -o ds41_attn_test engine/attn/tests/ds41_attn_test.cu engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm
 //   run:   ds41_attn_test FIXTURE_DIR [--time ITERS]
 //          ds41_attn_test --mgate [--M 16,32] [--start ..] [--kind r2,r1,w] [--gv 0|1|both]   (no fixture: chunk == M single-row calls per op; see ds41_attn_mgate.inc)
+//          ds41_attn_test --gv-nt   (no fixture: the M = 9..32 decode GEMV exactness and row-cap gates, ds41_attn_gv_nt.inc)
 //          ds41_attn_test --commit [--no-commit]   (no fixture: forced rejection at the compressor, k_comp_commit gate; see commit_test)
 //          FIXTURE_DIR written by `attn_ref_run.py decode` (has d.* tensors) also runs the decode-step tests: prefill n0 rows, then D
 //          one-row steps (ring R = 128 and R = 136), then the same D rows as one verify chunk at start > 0.
@@ -14,6 +15,7 @@
 // BAD otherwise. Exit code 1 if any stage is BAD.
 #include "../ds41_attn.cuh"
 #include "../ds41_attn_gv.cuh"   // single TU: the kernels and the launcher hooks together
+#include "ds41_attn_gv_nt.inc"   // --gv-nt: the M = 9..32 decode GEMV gates (ds41a::gvnt)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -690,6 +692,7 @@ int test_main(int argc, char** argv)
 {
     if (argc >= 2 && !strcmp(argv[1], "--commit")) return commit_test(argc, argv);
     if (argc >= 2 && !strcmp(argv[1], "--mgate")) return mgate_test(argc, argv);
+    if (argc >= 2 && !strcmp(argv[1], "--gv-nt")) { gvnt::run_all(); return 0; }
     if (argc < 2) { fprintf(stderr, "usage: %s FIXTURE_DIR [--time ITERS] [--dump DIR] [--gv] | --commit [--no-commit] | --mgate [--M a,b] [--start a,b] [--kind r2,r1,w] [--gv 0|1|both] [--tk N]\n", argv[0]); return 2; }
     Fix F;
     F.load(argv[1]);

@@ -131,3 +131,28 @@ fn yaml_file_rules() {
     yaml::add(&mut out, &mut vec![], "t.yaml", &old).unwrap();
     assert_eq!(out["TEST_X"].legacy, ["G6_X", "ATTNK_X"]);
 }
+
+#[test]
+fn ds41_diagnostics_default_off_and_cache_deferred() {
+    let log = &TABLE[find("DS_MOE_ELOG")];
+    assert_eq!(log.default, Some("0"));
+    assert_eq!(log.scope, Scope::Local);
+    let cache = &TABLE[find("DS_CACHE_DEFER_REPLACE")];
+    assert_eq!(cache.default, Some("1"));
+    assert_eq!(cache.scope, Scope::Agree);
+}
+
+#[test]
+fn ds41_draft_log_default_off_and_span_ops_level() {
+    let log = &TABLE[find("DS_DRAFT_LOG")];
+    assert_eq!(log.default, Some("0"));
+    assert_eq!(log.scope, Scope::Local);
+    let span = &TABLE[find("DS_SPAN")];
+    assert_eq!(parse(span, "3"), Ok(Value::Int(3)));
+    assert!(parse(span, "4").unwrap_err().contains("outside 0..3"));
+    let e = env(&[("GR8_DS_SPAN", "3")]);
+    assert!(e.problems().is_empty());
+    assert_eq!(e.get(find("DS_SPAN"), 0), Some(&Value::Int(3)));
+    let e = env(&[("GR8_DS_SPAN", "4")]);
+    assert!(e.problems()[0].error && e.problems()[0].text.starts_with("GR8_DS_SPAN=4 is outside 0..3"));
+}

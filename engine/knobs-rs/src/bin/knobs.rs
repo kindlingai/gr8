@@ -1,5 +1,5 @@
-//! knobs gen                    write gr8_knobs.h and docs/ENV.md from the table
-//! knobs check                  fail when either file is not what gen writes
+//! knobs gen                    write gr8_knobs.h, gr8_knob_ids.rs and docs/ENV.md from the table
+//! knobs check                  fail when any of them is not what gen writes
 //! knobs validate NAME=VALUE..  fail on an assignment the engine would refuse: an unknown name or a bad value
 //! knobs list                   one line per knob: NAME, scope, kind, and `family` for NAME<n>
 

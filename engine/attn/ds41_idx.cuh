@@ -906,15 +906,22 @@ inline void launch_logits_pipe(const LogitsP& p, cudaStream_t s, bool exact)
 // ------------------------------------------------------------------------------------------------ candidate block scores (layer 20)
 // sc[r][b] = max of p over block b's visible tokens (-inf past the last visible block); the last visible block is +inf so it is
 // always chosen. nvalid[r] = number of visible blocks. Requires ldp % 8 == 0 and p 16 B aligned.
+// Tiled (key tile of the prefill indexer): p and sc hold the nbt blocks b0 .. b0 + nbt - 1 of the row (p from token 8 b0); nb, klen and the
+// last-visible rule stay those of the whole row; nvalid[r] = the tile's visible blocks + nv_add (the carry's real count when the tile has none). b0 = 0, nbt = nb, nv_add = 0: the whole row.
 __global__ void k_block_scores(const bf16* __restrict__ p, long ldp, const int32_t* __restrict__ klen, int nb, bf16* __restrict__ sc,
-                               long ldsc, int32_t* __restrict__ nvalid)
+                               long ldsc, int32_t* __restrict__ nvalid, int b0, int nbt, int nv_add)
 {
     const int r = blockIdx.y, b = blockIdx.x * blockDim.x + threadIdx.x;
     const int kl = klen[r], vb = min((kl + CAND_BS - 1) / CAND_BS, nb);
-    if (blockIdx.x == 0 && threadIdx.x == 0) nvalid[r] = vb;
-    if (b >= nb) return;
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        const int nt = max(0, min(vb - b0, nbt));
+        nvalid[r] = nt > 0 ? nt + nv_add : min(nv_add, max(0, min(vb, b0)));   // no block in the tile: the carry count (see k_tile_len)
+    }
+    if (b >= nbt) return;
+    const int gb = b0 + b;
     float m = -INFINITY;
-    if (b < vb)
+    if (gb < vb)
     {
         const uint4 raw = *reinterpret_cast<const uint4*>(p + (size_t)r * ldp + (size_t)b * CAND_BS);
         const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
@@ -922,10 +929,10 @@ __global__ void k_block_scores(const bf16* __restrict__ p, long ldp, const int32
         for (int j = 0; j < 4; j++)
         {
             const float2 f = __bfloat1622float2(b2[j]);
-            if (b * CAND_BS + 2 * j < kl) m = fmaxf(m, f.x);
-            if (b * CAND_BS + 2 * j + 1 < kl) m = fmaxf(m, f.y);
+            if (gb * CAND_BS + 2 * j < kl) m = fmaxf(m, f.x);
+            if (gb * CAND_BS + 2 * j + 1 < kl) m = fmaxf(m, f.y);
         }
-        if (b == vb - 1) m = INFINITY;
+        if (gb == vb - 1) m = INFINITY;
     }
     sc[(size_t)r * ldsc + b] = __float2bfloat16_rn(m);
 }
@@ -1508,10 +1515,11 @@ inline int sm_count()
     return cache[dev] > 0 ? cache[dev] : 48;
 }
 // exact = true: bit-identical to launch_logits_dense on every input; false: the faster variant with its own fp32 rounding (see k_logits_mma)
-inline void launch_logits_dense_mma(const LogitsP& p, cudaStream_t s, bool exact = true)
+// min_iter: at least that many 4-unit strides per CTA (fewer CTAs, each loads its 8 query rows once for more keys; the key tiles use 8)
+inline void launch_logits_dense_mma(const LogitsP& p, cudaStream_t s, bool exact = true, int min_iter = 1)
 {
     const int units = (p.ncols + 31) / 32;
-    const int gx = max(1, min((units + 3) / 4, sm_count() * 6));
+    const int gx = max(1, min((units + 4 * min_iter - 1) / (4 * min_iter), sm_count() * 6));
     const dim3 grid(gx, (p.R + MMA_RB - 1) / MMA_RB);
     if (exact) k_logits_mma<true><<<grid, 128, 0, s>>>(p);
     else k_logits_mma<false><<<grid, 128, 0, s>>>(p);
@@ -1523,7 +1531,7 @@ inline void launch_logits_gather(const LogitsP& p, cudaStream_t s)
 inline void launch_block_scores(const bf16* p, long ldp, const int32_t* klen, int nb, bf16* sc, long ldsc, int32_t* nvalid, int R,
                                 cudaStream_t s)
 {
-    k_block_scores<<<dim3((nb + 255) / 256, R), 256, 0, s>>>(p, ldp, klen, nb, sc, ldsc, nvalid);
+    k_block_scores<<<dim3((nb + 255) / 256, R), 256, 0, s>>>(p, ldp, klen, nb, sc, ldsc, nvalid, 0, nb, 0);
 }
 template <int K>
 inline void launch_topk(const bf16* v, long ldv, const int32_t* end, int ncap, int32_t* out, int ldo, int R, cudaStream_t s)
@@ -1573,51 +1581,145 @@ inline void launch_gemm_mx(const GemmMxP& p, cudaStream_t s)
 }
 inline void launch_ca_dequant(const PagedRows& ca, int row0, int n, bf16* out, cudaStream_t s) { k_ca_dequant<<<n, 512, 0, s>>>(ca, row0, out); }
 
+// ------------------------------------------------------------------------------------------------ key tiles (prefill indexer)
+// A long prefill chunk runs the dense logits / top-k over key tiles of T tokens. Each row's buffer is [carry K | tile T]: the carry is the
+// top-K of the keys before the tile (their bf16 values, ascending key index, beside the int32 index list), the tile its logits. All carry
+// indices are below the tile's, both parts ascending, so the plain top-K of the buffer under the select's order (larger key first, ties to
+// the lower column) is the top-K of all keys so far under the same order on key ids: the result after the last tile is the one-pass result.
+// klen_t[r] = the row's visible keys in the tile [c0, c0 + T) (bound N = the one-pass ncap), end_t[r] = K + klen_t[r]. A row with no key in
+// the tile has end_t = its carry count, so the select keeps the carry and never reads a -1 pad slot (its value is stale scratch). A row
+// with keys in a later tile (c0 >= T >= K) always has a full carry, so the valid columns stay one run [0, end_t).
+__global__ void k_tile_len(const int32_t* __restrict__ klen, int c0, int T, int N, int K, int32_t* __restrict__ klen_t,
+                           int32_t* __restrict__ end_t, int R)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= R) return;
+    const int kv = min(klen[r], N), n = max(0, min(kv - c0, T));
+    klen_t[r] = n;
+    end_t[r] = n > 0 ? K + n : min(K, max(0, min(kv, c0)));
+}
+// After the select over a row buffer: pos[r][j] = selected columns (ascending, -1 pad). Column c < K (has_carry) is carry slot c, else key
+// base + (c - K); no carry (first tile): the select ran over v + K, column c is key base + c. Writes the new carry: idx[r][j] (-1 pad kept) and v[r][j] = the selected bf16 bits. One CTA per row.
+template <int K>
+__global__ void __launch_bounds__(1024) k_tile_carry(const int32_t* __restrict__ pos, int ldpos, bf16* __restrict__ v, long ldv,
+                                                     int32_t* __restrict__ idx, int ldi, int base, int has_carry)
+{
+    constexpr int PER = (K + 1023) / 1024;
+    const int r = blockIdx.x, tid = threadIdx.x;
+    bf16* vr = v + (size_t)r * ldv;
+    int32_t* ir = idx + (size_t)r * ldi;
+    const int32_t* pr = pos + (size_t)r * ldpos;
+    const int toff = has_carry ? K : 0;
+    int ni[PER];
+    bf16 nv[PER];
+#pragma unroll
+    for (int u = 0; u < PER; u++)
+    {
+        const int j = tid + u * 1024;
+        ni[u] = -1;
+        nv[u] = __float2bfloat16_rn(0.0f);
+        if (j >= K) continue;
+        const int c = pr[j];
+        if (c < 0) continue;
+        nv[u] = vr[c + (K - toff)];   // no carry: the select ran over the tile alone, columns from K
+        ni[u] = c < toff ? ir[c] : base + (c - toff);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < PER; u++)
+    {
+        const int j = tid + u * 1024;
+        if (j >= K) continue;
+        ir[j] = ni[u];
+        if (ni[u] >= 0) vr[j] = nv[u];
+    }
+}
+inline void launch_tile_len(const int32_t* klen, int c0, int T, int N, int K, int32_t* klen_t, int32_t* end_t, int R, cudaStream_t s)
+{
+    k_tile_len<<<(R + 255) / 256, 256, 0, s>>>(klen, c0, T, N, K, klen_t, end_t, R);
+}
+template <int K>
+inline void launch_tile_carry(const int32_t* pos, int ldpos, bf16* v, long ldv, int32_t* idx, int ldi, int base, bool has_carry, int R,
+                              cudaStream_t s)
+{
+    k_tile_carry<K><<<R, K < 1024 ? K : 1024, 0, s>>>(pos, ldpos, v, ldv, idx, ldi, base, has_carry ? 1 : 0);
+}
+
 // ================================================================================================ stages (what the step driver calls)
+// Key tile of the prefill indexer (tokens). The scratch is carved for Rcap rows of [TOPK + IDX_TILE] logits and [CAND_BLOCKS + IDX_TILE / 8]
+// block scores when the one-pass row (max_rows) is longer; a call whose R rows of the one-pass row fit in that space runs the one-pass path.
+// Must be a multiple of MC_TILE and >= CAND_BLOCKS * CAND_BS (so a row with keys in a later tile has a full candidate carry).
+constexpr int IDX_TILE = 32768;
+// Tiled mma logits: >= 8 key strides per CTA. One CTA a stride per tile (the one-pass grid formula) was 21% slower than one pass over
+// the same keys on an RTX 5090 (4096 rows, 262,144 keys); 8 strides: 6% faster. The grid does not change any logit.
+constexpr int TILE_MMA_ITERS = 8;
+static_assert(IDX_TILE % MC_TILE == 0 && IDX_TILE >= CAND_BLOCKS * CAND_BS && IDX_TILE >= TOPK, "IDX_TILE");
 // Scratch for R query rows over at most max_rows compressed rows (decode: R <= 8; the step driver carves it once per session).
+// Fixed part (address independent of the call's R): q prep, candidates, the consumers' compact buffers, tile lengths. Then the logits,
+// block scores and top-k workspace, whose shape is the call's: one pass (tile = 0, ldp = ld_of(max_rows)) or tiles (ldp = TOPK + tile).
 struct Scratch
 {
     uint8_t *q_pack, *q_exp;   // [R][32][64], [R][32][4]
     bf16* w;                   // [R][32]
-    bf16* p;                   // [R][ldp] logits, ldp = max_rows rounded up to a multiple of 128
-    long ldp;
-    bf16* sc;                  // [R][ldsc] block scores, ldsc = ldp / 8
-    long ldsc;
     int32_t* nvalid;           // [R]
     int32_t* cand;             // [R][2048] candidate block ids
-    bf16* cp;                  // [R][16384] compact logits
+    bf16* cp;                  // [R][16384] compact logits (tiled layer 20: int32 [R][2048] candidate select columns)
     int32_t* clen;             // [R]
-    int32_t* ci;               // [R][512] compact top-k before restore
-    int32_t* tkw;              // multi-CTA top-k workspace, topk_mc_ws_ints(R, ldp) ints
+    int32_t* ci;               // [R][512] compact top-k before restore (tiled: top-k select columns)
     float2* trig;              // [R][32] row-shared cosine/sine, default-off
+    int32_t *klen_t, *end_t;   // [R] tiled: visible keys of the tile, TOPK + that
+    bf16* p;                   // [R][ldp] logits, ldp = max_rows rounded up to a multiple of 128 (tiled: TOPK + tile)
+    long ldp;
+    bf16* sc;                  // [R][ldsc] block scores, ldsc = ldp / 8 (tiled: CAND_BLOCKS + tile / 8)
+    long ldsc;
+    int32_t* tkw;              // multi-CTA top-k workspace, topk_mc_ws_ints(R, ldp) ints
+    long ld_full;              // ld_of(max_rows): the one-pass row
+    int tile;                  // 0 = one pass, else the key tile
     static size_t al(size_t b) { return (b + 255) & ~(size_t)255; }
     static long ld_of(int max_rows) { return ((long)max_rows + 127) / 128 * 128; }
-    static size_t bytes(int R, int max_rows)
+    static bool tiled_alloc(long ld, int tile) { return tile > 0 && ld > (long)TOPK + tile; }
+    static size_t fixed_bytes(int R)
     {
-        const long ld = ld_of(max_rows);
-        return al((size_t)R * IH * IK_CODES) + al((size_t)R * IH * IK_SF) + al((size_t)R * IH * 2) + al((size_t)R * ld * 2) +
-               al((size_t)R * (ld / 8) * 2) + al((size_t)R * 4) + al((size_t)R * CAND_BLOCKS * 4) + al((size_t)R * CAND_COLS * 2) +
-               al((size_t)R * 4) + al((size_t)R * TOPK * 4) + al(topk_mc_ws_ints(R, ld) * 4) + al((size_t)R * 32 * sizeof(float2));
+        return al((size_t)R * IH * IK_CODES) + al((size_t)R * IH * IK_SF) + al((size_t)R * IH * 2) + al((size_t)R * 4) +
+               al((size_t)R * CAND_BLOCKS * 4) + al((size_t)R * CAND_COLS * 2) + al((size_t)R * 4) + al((size_t)R * TOPK * 4) +
+               al((size_t)R * 32 * sizeof(float2)) + 2 * al((size_t)R * 4);
     }
-    static Scratch carve(void* base, int R, int max_rows)
+    // logits / block-score widths the allocation is carved for
+    static long wp_of(long ld, int tile) { return tiled_alloc(ld, tile) ? (long)TOPK + tile : ld; }
+    static long wsc_of(long ld, int tile) { return tiled_alloc(ld, tile) ? (long)CAND_BLOCKS + tile / CAND_BS : ld / 8; }
+    static size_t bytes(int R, int max_rows, int tile = IDX_TILE)
+    {
+        const long ld = ld_of(max_rows), wp = wp_of(ld, tile);
+        return fixed_bytes(R) + al((size_t)R * wp * 2) + al((size_t)R * wsc_of(ld, tile) * 2) + al(topk_mc_ws_ints(R, wp) * 4);
+    }
+    // Rcap = the rows the scratch was carved for, R = the rows of this call (<= Rcap)
+    static Scratch carve(void* base, int Rcap, int max_rows, int R, int tile = IDX_TILE)
     {
         Scratch s;
         uint8_t* b = (uint8_t*)base;
         auto take = [&](size_t n) { uint8_t* r = b; b += al(n); return r; };
-        s.ldp = ld_of(max_rows);
-        s.ldsc = s.ldp / 8;
-        s.q_pack = take((size_t)R * IH * IK_CODES);
-        s.q_exp = take((size_t)R * IH * IK_SF);
-        s.w = (bf16*)take((size_t)R * IH * 2);
-        s.p = (bf16*)take((size_t)R * s.ldp * 2);
-        s.sc = (bf16*)take((size_t)R * s.ldsc * 2);
-        s.nvalid = (int32_t*)take((size_t)R * 4);
-        s.cand = (int32_t*)take((size_t)R * CAND_BLOCKS * 4);
-        s.cp = (bf16*)take((size_t)R * CAND_COLS * 2);
-        s.clen = (int32_t*)take((size_t)R * 4);
-        s.ci = (int32_t*)take((size_t)R * TOPK * 4);
-        s.tkw = (int32_t*)take(topk_mc_ws_ints(R, s.ldp) * 4);
-        s.trig = (float2*)take((size_t)R * 32 * sizeof(float2));
+        s.q_pack = take((size_t)Rcap * IH * IK_CODES);
+        s.q_exp = take((size_t)Rcap * IH * IK_SF);
+        s.w = (bf16*)take((size_t)Rcap * IH * 2);
+        s.nvalid = (int32_t*)take((size_t)Rcap * 4);
+        s.cand = (int32_t*)take((size_t)Rcap * CAND_BLOCKS * 4);
+        s.cp = (bf16*)take((size_t)Rcap * CAND_COLS * 2);
+        s.clen = (int32_t*)take((size_t)Rcap * 4);
+        s.ci = (int32_t*)take((size_t)Rcap * TOPK * 4);
+        s.trig = (float2*)take((size_t)Rcap * 32 * sizeof(float2));
+        s.klen_t = (int32_t*)take((size_t)Rcap * 4);
+        s.end_t = (int32_t*)take((size_t)Rcap * 4);
+        s.ld_full = ld_of(max_rows);
+        const long wp = wp_of(s.ld_full, tile), wsc = wsc_of(s.ld_full, tile);
+        s.p = (bf16*)take((size_t)Rcap * wp * 2);
+        s.sc = (bf16*)take((size_t)Rcap * wsc * 2);
+        s.tkw = (int32_t*)take(topk_mc_ws_ints(Rcap, wp) * 4);
+        // one pass when this call's R rows of the full row fit the carve (always when the allocation is not tiled)
+        const bool flat = !tiled_alloc(s.ld_full, tile) ||
+                          ((long)R * s.ld_full <= (long)Rcap * wp && topk_mc_ws_ints(R, s.ld_full) <= topk_mc_ws_ints(Rcap, wp));
+        s.tile = flat ? 0 : tile;
+        s.ldp = flat ? s.ld_full : wp;
+        s.ldsc = flat ? s.ld_full / 8 : wsc;
         return s;
     }
 };
@@ -1640,27 +1742,87 @@ struct IndexIn
     int topk_mc = 1;             // 1: multi-CTA top-k for long rows, 0: the single-CTA kernel
 };
 
-// ST_INDEX_TOPK at an index source (dense, layers 2, 8, 14, 20; also 24.. when the candidate stage is off): q prep, logits over all
-// visible rows, top-512. out [R][ldo >= 512] int32 ascending, -1 tail. Leaves the logits in sc.p (the candidate stage reads them at 20).
-inline void stage_index_dense(const IndexIn& in, const Scratch& sc, int32_t* out, int ldo, cudaStream_t s)
+inline void index_q(const IndexIn& in, const Scratch& sc, cudaStream_t s)
 {
     IdxQP q{in.q_b, in.wproj, in.inv, in.pos0, sc.q_pack, sc.q_exp, sc.w, in.dpos, sc.trig};
     if (in.q_trig) launch_index_q_cached(q, in.R, s);
     else launch_index_q(q, in.R, s);
+}
+inline void launch_dense_logits(const IndexIn& in, const LogitsP& l, cudaStream_t s, int min_iter = 1)
+{
+    if (in.pipe_qr) launch_logits_pipe_qr(l, s);
+    else if (in.pipe_b) launch_logits_pipe(l, s, false);
+    else if (in.logits_mma) launch_logits_dense_mma(l, s, in.logits_mma == 1, min_iter);
+    else launch_logits_dense(l, s);
+}
+template <int K>
+inline void select(const IndexIn& in, const bf16* v, long ldv, const int32_t* end, int ncap, int32_t* out, int ldo, const Scratch& sc,
+                   cudaStream_t s)
+{
+    if (in.topk_mc) launch_topk_mc<K>(v, ldv, end, ncap, out, ldo, in.R, sc.tkw, MC_CTAS, s);
+    else launch_topk<K>(v, ldv, end, ncap, out, ldo, in.R, s);
+}
+// The tiled dense stage (sc.tile > 0): per key tile the dense logits into [TOPK, TOPK + tile) of each row, then (topk) the top-512 of
+// [carry | tile] into out, and (cand, layer 20) the tile's block scores into [CAND_BLOCKS, ..) of sc.sc and the top-2048 blocks of
+// [carry | tile] into sc.cand. Same lists as stage_index_dense + stage_cand_blocks (see k_tile_len). The tile's keys are read through a key
+// map shifted by c0 rows: the ica pool is one page per slot holding every row below N, so row c0 + j of the page is row j of the shift.
+inline void stage_index_tiled(const IndexIn& in, const Scratch& sc, int32_t* out, int ldo, bool topk, bool cand, cudaStream_t s)
+{
+    index_q(in, sc, s);
+    const int T = sc.tile, N = max(1, min(in.max_klen, (int)sc.ld_full)), nb = (int)(sc.ld_full / 8);
+    int32_t* cpos = reinterpret_cast<int32_t*>(sc.cp);
+    for (int c0 = 0; c0 < N; c0 += T)
+    {
+        const bool first = c0 == 0;
+        const int nc = min(T, N - c0), nbt = (nc + CAND_BS - 1) / CAND_BS;
+        launch_tile_len(in.klen, c0, T, N, TOPK, sc.klen_t, sc.end_t, in.R, s);
+        LogitsP l{};
+        l.q_pack = sc.q_pack; l.q_exp = sc.q_exp; l.w = sc.w; l.k = in.k; l.klen = sc.klen_t;
+        l.k.codes.base += (size_t)c0 * l.k.codes.row_stride;
+        l.k.sf.base += (size_t)c0 * l.k.sf.row_stride;
+        l.p = sc.p + TOPK; l.ldp = sc.ldp; l.ncols = nc; l.R = in.R;
+        launch_dense_logits(in, l, s, TILE_MMA_ITERS);
+        if (topk)
+        {
+            if (first) select<TOPK>(in, sc.p + TOPK, sc.ldp, sc.klen_t, nc, sc.ci, TOPK, sc, s);
+            else select<TOPK>(in, sc.p, sc.ldp, sc.end_t, TOPK + nc, sc.ci, TOPK, sc, s);
+            launch_tile_carry<TOPK>(sc.ci, TOPK, sc.p, sc.ldp, out, ldo, c0, !first, in.R, s);
+        }
+        if (cand)
+        {
+            bf16* tsc = sc.sc + CAND_BLOCKS;
+            k_block_scores<<<dim3((nbt + 255) / 256, in.R), 256, 0, s>>>(sc.p + TOPK, sc.ldp, in.klen, nb, tsc, sc.ldsc, sc.nvalid, c0 / CAND_BS,
+                                                                          nbt, first ? 0 : CAND_BLOCKS);
+            if (first) select<CAND_BLOCKS>(in, tsc, sc.ldsc, sc.nvalid, nbt, cpos, CAND_BLOCKS, sc, s);
+            else select<CAND_BLOCKS>(in, sc.sc, sc.ldsc, sc.nvalid, CAND_BLOCKS + nbt, cpos, CAND_BLOCKS, sc, s);
+            launch_tile_carry<CAND_BLOCKS>(cpos, CAND_BLOCKS, sc.sc, sc.ldsc, sc.cand, CAND_BLOCKS, c0 / CAND_BS, !first, in.R, s);
+        }
+    }
+}
+// ST_INDEX_TOPK at an index source (dense, layers 2, 8, 14, 20; also 24.. when the candidate stage is off): q prep, logits over all
+// visible rows, top-512. out [R][ldo >= 512] int32 ascending, -1 tail. Leaves the logits in sc.p (the candidate stage reads them at 20).
+// Tiled scratch (sc.tile > 0): stage_index_tiled; cand_src = this is layer 20 and its candidate blocks are read later, so they are made here.
+inline void stage_index_dense(const IndexIn& in, const Scratch& sc, int32_t* out, int ldo, cudaStream_t s, bool cand_src = false)
+{
+    if (sc.tile) { stage_index_tiled(in, sc, out, ldo, true, cand_src, s); return; }
+    index_q(in, sc, s);
     LogitsP l{};
     l.q_pack = sc.q_pack; l.q_exp = sc.q_exp; l.w = sc.w; l.k = in.k; l.klen = in.klen;
     l.p = sc.p; l.ldp = sc.ldp; l.ncols = in.max_klen; l.R = in.R;
-    if (in.pipe_qr) launch_logits_pipe_qr(l, s);
-    else if (in.pipe_b) launch_logits_pipe(l, s, false);
-    else if (in.logits_mma) launch_logits_dense_mma(l, s, in.logits_mma == 1);
-    else launch_logits_dense(l, s);
+    launch_dense_logits(in, l, s);
     const int ncap = max(1, min(in.max_klen, (int)sc.ldp));
     if (in.topk_mc) launch_topk_mc<TOPK>(sc.p, sc.ldp, in.klen, ncap, out, ldo, in.R, sc.tkw, MC_CTAS, s);
     else launch_topk<TOPK>(sc.p, sc.ldp, in.klen, (int)sc.ldp, out, ldo, in.R, s);
 }
 // ST_CAND_BLOCKS (layer 20, after stage_index_dense): block scores from the dense logits, top-2048 blocks -> sc.cand
-inline void stage_cand_blocks(const IndexIn& in, const Scratch& sc, cudaStream_t s)
+// Tiled scratch: nothing when the dense stage made them (cand_src), else the tiled stage without its top-512.
+inline void stage_cand_blocks(const IndexIn& in, const Scratch& sc, cudaStream_t s, bool cand_src = false)
 {
+    if (sc.tile)
+    {
+        if (!cand_src) stage_index_tiled(in, sc, nullptr, 0, false, true, s);
+        return;
+    }
     const int nb = (int)sc.ldsc;
     launch_block_scores(sc.p, sc.ldp, in.klen, nb, sc.sc, sc.ldsc, sc.nvalid, in.R, s);
     if (in.topk_mc)

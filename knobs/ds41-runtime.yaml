@@ -1,6 +1,16 @@
 # DeepSeek-V4.1-Flash (MODEL=ds41) step driver, prefill and serving. Read only by a DS41 build.
 prefix: "GR8_DS"
 knobs:
+  GR8_DS_PF_V2_ATTN_PIPE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      V2 prefill only: pipeline two packed K stages in the cp.async CQ attention core, preserving bf16 operands and arithmetic order.
+      Needs GR8_DS_PF_V2=1, GR8_DS_ATTN_CPA=1 and packed compressed rows (GR8_DS_COMP_FP4=1) to select the new kernel.
+      Window-only, bounded replay, decode and eligible split launches stay unchanged. Mixed window/CQ blocks stay serial.
+      Logs request/on once per v2 request per rank, including on=0. Default 0 keeps the original kernels.
   GR8_DS_BLOCK:
     scope: agree
     kind: text
@@ -18,11 +28,77 @@ knobs:
   GR8_DS_CACHE_MIB:
     scope: local
     kind: int
-    unset: "the prefix cache's own size"
+    unset: "4096 MiB per rank"
     values: "1.."
     legacy: ["G6_DS41_CACHE_MIB"]
     doc: >-
       Size in MiB of the host prefix cache of DS41 session snapshots (--reuse-prefix).
+  GR8_DS_CACHE_DEDUP:
+    scope: agree
+    kind: int
+    default: "1"
+    values: "0..64"
+    doc: >-
+      Skip a new DS41 prefix snapshot when a stored same-namespace prefix is at most this many tokens shorter.
+      The default 1 reuses a stored same-namespace prefix at most one token behind the requested snapshot position. This
+      includes short replies: their request end then adds no snapshot. Longer replies' snapshots follow
+      GR8_DS_CACHE_REPLACE. Set 0, with GR8_DS_CACHE_REPLACE=0, to keep every snapshot. Larger values may cause short
+      follow-ups to re-prefill on the next turn.
+  GR8_DS_CACHE_DEFER_REPLACE:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_CACHE_REPLACE=1, keep a request's prompt-end snapshot linked to its request end until the next turn
+      chooses one, even after a previous request-end hit. A re-tokenized assistant reply or dropped reasoning can then
+      fall back to prompt end. Applies to captured and parked request ends; LRU budget eviction still applies.
+      Set 0 to restore eager prompt-end replacement after a request-end hit. Every rank must agree.
+  GR8_DS_CACHE_REPLACE:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    doc: >-
+      Link a request's two DS41 prefix snapshots (prompt end, request end). The follow-up's restore or parked resume of
+      one frees the unused sibling: a chat that sends the reply back unchanged continues from request end; a thinking
+      chat that drops reasoning, or a re-tokenized reply, can use prompt end. GR8_DS_CACHE_DEFER_REPLACE=1 keeps this
+      choice on every turn. Set GR8_DS_CACHE_DEFER_REPLACE=0 for the legacy policy, which frees a request's prompt end
+      eagerly when it finishes after a request-end hit. A freed snapshot is unavailable to later retries, edits or
+      changes to whether reasoning is included; those prompts prefill again. Set 0 (and GR8_DS_CACHE_DEDUP=0) to keep
+      every snapshot until LRU eviction.
+  GR8_DS_PARK:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      A finished chat keeps its slot (parked) instead of being copied into the prefix cache: a follow-up whose prompt
+      extends it is admitted into that slot with no restore and prefills only the new tokens. A new chat with no free
+      slot evicts the oldest parked slot, captured into the prefix cache first. The prompt-end snapshot is captured as
+      before. With GR8_DS_CACHE_REPLACE the eviction capture is the request-end snapshot, linked to the prompt-end one as
+      at request end, and a resume frees the unused prompt-end snapshot as a request-end restore does. Needs --serve,
+      --s2-sessions >= 2 and --reuse-prefix. The ds41 launcher sets 1 when REUSE=1 and SESS>=2 unless EXTRA_ENV
+      disables the cache. An explicit EXTRA_ENV GR8_DS_PARK=0 rolls back to copying snapshots at request end.
+  GR8_DS_CONF_TEMP:
+    scope: agree
+    kind: text
+    unset: "1.0"
+    doc: >-
+      Temperature of the DSpark confidence head: one positive number for every draft row, or five comma separated, one
+      a row. A draft's confidence is the sigmoid of its head score over the temperature. Only GR8_DS_VERIFY_CAP reads
+      the confidence; at 1.0 the scores keep their order.
+  GR8_DS_DRAFT_LOG:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      Log one bounded DSpark calibration summary per finished request on every rank: verified and accepted drafts,
+      emitted tokens, rows-per-session histogram, cumulative predicted versus realized survival by draft position,
+      and a digest of the executed (session count, rows per session) sequence. Reuses already copied confidence
+      scores; adds no device synchronization. Off by default.
+      Includes host elapsed MAIN time by cohort and rows per session, and draft time, around existing stream fences.
+      Timing values are rank-local diagnostics, not rank-agreement inputs.
   GR8_DS_DEC_STAGE:
     scope: agree
     kind: flag
@@ -44,6 +120,13 @@ knobs:
     unset: "off"
     doc: >-
       Debug: a directory of reference activations the step driver feeds in place of its own, layer by layer.
+  GR8_DS_MANIFEST:
+    scope: agree
+    kind: text
+    unset: "native"
+    doc: >-
+      The release manifest the loader plans from, manifests/exlr8-manifest-NAME.json. A layer whose widths are numbers
+      loads its experts as exlr8 trellis (pmcgx-k4: layers 0-7 at K4); the other layers keep the native experts.
   GR8_DS_MHC_DECOMP:
     scope: agree
     kind: flag
@@ -88,6 +171,155 @@ knobs:
     unset: "0, no drafts"
     doc: >-
       DSpark drafts verified a round, 1..5 (the checkpoint's three draft layers, block of 5). Served only.
+  GR8_DS_PF_V2:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      The v2 sequence-parallel prefill for layers 0..20 of a W-row chunk. Own-row residual state,
+      a dedicated fabric and high-priority communication stream; late layers remain on the stock path.
+      The launcher sets 1 for DS41 (the release stack); EXACT=1 leaves it unset. It runs where these hold:
+      serve, W-row prefill, TP4, W 256..8192 in steps of 256, GR8_DS_PF_TAIL 128, one lane, no
+      GR8_DS_PF_L20_TAIL, GR8_DS_SH_TC=1, no GR8_DS_MHC_ROW_SHARD, and native MXFP4 experts in layers 0..20.
+      Elsewhere the boot logs one line naming the failed condition and runs the old range-A path, with
+      W-row chunks of at most 4096 rows. 0 runs the old path.
+  GR8_DS_PF_V2_GATE_RO:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      V2 FFN own-row gate only: use the existing read-once register-tile gate
+      for 384 experts. Default 0 retains k_gate_logits_mt; other expert counts
+      retain that kernel. Independent of GR8_DS_GATE_RO. Logs on/off once per
+      request per rank; shared-memory opt-in is set at scratch initialization.
+  GR8_DS_PF_V2_RS_BLOCKS:
+    scope: local
+    kind: ints
+    default: "48"
+    doc: >-
+      V2 FFN reduce-scatter only. The default, 48, runs the reduce with 48 blocks;
+      0 selects the eight-block scalar reduce kernel.
+      Otherwise a comma list of positive block counts (e.g. 48,192,1024);
+      request ID r selects list[r % length], logged once per request per rank.
+      Uses aligned 16-byte cache-volatile loads and 16-byte stores with a scalar tail,
+      preserving the original FP32 rank summation order. Mixed zero/nonzero lists
+      are invalid. Boot gathers and non-v2 paths are unchanged.
+  GR8_DS_PF_V2_PACK_BLOCKS:
+    scope: local
+    kind: ints
+    default: "48"
+    doc: >-
+      V2 wire pack/unpack only (AG, A2A and RS). The default, 48, packs with 48 blocks;
+      0 selects the old eight blocks.
+      Otherwise a comma list of positive block counts (e.g. 48,192,1024);
+      request ID r selects list[r % length], logged once per request per rank.
+      Retains the existing aligned 16-byte copies and scalar ragged/unaligned
+      fallback, without changing kernels. Mixed zero/nonzero lists are invalid.
+      Boot gathers retain eight blocks. Independent of GR8_DS_PF_V2_RS_BLOCKS.
+  GR8_DS_PF_V2_STRIPE_MIN:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      Dedicated v2 fabric only: positive N sets the dual-rail payload striping
+      threshold in bytes. The existing proxy keeps its 8192-byte floor, so the
+      effective threshold is max(N, 8192); the first half is rounded down to
+      4096 bytes. Needs two mesh rails (--ips2) to stripe; one rail or a TP4
+      ring keeps the existing transport. Logs min, rails and effective_min once
+      per boot per rank. 0 leaves the inherited fabric configuration unchanged
+      (normally no striping; an existing GR8_DS_STRIPE setting is preserved).
+      No effect when GR8_DS_PF_V2=0. Wire bytes and tail ordering are unchanged.
+  GR8_DS_PF_V2_XTRACE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_XTRACE=1 and GR8_DS_PF_V2=1, trace the dedicated v2 fabric,
+      independently of GR8_XTRACE_PF. GPU producer, publish, peer-tail,
+      consume and join stamps accompany the existing proxy doorbell/post stamps.
+      Also enables v2 per-chunk timing and epoch/request/layer correlation on stderr,
+      with layer/attention/Engram/dispatch/FC1/FC2/combine/assemble boundaries and
+      separate pack-publication, peer wait, unpack and reduce event intervals.
+      Uses GR8_XTRACE_OUT/QUIT; retains the last 64 fabric epochs (one per v2
+      layer, including boot gathers), not a complete long request. Default 0
+      leaves v2's kernels, launches and timing setting unchanged.
+  GR8_DS_PF_V2_TIMING:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_V2=1, record per-layer compute/communication CUDA-event pairs
+      into a bounded ring and print per chunk at the existing completion fence.
+      Reports request id and chunk first-token offset, with intervals relative to
+      that chunk's start to expose stream overlap. Retires each chunk's samples so
+      long requests can reuse the ring without accumulating events.
+      Never synchronizes the GPU; not-ready or overflow samples are labelled.
+      Default 0 allocates no timing events and leaves the stock path unchanged.
+  GR8_DS_PF_V2_FC2:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_V2=1, use the experimental resident-weight routed-expert down kernel:
+      each CTA holds one 128-column weight slab across all bucketed rows, with heavy experts first.
+      Default 0 retains the grouped stock tensor-core kernel. Has no effect when V2 is off.
+
+  GR8_DS_PF_V2_L20_TAIL:
+    scope: agree
+    kind: ints
+    default: "0"
+    doc: >-
+      With GR8_DS_PF_V2=1, select a comma list of 0 or 1 by request modulo list length.
+      1 runs layers 0..19 full-row and hoists layer 20 ST_CA_ROW over all rows using
+      lossless BF16 AttnIn all-gather, even on skip-late chunks; the rest of layer 20
+      joins the 128-row late range. Logs request/on/rank once per active request/slot
+      unless the list is the single default 0. Default 0 retains the existing split.
+  GR8_DS_PF_V2_SEND_FFN_OPT:
+    scope: agree
+    kind: ints
+    default: "0"
+    doc: >-
+      With GR8_DS_PF_V2=1, select comma-list bitmask modes 0..3 by request modulo
+      list length. Bit 1 packs remote AttnOut quarters directly from quantized
+      output codes/scales and publishes on the compute stream before the local
+      output projection; only remote peers unpack on the communication stream.
+      Bit 2 unpacks FfnIn into both ordinary and record activation layouts using
+      warp-quad shuffles, skipping the separate relayout. Logs rank/request/slot/mode
+      once per active request/slot for nonzero modes. Default 0 keeps both paths unchanged.
+
+  GR8_DS_PF_V2_BF16_TC:
+    scope: agree
+    kind: ints
+    default: "0"
+    doc: >-
+      V2 prefill only (GR8_DS_PF_V2=1): comma list of bitmasks in 0..7 (e.g. 0,
+      1, 2, 4, 7, 0,7), where request ID r selects mask = list[r % length].
+      Default 0 keeps stock projections. When rows >= 16: bit 1 runs V2 router
+      gate logits on BF16 Tensor Cores (FP32 accumulate); bit 2 runs V2 ratio-2
+      compressor paired projections (when GR8_DS_COMP_FP8=0) on BF16 Tensor
+      Cores (FP32 accumulate); bit 4 runs V2 indexer wproj and layer-20 cmp_wkv
+      projections on BF16 Tensor Cores (FP32 accumulate, BF16 round-to-nearest
+      output). Logs "# ds41_v2_bf16_tc rank=<r> request=<id> slot=<s> on=1 mask=<m>"
+      once per active request per rank when mask != 0 (0 lines when mask is 0).
+  GR8_DS_PF_V2_W16K:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_V2=1, allow sequence-parallel prefill and Engram widths
+      through 16384 rows in steps of 256, with matching GR8_DS_ATTN_PW and
+      GR8_DS41_IDX_PW. Use the 16384-row routed-FFN planner only for capacities
+      above 8192 and limit shared main-fabric prefill slots to 4096 rows.
+      Default 0 retains the 8192 cap, planner and main-fabric sizing.
+      Has no effect when GR8_DS_PF_V2=0.
+
   GR8_DS_PF_DIRECT:
     scope: agree
     kind: flag
@@ -109,6 +341,7 @@ knobs:
     unset: "1, one lane"
     doc: >-
       1 or 2. 2 runs W-row prefill quanta of up to 2W rows of one session on two lanes with their own streams and fabric.
+      The launcher sets 1 for DS41 (v2 needs one lane) and 2 with EXACT=1.
   GR8_DS_PF_LATE_FINAL:
     scope: agree
     kind: flag
@@ -117,6 +350,14 @@ knobs:
     doc: >-
       With GR8_DS_PF_TAIL, a chunk with at least tail + window rows after it skips the late layers' rows that no later
       reader needs.
+  GR8_DS_PF_L20_TAIL:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_TAIL, layer 20 joins the late layers: its compressed-KV row runs on every row of a chunk, the rest
+      of the layer only on the tail rows.
   GR8_DS_PF_POOL:
     scope: agree
     kind: text
@@ -165,13 +406,30 @@ knobs:
     doc: >-
       DSpark verify accepts a greedy row's draft by a relaxed rule: ratio:R (0 < R <= 1) and / or topp:P (0 < P < 1),
       comma separated. Not exact.
-  GR8_DS_SPAN:
-    scope: local
+  GR8_DS_SESS_DRAFTS:
+    scope: agree
     kind: flag
     default: "0"
     values: "0|1"
     doc: >-
-      Prints the host time of each step's spans.
+      DS41 DSpark serve: the drafts a session verifies in a decode round go by the sessions active in it, the most that
+      keep every session's verify rows within the step's row cap (min(GR8_DS_MTP, max_rows / sessions - 1)), and a draft
+      step of more than 6 sessions runs as launches of at most 6. At GR8_DS_MTP=5 and 32 rows: 1-5 active: 5 drafts (6
+      rows a session, the same as with the knob off); 6: 4; 7-8: 3; 9-10: 2; 11-16: 1; above 16: none. Lower GR8_DS_MTP
+      values use the same row-budget rule: 1-5 active sessions draft as with the knob off, drafts are first cut at 7
+      (GR8_DS_MTP=4), 9 (3), 11 (2) or 17 (1) active, and drafting goes on up to 16 active sessions. 0: today's drafting
+      limits (no drafts above 6 active sessions, above 5 at GR8_DS_MTP=5). Needs --serve and GR8_DS_MTP 1..5;
+      --s2-sessions 1..32.
+  GR8_DS_SPAN:
+    scope: local
+    kind: int
+    default: "0"
+    values: "0..3"
+    doc: >-
+      Prints the GPU time of each plan unit (attention, consume, MoE, head, ...) summed over the layers: every eager step,
+      and for a captured step graph the mean per step over 16 sampled replays (every 16th replay is read, through
+      globaltimer stamps the capture adds around each unit). 2: also one line per unit kind with the time of each layer.
+      3: per-op marks inside each unit (one ops line per layer).
   GR8_DS_STRIPE:
     scope: agree
     kind: flag
@@ -192,6 +450,14 @@ knobs:
     unset: "off"
     doc: >-
       Debug: a directory where each step's sub-layer partials are written.
+  GR8_DS_VERIFY_CAP:
+    scope: agree
+    kind: text
+    unset: "0, every draft is verified"
+    doc: >-
+      0, or a confidence threshold in (0, 1]: a DSpark draft whose confidence (GR8_DS_CONF_TEMP) is below it is not
+      verified, so a round's verify step holds fewer rows. Exact: the emitted tokens do not change. Checked at boot;
+      the verify step does not apply it yet.
   GR8_DS_WAIT_K:
     scope: agree
     kind: int
@@ -208,3 +474,29 @@ knobs:
     legacy: ["G6_XTRACE_DS"]
     doc: >-
       With GR8_XTRACE=1 and DSpark, also trace the DSpark draft fabric.
+  GR8_DS41_PUB16:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = a publish of 8 rows or fewer (the layer exchanges and the Engram reduce) copies into the send slot with 16
+      CTAs instead of 1, the grid a publish of more rows already runs. The same bytes and the same doorbell, so the
+      outputs do not change.
+  GR8_DS41_HEAD_MX:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the loader builds the decode head from the release's BF16 rows as MXFP8 records (G.lm_head.mx.gv, rounded to
+      nearest) in place of the BF16 GEMV records, so the head GEMV of a decode step reads a little over half the
+      bytes. Not exact: the logits round differently, and outputs can change.
+  GR8_DS41_VISION:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 = with --serve, a release that has dense/exlr8-extra-vision.safetensors loads the vision tower at boot, before
+      the KV pool is sized, and the engine takes requests with images (hello `vision`). Without that file the engine
+      serves text only. 0 (the default) never loads the tower: the engine runs as it did before image input. The
+      tower costs about 1.5 GB of device memory a rank, so image input is opt-in.

@@ -455,7 +455,7 @@ fn stale_shrink_refused() {
     assert_eq!(a[0].shrink(1, r.txn).unwrap_err().kind(), ErrorKind::StaleNetworkFileHandle);
 }
 
-// D-331 M8 E(c): a group opened with no cap= (cap_bytes 0, the engine's "the node's limit", kv_tier.cuh add_group)
+// A group opened with no cap= (cap_bytes 0, the engine's "the node's limit", kv_tier.cuh add_group)
 // grows past its floor under demand, as far as the node has room
 #[test]
 fn no_cap_grows_past_the_floor() {
@@ -472,7 +472,7 @@ fn no_cap_grows_past_the_floor() {
     assert_eq!(r.grant, 3, "16 segments on the node, 2 ranks at 5");
 }
 
-// D-331 M8 Flash grow: a group that asked once (its head asks ahead, one entry before the tier is full) and made the
+// Flash grow: a group that asked once (its head asks ahead, one entry before the tier is full) and made the
 // node ask another group to give is granted that room at its next report, even when that report asks for nothing more
 // (the head's want counts only what changed since its last report). Before, the given segments sat free until the
 // asker's tier dropped an entry and asked again

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""--variant: resolving home / down1 / up1 or a manifest path, the refusal without v2 widths, the canonical options,
+"""--variant: resolving a width profile name or a manifest path, the refusal without v2 widths, the canonical options,
 the model id, and the expert GB per rank.
     python3 -m unittest discover -s tools/launch"""
 import json
@@ -32,38 +32,39 @@ class ResolveTests(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp()
         self.v2 = os.path.join(self.t, 'v2')
-        manifest(os.path.join(self.v2, 'exlr8-manifest-home.json'), 'home', 3)
-        manifest(os.path.join(self.v2, 'manifests', 'exlr8-manifest-down1.json'), 'down1', 2)
+        manifest(os.path.join(self.v2, 'exlr8-manifest-bit400.json'), 'bit400', 4)
+        manifest(os.path.join(self.v2, 'manifests', 'exlr8-manifest-bit200.json'), 'bit200', 2)
         self.model = os.path.join(self.t, 'packs')
-        manifest(os.path.join(self.model, 'exlr8-manifest-up1.json'), 'up1', 4)
+        manifest(os.path.join(self.model, 'exlr8-manifest-bit390.json'), 'bit390', 4)
 
     def test_names_and_paths(self):
-        for name, where in (('home', self.v2), ('down1', os.path.join(self.v2, 'manifests')), ('up1', self.model)):
+        for name, where in (('bit400', self.v2), ('bit200', os.path.join(self.v2, 'manifests')), ('bit390', self.model)):
             v = M.resolve_variant(name, self.v2, [self.model])
             self.assertEqual((v.name, v.path), (name, os.path.join(where, f'exlr8-manifest-{name}.json')))
             self.assertEqual(len(v.sha256), 64)
-        self.assertEqual(M.resolve_variant(None, self.v2, []).name, 'home')
-        self.assertEqual([M.resolve_variant(None, self.v2, [], tp).name for tp in (3, 4)], ['down1', 'home'])
         self.assertEqual(M.resolve_variant(None, None, [], 3).name, 'home')      # packs carry home only
         p = manifest(os.path.join(self.t, 'mine.json'), 'route-budget-80', 3)
         v = M.resolve_variant(p, self.v2, [])
         self.assertEqual((v.name, v.path), ('route-budget-80', p))
 
-    def test_bit225_is_the_tp3_default_where_the_release_has_it(self):
-        self.assertEqual([M.resolve_variant(None, self.v2, [], tp).name for tp in (3, 4, 6)], ['down1', 'home', 'home'])
+    def test_the_defaults_by_tp(self):
         for name in ('bit225', 'bit325'):
             manifest(os.path.join(self.v2, 'manifests', f'exlr8-manifest-{name}.json'), name, 3)
-        self.assertEqual([M.resolve_variant(None, self.v2, [], tp).name for tp in (3, 4, 6)], ['bit225', 'home', 'home'])
-        self.assertEqual(M.resolve_variant('bit325', self.v2, [], 4).name, 'bit325')  # a name given wins
+        self.assertEqual([M.resolve_variant(None, self.v2, [], tp).name for tp in (3, 4, 5, 6)],
+                         ['bit225', 'bit325', 'bit325', 'bit325'])          # a release without bit260 boots bit225
+        manifest(os.path.join(self.v2, 'manifests', 'exlr8-manifest-bit260.json'), 'bit260', 3)
+        self.assertEqual(M.resolve_variant(None, self.v2, [], 3).name, 'bit260')
+        self.assertEqual(M.resolve_variant('bit400', self.v2, [], 4).name, 'bit400')  # a name given wins
+        self.assertEqual(M.resolve_variant('bit400', self.v2, [], 3).name, 'bit400')
 
     def test_refusals(self):
         with self.assertRaises(M.ModelError) as e:
-            M.resolve_variant('up1', self.v2, [])
-        self.assertIn('no exlr8-manifest-up1.json in ' + self.v2, str(e.exception))
+            M.resolve_variant('bit273', self.v2, [])
+        self.assertIn('no exlr8-manifest-bit273.json in ' + self.v2, str(e.exception))
         with self.assertRaises(M.ModelError) as e:
             M.resolve_variant('k5', self.v2, [])
-        self.assertIn('not one of home, down1, up1', str(e.exception))
-        for spec in ('down1', os.path.join(self.t, 'mine.json')):
+        self.assertIn('not one of bit200, bit225, bit239', str(e.exception))
+        for spec in ('bit200', os.path.join(self.t, 'mine.json')):
             with self.assertRaises(M.ModelError) as e:
                 M.resolve_variant(spec, None, [self.model])
             self.assertIn('needs the exlr8 v2 width files', str(e.exception))
@@ -72,11 +73,11 @@ class ResolveTests(unittest.TestCase):
 
     def test_model_id(self):
         ms = M.release_set(make_release(os.path.join(self.t, 'set')), 4)
-        home, down1 = M.resolve_variant('home', self.v2, []), M.resolve_variant('down1', self.v2, [])
+        a, b = M.resolve_variant('bit400', self.v2, []), M.resolve_variant('bit200', self.v2, [])
         self.assertEqual(M.model_id(ms, M.Variant('home')), ms.id)            # no v2: the set id
-        ids = {M.model_id(ms, home), M.model_id(ms, down1), ms.id}
+        ids = {M.model_id(ms, a), M.model_id(ms, b), ms.id}
         self.assertEqual(len(ids), 3)
-        self.assertEqual(M.model_id(ms, home), M.model_id(ms, M.resolve_variant('home', self.v2, [])))
+        self.assertEqual(M.model_id(ms, a), M.model_id(ms, M.resolve_variant('bit400', self.v2, [])))
 
     def test_expert_gb(self):
         p = manifest(os.path.join(self.t, 'k4.json'), 'k4', 4)
@@ -91,7 +92,7 @@ class OptionTests(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp()
         self.v2 = os.path.join(self.t, 'v2')
-        for name, w in (('home', 3), ('down1', 2)):
+        for name, w in (('bit400', 3), ('bit200', 2)):
             manifest(os.path.join(self.v2, f'exlr8-manifest-{name}.json'), name, w)
         self.rel = make_release(os.path.join(self.t, 'rel'), variants=('base',))
 
@@ -101,27 +102,27 @@ class OptionTests(unittest.TestCase):
         return o
 
     def test_conflicts(self):
-        for argv, want in ((['--variant', 'down1', '--v2-widths', '/w.json'], 'give one'), (['--v2', '/v'], '--v2-slices')):
+        for argv, want in ((['--variant', 'bit200', '--v2-widths', '/w.json'], 'give one'), (['--v2', '/v'], '--v2-slices')):
             with self.assertRaises(opt.OptionError) as e:
                 self.opts(*argv)
             self.assertIn(want, str(e.exception))
-        self.assertEqual(self.opts('--variant', 'down1').get('VARIANT'), 'down1')
+        self.assertEqual(self.opts('--variant', 'bit200').get('VARIANT'), 'bit200')
         self.assertTrue(os.path.isabs(self.opts('--variant', 'x/mine.json').get('VARIANT')))
 
     def test_resolve_model_sets_the_widths_and_the_digest_differs(self):
         digests = {}
-        for name in ('home', 'down1'):
+        for name in ('bit400', 'bit200'):
             o = self.opts('--v2', self.v2, '--v2-slices', self.v2, '--variant', name)
             ms, v, err = S.resolve_model(o)
             self.assertEqual(err, '')
             self.assertEqual(o.get('V2_WIDTHS'), os.path.join(self.v2, f'exlr8-manifest-{name}.json'))
             c, _, digests[name] = opt.canonical(o, opt.engine_plan(o), opt.split_list(PEERS), v)
             self.assertEqual((c['variant'], c['variant.sha256']), (name, v.sha256))
-        self.assertNotEqual(digests['home'], digests['down1'])
-        o = self.opts('--v2', self.v2, '--v2-slices', self.v2, '--v2-widths', os.path.join(self.v2, 'exlr8-manifest-down1.json'))
-        self.assertEqual(S.resolve_model(o)[1].name, 'down1')          # --v2-widths names the same manifest
-        _, v, err = S.resolve_model(self.opts('--variant', 'up1'))
-        self.assertIn('no exlr8-manifest-up1.json in', err)
+        self.assertNotEqual(digests['bit400'], digests['bit200'])
+        o = self.opts('--v2', self.v2, '--v2-slices', self.v2, '--v2-widths', os.path.join(self.v2, 'exlr8-manifest-bit200.json'))
+        self.assertEqual(S.resolve_model(o)[1].name, 'bit200')          # --v2-widths names the same manifest
+        _, v, err = S.resolve_model(self.opts('--variant', 'bit390'))
+        self.assertIn('no exlr8-manifest-bit390.json in', err)
 
 
 if __name__ == '__main__':

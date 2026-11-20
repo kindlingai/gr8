@@ -96,8 +96,11 @@ pub struct Generation {
     pub params: Params,
     tok: &'static Tok,
     engine: Option<Arc<Engine>>,
+    /// the request's admission (`Engine::admit`), held until `start` registers its route
+    pub admit: Option<crate::engine::Admit>,
     stream: Option<Stream>,
     detok: Detok,
+    detok_skip_special: bool,
     hold: usize, // chars
     max_stop_chars: usize,
     keep: bool, // accumulate ids/logprobs (non-streaming responses need them)
@@ -107,8 +110,11 @@ pub struct Generation {
     /// `</think>` while the reply is inside the think block its prompt opened
     think_end: Option<u32>,
     budget: Option<Budget>,
-    /// the reply's ids while a budget may still cut it: the continuation's prompt needs them
+    /// the reply's ids while a budget may still cut it, or always with `keep_reply`: a continuation's prompt needs them
     reply: Vec<u32>,
+    /// `res.text`'s length before each token of `reply` (the repeated-tool-call guard cuts the reply at a text position)
+    offsets: Vec<usize>,
+    keep_reply: bool,
     /// the last step closed the think block: the next call starts the continuation
     cut: bool,
     /// engine runs after the first (a budget cut starts one)
@@ -117,7 +123,7 @@ pub struct Generation {
     cont_prompt: usize,
     /// `return_step_stats`: the counters of the runs so far (None once a run's `finish` did not carry them)
     stats: Option<StepStats>,
-    /// with `return_step_stats`, the run a stop string ended: cancelled, its `finish` (and counters) not read yet
+    /// A run ended early by the frontend: cancelled, its `finish` (cache hits and optional counters) not read yet.
     ended: Option<Stream>,
 }
 
@@ -167,8 +173,10 @@ impl Generation {
             params,
             tok,
             engine: None,
+            admit: None,
             stream: None,
             detok: Detok::new(tok, skip_special),
+            detok_skip_special: skip_special,
             hold,
             max_stop_chars,
             keep,
@@ -178,6 +186,8 @@ impl Generation {
             think_end: None,
             budget: None,
             reply: Vec::new(),
+            offsets: Vec::new(),
+            keep_reply: false,
             cut: false,
             runs: 0,
             cont_prompt: 0,
@@ -217,13 +227,26 @@ impl Generation {
         s.decode_s = s.decode_s.zip(t.and_then(|t| t.decode_s)).map(|(a, b)| a + b);
     }
 
-    /// After the last step: with `return_step_stats`, read the counters into `res.step_stats`. A run a stop string
-    /// ended was cancelled; its `finish` comes once the engine has stopped it, so this waits for that.
+    /// After the last step, await any cancelled run's `finish` before completing the response: the engine must
+    /// retain/park its prefix before the next turn arrives. Always read cache hits; with `return_step_stats`, also
+    /// publish the counters in `res.step_stats`. Client disconnects can still drop the generation without waiting.
     pub async fn finish_stats(&mut self) {
         if let Some(mut s) = self.ended.take() {
             loop {
                 match s.next().await {
                     Some(Msg::Frame(Kind::Finish, f)) => {
+                        if let Ok(fin) = serde_json::from_slice::<wire::Finish>(&f) {
+                            if self.runs == 0 {
+                                self.res.cached_tokens = fin.cached_tokens.unwrap_or(0);
+                            } else {
+                                log::info!(
+                                    "{}: the continuation took {} of its {} prompt tokens from the cache",
+                                    self.id,
+                                    fin.cached_tokens.unwrap_or(0),
+                                    self.cont_prompt
+                                );
+                            }
+                        }
                         self.add_stats(&f);
                         break;
                     }
@@ -236,6 +259,11 @@ impl Generation {
             }
         }
         self.res.step_stats = self.stats.take();
+    }
+
+    /// Keep the reply's ids and text positions for the whole reply: `resample` may cut it back.
+    pub fn keep_reply(&mut self) {
+        self.keep_reply = true;
     }
 
     /// The reply starts inside a think block (the chat prompt opened one): count its reasoning tokens, and with a
@@ -254,6 +282,7 @@ impl Generation {
             .map_err(|e| ApiError::new(503, &e.0, None))?;
         self.stream = Some(s);
         self.engine = Some(engine.clone());
+        self.admit = None; // the route counts it now
         Ok(())
     }
 
@@ -287,15 +316,12 @@ impl Generation {
                     let step = self.on_tokens(t);
                     if step.finish_reason.is_some() {
                         // the reply ended here (a stop string, or a budget's close that reached max_tokens):
-                        // dropping the stream cancels the engine request; with step stats it is cancelled and kept,
-                        // so `finish_stats` can read its counters
+                        // cancel and keep the stream so `finish_stats` awaits prefix retention and reads cache hits
+                        // even without step stats
                         self.done = true;
-                        let s = self.stream.take();
-                        if self.stats.is_some() {
-                            if let Some(s) = s {
-                                s.cancel();
-                                self.ended = Some(s);
-                            }
+                        if let Some(s) = self.stream.take() {
+                            s.cancel();
+                            self.ended = Some(s);
                         }
                         return Ok(Some(step));
                     }
@@ -312,7 +338,7 @@ impl Generation {
                         self.res.cached_tokens = fin.cached_tokens.unwrap_or(0);
                     } else {
                         log::info!(
-                            "{}: thinking budget: the continuation took {} of its {} prompt tokens from the cache",
+                            "{}: the continuation took {} of its {} prompt tokens from the cache",
                             self.id,
                             fin.cached_tokens.unwrap_or(0),
                             self.cont_prompt
@@ -321,6 +347,11 @@ impl Generation {
                     let reason: &'static str = match fin.reason.as_str() {
                         "error" => {
                             let m = fin.message.as_deref().unwrap_or("unknown");
+                            // the busy guard's refusal (PROTOCOL.md `finish`): the HTTP status and Retry-After the
+                            // frame carries; an engine without them keeps the plain 500
+                            if fin.status == Some(429) {
+                                return Err(ApiError::busy(m, fin.retry_after.unwrap_or(60)));
+                            }
                             return Err(ApiError::new(500, &format!("engine error: {m}"), None));
                         }
                         "abort" => return Err(ApiError::new(500, "request aborted by the engine", None)),
@@ -346,17 +377,14 @@ impl Generation {
     }
 
     /// End the reply now: the caller's parser has seen a complete tool-call block, and anything the model writes after
-    /// it is a runaway. The step carries the text still held back and `finish_reason: stop`; dropping the stream
-    /// cancels the engine request (with step stats it is cancelled and kept for `finish_stats`, as a stop string's is).
+    /// it is a runaway. The step carries the text still held back and `finish_reason: stop`; cancel and keep the
+    /// engine stream for `finish_stats` to await prefix retention and read cache hits and any requested counters.
     pub fn end_now(&mut self) -> Step {
         self.done = true;
         self.cut = false;
-        let s = self.stream.take();
-        if self.stats.is_some() {
-            if let Some(s) = s {
-                s.cancel();
-                self.ended = Some(s);
-            }
+        if let Some(s) = self.stream.take() {
+            s.cancel();
+            self.ended = Some(s);
         }
         self.res.finish_reason = Some("stop");
         self.res.stop_reason = Some(StopReason::None);
@@ -376,12 +404,14 @@ impl Generation {
         }
     }
 
-    /// After a budget cut: end the cut run, then go on from the prompt, the reply and the close.
-    async fn continue_after_close(&mut self) -> Result<(), ApiError> {
+    /// End the current run (cancelled if still going) and wait for its finish: usage reports its cached tokens, and
+    /// the engine has let the run go (S2 keeps it for reuse) before a continuation is admitted.
+    async fn end_run(&mut self) -> Result<(), ApiError> {
         let Some(mut old) = self.stream.take() else { return Ok(()) };
+        if self.done {
+            return Ok(()); // its finish was read already
+        }
         old.cancel();
-        // Wait for the cut run's finish: usage reports its cached tokens, and the engine has let the run go (S2
-        // keeps it for reuse) before the continuation is admitted. Its tokens past the cut are not the reply's.
         loop {
             match old.next().await {
                 Some(Msg::Frame(Kind::Finish, f)) => {
@@ -389,7 +419,7 @@ impl Generation {
                         self.res.cached_tokens = fin.cached_tokens.unwrap_or(0);
                     }
                     self.add_stats(&f);
-                    break;
+                    return Ok(());
                 }
                 Some(Msg::Frame(..)) => {}
                 Some(Msg::Lost(m)) => {
@@ -402,13 +432,15 @@ impl Generation {
                 }
             }
         }
+    }
+
+    /// A new run whose prompt is the prompt and the reply so far, with `p` for its sampling.
+    fn start_continuation(&mut self, mut p: wire::GenParams) -> Result<(), ApiError> {
         let engine = self.engine.clone().ok_or_else(|| ApiError::new(500, "generation not started", None))?;
-        let reply = std::mem::take(&mut self.reply);
-        let mut prompt = Vec::with_capacity(self.prompt.len() + reply.len());
+        let mut prompt = Vec::with_capacity(self.prompt.len() + self.reply.len());
         prompt.extend_from_slice(&self.prompt);
-        prompt.extend_from_slice(&reply);
-        let n = reply.len() as u64;
-        let mut p = self.params.gen.clone();
+        prompt.extend_from_slice(&self.reply);
+        let n = self.reply.len() as u64;
         p.max_tokens -= n; // close_think() ends the reply when the close reaches max_tokens
         p.min_tokens = p.min_tokens.saturating_sub(n);
         p.prompt_logprobs = None;
@@ -417,7 +449,77 @@ impl Generation {
         let id = format!("{}-{}", self.id, self.runs);
         let s = engine.generate(id, &prompt, &p).map_err(|e| ApiError::new(503, &e.0, None))?;
         self.stream = Some(s);
+        self.done = false;
         Ok(())
+    }
+
+    /// After a budget cut: end the cut run, then go on from the prompt, the reply and the close.
+    async fn continue_after_close(&mut self) -> Result<(), ApiError> {
+        if self.stream.is_none() {
+            return Ok(());
+        }
+        self.end_run().await?;
+        self.start_continuation(self.params.gen.clone())?;
+        if !self.keep_reply {
+            self.reply.clear(); // a budget cuts once, and only `resample` needs the reply again
+            self.offsets.clear();
+        }
+        Ok(())
+    }
+
+    /// The repeated-tool-call guard (guard.rs, with `keep_reply`): take the reply back to `cut_bytes` of its text, a
+    /// token boundary, and sample on from there in a new run at `temperature` and `top_p`. The tokens past the cut
+    /// leave the reply, the usage and the text. What was released to the caller past the cut is the caller's to drop
+    /// (the parser holds the call back, so the client never saw it). `attempt` moves a request seed, so a retry does
+    /// not redraw the same noise. False: `cut_bytes` is not a token boundary of the kept reply, and nothing changed.
+    pub async fn resample(
+        &mut self,
+        cut_bytes: usize,
+        temperature: f64,
+        top_p: f64,
+        attempt: u32,
+    ) -> Result<bool, ApiError> {
+        let cut = self.offsets.iter().position(|&o| o >= cut_bytes).unwrap_or(self.offsets.len());
+        if self.offsets.get(cut).is_some_and(|&o| o != cut_bytes)
+            || (cut == self.offsets.len() && self.res.text.len() != cut_bytes)
+        {
+            return Ok(false);
+        }
+        self.end_run().await?;
+        // the sequence penalty's guard scope: the retry must not reproduce the call it takes back
+        let avoid: Vec<u32> =
+            self.reply[cut..].iter().copied().filter(|&t| !self.params.gen.stop_ids.contains(&i64::from(t))).collect();
+        self.reply.truncate(cut);
+        self.offsets.truncate(cut);
+        self.res.text.truncate(cut_bytes);
+        if self.think_end.is_some() {
+            self.res.reasoning_tokens = cut; // the cut is inside the block: every kept token is reasoning
+        }
+        self.res.completion_tokens = cut;
+        if self.keep {
+            self.res.ids.truncate(cut);
+            self.res.logprobs.truncate(cut);
+        }
+        self.sent = self.sent.min(cut_bytes);
+        self.detok = Detok::new(self.tok, self.detok_skip_special);
+        for &t in &self.reply {
+            self.detok.step(t);
+        }
+        self.res.finish_reason = None;
+        self.res.stop_reason = None;
+        let mut p = self.params.gen.clone();
+        p.temperature = temperature;
+        p.top_p = top_p;
+        p.seed = p.seed.map(|s| s.wrapping_add(i64::from(attempt)));
+        if p.seq_guard.is_some() {
+            p.seq_avoid = avoid;
+        }
+        p.insert = None; // a budget or forced close already happened in the reply that stays
+        if self.think_end.is_none() {
+            p.think_end = None;
+        }
+        self.start_continuation(p)?;
+        Ok(true)
     }
 
     fn on_tokens(&mut self, f: wire::Tokens) -> Step {
@@ -480,8 +582,9 @@ impl Generation {
         if self.keep {
             self.res.ids.push(tid);
         }
-        if self.budget.is_some() {
+        if self.budget.is_some() || self.keep_reply {
             self.reply.push(tid);
+            self.offsets.push(self.res.text.len());
         }
         if let Some(e) = lp {
             if self.keep {
@@ -559,8 +662,9 @@ mod tests {
     use crate::wire::{FrameReader, GenParams};
 
     // a byte-level tokenizer small enough to read: a b c x y z ! and space, "\n" (4), "\n\n" (5), <think> (10),
-    // </think> (11) and <|endoftext|> (12)
+    // </think> (11), <|endoftext|> (12), <tool_call> (13) and </tool_call> (14)
     const A: u32 = 0;
+    const B: u32 = 1;
     const Y: u32 = 7;
     const Z: u32 = 8;
     const NL: u32 = 4;
@@ -568,6 +672,8 @@ mod tests {
     const THINK: u32 = 10;
     const END: u32 = 11;
     const EOS: u32 = 12;
+    const TC: u32 = 13;
+    const TCE: u32 = 14;
 
     fn tok() -> &'static Tok {
         static T: OnceLock<&'static Tok> = OnceLock::new();
@@ -581,7 +687,8 @@ mod tests {
             let tk = json!({
                 "version": "1.0", "truncation": null, "padding": null,
                 "added_tokens": [added(THINK, "<think>", false), added(END, "</think>", false),
-                                 added(EOS, "<|endoftext|>", true)],
+                                 added(EOS, "<|endoftext|>", true), added(TC, "<tool_call>", false),
+                                 added(TCE, "</tool_call>", false)],
                 "normalizer": null,
                 "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
                 "post_processor": null,
@@ -727,6 +834,16 @@ mod tests {
                 top_p: 1.0,
                 top_k: 0,
                 min_p: 0.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                thinking_presence_penalty: 0.0,
+                thinking_frequency_penalty: 0.0,
+                think_end: None,
+                think_end_boost: None,
+                seq_thinking: None,
+                seq_answer: None,
+                seq_guard: None,
+                seq_avoid: Vec::new(),
                 seed: None,
                 stop_ids: vec![EOS as i64],
                 logprobs: None,
@@ -736,6 +853,7 @@ mod tests {
                 grammar: None,
                 steering_profile: None,
                 steering_scale: None,
+                images: Default::default(),
             },
             stop: vec![],
             include_stop: false,
@@ -966,6 +1084,179 @@ mod tests {
         let s = g.res.step_stats.unwrap();
         // the engine generated the whole frame the stop string was found in (and ended on its EOS)
         assert_eq!((s.steps, s.generated_tokens, s.accepted_tokens), (2, 6, 4));
+    }
+
+    #[tokio::test]
+    async fn parser_early_stop_reads_cache_hits_with_or_without_stats() {
+        for stats in [false, true] {
+            let fake = fake_engine(endless_thinking).await;
+            let mut g = Generation::new(tok(), crate::util::hex_id(), PROMPT.to_vec(), params(1000, 0), false, true);
+            if stats {
+                g.want_step_stats();
+            }
+            g.start(&fake.engine).unwrap();
+            assert!(g.next().await.unwrap().is_some());
+            assert_eq!(g.end_now().finish_reason, Some("stop"));
+            assert!(g.next().await.unwrap().is_none());
+            g.finish_stats().await;
+            assert_eq!(g.res.cached_tokens, 200);
+            assert_eq!(g.res.step_stats.is_some(), stats);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_string_reads_cache_hits_with_or_without_stats() {
+        for stats in [false, true] {
+            let fake = fake_engine(endless_thinking).await;
+            let mut p = params(1000, 0);
+            p.stop = vec!["aa".into()];
+            let (steps, g) = run_with(&fake, &PROMPT, p, 0, true, stats).await;
+            assert_eq!(steps.last().unwrap().finish_reason, Some("stop"));
+            assert_eq!(g.res.cached_tokens, 200);
+            assert_eq!(g.res.step_stats.is_some(), stats);
+        }
+    }
+
+    // ---- the repeated-tool-call guard (guard.rs) ---------------------------------------------------------------
+
+    /// `</think>y<tool_call>a</tool_call>` then EOS; after a cut (the prompt ends with y): `<tool_call>b</tool_call>`
+    fn repeats_a_then_b(g: &Value) -> Vec<u32> {
+        if g["prompt"].as_array().unwrap().last() == Some(&json!(Y)) {
+            vec![TC, B, TCE, EOS]
+        } else {
+            vec![END, Y, TC, A, TCE, EOS]
+        }
+    }
+    /// the same call whatever the prompt
+    fn always_a(g: &Value) -> Vec<u32> {
+        if g["prompt"].as_array().unwrap().last() == Some(&json!(Y)) {
+            vec![TC, A, TCE, EOS]
+        } else {
+            vec![END, Y, TC, A, TCE, EOS]
+        }
+    }
+    fn guard_tools() -> Value {
+        json!([{"type": "function", "function": {"name": "a", "parameters": {}}},
+               {"type": "function", "function": {"name": "b", "parameters": {}}}])
+    }
+    /// a conversation whose last `turns` turns all called a() and got "ok"
+    fn guard_for(turns: usize, cfg: crate::guard::Config) -> crate::guard::Guard {
+        let mut m = vec![json!({"role": "user", "content": "go"})];
+        for i in 0..turns {
+            m.push(json!({"role": "assistant", "tool_calls": [{"id": format!("c{i}"), "type": "function", "function": {"name": "a", "arguments": "{}"}}]}));
+            m.push(json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": "ok"}));
+        }
+        crate::guard::Guard::new(cfg, true, Some(&Value::Array(m))).unwrap()
+    }
+    /// A request through the guard, as run_to_end drives it: (the client's deltas, the calls, the generation).
+    async fn run_guarded(
+        fake: &FakeEngine,
+        p: Params,
+        guard: &mut crate::guard::Guard,
+    ) -> (Vec<crate::parser::Delta>, Vec<String>, Generation) {
+        let t = tok();
+        let mut g = Generation::new(t, format!("chatcmpl-{}", crate::util::hex_id()), PROMPT.to_vec(), p, false, true);
+        g.thinking(END, None);
+        g.keep_reply();
+        let mut parser =
+            crate::parser::GlmParser::new(Some(&guard_tools()), &json!("auto"), true).guard_names(guard.names());
+        g.start(&fake.engine).unwrap();
+        let mut deltas = Vec::new();
+        let mut calls = Vec::new();
+        while let Some(s) = g.next().await.unwrap() {
+            let finished = s.finish_reason.is_some();
+            if let Some(d) = parser.delta(&s.text, false) {
+                deltas.push(d);
+            }
+            if finished {
+                if crate::guard::take_back(&mut g, &mut parser, guard).await.unwrap() {
+                    continue;
+                }
+                if let Some(d) = parser.delta("", true) {
+                    deltas.push(d);
+                }
+            }
+        }
+        // the calls as the client saw them: a name per call (a live one streams its arguments in pieces)
+        calls.extend(deltas.iter().flat_map(|d| d.tool_calls.iter()).filter_map(|t| t.name.clone()));
+        (deltas, calls, g)
+    }
+
+    #[tokio::test]
+    async fn a_repeated_call_is_taken_back_and_resampled_from_before_its_opener() {
+        let fake = fake_engine(repeats_a_then_b).await;
+        let cfg = crate::guard::Config { on: true, repeats: 2, temperature: 0.7, retries: 2 };
+        let mut guard = guard_for(2, cfg);
+        let mut p = params(50, 0);
+        p.gen.presence_penalty = 0.2; // resolved for a greedy request: the retry keeps it though it samples at 0.7
+        p.gen.seq_guard = Some(crate::sampling::Seq { mult: 1.0, base: 2.0, min: 1, cap: 8.0 });
+        let (deltas, calls, g) = run_guarded(&fake, p, &mut guard).await;
+        assert_eq!(calls, vec!["b"]);
+        assert_eq!(g.res.ids, [END, Y, TC, B, TCE, EOS]);
+        assert_eq!(g.res.text, "</think>y<tool_call>b</tool_call>");
+        assert_eq!((g.res.completion_tokens, g.res.reasoning_tokens, guard.attempts), (6, 1, 1));
+        // the client saw "y" once and nothing of the call a
+        let content: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
+        assert_eq!(content, "y");
+        assert!(deltas.iter().all(|d| d.tool_calls.iter().all(|t| t.name.as_deref() != Some("a"))));
+        // the continuation: the prompt and the reply up to the opener, at the guard's temperature and top_p, a new id
+        let gens = fake.gens.lock().unwrap().clone();
+        assert_eq!(gens.len(), 2);
+        let mut cont = PROMPT.to_vec();
+        cont.extend([END, Y]);
+        assert_eq!(gens[1]["prompt"], json!(cont));
+        assert_eq!((gens[1]["temperature"].as_f64(), gens[1]["top_p"].as_f64()), (Some(0.7), Some(0.95)));
+        assert_eq!(
+            (gens[0]["presence_penalty"].as_f64(), gens[1]["presence_penalty"].as_f64()),
+            (Some(0.2), Some(0.2))
+        );
+        // the retry carries the taken-back call (its stop id left out) for the sequence penalty's guard scope
+        assert!(!gens[0].as_object().unwrap().contains_key("sequence_penalty"));
+        assert_eq!(gens[1]["sequence_penalty"]["guard"]["avoid"], json!([TC, A, TCE]));
+        assert_eq!(gens[1]["max_tokens"], json!(48));
+        assert_ne!(gens[0]["id"], gens[1]["id"]);
+        assert_eq!(crate::guard::RETRIES.load(std::sync::atomic::Ordering::Relaxed) >= 1, true);
+    }
+
+    #[tokio::test]
+    async fn the_request_s_own_sampling_wins_when_it_is_already_warmer() {
+        let fake = fake_engine(repeats_a_then_b).await;
+        let cfg = crate::guard::Config { on: true, repeats: 2, temperature: 0.7, retries: 2 };
+        let mut p = params(50, 0);
+        p.gen.temperature = 1.0;
+        p.gen.top_p = 0.9;
+        p.gen.seed = Some(5);
+        run_guarded(&fake, p, &mut guard_for(3, cfg)).await;
+        let gens = fake.gens.lock().unwrap().clone();
+        assert_eq!((gens[1]["temperature"].as_f64(), gens[1]["top_p"].as_f64()), (Some(1.0), Some(0.9)));
+        assert_eq!((gens[0]["seed"].clone(), gens[1]["seed"].clone()), (json!(5), json!(6)));
+        // a retry draws new noise
+    }
+
+    #[tokio::test]
+    async fn after_the_retries_the_call_goes_out_as_sampled() {
+        let fake = fake_engine(always_a).await;
+        let cfg = crate::guard::Config { on: true, repeats: 2, temperature: 0.7, retries: 2 };
+        let mut guard = guard_for(2, cfg);
+        let before = crate::guard::GIVEN_UP.load(std::sync::atomic::Ordering::Relaxed);
+        let (_, calls, g) = run_guarded(&fake, params(50, 0), &mut guard).await;
+        assert_eq!(calls, vec!["a"]);
+        assert_eq!(g.res.ids, [END, Y, TC, A, TCE, EOS]);
+        assert_eq!((guard.attempts, fake.gens.lock().unwrap().len()), (2, 3));
+        assert!(crate::guard::GIVEN_UP.load(std::sync::atomic::Ordering::Relaxed) > before);
+        // below the repeat count nothing is taken back
+        let fake = fake_engine(always_a).await;
+        let (_, calls, _) = run_guarded(&fake, params(50, 0), &mut guard_for(1, cfg)).await;
+        assert_eq!((calls.len(), fake.gens.lock().unwrap().len()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn resample_refuses_a_cut_off_a_token_boundary() {
+        let fake = fake_engine(always_a).await;
+        let (_, mut g) = run(&fake, params(50, 0), 0, true).await;
+        g.keep_reply(); // too late for the ids: nothing kept, so no cut is a boundary
+        assert!(!g.resample(1, 0.7, 0.95, 1).await.unwrap());
+        assert_eq!(fake.gens.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

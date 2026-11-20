@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Fail on environment reads that go around the knob table (engine/knobs-rs), and on a table out of step with the tree.
 
-  - C, C++ and CUDA under engine/ and tools/: no getenv, secure_getenv or environ, no setenv, unsetenv or putenv
-    outside tests (a test sets a child's environment with them), and no "G6_NAME" string where NAME is a knob and
-    G6_NAME no compile-time macro. Rust anywhere: no std::env::var, var_os or vars, and no set_var or remove_var
+  - C, C++ and CUDA under engine/ and tools/: no getenv, secure_getenv or environ, no setenv, unsetenv or putenv outside
+    tests (a test sets a child's environment with them), and no "G6_NAME" string where NAME is a knob and G6_NAME no
+    compile-time macro. Rust anywhere: no std::env::var, var_os or vars, no libc getenv, and no set_var or remove_var
     outside tests. The knobs crate itself is the one exception. Read a setting through its knob: knob::name() in C++,
-    gr8knobs::NAME.get() in Rust.
+    gr8knobs::NAME.get() in Rust, or its id (gr8_knob_ids.rs, knob_ids::NAME or kid::NAME) through the C API.
   - every knob the engine, its tests or the front end should read (scope agree, local or test) is read somewhere.
-  - every G6_ or GR8_ assignment in the launcher (scripts/engine_args.sh) and the recipes (recipes/**/*.env) is one the
+  - every G6_ or GR8_ assignment in the launcher (scripts/engine_args.sh) is one the
     engine accepts (`knobs validate`).
   - gr8_knobs.h and docs/ENV.md are what `knobs gen` writes (`knobs check`).
 
@@ -23,7 +23,7 @@ CRATE = 'engine/knobs-rs/'
 C_EXT = re.compile(r'\.(c|cc|cpp|cu|cuh|h|hpp)$')
 C_READ = re.compile(r'\b(?:std::)?(?:secure_getenv|getenv)\s*\(|\benviron\b')
 C_SET = re.compile(r'\b(?:std::)?(?:setenv|unsetenv|putenv|clearenv)\s*\(')
-RS_READ = re.compile(r'\benv::(?:var|var_os|vars|vars_os)\s*\(')
+RS_READ = re.compile(r'\benv::(?:var|var_os|vars|vars_os)\s*\(|\b(?:secure_)?getenv\s*\(')   # getenv: libc declared by hand
 RS_SET = re.compile(r'\benv::(?:set_var|remove_var)\s*\(')
 TEST = re.compile(r'(^|/)tests?/|(^|/)test_|_test\.\w+$')
 G6_NAME = re.compile(r'\bG6_[A-Z0-9_]*[A-Z0-9]\b')
@@ -113,17 +113,18 @@ def unread(paths, table):
     for name, scope, _kind, _family in table:
         if scope == 'Outside':
             continue
-        if not re.search(r'\bknob::' + name.lower() + r'\s*\(', text) and not re.search(r'\b' + name + r'\.(?:get|var)\(', text):
+        if not re.search(r'\bknob::' + name.lower() + r'\s*\(', text) and not re.search(r'\b' + name + r'\.(?:get|var)\(', text) \
+                and not re.search(r'\b(?:knob_ids|kid)::' + name + r'\b', text):
             errs.append(f'{name}: scope {scope.lower()}, but nothing reads knob::{name.lower()}() or {name}.get(): '
                         'remove it from the table, or mark it outside')
     return errs
 
 
 def assignments(paths):
-    """(file, NAME=VALUE) for each literal G6_/GR8_ assignment outside comments in the launcher and the recipes."""
+    """(file, NAME=VALUE) for each literal G6_/GR8_ assignment outside comments in the launcher."""
     out = []
     for f in paths:
-        if f != 'scripts/engine_args.sh' and not (f.startswith('recipes/') and f.endswith('.env')):
+        if f != 'scripts/engine_args.sh':
             continue
         for line in open(os.path.join(REPO, f)):
             line = line.split('#', 1)[0]

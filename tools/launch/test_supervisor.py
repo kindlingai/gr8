@@ -197,6 +197,70 @@ class MentatRingTests(unittest.TestCase):
 
 class ControlPortTests(unittest.TestCase):
     @mock.patch.object(S, 'log')
+    def test_early_serving_is_applied_when_the_worker_starts_loading(self, logged):
+        s = supervisor(rank=1)
+        self.addCleanup(shutil.rmtree, s.home)
+        s.locked = True
+        s.set_state('handshake')
+        msg = {'t': 'serving', 'url': '<api>', 'epoch': 8}
+        self.assertEqual(s.on_rpc(msg, MEMBERS[0]), {'t': 'ok'})
+        self.assertEqual(s.state, 'handshake')
+        logged.assert_not_called()
+        s.hs = {'epoch': 8}
+        s.set_state('loading')
+        self.assertEqual(s.state, 'serving')
+        with open(os.path.join(s.out, 'gr8.state')) as f:
+            self.assertEqual(json.load(f)['state'], 'serving')
+        logged.assert_called_once_with('the head serves <api>')
+        s.on_rpc(msg, MEMBERS[0])
+        logged.assert_called_once_with('the head serves <api>')
+
+    @mock.patch.object(S, 'log')
+    def test_serving_received_while_loading_still_applies_immediately(self, logged):
+        s = supervisor(rank=1)
+        self.addCleanup(shutil.rmtree, s.home)
+        s.hs = {'epoch': 8}
+        s.set_state('loading')
+        self.assertEqual(s.on_rpc({'t': 'serving', 'url': '<api>', 'epoch': 8}, MEMBERS[0]), {'t': 'ok'})
+        self.assertEqual(s.state, 'serving')
+        logged.assert_called_once_with('the head serves <api>')
+
+    @mock.patch.object(S, 'log')
+    def test_old_serving_cannot_publish_readiness_for_a_new_boot(self, logged):
+        s = supervisor(rank=1)
+        self.addCleanup(shutil.rmtree, s.home)
+        s.locked = True
+        s.set_state('preparing')
+        old = {'t': 'serving', 'url': '<old-api>', 'epoch': 7}
+        s.on_rpc(old, MEMBERS[0])
+        s.on_rpc({'t': 'down', 'epoch': 7}, MEMBERS[0])
+        self.assertFalse(s.stop_ev.is_set())
+        s.hs = {'epoch': 8}
+        s.set_state('loading')
+        self.assertEqual(s.state, 'loading')
+        s.on_rpc(old, MEMBERS[0])
+        s.on_rpc({'t': 'serving', 'url': '<unscoped-api>'}, MEMBERS[0])
+        self.assertEqual(s.state, 'loading')
+        with open(os.path.join(s.out, 'gr8.state')) as f:
+            self.assertEqual(json.load(f)['state'], 'loading')
+        logged.assert_not_called()
+        s.on_rpc({'t': 'serving', 'url': '<new-api>', 'epoch': 8}, MEMBERS[0])
+        self.assertEqual(s.state, 'serving')
+        logged.assert_called_once_with('the head serves <new-api>')
+
+    @mock.patch.object(S, 'log')
+    def test_matching_early_serving_survives_an_old_retry_before_verdict(self, logged):
+        s = supervisor(rank=1)
+        self.addCleanup(shutil.rmtree, s.home)
+        s.set_state('handshake')
+        s.on_rpc({'t': 'serving', 'url': '<new-api>', 'epoch': 8}, MEMBERS[0])
+        s.on_rpc({'t': 'serving', 'url': '<old-api>', 'epoch': 7}, MEMBERS[0])
+        s.hs = {'epoch': 8}
+        s.set_state('loading')
+        self.assertEqual(s.state, 'serving')
+        logged.assert_called_once_with('the head serves <new-api>')
+
+    @mock.patch.object(S, 'log')
     def test_requests_from_non_members_are_ignored(self, logged):
         s = supervisor(rank=1)
         for t in ('down', 'abort', 'serving', 'hello', 'verdict', 'status', 'logs'):
@@ -262,6 +326,44 @@ class ControlPortTests(unittest.TestCase):
         self.assertIn('10.1.0.4,10.2.0.4', v['values'].values())
         self.assertNotIn('10.110.0.1,10.111.0.1', v['values'].values())
 
+    def test_a_refused_head_says_why_before_the_extra_wait(self):
+        s = supervisor()
+        s.rails, s.tmpl, s.digest, s.model_id, s.variant = ('10.1.0.1', '10.2.0.1'), {'knobs': {}}, 'd', 'm', mock.Mock()
+        head = mock.Mock(verdict=None, gave_up=False)
+        head.have = {r: hello(r, lan=MEMBERS[r]) for r in range(4)}
+        head.wait_all.return_value = True
+        head.decide.side_effect = lambda v: setattr(head, 'verdict', v)
+        head.untold.return_value = [2, 3]
+        lines = []
+        with mock.patch.object(S.handshake, 'Head', return_value=head), \
+                mock.patch.object(s, 'rail_check', return_value='rank 3 does not answer'), \
+                mock.patch.object(S, 'log', side_effect=lines.append), \
+                mock.patch.object(s, 'linger', side_effect=lambda: lines.append('LINGER')), \
+                mock.patch.dict(os.environ, {'GR8_REFUSAL_LINGER': '15'}), \
+                mock.patch.object(S, 'opt_timeout', return_value=600.0):
+            v = s.handshake_head(hello(0, lan=MEMBERS[0]))
+        self.assertEqual(v['field'], 'fabric')
+        i = lines.index('LINGER')
+        self.assertTrue(lines[i - 2].startswith('handshake refused: fabric'), lines)
+        self.assertEqual(lines[i - 1], 'head: answering late hellos with the refusal for 15 s, then up to 600 s more '
+                                       'until ranks 2, 3 have it')
+        self.assertTrue(s.refusal_logged)
+        # no extra wait to announce: every rank has it, the head gave up on one, or JOIN_TIMEOUT is 0
+        for untold, gave_up, more in (([], False, 600.0), ([3], True, 600.0), ([3], False, 0.0)):
+            head.untold.return_value, head.gave_up = untold, gave_up
+            with mock.patch.object(S, 'opt_timeout', return_value=more):
+                self.assertEqual(s.linger_plan(), 'head: answering late hellos with the refusal for 15 s')
+        # a head stopped while it waits for hellos (down, Ctrl-C) says so and announces no wait: linger() returns at once
+        head.verdict, head.wait_all.return_value, head.untold.return_value, head.gave_up = None, False, [1, 2, 3], False
+        s.stop_ev.set()
+        s.stop_why, s.refusal_logged, lines[:] = 'SIGTERM', False, []
+        with mock.patch.object(S.handshake, 'Head', return_value=head), mock.patch.object(S, 'log', side_effect=lines.append), \
+                mock.patch.object(s, 'linger', side_effect=lambda: lines.append('LINGER')):
+            v = s.handshake_head(hello(0, lan=MEMBERS[0]))
+        self.assertEqual(v['field'], 'stopped')
+        self.assertTrue(any(x.startswith('handshake refused: stopped: SIGTERM') for x in lines), lines)
+        self.assertFalse([x for x in lines if x.startswith('head: answering')], lines)
+
     def test_hello_before_the_head_is_ready(self):
         s = supervisor()
         s.state = 'preparing'
@@ -307,6 +409,46 @@ class ShimTests(unittest.TestCase):
                          ('deepseek-v4.1-flash', '129280', '1'))
         self.assertEqual(a[a.index('--capacity-slots') + 1], a[a.index('--sessions') + 1])
 
+    def test_the_shim_divides_the_ds41_pool_by_the_engines_sessions(self):
+        # the engine's default is 5 sessions (scripts/engine_args.sh); a shim told 8 capped a request at 5 x 262144 // 8 - 10
+        for argv, want in ((('--gr8-model', 'ds41'), '5'), (('--gr8-model', 'ds41', '--sess', '3'), '3')):
+            a = self.shim_argv(*argv)
+            self.assertEqual((a[a.index('--sessions') + 1], a[a.index('--capacity-slots') + 1]), (want, want))
+
+    def test_the_glm_shim_reports_the_engines_sessions(self):
+        s = supervisor()
+        with mock.patch.object(s, 'spawn', side_effect=self.Spawned) as spawn:
+            with self.assertRaises(self.Spawned):
+                s.start_shim('/work')
+        a = spawn.call_args[0][1]
+        self.assertEqual(a[a.index('--sessions') + 1], opt.engine_plan(s.o)['knobs']['SESS'])
+
+    def test_the_flash_shim_reports_its_sessions_by_tp(self):
+        # GLM-5.3-Flash runs 8, 4 or 1 sessions at TP 4, 3 or 2 (scripts/engine_args.sh); its pool is shared, so no slots
+        for tp, want in ((4, '8'), (3, '4'), (2, '1')):
+            s = supervisor('--gr8-model', 'glm53f', '--tp', str(tp), members=MEMBERS[:tp])
+            with mock.patch.object(s, 'spawn', side_effect=self.Spawned) as spawn:
+                with self.assertRaises(self.Spawned):
+                    s.start_shim('/work')
+            a = spawn.call_args[0][1]
+            self.assertEqual(a[a.index('--sessions') + 1], want)
+            self.assertNotIn('--capacity-slots', a)
+
+    def test_the_shim_takes_max_model_len(self):
+        # #339: MAX_MODEL_LEN caps a request apart from CAP; unset, the model's max positions (the shim then takes the
+        # smaller of that and the pool's room)
+        a = self.shim_argv('--gr8-model', 'glm53f')
+        self.assertEqual(a[a.index('--max-model-len') + 1], '1048576')
+        a = self.shim_argv('--gr8-model', 'glm53f', '--cap', '1048640', '--max-model-len', '262144')
+        self.assertEqual(a[a.index('--max-model-len') + 1], '262144')
+
+    def test_the_shim_holds_one_request_to_cap(self):
+        # GR8_CAP_TOTAL may make the pool larger than --cap; the engine fails its epoch on a longer request
+        a = self.shim_argv('--gr8-model', 'glm53f', '--cap', '131100')
+        self.assertEqual(a[a.index('--cap-rows') + 1], '131072')
+        self.assertNotIn('--cap-rows', self.shim_argv('--gr8-model', 'glm53f'))
+        self.assertNotIn('--cap-rows', self.shim_argv('--gr8-model', 'ds41', '--cap', '262144'))
+
     def test_the_ds41_identity_is_the_engines_own(self):
         geom = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'engine', 'model_geom_ds41.h')).read()
         vocab = int(re.search(r'constexpr int VOCAB = (\d+);', geom).group(1))
@@ -336,6 +478,48 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-max-tokens') + 1], '16384')
         self.assertNotIn('--share-tokens', a)
 
+    def test_the_penalty_defaults_reach_the_front_end_only_when_set(self):
+        a = self.front_argv()
+        self.assertNotIn('--default-presence-penalty', a)
+        self.assertNotIn('--default-frequency-penalty', a)
+        a = self.front_argv('--default-presence-penalty', 'thinking=0.5,greedy=0.2,nongreedy=0',
+                            '--default-frequency-penalty', '-0.5')
+        self.assertEqual(a[a.index('--default-presence-penalty') + 1], 'thinking=0.5,greedy=0.2,nongreedy=0')
+        self.assertEqual(a[a.index('--default-frequency-penalty') + 1], '-0.5')
+
+    def test_the_think_end_boost_reaches_the_front_end_when_set(self):
+        self.assertNotIn('--default-think-end-boost', self.front_argv())
+        a = self.front_argv('--default-think-end-boost', 'start=0.5x,per1k=2,max=10')
+        self.assertEqual(a[a.index('--default-think-end-boost') + 1], 'start=0.5x,per1k=2,max=10')
+
+    def test_the_sequence_penalty_reaches_the_front_end_when_set(self):
+        self.assertNotIn('--default-sequence-penalty', self.front_argv())
+        a = self.front_argv('--default-sequence-penalty', 'thinking=0.8:1.75:4:6,guard=1:2:1:8')
+        self.assertEqual(a[a.index('--default-sequence-penalty') + 1], 'thinking=0.8:1.75:4:6,guard=1:2:1:8')
+
+    def test_forced_tool_thinking_rollback_reaches_the_front_end(self):
+        for value in (None, '0', '1'):
+            args = [] if value is None else ['--forced-tool-thinking', value]
+            a = self.front_argv('--gr8-model', 'ds41', *args)
+            if value == '1':
+                self.assertEqual(a[a.index('--forced-tool-thinking') + 1], '1')
+            else:
+                self.assertNotIn('--forced-tool-thinking', a)
+        a = self.front_argv('--gr8-model', 'ds41', '--default-reasoning-effort', 'none')
+        self.assertEqual(a[a.index('--default-reasoning-effort') + 1], 'none')
+
+    def test_the_tool_repeat_guard_reaches_the_front_end_when_on(self):
+        a = self.front_argv()
+        self.assertNotIn('--tool-repeat-guard', a)
+        a = self.front_argv('--tool-repeat-guard', '1')
+        self.assertEqual(a[a.index('--tool-repeat-guard') + 1], '1')
+        self.assertNotIn('--tool-repeat-guard-repeats', a)   # the defaults stay the front end's own
+        a = self.front_argv('--tool-repeat-guard', '1', '--tool-repeat-guard-repeats', '3',
+                            '--tool-repeat-guard-temperature', '1', '--tool-repeat-guard-retries', '1')
+        self.assertEqual(a[a.index('--tool-repeat-guard-repeats') + 1], '3')
+        self.assertEqual(a[a.index('--tool-repeat-guard-temperature') + 1], '1')
+        self.assertEqual(a[a.index('--tool-repeat-guard-retries') + 1], '1')
+
     def test_the_thinking_defaults_reach_the_front_end_only_when_set(self):
         a = self.front_argv()
         self.assertNotIn('--default-reasoning-effort', a)
@@ -344,11 +528,12 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-reasoning-effort') + 1], 'low')
         self.assertEqual(a[a.index('--default-thinking-budget') + 1], '2048')
 
-    def test_undeclared_tool_calls_reach_the_front_end_only_when_emitted(self):
+    def test_undeclared_tool_calls_reach_the_front_end_only_when_text(self):
+        # emit is the front end's default as well as the launcher's
         self.assertNotIn('--undeclared-tool-calls', self.front_argv())
-        self.assertNotIn('--undeclared-tool-calls', self.front_argv('--undeclared-tool-calls', 'text'))
-        a = self.front_argv('--undeclared-tool-calls', 'emit')
-        self.assertEqual(a[a.index('--undeclared-tool-calls') + 1], 'emit')
+        self.assertNotIn('--undeclared-tool-calls', self.front_argv('--undeclared-tool-calls', 'emit'))
+        a = self.front_argv('--undeclared-tool-calls', 'text')
+        self.assertEqual(a[a.index('--undeclared-tool-calls') + 1], 'text')
 
     def test_ds41_runs_the_front_end_in_its_dialect(self):
         a = self.front_argv('--gr8-model', 'ds41', '--allow-thinking-off', '1')
@@ -364,6 +549,12 @@ class FrontTests(unittest.TestCase):
         self.assertNotIn('--dialect', a)
         self.assertNotIn('--served-model-name', a)
         self.assertIn('--allow-thinking-off', a)
+
+    def test_flash_serves_under_its_own_names(self):
+        a = self.front_argv('--gr8-model', 'glm53f')
+        i = a.index('--served-model-name')
+        self.assertEqual(a[i + 1:i + 3], ['glm-5.3-flash', 'glm53f'])
+        self.assertNotIn('--dialect', a)
 
     def test_the_front_end_finds_the_supervisor_for_deep_health(self):
         a = self.front_argv()
@@ -455,8 +646,10 @@ class EngineTests(unittest.TestCase):
         os.makedirs(os.path.join(home, 'bin'))
         with open(os.path.join(home, 'bin', 'g6m4'), 'w') as f:
             f.write('fp8')
-        o8 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'], GLM)
-        o4 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--kv-format', 'int4'], GLM)
+        o8 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--kv-format', 'fp8'], GLM)
+        o4 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'], GLM)
+        o3 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], GLM)
+        self.assertEqual(S.engine_bin(o3), 'g6m4')
         self.assertEqual((S.engine_bin(o8), S.engine_bin(o4)), ('g6m4', 'g6m4-int4'))
         self.assertEqual(S.engine_build(home, S.engine_bin(o4)), 'missing', 'an fp8-only bin/ cannot run int4')
         with open(os.path.join(home, 'bin', 'g6m4-int4'), 'w') as f:
@@ -476,7 +669,7 @@ def donor_budget(kib, **env):
 
 
 class DonorTests(unittest.TestCase):
-    """D-331 M7: a Flash box lends what its serve leaves to a KV node beside it."""
+    """A Flash box lends what its serve leaves to a KV node beside it."""
 
     def test_the_budget_is_memavailable_less_growth_and_reserve_capped_by_the_ask(self):
         w = {'FLASH_KV_GROWTH_GIB': '8', 'KV_MIN_FREE_GB': '10'}
@@ -546,7 +739,8 @@ class DonorTests(unittest.TestCase):
             s.donate(knobs)
         return s, ' '.join(str(c.args[0]) for c in logged.call_args_list)
 
-    @unittest.skipUnless(S.ledger_bin(opt.REPO), 'kvman-ledger is not built (cargo build --release in engine/kvman-rs)')
+    @unittest.skipUnless(S.ledger_bin(opt.REPO) and sys.platform.startswith('linux'),
+                         'needs Linux (/proc/meminfo) and kvman-ledger (cargo build --release in engine)')
     def test_a_flash_box_starts_a_lazy_node_with_a_ledger_and_stops_it(self):
         s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '0', 'FLASH_KV_GROUP': 'gr8-full'})
         try:
@@ -572,7 +766,8 @@ class DonorTests(unittest.TestCase):
         self.assertFalse(s.donor)
         self.assertFalse(S.kvnode.running(os.path.join(s.home, 'out', 'kv')))
 
-    @unittest.skipUnless(S.ledger_bin(opt.REPO), 'kvman-ledger is not built (cargo build --release in engine/kvman-rs)')
+    @unittest.skipUnless(S.ledger_bin(opt.REPO) and sys.platform.startswith('linux'),
+                         'needs Linux (/proc/meminfo) and kvman-ledger (cargo build --release in engine)')
     def test_borrow_idle_books_the_gpu_chunks_in_the_ledger(self):
         g = 5 * (1 << 30) + 12345
         s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '0', 'FLASH_KV_GROUP': 'gr8-full',
@@ -934,6 +1129,225 @@ class HealthTests(unittest.TestCase):
         os.unlink(os.path.join(self.out, 'supervisor.lock'))
         self.assertEqual(self.run_health()[0], 0)
         self.assertFalse(os.path.exists(os.path.join(self.out, 'supervisor.lock')), 'health created the lock file')
+
+
+class QuitWait(unittest.TestCase):
+    """quit_wait: an ssd store with persist=on that keeps sessions gives the engine's quit 120 s (it stores the pool)."""
+
+    def wait(self, **env):
+        return S.quit_wait(opt.parse([], environ={'GR8_WORK_DIR': '/tmp/gr8-qw', **env}))
+
+    def test_only_a_persisted_ssd_store_that_keeps_sessions_waits_long(self):
+        self.assertEqual(self.wait(), 10)
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G'), 10)
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,persist=on'), 10)   # keep system: prefixes only
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,persist=on,keep=sessions'), 120)
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,persist=on', KV_KEEP='all'), 120)
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,persist=on,keep=system', KV_KEEP='all'), 10)
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,keep=sessions'), 10)   # not kept across a boot
+
+    def test_down_takes_the_wait_the_supervisor_recorded(self):
+        import tempfile
+        o = opt.parse([], environ={'GR8_WORK_DIR': '/tmp/gr8-qw'})   # down's own parse sees no store
+        with tempfile.TemporaryDirectory() as out:
+            self.assertEqual(S.recorded_quit_wait(out, o), 10)
+            with open(os.path.join(out, 'quit_wait'), 'w') as f:
+                f.write('120\n')   # the store was given on the up command line only
+            self.assertEqual(S.recorded_quit_wait(out, o), 120)
+
+class DispramTests(unittest.TestCase):
+    def test_probe_fail_open_and_opt_out(self):
+        s_def = supervisor()
+        self.assertEqual(S.probe_dispram(s_def.o, {'DISPRAM_SOCKET': '/tmp/nonexistent-dispram.sock'}), 0)
+        s = supervisor('--dispram', '1')
+        self.assertEqual(S.probe_dispram(s.o, {'DISPRAM_SOCKET': '/tmp/nonexistent-dispram.sock'}), 0)
+        self.assertEqual(S.probe_dispram(supervisor('--dispram', '0').o), 0)
+        self.assertEqual(S.probe_dispram(s.o, {'DISPRAM_DISABLE': '1'}), 0)
+        with mock.patch.object(S.socket, 'SOCK_SEQPACKET', None, create=True):
+            self.assertEqual(S.probe_dispram(s.o, {}), 0)
+
+    @unittest.skipUnless(hasattr(socket, 'SOCK_SEQPACKET'), 'no Unix seqpacket')
+    def test_probe_protocol_and_alignment(self):
+        s = supervisor('--dispram', '1')
+        for free in (2145386496, 2146000000, True, -1, '2048'):
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, 's')
+                try:
+                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                except OSError:
+                    self.skipTest('Unix seqpacket unsupported')
+                with listener:
+                    listener.bind(path)
+                    listener.listen()
+                    requests = []
+                    def server():
+                        with listener.accept()[0] as c:
+                            requests.append(json.loads(c.recv(4096)))
+                            c.sendall(json.dumps({'free': free, 'size': 2145386496}).encode())
+                    t = threading.Thread(target=server)
+                    t.start()
+                    self.assertEqual(S.probe_dispram(supervisor().o, {'DISPRAM_SOCKET': path}), 0)
+                    self.assertEqual(requests, [])
+                    got = S.probe_dispram(s.o, {'DISPRAM_SOCKET': path})
+                    t.join(2)
+                    self.assertFalse(t.is_alive())
+                    self.assertEqual(requests, [{'key': 'kindlingai_1', 'op': 'info'}])
+                    self.assertEqual(got, 2145386496 if type(free) is int and free > 0 else 0)
+
+    def test_cluster_minimum(self):
+        for values, expected in [([2145386496]*4, 2145386496), ([2145386496,2145386496,0,2145386496], 0)]:
+            s = supervisor()
+            s.tmpl, s.digest, s.model_id, s.variant = {'knobs': {}}, 'd', 'm', mock.Mock()
+            head = mock.Mock(verdict=None)
+            head.have = {r: hello(r, lan=MEMBERS[r], dispram_bytes=values[r]) for r in range(4)}
+            self.assertEqual(len({h['opts_digest'] for h in head.have.values()}), 1)
+            head.wait_all.return_value = True
+            head.decide.side_effect = lambda v: setattr(head, 'verdict', v)
+            with mock.patch.object(S.handshake, 'Head', return_value=head), mock.patch.object(s, 'rail_check', return_value=''):
+                self.assertEqual(s.handshake_head(hello(0))['dispram_bytes'], expected)
+
+    def test_engine_opt_out_and_attempt_guard(self):
+        s = supervisor()
+        with mock.patch.dict(os.environ, {'DISPRAM_DISABLE': '1', 'DISPRAM_SOCKET': '/tmp/test.sock'}):
+            env = s.engine_env({'env': [], 'knobs': {}})
+            self.assertEqual(env['DISPRAM_DISABLE'], '1')
+            self.assertEqual(env['DISPRAM_SOCKET'], '/tmp/test.sock')
+        s.dispram_off = True
+        env = s.engine_env({'env': ['GR8_DISPRAM_MIN_BYTES=2097152', 'GR8_DISPRAM=1'], 'knobs': {}})
+        self.assertEqual(env['GR8_DISPRAM'], '0')
+        self.assertNotIn('GR8_DISPRAM_MIN_BYTES', env)
+        self.assertEqual(s.on_rpc({'t': 'verdict', 'attempt': 1}, MEMBERS[1])['t'], 'retry')
+        s.boot_attempt = 1
+        self.assertEqual(s.on_rpc({'t': 'hello', 'attempt': 0}, MEMBERS[1])['field'], 'attempt')
+        self.assertEqual(s.on_rpc({'t': 'verdict', 'attempt': 0}, MEMBERS[1])['t'], 'dispram_fallback')
+        s.hs = {'epoch': 22}
+        self.assertEqual(s.on_rpc({'t': 'dispram_fallback', 'epoch': 21}, MEMBERS[1])['detail'], 'ignored')
+
+    def test_cluster_retry_after_worker_exits_75(self):
+        self.cluster_retry_after_worker_exits_75(False)
+
+    def test_slow_worker_verdict_poll_joins_fallback_attempt(self):
+        self.cluster_retry_after_worker_exits_75(True)
+
+    def cluster_retry_after_worker_exits_75(self, slow_poll):
+        # Real run(), handshakes, RPC attempt checks and watch(); mock only model/GPU boot prerequisites.
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        ranks = [supervisor('--tp', '4', '--join-timeout', '10', '--kv-format', 'int4', '--dispram', '1', rank=r) for r in range(4)]
+        for s in ranks:
+            s.o.values['CONTROL_PORT'] = str(ranks[0].port)
+            s.port = ranks[0].port
+        early_fallback = threading.Event()
+        early_receipts = []
+        slow_replies = []
+        final = threading.Barrier(4, timeout=10)
+        plans, errors, fallbacks = {}, [], []
+        ms = SimpleNamespace(id='a'*64, source='test', dir='/test-model')
+        variant = SimpleNamespace(path='', name='test', sha256='c'*64)
+        def tell(s, r, m, timeout=5):
+            reply = ranks[r].on_rpc(m, s.lan)
+            if r == 3 and m.get('t') == 'dispram_fallback' and not early_fallback.is_set():
+                early_receipts.append((dict(ranks[r].hs), m['epoch'] in ranks[r].fallback_by_epoch))
+                early_fallback.set()
+            return reply
+        def worker_handshake(s, h):
+            ask = h
+            end = time.monotonic() + 10
+            while time.monotonic() < end:
+                if slow_poll and s.rank == 2 and h['attempt'] == 0 and ask['t'] == 'verdict':
+                    if ranks[0].boot_attempt == 0:
+                        time.sleep(.005)
+                        continue
+                v = tell(s, 0, ask)
+                if slow_poll and s.rank == 2 and h['attempt'] == 0 and ask['t'] == 'hello' and v['t'] == 'ok':
+                    v = {'t': 'wait'}  # Exercise a delayed verdict poll even if the hello completed the quorum.
+                if slow_poll and s.rank == 2 and h['attempt'] == 0 and ask['t'] == 'verdict':
+                    slow_replies.append(v['t'])
+                if v['t'] == 'wait':
+                    ask = {'t': 'verdict', 'rank': s.rank, 'attempt': h['attempt']}
+                elif v['t'] == 'retry':
+                    ask = h
+                else:
+                    if s.rank == 3 and h['attempt'] == 0 and v['t'] == 'ok':
+                        # Hold the verdict before run() assigns hs: the notice must survive this ordering.
+                        if not early_fallback.wait(10):
+                            raise AssertionError('no fallback before slow worker installs verdict')
+                    return v
+                time.sleep(.005)
+            raise AssertionError('handshake timeout')
+        def fake_boot(s):
+            p = opt.engine_plan(s.o, dispram_bytes=0 if s.dispram_off else s.hs['dispram_bytes'])
+            env = s.engine_env(p)
+            plans[s.rank, s.boot_attempt] = (p, env, dict(s.hs))
+            s.set_state('loading')
+            if s.boot_attempt == 0:
+                s.started = True
+                if s.rank == 1:
+                    path = os.path.join(s.out, 'g6m4.r1.err')
+                    with open(path, 'w') as f:
+                        f.write('g6: dispram shortfall: live mapped 0 bytes < required 1983905792 bytes\n')
+                    s.engine = subprocess.Popen([sys.executable, '-c', 'raise SystemExit(75)'])
+                    s.engine.wait(timeout=5)
+                end = time.monotonic()+10
+                while time.monotonic() < end:
+                    try:
+                        s.watch()
+                    except S.DispramFallback:
+                        fallbacks.append(s.rank)
+                        raise
+                    time.sleep(.005)
+                raise AssertionError('fallback not propagated')
+            final.wait()
+            s.set_state('serving')
+        def run(s):
+            try:
+                s.run()
+            except Exception as e:
+                errors.append(e)
+        with ExitStack() as stack:
+            for name, value in [('resolve_model', (ms, variant, '')), ('engine_build', 'b'*64),
+                                ('version', 'test'), ('probe_dispram', 2145386496)]:
+                stack.enter_context(mock.patch.object(S, name, return_value=value))
+            stack.enter_context(mock.patch.object(S.modelset, 'model_id', return_value='a'*64))
+            stack.enter_context(mock.patch.object(S, 'stop_local'))
+            for s in ranks:
+                stack.enter_context(mock.patch.object(s, 'rendezvous'))
+                stack.enter_context(mock.patch.object(s, 'serve'))
+                stack.enter_context(mock.patch.object(s, 'checks', return_value=[]))
+                stack.enter_context(mock.patch.object(s, 'rail_check', return_value=''))
+                stack.enter_context(mock.patch.object(s, 'tell', side_effect=lambda r,m,timeout=5,s=s: tell(s,r,m,timeout)))
+                stack.enter_context(mock.patch.object(s, 'tell_head', side_effect=lambda m,s=s: tell(s,0,m)))
+                if s.rank:
+                    stack.enter_context(mock.patch.object(s, 'handshake_worker', side_effect=lambda h,s=s: worker_handshake(s,h)))
+                stack.enter_context(mock.patch.object(s, 'boot', side_effect=lambda s=s: fake_boot(s)))
+            ts = [threading.Thread(target=run, args=(s,), daemon=True) for s in ranks]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(20)
+            self.assertFalse(any(t.is_alive() for t in ts))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(fallbacks), [0, 1, 3] if slow_poll else list(range(4)))
+        self.assertEqual(slow_replies, ['dispram_fallback'] if slow_poll else [])
+        self.assertEqual(early_receipts, [({}, True)])
+        for s in ranks:
+            second, env1, hs1 = plans[s.rank, 1]
+            if slow_poll and s.rank == 2:
+                self.assertNotIn((s.rank, 0), plans)
+            else:
+                first, env0, hs0 = plans[s.rank, 0]
+                self.assertEqual(first['knobs']['CAP'], '611328')
+                self.assertEqual(env0['GR8_DISPRAM'], '1')
+                self.assertEqual(env0['GR8_DISPRAM_MIN_BYTES'], '1983905792')
+                self.assertGreater(hs1['epoch'], hs0['epoch'])
+            self.assertEqual(second['knobs']['CAP'], '513536')
+            self.assertEqual(env1['GR8_DISPRAM'], '0')
+            self.assertNotIn('GR8_DISPRAM_MIN_BYTES', env1)
+            self.assertEqual(hs1['dispram_bytes'], 0)
+            self.assertEqual(s.boot_attempt, 1)
+            self.assertEqual(s.state, 'serving')
+            s.lock.close()
+
 
 if __name__ == '__main__':
     unittest.main()

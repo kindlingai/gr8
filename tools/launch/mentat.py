@@ -430,6 +430,20 @@ def member_rails(snap, node_ids, names=None):
     return {me: tuple(mine), **{n: tuple(table[a][n][0] for a in mine) for n in others}}
 
 
+def rails_view(daemon, snap, node_ids):
+    """The snapshot member_rails reads. The group status is the mentat head's snapshot, and the mentat head need not
+    be a member: its probe table then says nothing about the members' cables, and member_rails falls back to each
+    member's two lowest addresses, which on a box with a direct cable can sit on two different cables. The local
+    daemon's own snapshot carries this box's probe table, and this box is a member."""
+    if snap.get('node_id') in node_ids:
+        return snap
+    try:
+        local = daemon.local_status()
+    except (OSError, ValueError):
+        return snap
+    return local if local.get('node_id') in node_ids else snap
+
+
 def reach_text(snap, node_ids):
     """What the local probe table says each local rdma address reaches, for a log line."""
     table, others = reach(snap, node_ids)
@@ -714,12 +728,13 @@ def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, slee
             if key == last:
                 ips = assign_ranks([ip for ip, _, _ in ms], {ip: parse_offers(o) for ip, _, o in ms}, tp, lan_head)
                 ids = {ip: n for ip, n, _ in ms}
-                rails = member_rails(snap, [ids[ip] for ip in ips], {n: ip for ip, n in ids.items()})
+                view = rails_view(daemon, snap, [ids[ip] for ip in ips])
+                rails = member_rails(view, [ids[ip] for ip in ips], {n: ip for ip, n in ids.items()})
                 if rails is not None:
                     return [(ip, ids[ip], rails[ids[ip]]) for ip in ips], snap
                 if waited - said >= 60:
                     log('waiting for a pair of rdma addresses that reaches every member: '
-                        + reach_text(snap, [ids[ip] for ip in ips]))
+                        + reach_text(view, [ids[ip] for ip in ips]))
                     said = waited
             last = key
             sleep(hold_s)

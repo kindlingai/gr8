@@ -13,6 +13,8 @@ use std::os::unix::fs::FileExt;
 
 const ALIGN: u64 = 4096;
 pub(crate) const NH: usize = 16;
+/// The most 128-blocks an expert of any model has: DeepSeek-V4.1-Flash, 2304 wide.
+pub(crate) const NH_MAX: usize = 18;
 
 /// A manifest entry (tools/convert/pack.py): dtype is the manifest label (u8, f16, i64, ...).
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +32,8 @@ pub struct V2Image {
     pub tensors: Vec<Tensor>,
     pub bytes: u64,
     pub plan: Plan,
+    /// GR8_GEN_CACHE (loader-rs/gencache.rs): set by the C entry point after planning; None = cache off.
+    pub cache: Option<crate::gencache::GenCache>,
 }
 
 impl V2Image {
@@ -118,28 +122,36 @@ fn layer_slice(s: &Slice, l: usize) -> Result<Option<LayerSlice>, String> {
 }
 
 /// Widths of one layer from a width manifest: gate[e][h], up[e][h], down[e], and the shared expert's (down 0: none).
+/// Rows hold `nh` blocks (16 for GLM, 18 for DeepSeek-V4.1-Flash); entries from nh on are 0.
 pub(crate) struct Widths {
-    pub(crate) gate: Vec<[u8; NH]>,
-    pub(crate) up: Vec<[u8; NH]>,
+    pub(crate) gate: Vec<[u8; NH_MAX]>,
+    pub(crate) up: Vec<[u8; NH_MAX]>,
     pub(crate) down: Vec<u8>,
-    pub(crate) sgate: [u8; NH],
-    pub(crate) sup: [u8; NH],
+    pub(crate) sgate: [u8; NH_MAX],
+    pub(crate) sup: [u8; NH_MAX],
     pub(crate) sdown: u8,
+    pub(crate) nh: usize,
 }
 
 pub(crate) fn widths(m: &Json, l: usize) -> Result<Option<Widths>, String> {
+    widths_nh(m, l, NH)
+}
+
+/// widths() for a model whose experts have `nh` 128-blocks.
+pub(crate) fn widths_nh(m: &Json, l: usize, nh: usize) -> Result<Option<Widths>, String> {
     let Some(e) = m.get("layers").and_then(|x| x.get(&l.to_string())) else { return Ok(None) };
-    let row16 = |v: &Json| -> Result<[u8; NH], String> {
+    let row16 = |v: &Json| -> Result<[u8; NH_MAX], String> {
         let a = v.arr().ok_or("width row is not a list")?;
-        if a.len() != NH {
-            return Err("width row is not 16 halves".into());
+        if a.len() != nh {
+            return Err(format!("width row is not {nh} halves"));
         }
-        let mut r = [0u8; NH];
+        let mut r = [0u8; NH_MAX];
         for (i, x) in a.iter().enumerate() {
             r[i] = x.int().ok_or("width is not an integer")? as u8;
         }
         Ok(r)
     };
+    let full = |w: u8| { let mut r = [0u8; NH_MAX]; r[..nh].fill(w); r };
     let list = |k: &str| e.get(k).and_then(Json::arr).ok_or(format!("layer {l}: no {k} widths"));
     let gate = list("gate")?.iter().map(row16).collect::<Result<Vec<_>, _>>()?;
     let up = list("up")?.iter().map(row16).collect::<Result<Vec<_>, _>>()?;
@@ -147,10 +159,10 @@ pub(crate) fn widths(m: &Json, l: usize) -> Result<Option<Widths>, String> {
     let (sgate, sup, sdown) = match e.get("shared") {
         Some(Json::Obj(_)) => {
             let s = e.get("shared").unwrap();
-            let b = |k| -> Result<[u8; NH], String> {
+            let b = |k| -> Result<[u8; NH_MAX], String> {
                 match s.get(k) {
                     Some(Json::Arr(_)) => row16(s.get(k).unwrap()),
-                    Some(v) => Ok([v.int().ok_or("bad shared width")? as u8; NH]),
+                    Some(v) => Ok(full(v.int().ok_or("bad shared width")? as u8)),
                     None => Err(format!("layer {l}: shared has no {k}")),
                 }
             };
@@ -158,11 +170,11 @@ pub(crate) fn widths(m: &Json, l: usize) -> Result<Option<Widths>, String> {
         }
         Some(v) => {
             let w = v.int().unwrap_or(0) as u8;
-            ([w; NH], [w; NH], w)
+            (full(w), full(w), w)
         }
-        None => ([0; NH], [0; NH], 0),
+        None => ([0; NH_MAX], [0; NH_MAX], 0),
     };
-    Ok(Some(Widths { gate, up, down, sgate, sup, sdown }))
+    Ok(Some(Widths { gate, up, down, sgate, sup, sdown, nh }))
 }
 
 pub(crate) struct Builder {
@@ -212,11 +224,16 @@ impl Builder {
     }
 }
 
-fn kmix_word(gw: &[u8; NH], uw: &[u8; NH], dk: u8, hs: &[usize]) -> i64 {
+/// The tr3.kmix word packs 8 bits per block in one i64, so mixed widths fit at most 8 blocks of an expert on a rank:
+/// None past that (all 16 blocks at TP=1, for one).
+fn kmix_word(gw: &[u8; NH_MAX], uw: &[u8; NH_MAX], dk: u8, hs: &[usize]) -> Option<i64> {
     if hs.iter().all(|&h| gw[h] == dk && uw[h] == dk) {
-        return 0;
+        return Some(0);
     }
-    hs.iter().enumerate().fold(0i64, |v, (b, &h)| v | (gw[h] as i64) << (8 * b) | (uw[h] as i64) << (8 * b + 4))
+    if hs.len() > 8 {
+        return None;
+    }
+    Some(hs.iter().enumerate().fold(0i64, |v, (b, &h)| v | (gw[h] as i64) << (8 * b) | (uw[h] as i64) << (8 * b + 4)))
 }
 
 fn f16_signed(scale: [u8; 2], sign: i8) -> [u8; 2] {
@@ -266,7 +283,7 @@ pub fn plan(base_manifest: &str, base_pack: &str, v2_dir: &str, slices_dir: &str
     }
     let bytes = b.cur.div_ceil(ALIGN) * ALIGN;
     let plan = Plan::from_segs(b.files, b.segs, b.mems, b.gens, bytes)?;
-    Ok(V2Image { rank, tensors: b.tensors, bytes, plan })
+    Ok(V2Image { rank, tensors: b.tensors, bytes, plan, cache: None })
 }
 
 /// A width manifest (exlr8-v2-manifest).
@@ -281,7 +298,12 @@ pub(crate) fn width_manifest(path: &str) -> Result<Json, String> {
 /// The halves of expert e in layer l that rank `rank` of TP `nr` owns under the formula, which the index slices of
 /// TP `nr` follow too (tools/convert/v2.py owner).
 pub(crate) fn formula_halves(e: usize, l: usize, nr: usize, rank: usize) -> Vec<usize> {
-    (0..NH).filter(|&h| (16 * e + h + l) % nr == rank).collect()
+    formula_halves_nh(e, l, nr, rank, NH)
+}
+
+/// formula_halves() for experts of `nh` 128-blocks: block h of expert e is rank (nh e + h + l) % nr's.
+pub(crate) fn formula_halves_nh(e: usize, l: usize, nr: usize, rank: usize, nh: usize) -> Vec<usize> {
+    (0..nh).filter(|&h| (nh * e + h + l) % nr == rank).collect()
 }
 
 /// Index slices at TP `nr` of some of its ranks, by (width, rank): unit (e, h) of layer l is in rank
@@ -373,7 +395,13 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
     let nroute = w.down.len();
     let shared = nroute;
     let hidden = ls.values().next().ok_or("no layer slices")?.hidden;
-    if ![4096, 6144].contains(&hidden) || (hidden == 4096 && nroute != 288) || w.gate.len() != nroute || w.up.len() != nroute {
+    let geometry = match (hidden, w.nh) {
+        (6144, NH) => true,
+        (4096, NH) => nroute == 288,
+        (5120, 18) => nroute == 384,
+        _ => false,
+    };
+    if !geometry || w.gate.len() != nroute || w.up.len() != nroute {
         return Err(format!("layer {l}: invalid geometry or widths"));
     }
     let blocks = hidden / 128;
@@ -385,15 +413,17 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
             return Err(format!("layer {l}: inconsistent slice shapes"));
         }
     }
-    if w.down.iter().chain(w.gate.iter().flatten()).chain(w.up.iter().flatten()).any(|k| !(2..=4).contains(k))
-        || (w.sdown > 0 && (!(2..=4).contains(&w.sdown) || w.sgate.iter().chain(&w.sup).any(|k| !(2..=4).contains(k)))) {
+    let nh = w.nh;
+    let rows = w.gate.iter().chain(&w.up).flat_map(|r| &r[..nh]);
+    if w.down.iter().chain(rows).any(|k| !(2..=4).contains(k))
+        || (w.sdown > 0 && (!(2..=4).contains(&w.sdown) || w.sgate[..nh].iter().chain(&w.sup[..nh]).any(|k| !(2..=4).contains(k)))) {
         return Err(format!("layer {l}: invalid width"));
     }
     let mut experts: Vec<usize> = (0..nroute).collect();
     if w.sdown > 0 {
         experts.push(shared);
     }
-    let of = |e: usize| -> ([u8; NH], [u8; NH], u8) {
+    let of = |e: usize| -> ([u8; NH_MAX], [u8; NH_MAX], u8) {
         if e == shared { (w.sgate, w.sup, w.sdown) } else { (w.gate[e], w.up[e], w.down[e]) }
     };
     let own: Vec<Vec<usize>> = experts.iter().map(|&e| own(e)).collect::<Result<_, _>>()?;
@@ -417,7 +447,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
     };
     let bs = w.sdown > 0;
     // the slice that holds unit (e, h) at width k
-    let get = |k: u8, e: usize, h: usize| ls.get(&(k, (16 * e + h + l) % slices.nr)).ok_or(format!("layer {l}: no index slice at K{k}"));
+    let get = |k: u8, e: usize, h: usize| ls.get(&(k, (w.nh * e + h + l) % slices.nr)).ok_or(format!("layer {l}: no index slice at K{k}"));
     let row_of = |s: &LayerSlice, e: usize, h: usize| s.row.get(&(e, h)).copied().ok_or(format!("layer {l}: expert {e} half {h} not in the slice"));
     // block row of expert e: routed e, the shared expert after the routed ones
     let brow = |e: usize| if e == shared { nroute } else { e };
@@ -449,7 +479,9 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
         let (gw, uw, dk) = of(e);
         let hs = &own[i];
         table[i] = [off as i64, 0, row as i64, hs.len() as i64, dk as i64, *hs.first().unwrap_or(&0) as i64];
-        kmix[i] = kmix_word(&gw, &uw, dk, hs);
+        kmix[i] = kmix_word(&gw, &uw, dk, hs).ok_or_else(|| format!(
+            "layer {l}: expert {e} has {} blocks on this rank with mixed widths; tr3.kmix holds at most 8 (a \
+             uniform-width manifest or a larger TP avoids it)", hs.len()))?;
         for &h in hs {
             for (proj, k) in [(0usize, gw[h]), (1, uw[h])] {
                 let s = get(k, e, h)?;
@@ -657,5 +689,18 @@ mod tests {
         std::fs::remove_file(d.join("exlr8-layer-004.k3.safetensors")).unwrap();
         assert_eq!(plan_layers(&d).unwrap(), ["exlr8-e4m3-pmcgx", codebook::UNCHECKED]);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn kmix_holds_mixed_widths_of_at_most_8_blocks() {
+        let all: Vec<usize> = (0..16).collect();
+        let (mut gw, uw) = ([3u8; NH_MAX], [3u8; NH_MAX]);
+        // uniform widths need no word at any block count
+        assert_eq!(kmix_word(&gw, &uw, 3, &all), Some(0));
+        gw[1] = 4;
+        assert_eq!(kmix_word(&gw, &uw, 3, &all[..2]), Some(0x3433));
+        assert!(kmix_word(&gw, &uw, 3, &all[..8]).is_some());
+        assert_eq!(kmix_word(&gw, &uw, 3, &all[..9]), None);
+        assert_eq!(kmix_word(&gw, &uw, 3, &all), None);
     }
 }

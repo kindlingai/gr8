@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include "../knobs-rs/gr8_knobs.h"
 #ifdef __CUDACC__
 #define G6_RS_HD __host__ __device__
 #else
@@ -38,3 +39,11 @@ inline void unpack(const uint8_t* slot, int M, int nr, int p, int32_t* tok_e, fl
 }
 } // namespace flash_route_split
 #undef G6_RS_HD
+
+namespace g6rt {
+// GR8_PF_ROUTER_SPLIT: unset = 0, 1 = on (g6m4 dies if the build or topology cannot run it).
+inline int flash_route_split_mode()
+{
+    return knob::pf_router_split() ? 1 : 0;
+}
+}

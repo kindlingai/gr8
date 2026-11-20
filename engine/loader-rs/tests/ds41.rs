@@ -9,6 +9,20 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::ops::Range;
 
+// This miniature table predates column ownership and has no production hash columns.
+// Run its existing planner/FFI oracles with the explicit legacy knob in a child,
+// rather than mutate a multithreaded test process's environment. Production-sized
+// column geometry is tested separately in ds41::col_shard_tests.
+fn legacy_child(name: &str) -> bool {
+    if !gr8knobs::DS_ENGRAM_COL_SHARD.get() { return false; }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(gr8knobs::DS_ENGRAM_COL_SHARD.var(), "0")
+        .status().unwrap();
+    assert!(status.success(), "legacy fixture {name}: {status}");
+    true
+}
+
 const HID: usize = 128;
 const V: usize = 2048;
 const HEADS: usize = 16;
@@ -482,6 +496,7 @@ fn ownership_rules() {
 
 #[test]
 fn coverage_and_errors() {
+    if legacy_child("coverage_and_errors") { return; }
     let mut m = mini("coverage");
     m.write();
     for nr in [1, 2, 4] {
@@ -506,7 +521,7 @@ fn coverage_and_errors() {
     let e = plan_err(&m.dir, 2, 0);
     assert!(e.contains("layers.1.surprise.weight"), "{e}");
     // a sample plan skips the coverage check
-    let o = Opts { layers: Some(vec![0]), experts: Some(4), no_globals: true };
+    let o = Opts { layers: Some(vec![0]), experts: Some(4), no_globals: true, ..Opts::default() };
     let img = ds41::plan(&m.dir, 2, 0, &o).unwrap().img;
     assert!(img.tensors.iter().all(|t| t.name.starts_with("L000.")));
     assert_eq!(img.tensors.iter().find(|t| t.name == "L000.x.fc1").unwrap().shape[0], 4);
@@ -520,6 +535,7 @@ fn coverage_and_errors() {
 
 #[test]
 fn slices_match_the_checkpoint() {
+    if legacy_child("slices_match_the_checkpoint") { return; }
     let m = mini("slices");
     m.write();
     let dsp0 = NMAIN;
@@ -545,7 +561,12 @@ fn slices_match_the_checkpoint() {
                 assert_eq!(tensor(&img, &format!("{p}.hc_attn.fn")), *m.get(&format!("{pre}hc_attn_fn")));
                 assert_eq!(tensor(&img, &format!("{p}.hc_ffn.scale")), *m.get(&format!("{pre}hc_ffn_scale")));
                 assert_eq!(tensor(&img, &format!("{p}.router.bias")), *m.get(&format!("{pre}ffn.gate.bias")));
-                assert!(!names.iter().any(|n| n.contains("bias_vl")));
+                // gate.bias_vl (image rows): bound whole on the main layers, not loaded on the DSpark layers
+                if l < NMAIN {
+                    assert_eq!(tensor(&img, &format!("{p}.router.bias_vl")), *m.get(&format!("{pre}ffn.gate.bias_vl")));
+                } else {
+                    assert!(!names.contains(&format!("{p}.router.bias_vl").as_str()));
+                }
                 // attention: q_b rows, attn_sink, o_a rows, o_b columns of this rank's groups
                 let sink = m.get(&format!("{pre}attn.attn_sink"));
                 assert_eq!(tensor(&img, &format!("{p}.attn_sink")), sink[g.start * hpg * 4..g.end * hpg * 4]);
@@ -602,6 +623,7 @@ fn slices_match_the_checkpoint() {
 
 #[test]
 fn mx4g_experts_decode_to_the_checkpoint_values() {
+    if legacy_child("mx4g_experts_decode_to_the_checkpoint_values") { return; }
     let m = mini("mx4g");
     m.write();
     let k1 = HID;
@@ -657,6 +679,7 @@ fn mx4g_experts_decode_to_the_checkpoint_values() {
 
 #[test]
 fn engram_slices_rebuild_the_table() {
+    if legacy_child("engram_slices_rebuild_the_table") { return; }
     let m = mini("engram");
     m.write();
     let (w_all, s_all) = (m.get("layers.1.engram.embed.weight").clone(), m.get("layers.1.engram.embed.scale").clone());
@@ -693,6 +716,7 @@ fn engram_slices_rebuild_the_table() {
 
 #[test]
 fn sizes_and_ffi() {
+    if legacy_child("sizes_and_ffi") { return; }
     let m = mini("ffi");
     m.write();
     let (img, eg) = plan(&m, 4, 2);
@@ -729,6 +753,7 @@ fn sizes_and_ffi() {
 /// tensor of the loaded image must equal what the pack writer would store, and the padding between them must be zero.
 #[test]
 fn engine_load_path_fills_the_image() {
+    if legacy_child("engine_load_path_fills_the_image") { return; }
     use std::os::raw::c_void;
     use std::sync::Mutex;
     struct Ctx {
@@ -823,6 +848,7 @@ fn mx4g_matches_the_b6_cpp_packer() {
 /// image, byte for byte.
 #[test]
 fn reads_cover_the_load() {
+    if legacy_child("reads_cover_the_load") { return; }
     let m = mini("reads");
     m.write();
     for (nr, rank) in [(4usize, 1usize), (2, 0)] {

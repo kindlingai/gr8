@@ -2,7 +2,7 @@
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
 # GR8_MODEL picks the model: glm53 (unset), glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2), ds41, DeepSeek-V4.1-Flash-1017
-# (bin/g6m4_ds41, TP 4; docs/DEEPSEEK.md), or pseudo, the pseudo engine (bin/g6pseudo, frontend/pseudo-engine).
+# (bin/g6m4_ds41, TP 4; docs/DEEPSEEK.md), ink2, Inkling-2-Small (bin/g6m4_ink2, TP 6 or 4), or pseudo, the pseudo engine (bin/g6pseudo, frontend/pseudo-engine).
 #
 #   engine_defaults          needs TP (4, 6, 3 or 5); sets every knob that is unset to its default for this TP. An unset CAP
 #                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
@@ -14,6 +14,15 @@
 #                            the drafter and QO packs, HOME is GR8_WORK_DIR
 #                            (the s2/ directory), EPOCH the S2 epoch. SET_ID, when set, adds --set-id.
 #   flash_donor_budget [KIB] GLM-5.3-Flash: the whole GiB this box lends a KV node next to the serve (below)
+
+# The registry owns dispatch and per-TP metadata; profiles below own geometry-specific tuning.
+_model_registry=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/launch" && pwd)/models.py
+model_field() { python3 "$_model_registry" get "${GR8_MODEL:-glm53}" "$@"; }
+_engine_profile=$(model_field engine_profile) || return 2
+_engine_binary=$(model_field engine) || return 2
+case $_engine_profile in glm|flash|ds41|ink2|pseudo) ;;
+  *) echo "unknown engine profile: $_engine_profile" >&2; return 2 ;;
+esac
 
 # share_cap P: the CAP that gives P physical KV pages per rank at this SHARE_LIMIT. Each rank holds the first
 # SHARE_LIMIT tokens of a session (64 per page) and 1/TP of the rest.
@@ -35,11 +44,31 @@ int4_pages() {
     *) echo "engine_defaults: no int4 page count for $1 fp8 pages at TP=$TP: set CAP" >&2; return 2 ;;
   esac
 }
-# pool_cap P: the default CAP from P fp8 pages a rank, or their int4 equivalent
+# dispram_bonus_pages: extra physical KV pages per rank funded by DISPRAM_BYTES (the cluster-wide minimum free bytes
+# probed from Kindling OS dispramd across all ranks), with an 8% safety margin over analytical per-page growth (docs/KV4.md).
+dispram_bonus_pages() {
+  local bytes=${DISPRAM_BYTES:-0}
+  [ "${DISPRAM:-0}" = 1 ] && [[ $bytes =~ ^[0-9]+$ ]] && [ "$bytes" -gt 0 ] || { echo 0; return 0; }
+  local row=656
+  [ "${KV_FORMAT:-fp8}" = int4 ] && row=416
+  local per_page=$(( (78 * 64 * row + 21 * 64 * 132 + 64 * TP * (3 * (row + 132) + 9840)) * 108 / 100 ))
+  echo $(( bytes / per_page ))
+}
+# pool_cap P: the default CAP from P fp8 pages a rank, or their int4 equivalent, plus any dispramd page bonus
 pool_cap() {
-  local p=$1
+  local p=$1 base_cap cap bonus
   if [ "${KV_FORMAT:-fp8}" = int4 ]; then p=$(int4_pages "$1") || return 2; fi
-  share_cap "$p"
+  base_cap=$(share_cap "$p") || return 2
+  bonus=$(dispram_bonus_pages)
+  if [ "$bonus" -gt 0 ]; then
+    cap=$(share_cap $(( p + bonus ))) || return 2
+    if [ "$cap" -gt 1048576 ] && [ "$base_cap" -le 1048576 ]; then
+      cap=$(( SHARE_LIMIT + ((1048576 - SHARE_LIMIT) / (64 * TP)) * 64 * TP ))
+    fi
+    echo "$cap"
+  else
+    echo "$base_cap"
+  fi
 }
 
 # EXTRA_ENV with each old G6_ name as its GR8_ name, so an override under the old name and a default here are one
@@ -58,28 +87,50 @@ tp4_default() {
   printf -v "$1" %s "$2"
 }
 
-# GLM-5.3-Flash under --serve takes no CP, prefix reuse, DFlash or PF_OWN (engine/runtime/g6m4.cu refuses them).
-# MTP=1: --serve needs a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH.md).
-# SESS: 1 (the default) serves one request at a time; 2..8 share decode steps and the CAP pool, each with its own KDA
-# state slots (docs/FLASH.md, Several sessions), and a round of every session, SESS x (MTP + 1) rows, must fit the
-# engine's 32. CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and
-# the MTP layer keep KV, 1,664 B a token each, and without CP every rank holds the whole context: about 5.2 GB a rank at
-# any TP (docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
+# GLM-5.3-Flash under --serve takes no CP, prefix reuse or PF_OWN (engine/runtime/g6m4.cu refuses them). DFLASH=1 (TP=4,
+# the default): a session alone drafts with the DFlash2 drafter, SPEC_ADAPT on with it. MTP=1 for sessions sharing steps.
+# SESS: 2..8 share decode steps and the CAP pool, each with its own KDA state slots (docs/FLASH.md, Several sessions);
+# 8 at TP=4, 4 at TP=3 and TP=2 with KV_FORMAT=int4; otherwise 1 at TP=2 and TP=1. TP=2 INT4 with SESS >= 2
+# defaults to MTP=3, S2_SHARED_WATERFILL=1 and S2_SHARED_WF_MARGIN=0.02. A round of SESS x (MTP + 1) rows must fit
+# the engine's 32. CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and
+# the MTP layer keep KV, 1,664 B a token each (928 B with KV_FORMAT=int4), and without CP every rank holds the whole
+# context: about 5.2 GB a rank at any TP (2.9 GB with int4; docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
 flash_defaults() {
-  case $TP in 4|3|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4, 3 or 2" >&2; return 2 ;; esac
+  case $TP in 4|3|2|1) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4, 3, 2 or 1" >&2; return 2 ;; esac
   local k
-  for k in DFLASH REUSE PF_OWN SPEC_ADAPT; do
+  for k in REUSE PF_OWN; do
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
   done
-  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=${SESS:-1}
+  [ "${DFLASH:-0}" = 0 ] || [ "$TP" != 3 ] || { echo "engine_defaults: DFLASH=1: GLM-5.3-Flash runs its DFlash2 drafter at TP=4, TP=2 and TP=1" >&2; return 2; }
+  local mtp_set=${MTP:+1}
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}
+  case $TP in
+    4) SESS=${SESS:-8} ;;
+    3) SESS=${SESS:-4} ;;
+    2) if [ "${KV_FORMAT:-fp8}" = int4 ]; then SESS=${SESS:-4}; else SESS=${SESS:-1}; fi ;;
+    *) SESS=${SESS:-1} ;;
+  esac
   case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves 1 to 8 sessions" >&2; return 2 ;; esac
+  if [ "$TP" = 2 ] && [ "${KV_FORMAT:-fp8}" = int4 ] && [ "$SESS" -ge 2 ]; then
+    tp4_default S2_SHARED_WATERFILL 1
+    local _wf_eff=${S2_SHARED_WATERFILL:-0}
+    case " ${EXTRA_ENV:-} " in *" GR8_S2_SHARED_WATERFILL=1 "*) _wf_eff=1 ;; *" GR8_S2_SHARED_WATERFILL=0 "*) _wf_eff=0 ;; esac
+    if [ "$_wf_eff" = 1 ]; then
+      tp4_default S2_SHARED_WF_MARGIN 0.02
+      [ -n "$mtp_set" ] || MTP=3
+    fi
+  fi
+  MTP=${MTP:-1}
   [ "$SESS" = 1 ] || [ $((SESS * (MTP + 1))) -le 32 ] ||
     { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; GLM-5.3-Flash steps hold 32" >&2; return 2; }
-  S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
+  # DFLASH: on at TP=4, TP=2 and TP=1, where the drafter's 8 KV heads split evenly across the ranks (the supervisor
+  # turns it off, with a notice, when no drafter is given)
+  case $TP in 4|2|1) DFLASH=${DFLASH:-1} ;; *) DFLASH=${DFLASH:-0} ;; esac
+  S2PORT=${S2PORT:-7341}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=0; REUSE=0
   flash_donor_defaults
 }
 
-# A KV node next to the Flash serve (D-331 M7): FLASH_KV_DONATE_GIB > 0 lends at most that many GiB of this box to a
+# A KV node next to the Flash serve: FLASH_KV_DONATE_GIB > 0 lends at most that many GiB of this box to a
 # ./gr8 kv up --lazy-lock node once the serve has booted. FLASH_KV_GROWTH_GIB is what the serve may still allocate after
 # boot; it has no default because it is not measured yet. FLASH_KV_GROUP is the mentat group the node serves (the cluster
 # that borrows from it, not this serve's), also without a default. FLASH_CAP_POLICY=protected: the configured CAP's memory is
@@ -115,10 +166,11 @@ flash_donor_budget() {
 }
 
 # DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): TP 4 only; CP, DFlash2 and PF_OWN remain off.
-# Prefix reuse is opt-in via REUSE=1 and the DS41 snapshot cache. MTP is the DSpark draft length k (0..5: the checkpoint's block is 5);
-# 0 by default, and the only value taken until the DSpark serve is built. SESS 1..32 sessions; a round of SESS x (MTP + 1) rows must
-# fit the engine's 32. CAP: the full 1,048,576-token context (MAX_POS); the engine's admit gate already holds 2 x MTP draft rows inside
-# CAP. The KV row is 890 B a token a rank (CA 288 B + ICA 68 B at 2.5 rows a token), so the pool is 16,384 pages x 56,960 B = 0.933 GB.
+# REUSE=1 by default: prefix reuse through the DS41 snapshot cache. MTP stays 0: the DSpark drafts are GR8_DS_MTP (DS41_TUNED below).
+# SESS 1..32 sessions, 5 by default: with GR8_DS_MTP=5 a round of 5 x 6 rows fits the default build's 32 rows a step (8 sessions need
+# DS41_MX=48 at build). CAP: the tokens of one session; every session holds its own attention, index and Engram slab of CAP rows, and
+# five slabs of the full 1,048,576-token context (MAX_POS) leave a rank under GR8_MEM_MIN, so 262,144 by default. The KV row is 890 B
+# a token a rank (CA 288 B + ICA 68 B at 2.5 rows a token).
 # READY_TMO: the 289 GB of routed experts load from disk; the worst boot
 # seen was 807 s, so 1800. Each DeepSeek-only variable is a GR8_DS_* engine variable in EXTRA_ENV (GR8_DS_ENGRAM=0
 # turns Engram off, which gives wrong logits: use it only to diagnose).
@@ -129,7 +181,7 @@ ds41_defaults() {
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: DeepSeek-V4.1-Flash-1017 has no $k" >&2; return 2; }
   done
   case ${REUSE:-0} in 0|1) ;; *) echo "engine_defaults: REUSE=${REUSE}: DeepSeek-V4.1-Flash-1017 needs REUSE=0 or 1" >&2; return 2 ;; esac
-  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-1048576}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-0}; SESS=${SESS:-1}
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262144}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-0}; SESS=${SESS:-5}
   # CHUNK: the prompt rows a main step takes (the DS41 serve path runs the prompt as decode steps). 8 gives 140-145 prompt
   # tok/s on the ring against about 37 at 1; the engine takes 1..8 and dies at parse time on more (the MoE slots)
   CHUNK=${CHUNK:-8}
@@ -141,27 +193,39 @@ ds41_defaults() {
   case $SESS in [1-9]|[12][0-9]|3[0-2]) ;; *) echo "engine_defaults: SESS=$SESS: DeepSeek-V4.1-Flash-1017 serves 1 to 32 sessions" >&2; return 2 ;; esac
   [ $((SESS * (MTP + 1))) -le 32 ] ||
     { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; DeepSeek-V4.1-Flash-1017 steps hold 32" >&2; return 2; }
-  # The DS41 serve path: MTP 0, split 0, no KV store, no --prefill (engine_args() passes none); several sessions need the
-  # W-row prefill (below). Engram is off unless the box sets
+  # The DS41 serve path: MTP 0, split 0, no --prefill (engine_args() passes none); prompts take the W-row prefill
+  # (GR8_DS_PREFILL_*), which several sessions need (below). Engram is off unless the box sets
   # EXTRA_ENV='GR8_DS_ENGRAM=1 GR8_DS_ENGRAM_PREFIX=/path/PREFIX' (the token ring of ds41_engram_ops.cuh covers one session from position 0,
   # MTP 0; the sidecar PREFIX.engram.* must be on every rank, same path; with GR8_DS_MTP=k also in EXTRA_ENV the engine refuses unless
   # GR8_DS_ENGRAM_MTP=1 is there too, g6m4.cu). g6m4_ds41 dies at parse time on the rest; refusing here
   # saves a boot. Each line below goes when the engine takes the setting (DSpark serve, per-session attention buffers);
   # test_models.py holds the refusals.
   [ "$MTP" = 0 ] || { echo "engine_defaults: MTP=$MTP: DeepSeek-V4.1-Flash-1017 serves with MTP=0 (DSpark serve is not built)" >&2; return 2; }
-  case ${KV_STORE:-} in ''|off) ;; *) echo "engine_defaults: KV_STORE=$KV_STORE: DeepSeek-V4.1-Flash-1017 has no KV store" >&2; return 2 ;; esac
-  local kv kvs engram=0 prefix=0 pmin=0 dsmtp=0
+  # EXACT=1 (exact output): the old prefill stack (layers 0..20 on the range-A path, two lanes, W 4096, GR8_DS_SH_TC unset = 0).
+  # The default is the release stack: the v2 sequence-parallel prefill (GR8_DS_PF_V2=1, docs/DEEPSEEK.md), whose tensor-core
+  # shared expert (GR8_DS_SH_TC=1) changes output bits; v2 BF16 projections stay on the stock reductions (GR8_DS_PF_V2_BF16_TC=0).
+  # EXTRA_ENV GR8_DS_PF_V2=0 or GR8_DS_MHC_ROW_SHARD=1 (the 1M-context setup) selects the old stack;
+  # EXTRA_ENV GR8_DS_PF_V2_BF16_TC=7 opts into tensor-core BF16 projections, which change output bits.
+  EXACT=${EXACT:-0}
+  case $EXACT in 0|1) ;; *) echo "engine_defaults: EXACT=$EXACT: 0 (the release stack, v2 prefill) or 1 (exact output, the old prefill)" >&2; return 2 ;; esac
+  local kv kvs engram=0 prefix=0 pmin=2 dsmtp=5 pw= old=$EXACT w16k=1
   read -ra kvs <<<"${EXTRA_ENV:-}"
   for kv in ${kvs[@]+"${kvs[@]}"}; do
     case $kv in
+      GR8_DS_PF_V2=0) old=1 ;;
+      GR8_DS_PF_V2_W16K=0) w16k=0 ;;
+      GR8_DS_MHC_ROW_SHARD=1) old=1 ;;
       GR8_DS_PREFILL_MIN=[0-9]*) pmin=${kv#*=} ;;
       GR8_DS_MTP=[0-5]) dsmtp=${kv#*=} ;;
+      GR8_DS_PREFILL_W=[0-9]*) pw=${kv#*=} ;;
       GR8_DEC_SPLIT=0) ;;
       GR8_DEC_SPLIT=*) echo "engine_defaults: $kv: DeepSeek-V4.1-Flash-1017 serves at GR8_DEC_SPLIT=0" >&2; return 2 ;;
       GR8_DS_ENGRAM=1) engram=1 ;;
       GR8_DS_ENGRAM_PREFIX=?*) prefix=1 ;;
     esac
   done
+  # W: 12288-row chunks on v2 (8192 when GR8_DS_PF_V2_W16K=0), 4096 on the old path; EXTRA_ENV GR8_DS_PREFILL_W wins
+  [ -n "$pw" ] || { [ "$old" = 1 ] && pw=4096 || { [ "$w16k" = 1 ] && pw=12288 || pw=8192; }; }
   # Engram ON needs the sidecar PREFIX (the engine dies at parse time without it)
   [ "$engram" = 0 ] || [ "$prefix" = 1 ] ||
     { echo "engine_defaults: GR8_DS_ENGRAM=1 needs GR8_DS_ENGRAM_PREFIX=/path/PREFIX in EXTRA_ENV (the Engram sidecar, PREFIX.engram.*)" >&2; return 2; }
@@ -174,6 +238,88 @@ ds41_defaults() {
   local dsmtp_sess=$(( SESS < 8 ? SESS : 8 ))
   [ "$SESS" = 1 ] || [ "$dsmtp" = 0 ] || { [ $((dsmtp_sess * (dsmtp + 1))) -le 48 ] && [ $((dsmtp_sess * 5)) -le 48 ]; } ||
     { echo "engine_defaults: SESS=$SESS GR8_DS_MTP=$dsmtp: a round of $((dsmtp_sess * (dsmtp + 1))) verify rows; DeepSeek-V4.1-Flash-1017 steps hold 48" >&2; return 2; }
+  # DS41_TUNED: the DSpark drafts with Engram, the W-row prefill (the prefill stack below) with its reduce-scatter and direct-send collectives,
+  # and the decode and prefill kernel paths that give the same bytes as their defaults. Measured together at TP4 (RigMark, reasoning
+  # effort low, thermal-capped clocks): decode code 33.8 -> 77.8 tok/s, prose 33.7 -> 49.7, 8K prefill 149 -> 2,023 tok/s against
+  # SESS=1 and none of these. GR8_DS_ATTN_TC=1 puts the attention projections of a prefill chunk on the tensor-core MXFP8 GEMM: 8K
+  # prefill 2,102 -> 3,288 tok/s, 2 / 4 stream aggregates 51 / 72 -> 87 / 113 tok/s; same operands, another summation order, so
+  # the partials' bytes change (the tokens at temperature 0 did not). GR8_DS_MOE_TC=1 runs the routed experts of a prefill chunk on
+  # the block-scaled tensor cores with MXFP8 activations: 8K prefill 3,265 -> 3,820 tok/s, 32K 3,375 -> 3,920, decode unchanged;
+  # the expert outputs move by about 5% RMS (E4M3 rounding). W = 4096 with GR8_DS_PF_POOL=4: 32K prefill +4.6% over W = 1024, 8K
+  # within the boot spread. GR8_DS_SRC_FAST=3: decode +3.4 to +3.8% (bit 1 gives the same bytes; bit 2 sums in another order, the
+  # qeval answers did not change). GR8_DS_MOE_PDL=1: decode +0.6 to +1.4%. GR8_DS41_ADMIT_KEEP_SCRATCH=1: a request starts 12-17 ms
+  # sooner. GR8_DS41_PUB16=1 and GR8_DS41_GV_QUAD=1: a decode round -0.9 to -1.3% and -1.6 to -1.8%, the same bytes. A variable
+  # EXTRA_ENV names keeps its value; GR8_DS_ATTN_PW and GR8_DS41_IDX_PW follow GR8_DS_PREFILL_W.
+  # GR8_DS_COMP_FP4=1: the compressed KV rows are kept as packed FP4 (288 B, not 1,024 B BF16) and layer 20's BF16 copy is gone,
+  # the same values, so the same bytes out: 0 of 75 qeval outputs differ on 2 boot pairs, 2.1-2.9 GiB a box more free at ready
+  # (5 x 262,144), a prefix snapshot at about 1M 882 MiB a rank instead of 3,134 (measured), one-chat decode within the
+  # boot spread. EXTRA_ENV GR8_DS_COMP_FP4=0 keeps the BF16 rows.
+  # A 4096-row prefill quantum with 16 decode rounds keeps chats writing during a long new prompt.
+  # The caller may override either in EXTRA_ENV or with S2_DECODE_PF / S2_DECODE_ROUNDS; cap the quantum at W.
+  local dpf=${S2_DECODE_PF:-$((pmin == 0 ? 0 : (pw < 4096 ? pw : 4096)))}
+  local effective_dpf=$dpf rounds=
+  for kv in ${kvs[@]+"${kvs[@]}"}; do
+    case $kv in GR8_S2_DECODE_PF=*) effective_dpf=${kv#*=} ;; esac
+  done
+  # No implicit decode burst when interleaving is disabled. An explicit rounds setting still wins.
+  if [ -n "${S2_DECODE_ROUNDS:-}" ]; then rounds=GR8_S2_DECODE_ROUNDS=$S2_DECODE_ROUNDS
+  elif [ "${effective_dpf:-0}" -gt 0 ]; then rounds=GR8_S2_DECODE_ROUNDS=16; fi
+  # The prefill stack: 12,288-row v2 default, layer-20 bounded-replay tail hoist, direct quarter publish / dual unpack, and
+  # stock BF16 router, ratio-2 compressor and indexer/cmp_wkv reductions (GR8_DS_PF_V2_BF16_TC=0).
+  # The release stack (default): v2 for layers 0..20 of a W-row chunk on one lane with the 128-row late
+  # tail, the tensor-core shared expert v2's FFN reads, v2's own-row gate, its two-rail stripe at 1 MiB and its pipelined
+  # attention core; Engram's pread pool at 64 threads (where io_uring is denied); the persistent attention GEMM tile; S2
+  # admits a queued burst at one boundary and serves a prompt tail first. The old stack (EXACT=1): two lanes, nothing else.
+  # The engine runs the old path, with one log line, where v2's conditions fail (a trellis release, an EXTRA_ENV word).
+  local pfs
+  if [ "$old" = 1 ]; then pfs="GR8_DS_PF_LANES=2"
+  else
+    pfs="GR8_DS_PF_V2=1 GR8_DS_PF_LANES=1 GR8_DS_PF_TAIL=128 GR8_DS_SH_TC=1 GR8_DS_PF_V2_GATE_RO=1 GR8_DS_PF_V2_STRIPE_MIN=1048576"
+    pfs="$pfs GR8_DS_PF_V2_ATTN_PIPE=1 GR8_DS_ENGRAM_IO_THREADS=64 GR8_DS_ATTN_TC_TILE=2 GR8_S2_ADMIT_HOLD=${S2_ADMIT_HOLD:-1} GR8_S2_TAIL_FIRST=1"
+    pfs="$pfs GR8_DS_PF_V2_L20_TAIL=1 GR8_DS_PF_V2_SEND_FFN_OPT=3 GR8_DS_PF_V2_BF16_TC=0"
+    [ "$pw" -gt 8192 ] && pfs="$pfs GR8_DS_PF_V2_W16K=1"
+  fi
+  # Park finished chats in their session slots instead of copying their state through the prefix cache.
+  # Explicit park overrides win below. Keep disabled-cache spellings out of the default, including the old alias
+  # after this file's G6_ -> GR8_ normalization.
+  REUSE=${REUSE:-1}
+  local park= cache_mib_zero=0 word
+  for word in ${EXTRA_ENV:-}; do
+    case ${word%%=*} in
+      GR8_DS_CACHE_MIB|G6_DS41_CACHE_MIB|GR8_DS41_CACHE_MIB)
+        [ "${word#*=}" != 0 ] || cache_mib_zero=1 ;;
+    esac
+  done
+  if [ "$REUSE" = 1 ] && [ "$SESS" -ge 2 ] && [ "$cache_mib_zero" = 0 ]; then park=GR8_DS_PARK=1; fi
+  DS41_TUNED=
+  for kv in GR8_DS_MTP=5 GR8_DS_ENGRAM_MTP=1 GR8_DS_PREFILL_MIN=2 GR8_DS_PREFILL_W=$pw GR8_DS_ATTN_PW=$pw GR8_DS41_IDX_PW=$pw GR8_S2_DECODE_PF=$dpf \
+      $rounds $pfs GR8_DS_PF_RS=1 GR8_DS_PF_DIRECT=1 GR8_DS_PF_GATHER=1 GR8_DS_PF_LATE_FINAL=1 GR8_DS_WAIT_K=2 GR8_DS_DEC_STAGE=1 \
+      GR8_DS_ATTN_CPA=1 GR8_DS_DSP_GV=1 GR8_DS_RO_ORDER=1 GR8_DS_GATE_RO=1 GR8_DS_ENGRAM_LOOKAHEAD=1 GR8_DS_ATTN_TC=1 \
+      GR8_DS_MOE_TC=1 GR8_DS_PF_POOL=4 GR8_DS_SRC_FAST=3 GR8_DS_MOE_PDL=1 GR8_DS41_ADMIT_KEEP_SCRATCH=1 GR8_DS41_PUB16=1 \
+      GR8_DS41_GV_QUAD=1 GR8_DS_COMP_FP4=1 $park; do
+    case " ${EXTRA_ENV:-} " in *" ${kv%%=*}="*) ;; *) DS41_TUNED="$DS41_TUNED$kv " ;; esac
+  done
+  S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0
+}
+
+# Inkling-2-Small: TP 6 or 4, MTP 0 to 7 drafts a round from the checkpoint's drafter layers (0, the default: no
+# drafter), no DFlash2, no prefill stack: a
+# prompt runs as CHUNK-row steps. CAP: the tokens of one session; every session holds its own pages of the 8
+# full-attention layers. EAGER=1 drops --graph.
+ink2_defaults() {
+  case $TP in 6|4) ;; *) echo "engine_defaults: TP=$TP; Inkling-2-Small wants 6 or 4" >&2; return 2 ;; esac
+  local k
+  for k in DFLASH PF_OWN SPEC_ADAPT; do
+    [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: Inkling-2-Small has no $k" >&2; return 2; }
+  done
+  case ${REUSE:-0} in 0|1) ;; *) echo "engine_defaults: REUSE=${REUSE}: Inkling-2-Small needs REUSE=0 or 1" >&2; return 2 ;; esac
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262144}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-0}; SESS=${SESS:-4}
+  CHUNK=${CHUNK:-8}
+  case $CHUNK in [1-8]) ;; *) echo "engine_defaults: CHUNK=$CHUNK: Inkling-2-Small takes 1 to 8 prompt rows a step" >&2; return 2 ;; esac
+  EAGER=${EAGER:-0}
+  case $EAGER in 0|1) ;; *) echo "engine_defaults: EAGER=$EAGER: 0 (--graph) or 1 (eager, no --graph)" >&2; return 2 ;; esac
+  case $MTP in [0-7]) ;; *) echo "engine_defaults: MTP=$MTP: Inkling-2-Small drafts 0 to 7 tokens a round" >&2; return 2 ;; esac
+  case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: Inkling-2-Small serves 1 to 8 sessions" >&2; return 2 ;; esac
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-0}
 }
 
@@ -184,11 +330,19 @@ pseudo_defaults() {
 }
 
 engine_defaults() {
-  [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_defaults; return; }
-  [ "${GR8_MODEL:-glm53}" = ds41 ] && { ds41_defaults; return; }
-  [ "${GR8_MODEL:-glm53}" = pseudo ] && { pseudo_defaults; return; }
+  local _defaults _key _value
+  _defaults=$(model_field tp-defaults "$TP") || return 2
+  while IFS='=' read -r _key _value; do
+    [ -n "$_key" ] || continue
+    [ -n "${!_key:-}" ] || printf -v "$_key" %s "$_value"
+  done <<< "$_defaults"
+  [ "$_engine_profile" = flash ] && { flash_defaults; return; }
+  [ "$_engine_profile" = ds41 ] && { ds41_defaults; return; }
+  [ "$_engine_profile" = ink2 ] && { ink2_defaults; return; }
+  [ "$_engine_profile" = pseudo ] && { pseudo_defaults; return; }
+  local _cap_set=${CAP:+1} _base_p=0; DISPRAM_MIN_BYTES=0
   case $TP in
-    4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; _base_p=2280; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
        # the window-2 fc1 split on every MoE layer at M > 1 (bit-exact, measured at TP=4); 0 turns it off, and
        # GR8_TR3_W2ALL in EXTRA_ENV keeps its own value
@@ -198,26 +352,52 @@ engine_defaults() {
        tp4_default ROUTE_OVL 1; [ "$MTP" = 0 ] || tp4_default DRAFT_HEAD_I4 1
        tp4_default ATTN_SC2 4; tp4_default ATTN_SC2_TR 2; tp4_default ATTN_CTX2 4; tp4_default ATTN_CTX3 2
        tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
-       tp4_default IDX_VEC 1; tp4_default DEC_BK 512; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
-       tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248 ;;
+       tp4_default IDX_VEC 1; tp4_default DEC_BK 2048; tp4_default DEC_BK_MAX 32768; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
+       tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248
+       if [ "${KV_FORMAT:-fp8}" = int4 ]; then
+         tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
+         case " ${EXTRA_ENV:-} " in *" GR8_ATTN_FLIP=1 "*) ;; *) tp4_default CP_ONECHAIN 1 ;; esac
+         if [ "${KVB:-bf16}" != fp8 ]; then
+           case " ${EXTRA_ENV:-} " in *" GR8_KVB=fp8 "*) ;; *) tp4_default KV4_FOLD 1 ;; esac
+         fi
+         local _fold_eff=${KV4_FOLD:-0}
+         case " ${EXTRA_ENV:-} " in *" GR8_KV4_FOLD=1 "*) _fold_eff=1 ;; *" GR8_KV4_FOLD=0 "*) _fold_eff=0 ;; esac
+         if [ "$_fold_eff" = 1 ]; then tp4_default KV4_TC 1; fi
+         # the prefix-reuse grid: 64-row page hits instead of 4,096-row cold cells (docs/SETTINGS.md).
+         # REUSE_GRID=0 rolls it back; GR8_REUSE_GRID in EXTRA_ENV keeps its own value, and GR8_REUSE_ALIGN=0
+         # there takes no grid
+         if [ "$REUSE" = 1 ]; then
+           case " ${EXTRA_ENV:-} " in *" GR8_REUSE_ALIGN=0 "*|*" G6_REUSE_ALIGN=0 "*) ;; *) tp4_default REUSE_GRID 64 ;; esac
+         fi
+       fi ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
-         if [ "$SHARE_LIMIT" = 131072 ]; then CAP=${CAP:-$(pool_cap 3307)} || return 2; else CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
-       else [[ "$SHARE_LIMIT" = 32768 || "$SHARE_LIMIT" = 131072 ]] && CAP=${CAP:-614400} || CAP=${CAP:-$(share_cap 2026)} || return 2; fi; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+         if [ "$SHARE_LIMIT" = 131072 ]; then _base_p=3307; CAP=${CAP:-$(pool_cap 3307)} || return 2; else _base_p=2026; CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
+       else [[ "$SHARE_LIMIT" = 32768 || "$SHARE_LIMIT" = 131072 ]] && CAP=${CAP:-614400} || { _base_p=2026; CAP=${CAP:-$(pool_cap 2026)}; } || return 2; fi; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        # DFLASH=1: the DFlash2 drafter with its body replicated on every rank (dflash.cuh dfl::REP; the drafter
        # converted per rank in the replicated layout, --drafter). Off unless set
        DFLASH=${DFLASH:-0}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
-    3) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    3) SHARE_LIMIT=${SHARE_LIMIT:-32768}; _base_p=1941; CAP=${CAP:-$(pool_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
        DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
     5) [ "${KV_FORMAT:-fp8}" = fp8 ] || [ -n "${CAP:-}" ] || { echo "engine_defaults: KV_FORMAT=$KV_FORMAT at TP=5: no TP5 int4 page count; set CAP" >&2; return 2; }
-       SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+       SHARE_LIMIT=${SHARE_LIMIT:-32768}; _base_p=1981; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        # 1,981 pages a rank = TP4's default (not boot-proven at TP5; a rank holds about 1/5 of the experts, so more fit)
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=5: the drafter's 8 KV heads do not split five ways" >&2; return 2; }
        # PF_OWN=3: cold 8K prefill 1,554 tok/s against 935 with 1, at the same CAP; decode within 1 %
        DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
     *) echo "engine_defaults: TP=$TP; want 4, 6, 3 or 5" >&2; return 2 ;;
   esac
+  if [ -z "$_cap_set" ] && [ "$_base_p" -gt 0 ] && [ "${DISPRAM:-0}" = 1 ] && [[ ${DISPRAM_BYTES:-0} =~ ^[0-9]+$ ]] && [ "${DISPRAM_BYTES:-0}" -gt 0 ]; then
+    local _p=$_base_p _base_cap _added _row=656 _analytical
+    if [ "${KV_FORMAT:-fp8}" = int4 ]; then _p=$(int4_pages "$_base_p") || return 2; _row=416; fi
+    _base_cap=$(share_cap "$_p") || return 2
+    _added=$(( (CAP - _base_cap) / (64 * TP) ))
+    if [ "$_added" -gt 0 ]; then
+      _analytical=$(( 78 * 64 * _row + 21 * 64 * 132 + 64 * TP * (3 * (_row + 132) + 9840) ))
+      DISPRAM_MIN_BYTES=$(( ((_added * _analytical) / 2097152) * 2097152 ))
+    fi
+  fi
 }
 
 # The engine environment for every rank (docs/SETTINGS.md has each variable). Prefill: 64-row attention tiles, dense
@@ -229,17 +409,25 @@ engine_defaults() {
 # TP=4 defaults GR8_PF_OWN to 4. OWN=3 needs the 13 GB full-head QO pack on every rank, and that pack does not fit next to
 # a 90 GB TP=4 rank pack. OWN=4 runs the same attention over two head pairs, with the pair weights rolled in per layer
 # (about 1.3-1.4 GB of device memory plus 84 MB pinned per rank). About 1.4 KB per position of it scales with QP_CTX.
-# GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). GR8_PF_RS, GR8_PF_OWN and CP stay off.
+# GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). GR8_PF_RS, GR8_PF_OWN and CP stay off; EXTRA_ENV=GR8_CP=1
+# turns CP on with R = SHARE_LIMIT (docs/FLASH.md).
 flash_env() {
-  ENGINE_BIN=g6m4_flash
-  ENGINE_ENV="GR8_CP=0 GR8_PF_RS=0 GR8_PF_OWN=0 GR8_GLM53F_PF_POOL_OWNER=0 GR8_FPF_P1=0 GR8_FPF_DSA_P1=0 \
+  ENGINE_BIN=$_engine_binary; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=$_engine_binary-int4
+  # TP=4: mHC sequence-parallel (partials reduce-scatter, each owner runs mHC on its rows, the rows all-gather), which
+  # sends a quarter of the bytes and replaces the peer-partial staging: 8K prefill 2,151 -> 2,533 tok/s. And the routed
+  # experts on the expert tiles (GR8_PF_WT), which need the router unsplit: 8K 2,818 -> 2,963 with the G9 scan below.
+  # GR8_GLM53F_PF_SP_X16: an MoE layer's all-gathered MLP input as FP16 rows (byte-equal), about +1.5%
+  local sp=0 stage=1 rsplit=1
+  [ "$TP" = 4 ] && sp=1 stage=0 rsplit=0
+  [ "$TP" = 1 ] && rsplit=0   # one rank: no router to split
+  ENGINE_ENV="GR8_CP=0 GR8_CP_R=$SHARE_LIMIT GR8_PF_RS=0 GR8_PF_OWN=0 GR8_GLM53F_PF_POOL_OWNER=0 GR8_FPF_P1=0 GR8_FPF_DSA_P1=0 \
 GR8_FPF_ATTN_P1=0 GR8_GLM53F_PF_SPARSE_MLA=1 GR8_GLM53F_PF_SPARSE_MLA_512=1 \
 GR8_GLM53F_PF_SPARSE_MLA_V2=1 GR8_GLM53F_PF_SPARSE_MLA_H16C=1 GR8_PF_DTR8=1 GR8_GLM53F_PF_SHFP8=1 GR8_PF_FC2V2=1 GR8_GLM53F_PF_KDA_WS=1 \
-GR8_GLM53F_PF_DSA_FULL_GV=1 GR8_PF_ROUTER_SPLIT=1 GR8_GLM53F_PF_DSA_F16GEMM=1 GR8_GLM53F_PF_PREWARM=1 GR8_GLM53F_PF_MHC_STAGE=1 GR8_GLM53F_PF_MHC_FUSE=2 \
-GR8_GLM53F_PF_STAGE_ASYNC=1"
-  # the peer-partial staging (GR8_GLM53F_PF_STAGE_ASYNC) runs at any rank count; the G9 KDA scan is a precision arm, not the
-  # same bytes as the scan it replaces, so it stays where it was chosen: TP2 (it would change TP4's output)
-  [ "$TP" = 4 ] || ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_KDA_SCAN=1 GR8_GLM53F_KDA_VS=2"
+GR8_GLM53F_PF_DSA_FULL_GV=1 GR8_PF_ROUTER_SPLIT=$rsplit GR8_GLM53F_PF_DSA_F16GEMM=1 GR8_GLM53F_PF_PREWARM=1 GR8_GLM53F_PF_MHC_STAGE=1 GR8_GLM53F_PF_MHC_FUSE=2 \
+GR8_GLM53F_PF_STAGE_ASYNC=$stage GR8_GLM53F_PF_SP=$sp GR8_GLM53F_PF_SP_X16=$sp"
+  # the G9 KDA scan (a precision arm, not the same bytes as the scan it replaces) at every width: TP=4 8K prefill
+  # 2,533 -> 2,818 tok/s, speedbench quality guard 30/30
+  ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_KDA_SCAN=1 GR8_GLM53F_KDA_VS=2"
   # FLASH_CAP_POLICY=borrow-idle: the KV pool in chunks, lent once idle (the supervisor adds GR8_GLM53F_KV_LEDGER, the box's)
   if [ "${FLASH_CAP_POLICY:-protected}" = borrow-idle ]; then
     ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_KV_CHUNKS=1 GR8_GLM53F_KV_LEND_MS=$((${FLASH_KV_IDLE_S:-60} * 1000))"
@@ -249,27 +437,54 @@ GR8_GLM53F_PF_STAGE_ASYNC=1"
     ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_CACHE=$FLASH_CACHE"
     [ -n "${FLASH_STATE_BUDGET_MIB:-}" ] && ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_STATE_BUDGET_MIB=$FLASH_STATE_BUDGET_MIB"
   fi
+  # with DFLASH=1, a checkpoint hit inside the drafter's window keeps the drafter (DFL_REUSE, on with FLASH_CACHE; the
+  # engine's default) after DFL_REUSE_MIN warm-up rows (docs/FLASH.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${DFL_REUSE:+ GR8_DFL_REUSE=$DFL_REUSE}${DFL_REUSE_MIN:+ GR8_DFL_REUSE_MIN=$DFL_REUSE_MIN}"
   # its KV_STORE on a group lease: when it gives segments to other groups (KV_SHARE_WHEN; docs/SETTINGS.md)
   ENGINE_ENV="$ENGINE_ENV${KV_SHARE_WHEN:+ GR8_KV_SHARE_WHEN=$KV_SHARE_WHEN}"
-  # TP=3 ring: leave GR8_PF_STRIPE to the engine default (on for a three-rank ring: large prefill writes also use the
-  # devices on the other PCIe root); other TPs keep it off as before
-  [ "$TP" = 3 ] || ENGINE_ENV="$ENGINE_ENV GR8_PF_STRIPE=0"
+  # GR8_PF_STRIPE at the engine default at TP=3 and TP=4 (on: large prefill writes use both rails, or at TP=3 the devices
+  # on the other PCIe root); TP=4 8K prefill 2,965 -> 3,067 tok/s. TP=2 keeps it off
+  [ "$TP" = 2 ] && ENGINE_ENV="$ENGINE_ENV GR8_PF_STRIPE=0"
+  # while sessions decode: S2_DECODE_ROUNDS decode rounds per prefill quantum, quanta of S2_DECODE_PF rows (#402).
+  # Without them a long prompt holds the other sessions to one decode round per 8,192-row quantum. TP=2, a 240K prompt
+  # beside seven 600-token requests: 32 rounds and 1,024 rows bring the short ones from 232 s to 65 s (alone ~40 s)
+  # and the long one from 201 s to 249 s. TP 3 and 4 are not measured: 8 rounds, whole quanta
+  local drounds=8 dpf=
+  [ "$TP" -le 2 ] && drounds=32 dpf=1024
+  dpf=${S2_DECODE_PF:-$dpf}
+  ENGINE_ENV="$ENGINE_ENV GR8_S2_DECODE_ROUNDS=${S2_DECODE_ROUNDS:-$drounds}${dpf:+ GR8_S2_DECODE_PF=$dpf}"
+  ENGINE_ENV="$ENGINE_ENV${S2_SHARED_WATERFILL:+ GR8_S2_SHARED_WATERFILL=$S2_SHARED_WATERFILL}${S2_SHARED_WF_MARGIN:+ GR8_S2_SHARED_WF_MARGIN=$S2_SHARED_WF_MARGIN}"
+  ENGINE_ENV="$ENGINE_ENV${DISPRAM:+ GR8_DISPRAM=$DISPRAM}"
   ENGINE_ENV="$ENGINE_ENV ${EXTRA_ENV:-}"
 }
 
 # DeepSeek-V4.1-Flash-1017: no GLM prefill stack (GR8_PF_*), no CP; the DeepSeek-only GR8_DS_* variables come in EXTRA_ENV.
 ds41_env() {
-  ENGINE_BIN=g6m4_ds41
+  ENGINE_BIN=$_engine_binary
   # g6m4 turns the GLM-5.3 replicated-GEMV splits on at NR > 1 for any build that is not Flash (g6m4.cu: GR8_QA_SPLIT 2, GR8_IDXQ_SPLIT 1,
   # GR8_MTP_SPLIT 1 with --mtp); on DeepSeek TP 4 that asserts in Fabric::init (fabric.cpp) after "layers bound". So all three are 0 unless QA_SPLIT, IDXQ_SPLIT, MTP_SPLIT say otherwise; the plan's env is the same on every rank.
-  ENGINE_ENV="GR8_CP=0 GR8_PF_RS=0 GR8_PF_OWN=0 GR8_PF_POOL_OWNER=0 GR8_DEC_BK=${DEC_BK:-16384} GR8_QA_SPLIT=${QA_SPLIT:-0} GR8_IDXQ_SPLIT=${IDXQ_SPLIT:-0} GR8_MTP_SPLIT=${MTP_SPLIT:-0} ${KV_SHARE_WHEN:+GR8_KV_SHARE_WHEN=$KV_SHARE_WHEN }${EXTRA_ENV:-}"
+  # DEC_BK defaults to CAP: one decode graph bucket. The DS41 step reads the live context from its step cell at run time and never the
+  # bucket (ds41_step.cuh; the bucket only picks the graph), so the 16384..CAP buckets held identical graphs: 425 a rank at the
+  # default 5 sessions and 262,144, 832 at 8 sessions and 1,048,576. One bucket keeps 89 and 124, the same answers and speed, and
+  # 3.6-3.8 GiB (262,144) and 8.1-8.7 GiB (8 x 1,048,576) a box more free memory at ready (GBK, 11-03).
+  ENGINE_ENV="GR8_CP=0 GR8_PF_RS=0 GR8_PF_OWN=0 GR8_PF_POOL_OWNER=0 GR8_DEC_BK=${DEC_BK:-$CAP} GR8_QA_SPLIT=${QA_SPLIT:-0} GR8_IDXQ_SPLIT=${IDXQ_SPLIT:-0} GR8_MTP_SPLIT=${MTP_SPLIT:-0} ${KV_SHARE_WHEN:+GR8_KV_SHARE_WHEN=$KV_SHARE_WHEN }${DS41_TUNED:-}${EXTRA_ENV:-}"
+}
+
+# Inkling-2-Small: none of the GLM or DeepSeek engine variables; EXTRA_ENV passes through.
+ink2_env() {
+  ENGINE_BIN=$_engine_binary
+  ENGINE_ENV="${EXTRA_ENV:-}"
 }
 
 engine_env() {
-  [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_env; return 0; }
-  [ "${GR8_MODEL:-glm53}" = ds41 ] && { ds41_env; return 0; }
-  [ "${GR8_MODEL:-glm53}" = pseudo ] && { ENGINE_BIN=g6pseudo; ENGINE_ENV=""; return 0; }
-  ENGINE_BIN=g6m4; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4-int4
+  if [ "${KV4_FOLD:-0}" = 1 ] && { [ "$(model_field kv4_fold)" != 1 ] || [ "${KV_FORMAT:-fp8}" != int4 ] || [ "${KVB:-bf16}" = fp8 ]; }; then
+    echo "engine_env: KV4_FOLD=1 requires glm53 int4 KV and BF16 kv_b" >&2; return 2
+  fi
+  [ "$_engine_profile" = flash ] && { flash_env; return 0; }
+  [ "$_engine_profile" = ds41 ] && { ds41_env; return 0; }
+  [ "$_engine_profile" = ink2 ] && { ink2_env; return 0; }
+  [ "$_engine_profile" = pseudo ] && { ENGINE_BIN=$_engine_binary; ENGINE_ENV=""; return 0; }
+  ENGINE_BIN=$_engine_binary; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=$_engine_binary-int4
   ENGINE_ENV="GR8_PF_TILE=64 GR8_PF_DENSE=8192 GR8_PF_RS=1 GR8_PF_STREAMS=2 GR8_PF_ATTN_ROWS=${PF_ATTN_ROWS:-1024} GR8_PF_OWN=$PF_OWN \
 GR8_PF_BLAS_ROWS=1024 GR8_PF_HASH_GPU=1 GR8_PF_RSDIRECT=1 GR8_DEC_SPLIT=3 GR8_DEC_SHARED_SCRATCH=1 \
 GR8_CP=1 GR8_CP_R=$SHARE_LIMIT${SHARE_LIMIT_BUSY:+ GR8_CP_R2=$SHARE_LIMIT_BUSY}${SHARE_BIG:+ GR8_CP_R2_BIG=$SHARE_BIG} \
@@ -309,15 +524,24 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   ENGINE_ENV="$ENGINE_ENV${IDX_GRP:+ GR8_IDX_GRP=$IDX_GRP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_QT:+ GR8_ATTN_QT=$ATTN_QT}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_FRONT:+ GR8_ATTN_FRONT=$ATTN_FRONT}"
+  ENGINE_ENV="$ENGINE_ENV${KV4_SC:+ GR8_KV4_SC=$KV4_SC}"
+  ENGINE_ENV="$ENGINE_ENV${KV4_SC_TR:+ GR8_KV4_SC_TR=$KV4_SC_TR}"
+  ENGINE_ENV="$ENGINE_ENV${KV4_QT:+ GR8_KV4_QT=$KV4_QT}"
+  ENGINE_ENV="$ENGINE_ENV${KV4_CTX:+ GR8_KV4_CTX=$KV4_CTX}"
+  ENGINE_ENV="$ENGINE_ENV${KV4_FUSE_ROT:+ GR8_KV4_FUSE_ROT=$KV4_FUSE_ROT}"
   # the decode indexer's vector loads, the decode context buckets, the S2 MTP draft count from accept rates, S2 prefill
   # quanta and decode rounds while sessions decode, burst admissions, and prefill selx past PF_SELX_CTX (docs/SETTINGS.md):
   # off unless set; on at TP=4. DEC_BK 0 and PF_SELX_CTX 0 leave them to the engine (DEC_BK 2048, selx from 53248)
   ENGINE_ENV="$ENGINE_ENV${IDX_VEC:+ GR8_IDX_VEC=$IDX_VEC}"
   [ "${DEC_BK:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_DEC_BK=$DEC_BK"
+  [ "${DEC_BK_MAX:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_DEC_BK_MAX=$DEC_BK_MAX"
   ENGINE_ENV="$ENGINE_ENV${S2_ADAPT:+ GR8_S2_ADAPT=$S2_ADAPT}"
   ENGINE_ENV="$ENGINE_ENV${S2_DECODE_PF:+ GR8_S2_DECODE_PF=$S2_DECODE_PF}"
   ENGINE_ENV="$ENGINE_ENV${S2_ADMIT_HOLD:+ GR8_S2_ADMIT_HOLD=$S2_ADMIT_HOLD}"
+  ENGINE_ENV="$ENGINE_ENV${S2_SHARED_WATERFILL:+ GR8_S2_SHARED_WATERFILL=$S2_SHARED_WATERFILL}${S2_SHARED_WF_MARGIN:+ GR8_S2_SHARED_WF_MARGIN=$S2_SHARED_WF_MARGIN}"
   [ "${PF_SELX_CTX:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_PF_SELX_CTX=$PF_SELX_CTX"
+  # the prefix-reuse grid (REUSE_GRID; docs/SETTINGS.md): with REUSE only; 0 leaves the engine's --prefill grid
+  [ "${REUSE_GRID:-0}" = 0 ] || [ "${REUSE:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_REUSE_GRID=$REUSE_GRID"
   # KV_ROWS (remote attention rows): STORE,size=N(M|G|T)[,local=P][,pool=S][,place=P][,fmt=F] -> the engine's GR8_RT_*
   # (docs/SETTINGS.md). size is each rank's lease in bytes; options.py has checked the form
   if [ -n "${KV_ROWS:-}" ] && [ "$KV_ROWS" != off ]; then
@@ -370,7 +594,7 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   # CP decode's remote head groups as one attention call (CP_ONECHAIN; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${CP_ONECHAIN:+ GR8_CP_ONECHAIN=$CP_ONECHAIN}"
   # kv_b (UK / UV) as the release's block FP8 (KVB=fp8, #50; docs/SETTINGS.md): BF16 unless set. Needs V2_DENSE
-  ENGINE_ENV="$ENGINE_ENV${KVB:+ GR8_KVB=$KVB}"
+  ENGINE_ENV="$ENGINE_ENV${KVB:+ GR8_KVB=$KVB}${KV4_FOLD:+ GR8_KV4_FOLD=$KV4_FOLD}${KV4_TC:+ GR8_KV4_TC=$KV4_TC}"
   # deterministic fp-order attention variants (ATTN_CTX3_SP, ATTN_POSIDX; E1, docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${ATTN_CTX3_SP:+ GR8_ATTN_CTX3_SP=$ATTN_CTX3_SP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_POSIDX:+ GR8_ATTN_POSIDX=$ATTN_POSIDX}"
@@ -393,6 +617,8 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_P11:+ GR8_ATTN_P11=$ATTN_P11}"
   ENGINE_ENV="$ENGINE_ENV${DTR:+ GR8_DTR=$DTR}"
   ENGINE_ENV="$ENGINE_ENV${PF_AOP:+ GR8_PF_AOP=$PF_AOP}"
+  ENGINE_ENV="$ENGINE_ENV${DISPRAM:+ GR8_DISPRAM=$DISPRAM}"
+  [ "${DISPRAM_MIN_BYTES:-0}" -gt 0 ] && ENGINE_ENV="$ENGINE_ENV GR8_DISPRAM_MIN_BYTES=$DISPRAM_MIN_BYTES"
   return 0
 }
 
@@ -409,36 +635,69 @@ engine_args() {
   [ "$PF_OWN" = 3 ] && [ -z "${V2_DENSE:-}" ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"
   a="--manifest $rp/rank$r.manifest.json --pack $rp/rank$r.pack --image --layers all"
   [ -n "${V2_DENSE:-}" ] && a="--image --layers all"
-  if [ "${GR8_MODEL:-glm53}" = pseudo ]; then
+  if [ "$_engine_profile" = pseudo ]; then
     a="--model $V2_DENSE --cap $CAP --serve $home/s2 --s2-sessions $SESS --s2-epoch $epoch ${SET_ID:+--set-id $SET_ID}"
+    (set -f; echo $a ${EXTRA_ARGS:-})
+    return
+  fi
+  # Inkling-2-Small: the checkpoint directory is the model (--v2-dense), CHUNK prompt rows a step, MTP drafts a round
+  if [ "$_engine_profile" = ink2 ]; then
+    a="--layers all --v2-dense ${V2_DENSE:-$rp} --top-p-cands 256 --chunk $CHUNK --temp 0.7 --cap $CAP --graph \
+--mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
+    [ "${EAGER:-0}" = 1 ] && a=${a/ --graph / }
+    [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
+    a="$a ${EXTRA_ARGS:-}"
+    [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    if [ -n "${KV_STORE:-}" ] && [ "$KV_STORE" != off ]; then
+      local t IFS=';'
+      for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
+      unset IFS
+      [ -n "${KV_KEEP:-}" ] && a="$a --kv-keep $KV_KEEP"
+      [ -n "${KV_SYSTEM_AFTER:-}" ] && a="$a --kv-system-after $KV_SYSTEM_AFTER"
+      [ -n "${KV_WRITE_LIMIT:-}" ] && a="$a --kv-write-limit $KV_WRITE_LIMIT"
+    fi
     (set -f; echo $a)
     return
   fi
   # a release only, SESS sessions (flash_defaults). --chunk 1: a prompt tail goes one row a step, and a session's rows
   # in a main step stay within its KDA state ring (MTP + 1)
-  if [ "${GR8_MODEL:-glm53}" = glm53f ]; then
+  if [ "$_engine_profile" = flash ]; then
     a="--image --layers all $src --top-p-cands 256 --chunk 1 --temp 0.7 --cap $CAP --graph --prefill 4096 \
 --pf-lanes 2 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    # DFLASH=1: a session alone drafts with the DFlash2 drafter (SPEC_ADAPT: its draft count each round)
+    [ "$SPEC_ADAPT" = 1 ] && a="$a --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
+    a="$a $df"
     # FLASH_CACHE keeps its checkpoints in the KV_STORE store (one at most), else in memory
     if [ -n "${FLASH_CACHE:-}" ] && [ "$FLASH_CACHE" != off ] && [ -n "${KV_STORE:-}" ] && [ "$KV_STORE" != off ]; then
       local t IFS=';'
       for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
       unset IFS
     fi
-    (set -f; echo $a)
+    [ "${KV_FORMAT:-fp8}" = int4 ] && a="$a --kv-format int4"   # bin/g6m4_flash-int4, which needs it
+    (set -f; echo $a ${EXTRA_ARGS:-})
     return
   fi
   # DeepSeek-V4.1-Flash-1017: a release only, CHUNK rows a step for a prompt tail (8 unless set). No --prefill or --pf-lanes: the
   # DS41 serve path runs the prompt as decode steps and g6m4_ds41 refuses a prefill at parse time.
-  if [ "${GR8_MODEL:-glm53}" = ds41 ]; then
+  if [ "$_engine_profile" = ds41 ]; then
     a="--image --layers all $src --top-p-cands 256 --chunk $CHUNK --temp 0.7 --cap $CAP --graph \
 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
     [ "${EAGER:-0}" = 1 ] && a=${a/ --graph / }
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
+    a="$a ${EXTRA_ARGS:-}"
     [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    # KV_STORE: one --kv-store per store (stores separated by ;), and what they keep
+    if [ -n "${KV_STORE:-}" ] && [ "$KV_STORE" != off ]; then
+      local t IFS=';'
+      for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
+      unset IFS
+      [ -n "${KV_KEEP:-}" ] && a="$a --kv-keep $KV_KEEP"
+      [ -n "${KV_SYSTEM_AFTER:-}" ] && a="$a --kv-system-after $KV_SYSTEM_AFTER"
+      [ -n "${KV_WRITE_LIMIT:-}" ] && a="$a --kv-write-limit $KV_WRITE_LIMIT"
+    fi
     (set -f; echo $a)
     return
   fi
@@ -462,7 +721,7 @@ engine_args() {
 --steering-model-revision $STEERING_MODEL_REVISION --steering-tokenizer-revision $STEERING_TOKENIZER_REVISION \
 --steering-chat-template-sha256 $STEERING_CHAT_TEMPLATE_SHA256 --steering-chat-template $STEERING_CHAT_TEMPLATE \
 --steering-weight-set ${STEERING_WEIGHT_SET:-$SET_ID} ${STEERING_FORCE:+--steering-force $STEERING_FORCE}"
-  [ "$TP" = 6 ] && a="$a ${EXTRA_ARGS:-}"
+  a="$a ${EXTRA_ARGS:-}"
 
   [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
   [ "${KV_FORMAT:-fp8}" = int4 ] && a="$a --kv-format int4"   # bin/g6m4-int4 (the supervisor picks it), which needs it

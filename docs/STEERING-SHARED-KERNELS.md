@@ -1,5 +1,8 @@
 # Shared-expert finalizers
 
+> Historical note: this page describes the change that introduced the shared-expert finalizers. Profile loading and
+> request selection are live; see [STEERING.md](STEERING.md).
+
 The general consumes in `STEERING-KERNELS.md` steer the complete writer. Shared scope instead projects only a MoE
 layer's shared expert before the rank partial is consumed. Routed expert contributions do not enter its dot product.
 This extraction keeps boot activation disabled: real models have empty direction/alpha vectors and null scratch.

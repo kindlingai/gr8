@@ -250,7 +250,7 @@ static Trial run_trial(Config c, const std::vector<Req>& reqs, bool stalls, uint
     };
     long guard = 0;
     for (;;) {
-        const Scheduler& s = a.d->state();
+        const SchedulerView& s = a.d->state();
         Commit cm;
         cm.epoch = c.epoch; cm.event = s.next_event(); cm.boundary = s.boundary();
         if (!queue.empty() && s.resident() < c.limit()) {

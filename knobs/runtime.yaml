@@ -1,12 +1,66 @@
 # The engine runtime: loading, checks, tracing and memory. knobs/README.md describes the fields.
 prefix: "GR8_"
 knobs:
+  GR8_BUSY_GUARD:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      The busy guard: when granting a request would evict a retained run whose session is not idle (it has a request
+      in flight, or its last response ended under GR8_BUSY_IDLE_SECS ago), the head refuses the request at once with
+      HTTP 429, an OpenAI-shaped error body and Retry-After GR8_BUSY_RETRY_AFTER, instead of evicting the run or
+      leaving the request queued in silence. The refusal fires at intake, before the request queues (its arrival's
+      dry run of the grant finds a live victim), so the client reads it in under a second; the grant-time check
+      stays as the backstop, since the pool can change between the two. A request also gets the refusal when
+      GR8_BUSY_QUEUE_MAX requests already wait past the free session slots. A turn that continues its own retained run (a cache
+      hit) is never refused. The guard governs admissions; a live session's own growth or shrink may still evict as
+      before. 0: off, upstream behaviour.
+  GR8_BUSY_IDLE_SECS:
+    scope: agree
+    kind: int
+    default: "60"
+    values: "1.."
+    doc: >-
+      GR8_BUSY_GUARD=1: a session counts as idle when it has no request in flight and its last response ended at
+      least this many seconds ago; only idle sessions' retained runs are evicted. Tune it from the recorded
+      tool-call gaps (the busy trace lines carry each refused request's wait).
+  GR8_BUSY_QUEUE_MAX:
+    scope: agree
+    kind: int
+    default: "8"
+    values: "0.."
+    doc: >-
+      GR8_BUSY_GUARD=1: a request arriving while this many requests already wait past the free session slots is
+      refused at once instead of joining the queue. 0: no queue bound.
+  GR8_BUSY_RETRY_AFTER:
+    scope: agree
+    kind: int
+    default: "60"
+    values: "1.."
+    doc: >-
+      GR8_BUSY_GUARD=1: the seconds in a refused request's Retry-After header (HTTP 429) and error body.
   GR8_FABRIC_CONNECT_TRIES:
     scope: local
     kind: int
     default: "1200"
     doc: >-
       Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds.
+  GR8_FABRIC_DUMP:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = g6m4 prints every fabric's config (one line each, every field) where it would create it, then exits with code
+      4 before the first: no file, fabric, network or GPU work. The fabrics the built model completes show what the options set.
+      Compares the fabric bring-up of two builds (docs/HOST-CORE.md, R6c).
+  GR8_GEN_CACHE:
+    scope: local
+    kind: path
+    unset: "no cache: every boot computes the loader's generated tensors"
+    doc: >-
+      A directory where the Rust loader keeps the tensors it computes at load (Op::Gen), read back on the next boot
+      instead of computed. The key binds the engine binary and the planned image, so a rebuild or another plan is a miss;
+      every read is checked (key, size, xxh64), and any miss or error computes as before. The first boot writes them.
   GR8_IMG_VMM:
     scope: local
     kind: int
@@ -28,6 +82,24 @@ knobs:
     values: "1.."
     doc: >-
       Sets the chunk size in MB that the Rust loader reads and the weight check sums.
+  GR8_LOAD_COMPACT:
+    scope: local
+    kind: text
+    unset: "every range is read from its source file"
+    doc: >-
+      A directory of compacted copies: for a source file with DIR/<name>.g6map, the Rust loader reads the ranges that
+      map holds from DIR/<name> instead. Same bytes. Set this for prepare to write and verify this rank's expert copies
+      first; see docs/COMPACT-WEIGHTS.md.
+  GR8_LOAD_MERGE_KB:
+    scope: local
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      0 = the Rust loader reads each file range with its own read. N > 0, with GR8_LOAD_MODE=read (the default; mmap
+      ignores it): it sorts each chunk's ranges by file offset and reads the ranges of one file that are at most N KB
+      apart with one read, gaps included, so it reads more of the file than it loads. Each worker thread then holds a
+      scratch buffer of about twice GR8_LOAD_CHUNK_MB. Same bytes. Measured gains by drive class: docs/SWITCHING.md.
   GR8_LOAD_MODE:
     scope: local
     kind: text
@@ -35,6 +107,14 @@ knobs:
     values: "read|mmap"
     doc: >-
       Picks how the Rust loader reads weight files: read or mmap. Other values fail the load.
+  GR8_LOAD_PROF:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 = the Rust loader prints one load-prof line at the end of the load: time, bytes and calls per operation (zero
+      fill, copies, O_DIRECT and buffered reads, generated tensors). Same bytes.
   GR8_LOAD_THREADS:
     scope: local
     kind: int
@@ -119,3 +199,19 @@ knobs:
     unset: "unset"
     doc: >-
       With GR8_XTRACE=1, each fabric dumps its trace once when this file appears.
+  GR8_DISPRAM:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      0 (default) uses cudaMalloc only; 1 leases available 2 MiB physical granules from Kindling OS dispramd
+      (DISPRAM_SOCKET) into GLM-5.3 and non-chunked GLM-5.3-Flash attention KV bindings via CUDA VMM, failing open to
+      cudaMalloc when absent or exhausted (unless GR8_DISPRAM_MIN_BYTES > 0).
+  GR8_DISPRAM_MIN_BYTES:
+    scope: agree
+    kind: int
+    default: "0"
+    doc: >-
+      Minimum live VMM-mapped dispramd carveout bytes each rank must map before allocating host KV memory when CAP was
+      enlarged from the pre-boot dispramd probe; if unmet, the allocator unmaps its spans and exits 75 so the supervisor
+      falls back to baseline CAP.

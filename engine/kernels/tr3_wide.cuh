@@ -195,3 +195,137 @@ inline void tr3w_widen_host(uint8_t* mat)
         memcpy(grp, tmp, TR3W_GROUP);
     }
 }
+
+// ---------------------------------------------------------------------------------------------- K4 wide order (GR8_TR3_WIDE4)
+// In-place 128-bit coalesced order for 4-bit fc1 and fc2 matrices (0 extra bytes).
+// FC1 K4 group (8 k-steps x 8 tiles x 128 B = 8192 B):
+//   Pack order: [8 k-steps p][8 tiles j][32 lanes][4 B]
+//   Wide-K4:    [8 tiles j][2 uint4 loads n][32 lanes][16 B]
+// FC2 K4 n-tile (8 k-tiles x 128 B = 1024 B):
+//   Pack order: [8 k-tiles p][32 lanes][4 B]
+//   Wide-K4:    [2 uint4 loads n][32 lanes][16 B]
+// A warp reads 1024 B contiguous (+0 B and +512 B) with two 128-bit loads (512 B/warp per load).
+// Lane l receives exact u32 chunks w[0..3] (load 0) and w[4..7] (load 1) with no bit-unpacking.
+constexpr int TR4W_GROUP = 8 * 8 * 128;          // 8192 B per fc1 K4 group
+constexpr int TR4W_MAT   = KSH * 8 * 128;        // 393216 B per K4 fc1 matrix / fc2 block
+constexpr int TR4W_NT    = 8 * 128;              // 1024 B per K4 fc2 n-tile
+
+__device__ __forceinline__ uint4 tr4w_ld128(const void* p)
+{
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ uint4 tr4w_ld128_p256(const void* p)
+{
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ uint4 tr4w_ld128_ef(const void* p)
+{
+    uint4 v;
+    asm volatile(
+        "{\n\t.reg .b64 pol;\n\t"
+        "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
+        "ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], pol;\n\t}"
+        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ u64 tr4w_ld64_ef(const void* p)
+{
+    u64 v;
+    asm volatile(
+        "{\n\t.reg .b64 pol;\n\t"
+        "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
+        "ld.global.nc.L1::no_allocate.L2::cache_hint.u64 %0, [%1], pol;\n\t}"
+        : "=l"(v) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ void tr4w_st128_el(void* p, uint4 v)
+{
+    asm volatile(
+        "{\n\t.reg .b64 pol;\n\t"
+        "createpolicy.fractional.L2::evict_last.b64 pol, 1.0;\n\t"
+        "st.global.L2::cache_hint.v4.u32 [%0], {%1,%2,%3,%4}, pol;\n\t}"
+        :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+}
+
+__device__ __forceinline__ void tr4w_st128_ef(void* p, uint4 v)
+{
+    asm volatile(
+        "{\n\t.reg .b64 pol;\n\t"
+        "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
+        "st.global.L2::cache_hint.v4.u32 [%0], {%1,%2,%3,%4}, pol;\n\t}"
+        :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+}
+
+__device__ __forceinline__ void tr4w_st32_ef(void* p, u32 v)
+{
+    asm volatile(
+        "{\n\t.reg .b64 pol;\n\t"
+        "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
+        "st.global.L2::cache_hint.u32 [%0], %1, pol;\n\t}"
+        :: "l"(p), "r"(v) : "memory");
+}
+
+__global__ void __launch_bounds__(256) k_tr4_widen(uint8_t* fc1, const long long* tab, const long long* kmix, int nb)
+{
+    const int lane = threadIdx.x & 31, j = threadIdx.x >> 5;
+    const int g = blockIdx.x % (KSH / 8);
+    const int bm = (blockIdx.x / (KSH / 8)) % (2 * nb);
+    const int e = blockIdx.x / ((KSH / 8) * 2 * nb);
+    const long long* tr = tab + 6 * e;
+    if (bm >= 2 * static_cast<int>(tr[3])) return;
+    const long long km = kmix ? kmix[e] : 0;
+    int k = static_cast<int>(tr[4]);
+    size_t off = static_cast<size_t>(bm) * k * (TR3W_MAT / 3);
+    if (km)
+    {
+        k = static_cast<int>((km >> (4 * bm)) & 15);
+        off = 0;
+        for (int i = 0; i < bm; ++i) off += static_cast<size_t>((km >> (4 * i)) & 15) * (TR3W_MAT / 3);
+    }
+    if (k != 4) return;
+    uint8_t* grp = fc1 + tr[0] + off + static_cast<size_t>(g) * TR4W_GROUP;
+    u32 w[8];
+    #pragma unroll
+    for (int p = 0; p < 8; ++p)
+        w[p] = *reinterpret_cast<const u32*>(grp + (p * 8 + j) * 128 + lane * 4);
+    __syncthreads();
+    *reinterpret_cast<uint4*>(grp + (j * 2 + 0) * 512 + lane * 16) = make_uint4(w[0], w[1], w[2], w[3]);
+    *reinterpret_cast<uint4*>(grp + (j * 2 + 1) * 512 + lane * 16) = make_uint4(w[4], w[5], w[6], w[7]);
+}
+
+inline void launch_tr4_widen(void* fc1, const long long* tab, const long long* kmix, int n_experts, int nb, cudaStream_t st)
+{
+    k_tr4_widen<<<n_experts * nb * 2 * (KSH / 8), 256, 0, st>>>(static_cast<uint8_t*>(fc1), tab, kmix, nb);
+}
+
+__global__ void __launch_bounds__(256) k_tr4_widen2(uint8_t* fc2, const long long* tab, int nb)
+{
+    const int lane = threadIdx.x & 31, j = threadIdx.x >> 5;
+    const int g = blockIdx.x % (KSH / 8);
+    const int b = (blockIdx.x / (KSH / 8)) % nb;
+    const long long* tr = tab + 6 * (blockIdx.x / ((KSH / 8) * nb));
+    if (static_cast<int>(tr[4]) != 4 || b >= static_cast<int>(tr[3])) return;
+    uint8_t* nt = fc2 + tr[1] + static_cast<size_t>(b) * TR4W_MAT + static_cast<size_t>(g * 8 + j) * TR4W_NT;
+    u32 w[8];
+    #pragma unroll
+    for (int p = 0; p < 8; ++p)
+        w[p] = *reinterpret_cast<const u32*>(nt + p * 128 + lane * 4);
+    __syncwarp();
+    *reinterpret_cast<uint4*>(nt + 0 + lane * 16) = make_uint4(w[0], w[1], w[2], w[3]);
+    *reinterpret_cast<uint4*>(nt + 512 + lane * 16) = make_uint4(w[4], w[5], w[6], w[7]);
+}
+
+inline void launch_tr4_widen2(void* fc2, const long long* tab, int n_experts, int nb, cudaStream_t st)
+{
+    k_tr4_widen2<<<n_experts * nb * (KSH / 8), 256, 0, st>>>(static_cast<uint8_t*>(fc2), tab, nb);
+}

@@ -332,6 +332,105 @@ template <int BM, int BN, int ST> __global__ void __launch_bounds__(256) k_gemm_
         }
 }
 
+// GR8_DS_ATTN_TC_TILE=1: k_gemm_mx8t with 128-B smem rows and a 16-B chunk xor swizzle (chunk q of row r sits at chunk q ^ (r & 7)) in place of
+// the 144-B padded rows, so a 128 x 128 tile fits a 3-deep ring in 99 KB (3 x 33792 B; the padded rows need 3 x 37888 B). Only the smem
+// addresses change: the same cp.async sources, the same fragments, the same mma sequence in the same K order, so Y is k_gemm_mx8t's bit for bit
+// (tests/ds41_gemm_tc_bench.cu compares them). Reads stay conflict-free: the 8 rows g of a fragment read chunk q ^ g, 8 distinct bank quads.
+template <int BM, int BN, int ST> struct TcCfgSw
+{
+    static constexpr int WM = BM / 2, WN = BN / 4, MB = WM / 16, NT = WN / 8, PITCH = 128;
+    static constexpr int A_B = BM * PITCH, W_B = BN * PITCH, SA_B = BM * 4, SW_B = BN * 4, STAGE = A_B + W_B + SA_B + SW_B;
+    static constexpr size_t SMEM = (size_t)STAGE * ST;
+};
+__device__ __forceinline__ int tc_swz(int r, int q) { return r * 128 + ((q ^ (r & 7)) << 4); }
+template <int BM, int BN, int ST> __global__ void __launch_bounds__(256) k_gemm_mx8t_sw(GemmP p)
+{
+    using C = TcCfgSw<BM, BN, ST>;
+    extern __shared__ __align__(16) uint8_t tsm[];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp >> 2, wn = warp & 3, g = lane >> 2, t = lane & 3;
+    const uint8_t* A = p.A + blockIdx.z * p.a_gs;
+    const uint8_t* SA = p.SA + blockIdx.z * p.sa_gs;
+    const uint8_t* W = p.W + blockIdx.z * p.w_gs;
+    const uint8_t* SW = p.SW + blockIdx.z * p.sw_gs;
+    const int m0 = (p.mfast ? blockIdx.x : blockIdx.y) * BM, n0 = (p.mfast ? blockIdx.y : blockIdx.x) * BN, NK = p.K >> 7, KB = p.K >> 5;
+    auto issue = [&](int s, int kt)
+    {
+        uint8_t* b = tsm + (size_t)s * C::STAGE;
+        for (int c = tid; c < BM * 8; c += 256)
+            tc_cp16(b + tc_swz(c >> 3, c & 7), A + (size_t)min(m0 + (c >> 3), p.M - 1) * p.lda + kt * 128 + (c & 7) * 16);
+        for (int c = tid; c < BN * 8; c += 256)
+            tc_cp16(b + C::A_B + tc_swz(c >> 3, c & 7), W + (size_t)(n0 + (c >> 3)) * p.K + kt * 128 + (c & 7) * 16);
+        for (int c = tid; c < BM; c += 256) tc_cp4(b + C::A_B + C::W_B + c * 4, SA + (size_t)min(m0 + c, p.M - 1) * p.lsa + kt * 4);
+        for (int c = tid; c < BN; c += 256) tc_cp4(b + C::A_B + C::W_B + C::SA_B + c * 4, SW + (size_t)(n0 + c) * KB + kt * 4);
+    };
+    float acc[C::MB][C::NT][4];
+#pragma unroll
+    for (int i = 0; i < C::MB; i++)
+#pragma unroll
+        for (int j = 0; j < C::NT; j++)
+#pragma unroll
+            for (int k = 0; k < 4; k++) acc[i][j][k] = 0.0f;
+#pragma unroll
+    for (int s = 0; s < ST - 1; s++)
+    {
+        if (s < NK) issue(s, s);
+        tc_commit();
+    }
+    for (int kt = 0; kt < NK; kt++)
+    {
+        tc_wait<ST - 2>();
+        __syncthreads();
+        if (kt + ST - 1 < NK) issue((kt + ST - 1) % ST, kt + ST - 1);
+        tc_commit();
+        const uint8_t* b = tsm + (size_t)(kt % ST) * C::STAGE;
+        const uint8_t* sA = b;
+        const uint8_t* sW = b + C::A_B;
+        const uint8_t* sSA = sW + C::W_B;
+        const uint8_t* sSW = sSA + C::SA_B;
+        uint32_t wsa[C::MB], wsw[C::NT];
+#pragma unroll
+        for (int mb = 0; mb < C::MB; mb++) wsa[mb] = *(const uint32_t*)(sSA + (wm * C::WM + mb * 16 + g + ((lane & 1) ? 8 : 0)) * 4);
+#pragma unroll
+        for (int nt = 0; nt < C::NT; nt++) wsw[nt] = *(const uint32_t*)(sSW + (wn * C::WN + nt * 8 + g) * 4);
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++)
+        {
+            uint32_t a[C::MB][4], bb[C::NT][2];
+#pragma unroll
+            for (int mb = 0; mb < C::MB; mb++)
+            {
+                const int r = wm * C::WM + mb * 16 + g;   // r and r + 8 share r & 7
+                a[mb][0] = *(const uint32_t*)(sA + tc_swz(r, 2 * ks) + 4 * t);
+                a[mb][1] = *(const uint32_t*)(sA + tc_swz(r + 8, 2 * ks) + 4 * t);
+                a[mb][2] = *(const uint32_t*)(sA + tc_swz(r, 2 * ks + 1) + 4 * t);
+                a[mb][3] = *(const uint32_t*)(sA + tc_swz(r + 8, 2 * ks + 1) + 4 * t);
+            }
+#pragma unroll
+            for (int nt = 0; nt < C::NT; nt++)
+            {
+                const int r = wn * C::WN + nt * 8 + g;
+                bb[nt][0] = *(const uint32_t*)(sW + tc_swz(r, 2 * ks) + 4 * t);
+                bb[nt][1] = *(const uint32_t*)(sW + tc_swz(r, 2 * ks + 1) + 4 * t);
+            }
+#pragma unroll
+            for (int mb = 0; mb < C::MB; mb++)
+#pragma unroll
+                for (int nt = 0; nt < C::NT; nt++) tc_mma(acc[mb][nt], a[mb], bb[nt][0], bb[nt][1], (wsa[mb] >> (8 * ks)) & 0xFFu, (wsw[nt] >> (8 * ks)) & 0xFFu);
+        }
+    }
+    tc_wait<0>();
+    bf16* Y = p.Y + blockIdx.z * p.y_gs;
+#pragma unroll
+    for (int mb = 0; mb < C::MB; mb++)
+#pragma unroll
+        for (int nt = 0; nt < C::NT; nt++)
+        {
+            const int col = n0 + wn * C::WN + nt * 8 + 2 * t, row = m0 + wm * C::WM + mb * 16 + g;
+            if (row < p.M) *(__nv_bfloat162*)(Y + (size_t)row * p.ldy + col) = __floats2bfloat162_rn(acc[mb][nt][0], acc[mb][nt][1]);
+            if (row + 8 < p.M) *(__nv_bfloat162*)(Y + (size_t)(row + 8) * p.ldy + col) = __floats2bfloat162_rn(acc[mb][nt][2], acc[mb][nt][3]);
+        }
+}
+
 // Compressor FP8 arm: same block-scaled E4M3/UE8M0 MMA and K order as k_gemm_mx8t, but preserves the compressor's FP32 output contract.
 template <int BM, int BN, int ST> __global__ void __launch_bounds__(256) k_gemm_mx8t_f32(GemmP p, float* Y32)
 {
@@ -544,6 +643,7 @@ struct AttnP
     int floor = 0;       // decode: window positions below this are masked (bounded replay: ring slots the chunk's tail layers never wrote); 0 = none
     const int* dsess = nullptr;   // SESS > 1 (decode): device [n] S2 slot of each row; row t at position dstart[t], its ring = kvw + slot * ring_rows * 512,
     size_t ck_ss = 0;             // its compressed rows = ck + slot * ck_ss. nullptr: one session (row t at start + t)
+    int ckq = 0;                  // 1 (GR8_DS_COMP_FP4): ck holds packed fp4 rows of CQ_ROW bytes (the ca layout), ck_ss is in bytes
     float* split = nullptr;       // optional [n][heads][2][max,sum,HD accum], shared prefill scratch
 };
 constexpr int AT_THREADS = 256, AT_QLD = HD + 8, AT_KLD = HD + 8, AT_SLD = 64 + 4, AT_PLD = 64 + 8;
@@ -566,8 +666,88 @@ __device__ __forceinline__ void mma16816(float (&c)[4], const uint32_t (&a)[4], 
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// ------------------------------------------------------------------------------------------------ packed fp4 compressed rows (GR8_DS_COMP_FP4)
+// A packed row = 256 B of e2m1 codes (element 2k in the low nibble of byte k, sign bit 3) + 32 B of E4M3 scales (one per 16 elements): the
+// ca row layout (ds41i::CA_ROW). Its bf16 value bf16(e2m1 * scale) is what the bf16 rows hold (the product is exact in bf16, -0 keeps its sign).
+// In a slot list a packed row is its address + 1 (rows are 16 B aligned, so bit 0 is free). The 64 rows of a block split by warp: warp w
+// dequantizes rows w, w + 8, .., w + 56 into the shared K tile, lane g the 16 elements of scale g; the other rows load as before.
+// CQ_ROW / CQ_CODES: ds41_attn_types.h.
+__device__ __forceinline__ __nv_bfloat162 u32_bf2(uint32_t v) { return *(const __nv_bfloat162*)&v; }
+__device__ __forceinline__ bool cq_tag(const void* rp) { return ((uintptr_t)rp & 1) != 0; }
+__device__ __forceinline__ const uint8_t* cq_row(const void* rp) { return (const uint8_t*)((uintptr_t)rp & ~(uintptr_t)1); }
+// value of an e2m1 code: magnitude index m = 2e + mantissa -> fp32 bits (m = 1 is the subnormal 0.5), sign bit 3 (code 8 = -0)
+__device__ __forceinline__ float cq_e2m1(uint32_t c)
+{
+    const uint32_t m = c & 7;
+    const uint32_t b = m >= 2 ? ((((m >> 1) + 126u) << 23) | ((m & 1) << 22)) : (m ? 0x3F000000u : 0u);
+    return __uint_as_float(b | ((c & 8) << 28));
+}
+// this lane's 8 code bytes and scale byte of the packed rows among the warp's 8 rows of slot list cl (rows that are not packed: untouched)
+__device__ __forceinline__ void cq_load(const bf16* const* cl, int w, int lane, uint2 (&cd)[8], uint32_t (&sb)[8])
+{
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+    {
+        const bf16* rp = cl[w + 8 * k];
+        if (cq_tag(rp))
+        {
+            const uint8_t* r = cq_row(rp);
+            cd[k] = __ldg((const uint2*)r + lane);
+            sb[k] = __ldg(r + CQ_CODES + lane);
+        }
+    }
+}
+// 4 e2m1 codes (c, bits 0..15: elements e0..e3) times the bf16x2 scale s2 -> o0 = (e0, e1), o1 = (e2, e3), each bf16x2.
+// The bf16 bit patterns of the 8 magnitudes come from two byte tables (prmt), the sign bits move from bit 4i + 3 to the high
+// byte's bit 7, and one bf16x2 multiply applies the scale. Exact: an e2m1 magnitude has <= 2 significant bits and an E4M3 scale
+// <= 4, so the product fits bf16's 8 and the rounding never acts; the bytes equal bf16(float(e2m1) * float(scale)), -0 included.
+__device__ __forceinline__ void cq_dq4(uint32_t c, __nv_bfloat162 s2, uint32_t& o0, uint32_t& o1)
+{
+    const uint32_t m = c & 0x7777u;                                   // magnitude index of each code (prmt selector 0..7)
+    const uint32_t lo = __byte_perm(0xC0800000u, 0xC0804000u, m);     // low bytes of 0, .5, 1, 1.5 | 2, 3, 4, 6
+    uint32_t hi = __byte_perm(0x3F3F3F00u, 0x40404040u, m);           // high bytes
+    hi |= __byte_perm(c << 4, c, 0x5140) & 0x80808080u;               // sign of e0, e1, e2, e3 -> bit 7 of high byte 0..3
+    const __nv_bfloat162 a = __hmul2(u32_bf2(__byte_perm(lo, hi, 0x5140)), s2);
+    const __nv_bfloat162 b = __hmul2(u32_bf2(__byte_perm(lo, hi, 0x7362)), s2);
+    o0 = *(const uint32_t*)&a;
+    o1 = *(const uint32_t*)&b;
+}
+// the bf16 values of those rows into the K tile (row stride AT_KLD): lane g writes elements 16g .. 16g + 15
+__device__ __forceinline__ void cq_store(bf16* Ks, int ld, const bf16* const* cl, int w, int lane, const uint2 (&cd)[8], const uint32_t (&sb)[8])
+{
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+    {
+        if (!cq_tag(cl[w + 8 * k])) continue;
+        const __nv_bfloat162 s2 = __float2bfloat162_rn(f_e4m3((uint8_t)sb[k]));   // an E4M3 value is exact in bf16
+        uint32_t o[8];
+        cq_dq4(cd[k].x, s2, o[0], o[1]);
+        cq_dq4(cd[k].x >> 16, s2, o[2], o[3]);
+        cq_dq4(cd[k].y, s2, o[4], o[5]);
+        cq_dq4(cd[k].y >> 16, s2, o[6], o[7]);
+        uint4* dst = (uint4*)(Ks + (size_t)(w + 8 * k) * ld + lane * 16);
+        dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+        dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+    }
+}
+// slot list entry of compressed row j: bf16 row, or the tagged packed row (CQ)
+template <bool CQ>
+__device__ __forceinline__ const bf16* cq_slot(const bf16* ckr, int j)
+{
+    if (CQ) return (const bf16*)((const uint8_t*)ckr + (size_t)j * CQ_ROW + 1);
+    return ckr + (size_t)j * HD;
+}
+// this row's compressed rows: + slot * ck_ss (elements, or bytes for packed rows)
+template <bool CQ>
+__device__ __forceinline__ const bf16* cq_slab(const bf16* ck, size_t ss, int k)
+{
+    if (CQ) return (const bf16*)((const uint8_t*)ck + (size_t)k * ss);
+    return ck + (size_t)k * ss;
+}
+
 // FL = false: the plain kernel (pos >= 0). FL = true: also masks window positions below p.floor (bounded replay, k_attn_floor).
-template <bool FL>
+// CQ = true: the compressed rows are packed fp4 (p.ckq), dequantized into the K tile (output bytes == the bf16 rows).
+template <bool FL, bool CQ = false>
 __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_t(AttnP p)
 {
     extern __shared__ __align__(16) uint8_t smem[];
@@ -603,7 +783,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_t(AttnP p)
     {
         const int k = p.dsess[t];
         kvr += (size_t)k * R * HD;
-        if (ckr) ckr += (size_t)k * p.ck_ss;
+        if (ckr) ckr = cq_slab<CQ>(ckr, p.ck_ss, k);
     }
     for (int blk = 0; blk < nblk; blk++)
     {
@@ -628,7 +808,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_t(AttnP p)
             else if (i < L)
             {
                 const int j = p.topk[(size_t)t * p.ldtk + (i - p.WL)];
-                if (j >= 0) rp = ckr + (size_t)j * HD;
+                if (j >= 0) rp = cq_slot<CQ>(ckr, j);
             }
             rowp[tid] = rp;
             has = rp != nullptr;
@@ -639,9 +819,17 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_t(AttnP p)
         for (int c = tid; c < 64 * 64; c += AT_THREADS)
         {
             const bf16* rp = rowp[c >> 6];
+            if (CQ && cq_tag(rp)) continue;   // cq_store below
             uint4 v = make_uint4(0, 0, 0, 0);
             if (rp) v = ((const uint4*)rp)[c & 63];
             *(uint4*)(Ks + (c >> 6) * AT_KLD + (c & 63) * 8) = v;
+        }
+        if (CQ && (blk + 1) * 64 > p.WL)
+        {
+            uint2 cd[8];
+            uint32_t sb[8];
+            cq_load(rowp, w, lane, cd, sb);
+            cq_store(Ks, AT_KLD, rowp, w, lane, cd, sb);
         }
         __syncthreads();
         {   // S[16 heads][8 slots of this warp] = Q . K^T over 512
@@ -730,6 +918,8 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_t(AttnP p)
 // the plain kernel and the bounded replay one under plain names (tests and launch_attn take their address / launch them)
 inline void (*const k_attn)(AttnP) = k_attn_t<false>;
 inline void (*const k_attn_floor)(AttnP) = k_attn_t<true>;
+inline void (*const k_attn_q)(AttnP) = k_attn_t<false, true>;         // packed fp4 compressed rows (p.ckq)
+inline void (*const k_attn_floor_q)(AttnP) = k_attn_t<true, true>;
 
 // ------------------------------------------------------------------------------------------------ sparse attention core, cp.async gather
 // k_attn_cpa (GR8_DS_ATTN_CPA=1) = k_attn with the same arithmetic in the same order and a different way to fill smem: the 64 K rows of a
@@ -747,7 +937,8 @@ __device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_g
 __device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];\n" ::"l"(p)); }
 
 // FL = false: the plain kernel (pos >= 0). FL = true: also masks window positions below p.floor (bounded replay, k_attn_cpa_floor).
-template <bool FL>
+// CQ = true: packed fp4 compressed rows (p.ckq): plain loads issued with the cp.async group, dequantized into Ks before the block's barrier.
+template <bool FL, bool CQ = false>
 __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
 {
     extern __shared__ __align__(16) uint8_t smem[];
@@ -783,7 +974,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
     {
         const int k = p.dsess[t];
         kvr += (size_t)k * R * HD;
-        if (ckr) ckr += (size_t)k * p.ck_ss;
+        if (ckr) ckr = cq_slab<CQ>(ckr, p.ck_ss, k);
     }
     // slot list of block blk into lst; the return value (uniform) says whether any slot is live. A block with no live slot (the -1 tail
     // of a short top-k list, the masked front of a young window) changes nothing: P = 0, scale = exp(0) = 1 -> skipped
@@ -810,7 +1001,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
             else if (i < L)
             {
                 const int j = p.topk[(size_t)t * p.ldtk + (i - p.WL)];
-                if (j >= 0) rp = ckr + (size_t)j * HD;
+                if (j >= 0) rp = cq_slot<CQ>(ckr, j);
             }
             lst[tid] = rp;
             has = rp != nullptr;
@@ -827,22 +1018,29 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
         {
             const int c = tid + i * AT_THREADS;
             const bf16* rp = cl[c >> 6];
+            if (CQ && cq_tag(rp)) continue;   // cq_store below
             cp_async16(Ks + (c >> 6) * AT_KLD + (c & 63) * 8, rp ? (const void*)((const uint4*)rp + (c & 63)) : (const void*)p.q, rp ? 16 : 0);
         }
         cp_async_commit();
+        uint2 cd[8];
+        uint32_t sb[8];
+        const bool cqb = CQ && (cblk + 1) * 64 > p.WL;   // the block holds compressed slots (uniform)
+        if (cqb) cq_load(cl, w, lane, cd, sb);
         int nb = cblk + 1;
         const int nx = cur ^ 1;
         while (nb < nblk && !build(nb, rowp + 64 * nx)) nb++;
         if (nb < nblk)
         {
             const bf16* rp = rowp[64 * nx + (tid >> 2)];
-            if (rp)
+            if (CQ && cq_tag(rp)) prefetch_l2(cq_row(rp) + ((tid & 3) == 3 ? CQ_ROW - 1 : (tid & 3) * 128));   // the 288 B row's lines
+            else if (rp)
             {
                 prefetch_l2((const char*)rp + (tid & 3) * 256);
                 prefetch_l2((const char*)rp + (tid & 3) * 256 + 128);
             }
         }
         cp_async_wait0();
+        if (cqb) cq_store(Ks, AT_KLD, cl, w, lane, cd, sb);
         __syncthreads();
         {   // S[16 heads][8 slots of this warp] = Q . K^T over 512
             float cc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -931,8 +1129,10 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
         }
     }
 }
-// Split-key-block variant of the existing cp.async + mma.sync core; default-off.
-template <bool FL>
+#include "ds41_attn_pipe.cuh"
+
+// Split-key-block variant of the existing cp.async + mma.sync core; default-off. CQ as k_attn_cpa_t.
+template <bool FL, bool CQ = false>
 __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_split_t(AttnP p)
 {
     extern __shared__ __align__(16) uint8_t smem[];
@@ -970,7 +1170,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_split_t(AttnP p)
     {
         const int k = p.dsess[t];
         kvr += (size_t)k * R * HD;
-        if (ckr) ckr += (size_t)k * p.ck_ss;
+        if (ckr) ckr = cq_slab<CQ>(ckr, p.ck_ss, k);
     }
     // slot list of block blk into lst; the return value (uniform) says whether any slot is live. A block with no live slot (the -1 tail
     // of a short top-k list, the masked front of a young window) changes nothing: P = 0, scale = exp(0) = 1 -> skipped
@@ -997,7 +1197,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_split_t(AttnP p)
             else if (i < L)
             {
                 const int j = p.topk[(size_t)t * p.ldtk + (i - p.WL)];
-                if (j >= 0) rp = ckr + (size_t)j * HD;
+                if (j >= 0) rp = cq_slot<CQ>(ckr, j);
             }
             lst[tid] = rp;
             has = rp != nullptr;
@@ -1014,22 +1214,29 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_split_t(AttnP p)
         {
             const int c = tid + i * AT_THREADS;
             const bf16* rp = cl[c >> 6];
+            if (CQ && cq_tag(rp)) continue;   // cq_store below
             cp_async16(Ks + (c >> 6) * AT_KLD + (c & 63) * 8, rp ? (const void*)((const uint4*)rp + (c & 63)) : (const void*)p.q, rp ? 16 : 0);
         }
         cp_async_commit();
+        uint2 cd[8];
+        uint32_t sb[8];
+        const bool cqb = CQ && (cblk + 1) * 64 > p.WL;   // the block holds compressed slots (uniform)
+        if (cqb) cq_load(cl, w, lane, cd, sb);
         int nb = cblk + 1;
         const int nx = cur ^ 1;
         while (nb < blk_hi && !build(nb, rowp + 64 * nx)) nb++;
         if (nb < blk_hi)
         {
             const bf16* rp = rowp[64 * nx + (tid >> 2)];
-            if (rp)
+            if (CQ && cq_tag(rp)) prefetch_l2(cq_row(rp) + ((tid & 3) == 3 ? CQ_ROW - 1 : (tid & 3) * 128));   // the 288 B row's lines
+            else if (rp)
             {
                 prefetch_l2((const char*)rp + (tid & 3) * 256);
                 prefetch_l2((const char*)rp + (tid & 3) * 256 + 128);
             }
         }
         cp_async_wait0();
+        if (cqb) cq_store(Ks, AT_KLD, cl, w, lane, cd, sb);
         __syncthreads();
         {   // S[16 heads][8 slots of this warp] = Q . K^T over 512
             float cc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1140,6 +1347,8 @@ __global__ void __launch_bounds__(AT_THREADS) k_attn_cpa_split_merge(AttnP p)
 // the plain kernel and the bounded replay one under plain names (tests and launch_attn take their address / launch them)
 inline void (*const k_attn_cpa)(AttnP) = k_attn_cpa_t<false>;
 inline void (*const k_attn_cpa_floor)(AttnP) = k_attn_cpa_t<true>;
+inline void (*const k_attn_cpa_q)(AttnP) = k_attn_cpa_t<false, true>;   // packed fp4 compressed rows (p.ckq)
+inline void (*const k_attn_cpa_floor_q)(AttnP) = k_attn_cpa_t<true, true>;
 
 // ------------------------------------------------------------------------------------------------ ratio-2 compressor
 // x bf16 [M][K=5120] . W bf16 [N=512][K]^T for two weight matrices (wkv, wgate) -> fp32 [M][512] each. fp32 math; the weights are
@@ -1183,6 +1392,27 @@ __global__ void __launch_bounds__(256) k_f32gemm2(const bf16* __restrict__ x, co
             if (m0 + ty * 2 + i < M && n0 + tx * 4 + j < N) Y[(size_t)(m0 + ty * 2 + i) * N + n0 + tx * 4 + j] = acc[i][j];
 }
 
+// Store compressed row grp, element c (a = the 16-group's |max|, x = the roped value): fp4 quantize with an E4M3 scale per 16. ck: the bf16
+// row bf16(e2m1 * scale). ckq != null (GR8_DS_COMP_FP4): the packed CQ_ROW row instead, the same code (sign kept, so -0 stays -0) and scale.
+__device__ __forceinline__ void comp_store(bf16* ck, uint8_t* ckq, int grp, int c, float a, float x)
+{
+    const uint8_t sc8 = (uint8_t)__nv_cvt_float_to_fp8(a / 6.0f, __NV_SATFINITE, __NV_E4M3);
+    const float sc = f_e4m3(sc8);
+    const float q = e2m1_rne(fminf(fmaxf(x / sc, -6.0f), 6.0f));
+    if (!ckq)
+    {
+        ck[(size_t)grp * HD + c] = __float2bfloat16_rn(q * sc);
+        return;
+    }
+    const float aq = fabsf(q);   // q is e2m1-valued: its magnitude index, the cq_e2m1 inverse
+    const uint32_t code = (uint32_t)((aq > 0.25f) + (aq >= 0.75f) + (aq > 1.25f) + (aq >= 1.75f) + (aq > 2.5f) + (aq >= 3.5f) + (aq > 5.0f)) |
+                          (signbit(q) ? 8u : 0u);
+    const uint32_t nb = __shfl_xor_sync(0xFFFFFFFFu, code, 1);
+    uint8_t* row = ckq + (size_t)grp * CQ_ROW;
+    if ((c & 1) == 0) row[c >> 1] = (uint8_t)(code | (nb << 4));
+    if ((c & 15) == 0) row[CQ_CODES + (c >> 4)] = sc8;
+}
+
 // Pool pairs of tokens into compressed rows. Prefill (start == 0): block j pools tokens 2j, 2j+1 -> row j; with n odd, block n/2
 // parks the last token in the state slot 0. Decode (n == 1, start > 0): the token fills state slot start % 2 and, when it
 // completes a pair, row start / 2 is produced from the two slots. Row = softmax pool -> bf16 -> RMSNorm -> rope at position 2j
@@ -1190,7 +1420,7 @@ __global__ void __launch_bounds__(256) k_f32gemm2(const bf16* __restrict__ x, co
 // pre-rope row at index grp - first group of this call (the indexer's K input).
 __global__ void __launch_bounds__(512) k_comp_pool(const float* __restrict__ kvf, const float* __restrict__ scf, int n, int start,
                                                    const bf16* __restrict__ nw, const float* __restrict__ inv, bf16* ck, float* kvs,
-                                                   float* scs, bf16* lat_dbg, bf16* nrm)
+                                                   float* scs, bf16* lat_dbg, bf16* nrm, uint8_t* ckq = nullptr)
 {
     __shared__ float sh[32];
     const int c = threadIdx.x;
@@ -1244,9 +1474,7 @@ __global__ void __launch_bounds__(512) k_comp_pool(const float* __restrict__ kvf
     float a = fabsf(x);
     for (int o = 8; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, o));
     a = fmaxf(a, 6.0f * 0.001953125f);   // 6 * 2^-9
-    const float sc = f_e4m3((uint8_t)__nv_cvt_float_to_fp8(a / 6.0f, __NV_SATFINITE, __NV_E4M3));
-    const float q = e2m1_rne(fminf(fmaxf(x / sc, -6.0f), 6.0f));
-    ck[(size_t)grp * HD + c] = __float2bfloat16_rn(q * sc);
+    comp_store(ck, ckq, grp, c, a, x);
 }
 
 // Device-start form (the engine step): rows are positions start .. start+n-1 with start read from the device. Block k pools the k-th
@@ -1258,7 +1486,7 @@ __global__ void __launch_bounds__(512) k_comp_pool(const float* __restrict__ kvf
 __global__ void __launch_bounds__(512) k_comp_pool_dev(const float* __restrict__ kvf, const float* __restrict__ scf, int n, const int* dstart,
                                                        const bf16* __restrict__ nw, const float* __restrict__ inv, bf16* ck,
                                                        const float* __restrict__ kvs, const float* __restrict__ scs, bf16* nrm,
-                                                       const int* dsess = nullptr, size_t ck_ss = 0)
+                                                       const int* dsess = nullptr, size_t ck_ss = 0, uint8_t* ckq = nullptr)
 {
     __shared__ float sh[32];
     const int c = threadIdx.x, k = blockIdx.x;
@@ -1272,7 +1500,8 @@ __global__ void __launch_bounds__(512) k_comp_pool_dev(const float* __restrict__
     if (dsess)
     {
         const int s = dsess[row0];
-        ck += (size_t)s * ck_ss;
+        if (ckq) ckq += (size_t)s * ck_ss;   // packed rows: ck_ss in bytes
+        else ck += (size_t)s * ck_ss;
         kvs += (size_t)s * 2 * HD;
         scs += (size_t)s * 2 * HD;
     }
@@ -1301,9 +1530,7 @@ __global__ void __launch_bounds__(512) k_comp_pool_dev(const float* __restrict__
     float a = fabsf(x);
     for (int o = 8; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, o));
     a = fmaxf(a, 6.0f * 0.001953125f);
-    const float sc = f_e4m3((uint8_t)__nv_cvt_float_to_fp8(a / 6.0f, __NV_SATFINITE, __NV_E4M3));
-    const float q = e2m1_rne(fminf(fmaxf(x / sc, -6.0f), 6.0f));
-    ck[(size_t)grp * HD + c] = __float2bfloat16_rn(q * sc);
+    comp_store(ck, ckq, grp, c, a, x);
 }
 // After the call: when its last position is even, that token is the pending half of the next pair -> state slot 0.
 // SESS > 1: one block per session (grid = sessions, rows as k_comp_pool_dev), each parks into its slot's kvs / scs.
@@ -1375,6 +1602,71 @@ inline int g_tc_mfast = 0;   // launch order (GR8_DS_ATTN_TC_MF, default 0 = N t
 constexpr size_t TC_MF_AUTO_BYTES = (size_t)100 << 20;   // fp8 weight bytes N * K * groups; between the largest attention weight (10.5 MB) and the Engram wkv (157 MB), clear of the 78.6 MB DSpark main_proj that nobody has timed at M > 128
 inline bool tc_mfast_pick(int mode, int N, int K, int groups, unsigned mt) { return mode == 1 || (mode == 2 && mt >= 2 && (size_t)N * K * groups >= TC_MF_AUTO_BYTES); }
 inline bool tc_ok(const GemmP& p) { return p.K % 128 == 0 && p.N % 64 == 0 && p.lda % 16 == 0 && p.lsa % 4 == 0 && p.M >= 1; }
+#include "ds41_gemm_persist.cuh"
+inline int g_tc_tile = 0;   // GR8_DS_ATTN_TC_TILE (default 0): 1 = launch_gemm_tc's 128 x 128 tile runs as k_gemm_mx8t_sw <128,128,3> (swizzled 128-B rows, a 3-deep ring)
+                            // in place of k_gemm_mx8t <128,128,2>. The same Y bits (same mma, same K order per output; tests/ds41_gemm_tc_bench.cu). Falls back to 0 when
+                            // the device cannot give a block 3 x 33792 B of smem.
+                            // 2 = the same tile as k_gemm_persist_ldm_epi_bid (ds41_gemm_persist.cuh): persistent CTAs, ldmatrix fragments, a staged 16-B epilogue; the same Y bits
+                            // (tests/ds41_gemm_persist_test.cu). Takes tile 1 instead (which itself falls back to 0) when the grid order is M-fastest (GR8_DS_ATTN_TC_MF), when
+                            // Y or its strides are not 16-B aligned, when N < TC_PERSIST_MIN_N, or when the 3 x 33792 B of smem cannot be had.
+constexpr int TC_PERSIST_MIN_N = 1024;   // tile 2 is not used below this N: the attention wkv (N = 512, 4 column tiles) ran 3.4 % (M 4096) to 5.4 % (M 8192) slower than tile 1 on the 5090, while N = 1024 and 1280 gain
+inline int g_tc_persist_grid = 0;   // TEST HOOK, not a served knob (no GR8_ name, not in knobs/): > 0 caps the persistent grid at that many CTAs so a test makes each CTA walk several tiles; 0 = the SM count.
+template <int BM, int BN, int ST> inline bool launch_tc_sw(const GemmP& p, int groups, cudaStream_t st)
+{
+    static const bool ok = []
+    {   // first use, host only (no sync): one line a rank so a boot check can see the tile ran or fell back
+        const cudaError_t e = cudaFuncSetAttribute(k_gemm_mx8t_sw<BM, BN, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TcCfgSw<BM, BN, ST>::SMEM);
+        if (e == cudaSuccess) fprintf(stderr, "# DS41 GR8_DS_ATTN_TC_TILE=1: 3-stage swizzled tile active\n");
+        else
+        {
+            (void)cudaGetLastError();
+            fprintf(stderr, "# DS41 GR8_DS_ATTN_TC_TILE=1: FELL BACK to tile 0 (cudaFuncSetAttribute %zu B smem: rc %d %s)\n", TcCfgSw<BM, BN, ST>::SMEM, (int)e, cudaGetErrorString(e));
+        }
+        return e == cudaSuccess;
+    }();
+    if (!ok) return false;
+    GemmP q = p;
+    const unsigned nt = p.N / BN, mt = (p.M + BM - 1) / BM;
+    q.mfast = tc_mfast_pick(g_tc_mfast, p.N, p.K, groups, mt) ? 1 : 0;
+    k_gemm_mx8t_sw<BM, BN, ST><<<q.mfast ? dim3(mt, nt, groups) : dim3(nt, mt, groups), 256, TcCfgSw<BM, BN, ST>::SMEM, st>>>(q);
+    return true;
+}
+// SM count of the current device, queried once a device (host only, no sync, legal while a stream is captured).
+inline int tc_sm_count()
+{
+    static int cache[16];   // 0 = not queried yet; a benign race: every writer stores the same value
+    int dev = 0, n = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); return 1; }
+    if (dev >= 0 && dev < 16 && cache[dev] > 0) return cache[dev];
+    if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || n < 1) { (void)cudaGetLastError(); return 1; }
+    if (dev >= 0 && dev < 16) cache[dev] = n;
+    return n;
+}
+// GR8_DS_ATTN_TC_TILE=2: k_gemm_persist_ldm_epi_bid. false = nothing was launched (the caller takes tile 1).
+template <int BM, int BN, int ST> inline bool launch_tc_persist(const GemmP& p, int groups, cudaStream_t st)
+{
+    static const bool ok = []
+    {   // first use, host only (no sync): one line a rank so a boot check can see the tile ran or fell back
+        const cudaError_t e = cudaFuncSetAttribute(k_gemm_persist_ldm_epi_bid<BM, BN, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TcCfgSw<BM, BN, ST>::SMEM);
+        if (e == cudaSuccess) fprintf(stderr, "# DS41 GR8_DS_ATTN_TC_TILE=2: persistent tile active\n");
+        else
+        {
+            (void)cudaGetLastError();
+            fprintf(stderr, "# DS41 GR8_DS_ATTN_TC_TILE=2: FELL BACK to tile 1 (cudaFuncSetAttribute %zu B smem: rc %d %s)\n", TcCfgSw<BM, BN, ST>::SMEM, (int)e, cudaGetErrorString(e));
+        }
+        return e == cudaSuccess;
+    }();
+    if (!ok) return false;
+    const long nt = p.N / BN, mt = (p.M + BM - 1) / BM;
+    // the walk is N tile fastest: M-fastest launch order (GR8_DS_ATTN_TC_MF) goes to tile 1. The 16-B epilogue stores need 16-B aligned chunks of every Y row.
+    if (tc_mfast_pick(g_tc_mfast, p.N, p.K, groups, (unsigned)mt)) return false;
+    if (!(p.N >= TC_PERSIST_MIN_N && p.N % BN == 0 && p.K % 128 == 0 && p.ldy % 8 == 0 && (groups <= 1 || p.y_gs % 8 == 0) && ((uintptr_t)p.Y % 16) == 0)) return false;
+    GemmP q = p;
+    q.mfast = 0;
+    const long tiles = nt * mt * groups, cap = g_tc_persist_grid > 0 ? g_tc_persist_grid : tc_sm_count();
+    k_gemm_persist_ldm_epi_bid<BM, BN, ST><<<(unsigned)(tiles < cap ? tiles : cap), 256, TcCfgSw<BM, BN, ST>::SMEM, st>>>(q, groups);
+    return true;
+}
 template <int BM, int BN, int ST> inline void launch_tc_t(const GemmP& p, int groups, cudaStream_t st)
 {
     static bool init = false;
@@ -1388,13 +1680,19 @@ template <int BM, int BN, int ST> inline void launch_tc_t(const GemmP& p, int gr
     q.mfast = tc_mfast_pick(g_tc_mfast, p.N, p.K, groups, mt) ? 1 : 0;
     k_gemm_mx8t<BM, BN, ST><<<q.mfast ? dim3(mt, nt, groups) : dim3(nt, mt, groups), 256, TcCfg<BM, BN, ST>::SMEM, st>>>(q);
 }
-// tile pick: the tallest row tile the M fills, the wider column tile when it still leaves >= 96 CTAs (48 SMs x 2)
+// tile pick: the tallest row tile the M fills, the wider column tile when it still leaves >= 96 CTAs (48 SMs x 2).
+// 33..63 rows take BM 64 (one M tile, so one CTA reads each weight tile): the same Y bits as BM 32, and on the Spark at 33-48 rows
+// faster summed over the 5 attention weights (10-15%), the Engram wkv the same, the DSpark main_proj ~35% faster (TC48/TC48X bench, 11-05).
 inline void launch_gemm_tc(const GemmP& p, int groups, cudaStream_t st)
 {
-    const int BM = p.M >= 128 ? 128 : (p.M >= 64 ? 64 : 32);
+    const int BM = p.M >= 128 ? 128 : (p.M > 32 ? 64 : 32);
     const long ctas128 = (long)(p.N / 128) * ((p.M + BM - 1) / BM) * groups;
     const bool wide = p.N % 128 == 0 && ctas128 >= 96;
-    if (BM == 128) { if (wide) launch_tc_t<128, 128, 2>(p, groups, st); else launch_tc_t<128, 64, 3>(p, groups, st); }
+    if (BM == 128)
+    {
+        if (!wide) launch_tc_t<128, 64, 3>(p, groups, st);
+        else if (!(g_tc_tile == 2 && launch_tc_persist<128, 128, 3>(p, groups, st)) && !(g_tc_tile >= 1 && launch_tc_sw<128, 128, 3>(p, groups, st))) launch_tc_t<128, 128, 2>(p, groups, st);
+    }
     else if (BM == 64) { if (wide) launch_tc_t<64, 128, 3>(p, groups, st); else launch_tc_t<64, 64, 3>(p, groups, st); }
     else launch_tc_t<32, 64, 3>(p, groups, st);
 }
@@ -1447,11 +1745,22 @@ inline bool g_comp_fp8 = false; // GR8_DS_COMP_FP8, default off; lossy, quality 
 inline int g_src_fast = 0;   // GR8_DS_SRC_FAST bits, set by ds41_attn_set_src_fast: 1 = comp_row uses k_f32gemv2 (bit-identical to k_f32gemm2); 2 = the rank TU routes idx wq_b through the GEMV
 inline int g_win_floor = 0;  // ds41_attn_set_win_floor: the window floor attn_core puts in AttnP (bounded replay, eager prefill only); 0 = none
 inline int g_attn_cpa = 0;   // GR8_DS_ATTN_CPA, set by ds41_attn_set_cpasync: 1 = launch_attn runs k_attn_cpa (cp.async K gather, bit-identical to k_attn)
+inline bool g_attn_pipe = false; // enabled only while the v2 prefill conductor enqueues
 inline int g_attn_split = 0; // GR8_DS_ATTN_SPLIT=1, default off; two CTAs per row/head-group plus online-softmax merge
 inline int g_gv_tpc = 1, g_gv_ks = 0;   // output tiles per CTA; k-parts per tile (0 = the default pick, gv_pick_ks in ds41_attn_gv.cuh)
 inline XfragFn g_fn_xfrag = nullptr;
 inline GemvFn g_fn_gemv = nullptr;
-inline bool use_gv(const Fp8Mat& W, int n) { return g_use_gv && n >= 1 && n <= 8 && W.gv != nullptr && g_fn_xfrag && g_fn_gemv; }
+inline XfragNtFn g_fn_xfrag_nt = nullptr;   // project_rows_nt's multi-tile hooks (ds41_attn_set_gv_nt)
+inline GemvFn g_fn_gemv_nt = nullptr;
+// The largest row count that takes the GEMV (ds41_attn_set_gv_rows_max, 8..32): 8 by default and while anything eager runs (every prefill chunk
+// keeps its GEMV <= 8 / GEMM above path); the rank TU sets 32 only while it captures (or eagerly launches) the decode / verify steps, then 8 again.
+// A host global read when a stage is enqueued: a captured graph keeps the value it was captured with. DSpark passes an explicit 8.
+inline int g_gv_rows_max = 8;
+inline void set_gv_rows_max(int max_rows) { g_gv_rows_max = max_rows < 8 ? 8 : max_rows > 32 ? 32 : max_rows; }   // ds41_attn_set_gv_rows_max
+inline bool use_gv(const Fp8Mat& W, int n, int max_rows = g_gv_rows_max)
+{
+    return g_use_gv && n >= 1 && n <= max_rows && W.gv != nullptr && g_fn_xfrag && g_fn_gemv;
+}
 inline void launch_xfrag(const uint8_t* codes, int ldc, const uint8_t* sc, int lds, int M, int K, int groups, size_t gc, size_t gs, uint32_t* xf, cudaStream_t st)
 {
     g_fn_xfrag(codes, ldc, sc, lds, M, K, groups, gc, gs, xf, st);
@@ -1461,10 +1770,11 @@ inline void launch_gemv(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int ldy, i
     g_fn_gemv(xf, W, Y, ldy, M, groups, y_gs, st, tpc ? tpc : g_gv_tpc, ks ? ks : g_gv_ks);
 }
 // one projection: act codes/scales A/SA already quantized -> Y (groups > 1: block-diagonal, as launch_gemm). gv_ready: xf already holds A's table.
+// max_rows: the GEMV row cap (default g_gv_rows_max); a caller whose xf holds one row tile passes 8.
 inline void proj_mm(const Fp8Mat& W, const uint8_t* A, int lda, const uint8_t* SA, int lsa, uint32_t* xf, bool gv_ready, bf16* Y, int ldy, int M, int groups,
-                    size_t a_gs, size_t sa_gs, size_t y_gs, cudaStream_t st)
+                    size_t a_gs, size_t sa_gs, size_t y_gs, cudaStream_t st, int max_rows = g_gv_rows_max)
 {
-    if (use_gv(W, M))
+    if (use_gv(W, M, max_rows))
     {
         if (!gv_ready) launch_xfrag(A, lda, SA, lsa, M, W.K, groups, a_gs, sa_gs, xf, st);
         launch_gemv(xf, W, Y, ldy, M, groups, y_gs, st);
@@ -1485,6 +1795,22 @@ inline int project_rows(const Fp8Mat& W, const bf16* x, int rows, bf16* y, int l
     }
     return 0;
 }
+// project_rows with one weight pass per 32 rows: up to 32 rows are act-quantized at once, their nt = ceil(m / 8) row-tile tables built in one
+// launch, and the GEMV reads the records once for all nt tiles. Tile t's table holds the words project_rows' pass r0 = 8 t builds, and the
+// GEMV runs each tile's stock mma / scale / reduce sequence on its own columns, so every output equals project_rows' bit for bit.
+// codes u8 [32][K], scales u8 [32][K/32], xf u32 [4][K*4] are scratch; W.gv and the multi-tile hooks (ds41_attn_set_gv_nt) required.
+inline int project_rows_nt(const Fp8Mat& W, const bf16* x, int rows, bf16* y, int ldy, uint8_t* codes, uint8_t* scales, uint32_t* xf, cudaStream_t st)
+{
+    if (!W.gv || !g_fn_xfrag_nt || !g_fn_gemv_nt || rows < 1 || (W.K & 31) || (W.N & 15)) return 1;
+    for (int r0 = 0; r0 < rows; r0 += 32)
+    {
+        const int m = rows - r0 < 32 ? rows - r0 : 32;
+        launch_act_quant(x + (size_t)r0 * W.K, W.K, codes, W.K, scales, W.K / 32, m, W.K, st);
+        g_fn_xfrag_nt(codes, W.K, scales, W.K / 32, m, W.K, xf, st);
+        g_fn_gemv_nt(xf, W, y + (size_t)r0 * ldy, ldy, m, 1, 0, st, g_gv_tpc, g_gv_ks);
+    }
+    return 0;
+}
 inline void launch_attn(const AttnP& p, cudaStream_t st)
 {
     static bool init = false;
@@ -1495,26 +1821,58 @@ inline void launch_attn(const AttnP& p, cudaStream_t st)
         cudaFuncSetAttribute(k_attn_floor, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM);
         cudaFuncSetAttribute(k_attn_cpa_floor, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
         cudaFuncSetAttribute(k_attn_cpa_split_t<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
+        cudaFuncSetAttribute(k_attn_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM);
+        cudaFuncSetAttribute(k_attn_cpa_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
+        cudaFuncSetAttribute(k_attn_floor_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM);
+        cudaFuncSetAttribute(k_attn_cpa_floor_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
+        cudaFuncSetAttribute(k_attn_cpa_split_t<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
         init = true;
     }
+    if (p.heads % 16)   // one CTA = 16 heads: a remainder would skip the last heads
+    {
+        fprintf(stderr, "ds41 launch_attn: heads %d is not a multiple of 16\n", p.heads);
+        abort();
+    }
+    const bool q = p.ckq != 0 && p.TK > 0;   // packed fp4 compressed rows: the _q kernels (same arithmetic, the rows dequantized in the gather)
+    const dim3 g(p.n, p.heads / 16);
     if (p.floor > 0) {   // bounded replay range B (ds41_attn_set_win_floor): the _floor kernels; floor 0 runs the plain kernels
-        if (g_attn_cpa) k_attn_cpa_floor<<<dim3(p.n, p.heads / 16), AT_THREADS, AT_SMEM_CPA, st>>>(p);
-        else k_attn_floor<<<dim3(p.n, p.heads / 16), AT_THREADS, AT_SMEM, st>>>(p);
+        if (g_attn_cpa) (q ? k_attn_cpa_floor_q : k_attn_cpa_floor)<<<g, AT_THREADS, AT_SMEM_CPA, st>>>(p);
+        else (q ? k_attn_floor_q : k_attn_floor)<<<g, AT_THREADS, AT_SMEM, st>>>(p);
         return;
     }
     // W-prefill passes a device dstart and therefore uses the decode-form ring path even at 4096 rows.
     // A width threshold, not p.decode, separates wide prefill from 8/32-session decode batches.
     if (g_attn_split && g_attn_cpa && p.split && split_eligible(p.n, p.WL, p.TK)) {
-        k_attn_cpa_split_t<false><<<dim3(p.n, p.heads / 16, 2), AT_THREADS, AT_SMEM_CPA, st>>>(p);
-        k_attn_cpa_split_merge<<<dim3(p.n, p.heads / 16), AT_THREADS, 0, st>>>(p);
-    } else if (g_attn_cpa) k_attn_cpa<<<dim3(p.n, p.heads / 16), AT_THREADS, AT_SMEM_CPA, st>>>(p);
-    else k_attn<<<dim3(p.n, p.heads / 16), AT_THREADS, AT_SMEM, st>>>(p);
+        (q ? k_attn_cpa_split_t<false, true> : k_attn_cpa_split_t<false>)<<<dim3(p.n, p.heads / 16, 2), AT_THREADS, AT_SMEM_CPA, st>>>(p);
+        k_attn_cpa_split_merge<<<g, AT_THREADS, 0, st>>>(p);
+    } else if (g_attn_pipe && g_attn_cpa && q) {
+        static bool pipe_init = false;
+        if (!pipe_init) {
+            cudaFuncSetAttribute(k_attn_cpa_pipe_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_PIPE);
+            pipe_init = true;
+        }
+        k_attn_cpa_pipe_q<<<g, AT_THREADS, AT_SMEM_PIPE, st>>>(p);
+    } else if (g_attn_cpa) (q ? k_attn_cpa_q : k_attn_cpa)<<<g, AT_THREADS, AT_SMEM_CPA, st>>>(p);
+    else (q ? k_attn_q : k_attn)<<<g, AT_THREADS, AT_SMEM, st>>>(p);
 }
 
 // ---- the four stages of the step plan (runtime/ds41_ops.h): each is async on `st` and reads/writes only what its comment lists.
 // Rows are positions start .. start+n-1 (prefill from 0, or one decode row); y = bf16 [n][5120], the sub-layer input.
 //
 // ST_ATTN_PROJ: S.qa, S.qr (the indexer reads qr), S.q (rope applied), S.kvrows (this chunk's window rows, fp8-valued), C.ring.
+// attn_proj's per-row parts after its two y-wide GEMMs, shared with the v2 prefill (ds41_attn_v2.cuh), which runs those GEMMs
+// on its own rows and gathers qa / kv0: the query from qa [n][QA] (S.qr, S.q with rope), and the window rows from kv0 [n][HD].
+inline void attn_proj_q(const Weights& W, const Scratch& S, const bf16* qa, int n, int start, int heads, cudaStream_t st, const int* dstart)
+{
+    k_rmsnorm<<<n, 256, 0, st>>>(qa, QA, W.q_norm, S.qr, QA, QA, EPS);
+    launch_act_quant(S.qr, QA, S.qrq, QA, S.qrs, QA / 32, n, QA, st);
+    proj_mm(W.wq_b, S.qrq, QA, S.qrs, QA / 32, S.xf_qr, false, S.q, heads * HD, n, 1, 0, 0, 0, st);
+    k_rope_tail<<<(unsigned)(((long)n * heads * 32 + 255) / 256), 256, 0, st>>>(S.q, (long)heads * HD, n, heads, start, dstart, W.inv, 0, S.sess);
+}
+inline void attn_proj_kv(const Weights& W, Cache& C, const Scratch& S, const bf16* kv0, int n, int start, cudaStream_t st, const int* dstart)
+{
+    k_kv_prep<<<n, 512, 0, st>>>(kv0, W.kv_norm, W.inv, start, dstart, n, S.kvrows, C.ring, C.ring_rows, S.sess);
+}
 inline void attn_proj(const Weights& W, Cache& C, const Scratch& S, const bf16* y, int n, int start, int heads, cudaStream_t st,
                       const int* dstart = nullptr, const uint8_t* gathered_codes = nullptr, const uint8_t* gathered_scales = nullptr)
 {
@@ -1522,19 +1880,17 @@ inline void attn_proj(const Weights& W, Cache& C, const Scratch& S, const bf16* 
     const uint8_t* yq = gathered_codes ? gathered_codes : S.yq;
     const uint8_t* ys = gathered_scales ? gathered_scales : S.ys;
     proj_mm(W.wq_a, yq, HID, ys, HID / 32, S.xf_y, false, S.qa, QA, n, 1, 0, 0, 0, st);
-    k_rmsnorm<<<n, 256, 0, st>>>(S.qa, QA, W.q_norm, S.qr, QA, QA, EPS);
-    launch_act_quant(S.qr, QA, S.qrq, QA, S.qrs, QA / 32, n, QA, st);
-    proj_mm(W.wq_b, S.qrq, QA, S.qrs, QA / 32, S.xf_qr, false, S.q, heads * HD, n, 1, 0, 0, 0, st);
-    k_rope_tail<<<(unsigned)(((long)n * heads * 32 + 255) / 256), 256, 0, st>>>(S.q, (long)heads * HD, n, heads, start, dstart, W.inv, 0, S.sess);
+    attn_proj_q(W, S, S.qa, n, start, heads, st, dstart);
     proj_mm(W.wkv, yq, HID, ys, HID / 32, S.xf_y, use_gv(W.wq_a, n), S.kv0, HD, n, 1, 0, 0, 0, st);   // wq_a built y's table
-    k_kv_prep<<<n, 512, 0, st>>>(S.kv0, W.kv_norm, W.inv, start, dstart, n, S.kvrows, C.ring, C.ring_rows, S.sess);
+    attn_proj_kv(W, C, S, S.kv0, n, start, st, dstart);
 }
 // ST_CA_ROW at the ratio-2 KV sources (layers 2, 8, 14; W.c_* set): the compressed row(s) completed by this chunk go to C.comp
 // (row j = group j), the pending token to C.kvs / C.scs. Uses S.ckv / S.csc as scratch. Needs only y (not attn_proj's outputs).
 // S.cnorm row k = the post-norm pre-rope row k completed by this call (the first row it completes is row 0). n > 1 at start > 0
 // (verify chunk) pools the rows one position at a time, so it equals n single-row calls.
-inline void comp_row(const Weights& W, Cache& C, const Scratch& S, const bf16* y, int n, int start, cudaStream_t st,
-                     const int* dstart = nullptr)
+// comp_row's two halves, shared with the v2 prefill (ds41_attn_v2.cuh), which runs the GEMMs on its own rows and the pooling on
+// the gathered ones. comp_row_mm: ckv / csc [n][HD] fp32 from y; yq / ys = the scratch of the FP8 form's quantized y.
+inline void comp_row_mm(const Weights& W, const bf16* y, uint8_t* yq, uint8_t* ys, float* ckv, float* csc, int n, cudaStream_t st)
 {
     if (g_comp_fp8 && n >= 9)
     {
@@ -1544,33 +1900,44 @@ inline void comp_row(const Weights& W, Cache& C, const Scratch& S, const bf16* y
             abort();
         }
         // Quantize each BF16 source row once; the two FP8 projections consume the same codes/scales.
-        launch_act_quant(y, HID, S.yq, HID, S.ys, HID / 32, n, HID, st);
-        launch_comp_fp8(S.yq, S.ys, W.c_wkv8, S.ckv, n, st);
-        launch_comp_fp8(S.yq, S.ys, W.c_wgate8, S.csc, n, st);
+        launch_act_quant(y, HID, yq, HID, ys, HID / 32, n, HID, st);
+        launch_comp_fp8(yq, ys, W.c_wkv8, ckv, n, st);
+        launch_comp_fp8(yq, ys, W.c_wgate8, csc, n, st);
     }
-    else if (!(g_src_fast & 1) || !launch_f32gemv2(y, W.c_wkv, W.c_wgate, S.ckv, S.csc, n, HD, HID, st))
-        k_f32gemm2<<<dim3(HD / FB_N, (n + FB_M - 1) / FB_M, 2), 256, 0, st>>>(y, W.c_wkv, W.c_wgate, S.ckv, S.csc, n, HD, HID);
+    else if (!(g_src_fast & 1) || !launch_f32gemv2(y, W.c_wkv, W.c_wgate, ckv, csc, n, HD, HID, st))
+        k_f32gemm2<<<dim3(HD / FB_N, (n + FB_M - 1) / FB_M, 2), 256, 0, st>>>(y, W.c_wkv, W.c_wgate, ckv, csc, n, HD, HID);
+}
+// comp_row_pool: the pooling and the pending state from ckv / csc rows (per row, every rank)
+inline void comp_row_pool(const Weights& W, Cache& C, const Scratch& S, const float* ckv, const float* csc, int n, int start, cudaStream_t st,
+                          const int* dstart)
+{
     if (dstart)
     {
         const int ns = S.sess ? S.ns : 1;   // sessions of n / ns rows each (the op checks n % ns == 0)
-        k_comp_pool_dev<<<dim3((n / ns + 1) / 2, ns), 512, 0, st>>>(S.ckv, S.csc, n, dstart, W.c_norm, W.inv, C.comp, C.kvs, C.scs, S.cnorm,
-                                                                  S.sess, C.comp_ss);
-        k_comp_state<<<ns, 512, 0, st>>>(S.ckv, S.csc, n, dstart, C.kvs, C.scs, S.sess);
+        k_comp_pool_dev<<<dim3((n / ns + 1) / 2, ns), 512, 0, st>>>(ckv, csc, n, dstart, W.c_norm, W.inv, C.comp, C.kvs, C.scs, S.cnorm,
+                                                                  S.sess, C.comp_ss, C.compq);
+        k_comp_state<<<ns, 512, 0, st>>>(ckv, csc, n, dstart, C.kvs, C.scs, S.sess);
         return;
     }
     if (start == 0)
     {
-        k_comp_pool<<<(n + 1) / 2, 512, 0, st>>>(S.ckv, S.csc, n, 0, W.c_norm, W.inv, C.comp, C.kvs, C.scs, nullptr, S.cnorm);
+        k_comp_pool<<<(n + 1) / 2, 512, 0, st>>>(ckv, csc, n, 0, W.c_norm, W.inv, C.comp, C.kvs, C.scs, nullptr, S.cnorm, C.compq);
         return;
     }
     int done = 0;
     for (int r = 0; r < n; r++)
     {
         const int pos = start + r;
-        k_comp_pool<<<1, 512, 0, st>>>(S.ckv + (size_t)r * HD, S.csc + (size_t)r * HD, 1, pos, W.c_norm, W.inv, C.comp, C.kvs, C.scs, nullptr,
-                                       S.cnorm + (size_t)done * HD);
+        k_comp_pool<<<1, 512, 0, st>>>(ckv + (size_t)r * HD, csc + (size_t)r * HD, 1, pos, W.c_norm, W.inv, C.comp, C.kvs, C.scs, nullptr,
+                                       S.cnorm + (size_t)done * HD, C.compq);
         if (pos & 1) done++;
     }
+}
+inline void comp_row(const Weights& W, Cache& C, const Scratch& S, const bf16* y, int n, int start, cudaStream_t st,
+                     const int* dstart = nullptr)
+{
+    comp_row_mm(W, y, S.yq, S.ys, S.ckv, S.csc, n, st);
+    comp_row_pool(W, C, S, S.ckv, S.csc, n, start, st, dstart);
 }
 // k_comp_commit for one source layer (2, 8, 14); see the kernel
 inline void comp_commit(const Cache& C, const Scratch& S, const int* dq, const int* dacc, cudaStream_t st, const int* drow0 = nullptr,
@@ -1590,7 +1957,7 @@ inline void attn_core(const Weights& W, const Cache& C, const bf16* comp_src, co
     a.ldtk = ldtk; a.n = n; a.heads = heads; a.start = start; a.dstart = dstart;
     a.decode = decode; a.WL = decode ? WIN : (n < WIN ? n : WIN); a.ring_rows = C.ring_rows; a.TK = TK; a.scale = SOFTMAX_SCALE;
     a.floor = decode ? g_win_floor : 0;
-    a.dsess = decode && dstart ? S.sess : nullptr; a.ck_ss = C.src_ss;
+    a.dsess = decode && dstart ? S.sess : nullptr; a.ck_ss = C.src_ss; a.ckq = C.src_q;
     a.split = S.attn_split;
     launch_attn(a, st);
 }
@@ -1888,14 +2255,20 @@ template <int BM, int BN, int ST> inline void launch_tc_t_c2(const GemmP& p, int
     q.mfast = tc_mfast_pick(g_tc_mfast, p.N, p.K, groups, mt) ? 1 : 0;
     k_gemm_mx8t_c2<BM, BN, ST><<<q.mfast ? dim3(mt, nt, groups) : dim3(nt, mt, groups), 256, TcCfg<BM, BN, ST>::SMEM, st>>>(q);
 }
-// ST_ATTN_OUT: out [n][5120] bf16 = this rank's o_b partial (sum across ranks at TP > 1) from S.o.
-inline void attn_out(const Weights& W, const Scratch& S, int n, int start, int heads, bf16* out, cudaStream_t st,
-                     const int* dstart = nullptr, bool direct_c2 = false)
+// attn_out's first half, shared with the v2 prefill (ds41_attn_v2.cuh output_a): S.o -> wo_a -> S.oaq / S.oas, the wo_b operand.
+inline void attn_out_a(const Weights& W, const Scratch& S, int n, int start, int heads, cudaStream_t st, const int* dstart)
 {
     const int G = heads / HPG;
     k_o_prep<<<n * heads, 512, 0, st>>>(S.o, heads, start, dstart, W.inv, nullptr, S.oq, S.os, S.sess);
     proj_mm(W.wo_a, S.oq, heads * HD, S.os, heads * HD / 32, S.xf_o, false, S.oa, G * OLORA, n, G, GROUP_IN, GROUP_IN / 32, OLORA, st);
     launch_act_quant(S.oa, G * OLORA, S.oaq, G * OLORA, S.oas, G * OLORA / 32, n, G * OLORA, st);
+}
+// ST_ATTN_OUT: out [n][5120] bf16 = this rank's o_b partial (sum across ranks at TP > 1) from S.o.
+inline void attn_out(const Weights& W, const Scratch& S, int n, int start, int heads, bf16* out, cudaStream_t st,
+                     const int* dstart = nullptr, bool direct_c2 = false)
+{
+    const int G = heads / HPG;
+    attn_out_a(W, S, n, start, heads, st, dstart);
     if (direct_c2 && g_use_tc && n == 4096 && W.wo_b.N == 5120 && W.wo_b.K == 2048 && G * OLORA == 2048 && !use_gv(W.wo_b, n))
     {
         GemmP p{};

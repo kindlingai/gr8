@@ -22,6 +22,12 @@ struct G6AttnPack {
     // block scale of every weight row and 128-column block. Both null: uk / uv are BF16.
     G6AttnTensor uks;         // Lnnn.kv_b.uk.scale [H,192,4]; transposed once by binder to [H,4,192]
     G6AttnTensor uvs;         // Lnnn.kv_b.uv.scale [H,256,4]; borrowed unchanged
+    // the call's selected ids [ext_rows,2048] int32 and output [ext_rows,ext_heads,256] FP16, caller-owned and never
+    // freed by release; null = slices of storage. Bindings may share them only if their calls never overlap and a reuse
+    // layer's index layer is the last full-index layer called before it
+    void* ext_indices = nullptr;
+    void* ext_output = nullptr;
+    int ext_rows = 0, ext_heads = 0;
 };
 struct G6AttnStep {
     int rows, context;        // current logical context, NOT allocated capacity
@@ -32,6 +38,7 @@ struct G6AttnStep {
     int reuse_rows;
 #if G6_MODEL_FLASH
     const void* index_gate;   // FP16 [rows,128] x @ index_kpool_compress_gate^T, full-index steps only
+    const int* raw_sess;      // device [rows]: the S2 session of each row, its raw index ring (kvfmt.h); nullptr = 0
 #endif
 #ifdef DEC_S2
     int s2_batched;           // the step is replayed with a batched cell (G6AttnStepCell::rows): rows of several sessions
@@ -65,6 +72,8 @@ extern "C" int g6_attn_bind_create_chunked(G6AttnBinding*, const G6AttnPack*, in
     int max_rows, int query_tile, void* stream, G6KvChunks* mla, G6KvChunks* idx);
 // Pages of the smallest chunk that gives back all its bytes: its MLA and index bytes are whole granules (0: none).
 extern "C" uint32_t g6_flash_kv_chunk_pages(size_t granule);
+// Clears session sess's raw index ring (kvfmt.h) of the binding: a new sequence on that session (S2, several sessions)
+extern "C" int g6_attn_bind_raw_reset(G6AttnBinding*, int sess, void* stream);
 #endif
 // Decode scratch bytes a binding with these heads / capacity / max_rows / query_tile needs (0: invalid).
 extern "C" size_t g6a_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile);
@@ -74,6 +83,11 @@ extern "C" size_t g6a_bind_scratch_need(int heads, int capacity, int max_rows, i
 // ext_scratch / ext_bytes as g6_attn_bind_create_ext (nullptr, 0 = own scratch).
 extern "C" int g6a_bind_create_cp(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,
     int max_rows, int query_tile, int cp_R, int cp_nr, void* stream, void* ext_scratch, size_t ext_bytes);
+// A non-CP binding with `pages` physical pages (>= capacity / 64) behind a table of capacity / 64 entries: the KV and
+// index storage hold `pages`, the table, context and scratch stay those of `capacity`. S2 tables may then point past
+// capacity / 64 (GR8_CAP_TOTAL: the drafter's pool holds several sessions' tails).
+extern "C" int g6a_bind_create_pages(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity, int pages,
+    int max_rows, int query_tile, void* stream, void* ext_scratch, size_t ext_bytes);
 // cp_phys > 0: at most cp_phys physical pages (>= cp_R / 64); this rank's tail pages past them have -1 in the table as
 // built, and the driver maps them (remote rows release, runtime/rt_rows.cuh). 0 = every tail page, as above.
 extern "C" int g6a_bind_create_cp_phys(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,

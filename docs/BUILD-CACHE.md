@@ -19,7 +19,8 @@ A compile's key is the SHA-256 of:
 - in a link (no `-c`), the file each `-l` library resolves to: the contents of an archive, or the path, size and
   modification time of a shared library.
 
-A hit copies the stored output to `-o`, keeps its mode, and prints the compiler's stored stderr, so warnings still show.
+A hit copies the stored output to `-o`, keeps its mode, prints the compiler's stored stderr, so warnings still show, and
+sets the entry's time to now, so an entry's time is its last use.
 A miss runs the compiler, and stores the output and stderr only if the compile succeeds. Entries are written to a
 temporary name and then renamed, so parallel jobs on one key are safe.
 
@@ -42,7 +43,21 @@ Limits:
 | `GR8_NVCC_CACHE_LOG` | set by `build_m4.sh` and `build.sh` | one `hit`/`miss`/`pass` line per call; the builds print the counts |
 
 The cache never evicts. One full build (every width) adds about the size of `bin/obj` plus the binaries, so delete the
-directory when it gets large.
+directory when it gets large, or delete what no build used lately: `find ~/.cache/gr8-nvcc -type f -mtime +30 -delete`.
+
+## In the image build and CI
+
+Each engine stage of the `Dockerfile` mounts the cache at `/var/cache/gr8-nvcc` (`GR8_NVCC_CACHE_DIR`), as a BuildKit
+cache mount with one id a stage: `gr8-nvcc-fp8`, `-int4`, `-flash`, `-flash-int4`, `-ds41` and `-tests`. After its
+build the stage deletes the entries older than the build's start, the ones it did not read, so the mount holds one
+build. A local `docker buildx build` keeps the mount between builds on the same builder.
+
+CI (`.github/workflows/ci.yml`, the engine job) keeps each leg's mount in the Actions cache. Every run restores the
+newest copy for its leg (key `gr8-nvcc-<leg>-<hash of the compile inputs>`) and loads it into the builder with
+reproducible-containers/buildkit-cache-dance. Pushes to main save it, once for each set of inputs. The layer cache still
+comes first: when the engine layer is cached, nothing compiles. The compile cache matters when that layer has to run
+again: an edit to one engine file recompiles the objects that include it and takes the rest from the cache. The build
+log's `nvcc cache: N hit, M miss` line shows what it did.
 
 ## Test
 

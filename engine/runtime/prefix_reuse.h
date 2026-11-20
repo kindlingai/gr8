@@ -8,14 +8,15 @@
 // Hit = skip > 0 and (noend or prompt.size() >= written_end): every row the old sequence wrote past the new context is
 // rewritten by this request before any step reads it (kernels read only positions <= the row's own position; the rule
 // is redundant under that, GR8_REUSE_NOEND=1 drops it). Miss = reset + full prefill (the switch-off path).
-// The grid (GR8_REUSE_ALIGN=1, g6m4 sets grid = the cold prefill grid: --prefill MP, one sub-batch; the lane pairing does
-// not change a row): a hit retains
-// only [0, floor(min(skip, pf_end) / grid) * grid), pf_end = the rows prefilled contiguously from 0 in the current sequence
-// (decode-written rows never count). The re-prefill then starts on a cold grid point, and every retained grid cell was one
-// complete cold-shaped prefill cell of an earlier request, so a hit computes every row with the cold chunk shape (the
-// hit's own suffix chunk shape was otherwise the only difference). Retained < grid -> miss 'grid'. One exception: when the new
-// prompt's prefill ends exactly where the retained one did (limit == pf_end, the same prompt sent again), its last cell
-// [floor(pf_end / grid) * grid, pf_end) has the retained cell's rows and shape, so all pf_end rows are kept.
+// The grid: g6m4 sets grid = --prefill (MP, one sub-batch) with GR8_REUSE_ALIGN=1, or GR8_REUSE_GRID when set
+// (a positive multiple of 64 at most --prefill). GR8_REUSE_ALIGN=0 sets grid = 0, disabling the grid rule.
+// A hit retains [0, floor(min(skip, pf_end) / grid) * grid), where pf_end is the contiguous prefilled prefix
+// (decode-written rows never count). Only when grid == --prefill does the cold-chunk-shape argument apply:
+// re-prefill starts on a cold grid point, and every retained grid cell was one complete cold-shaped prefill cell.
+// A smaller grid (such as 64) still clamps to pf_end and retains whole 64-row KV pages, but the suffix prefill
+// starts off the cold --prefill grid: it is not cold-shaped by construction. Retained < grid -> miss 'grid'.
+// One exception: when the new prompt's prefill ends exactly where the retained one did (limit == pf_end, the same
+// prompt sent again), all pf_end rows are kept, including the partial last cell. This is not a cold-exactness claim.
 #include <algorithm>
 #include <cassert>
 #include <vector>
@@ -25,7 +26,7 @@ namespace g6rt {
 struct PrefixReuse
 {
     bool strict = false, noend = false;   // GR8_REUSE_STRICT=1 / GR8_REUSE_NOEND=1 (g6m4 sets them once)
-    int grid = 0;                       // GR8_REUSE_ALIGN=1 -> the cold prefill grid (rows); 0 = off (the old rule)
+    int grid = 0;                       // --prefill with ALIGN=1, or REUSE_GRID (64-row multiple <= MP); 0 = off; cold-shaped only at MP
     int pf_end = 0;                     // rows [0, pf_end) of the current sequence were written by prefill, contiguously
     int raw = 0;                        // the last begin()'s skip before the grid rule (log only)
     std::vector<int> history;           // previous full prompt + ACTUALLY emitted outputs

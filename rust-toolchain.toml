@@ -1,0 +1,6 @@
+# One compiler for the image and every pin. Keep this channel equal to
+# Dockerfile ARG RUST_VERSION, engine/rust-toolchain.toml,
+# frontend/g6front-rs/rust-toolchain.toml and frontend/pseudo-engine/rust-toolchain.toml.
+[toolchain]
+channel = "1.94.1"
+profile = "minimal"

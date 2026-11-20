@@ -3,6 +3,8 @@
 // one symbol the decode profiler hook needs (attn.cu:22 defines it for the other models) and makes the stage functions
 // link-visible through plain C entry points a step glue can bind without including the header.
 #include "ds41_attn.cuh"
+#include "ds41_attn_v2.cuh"
+#include "ds41_attn_v2_api.h"
 #include "ds41_sh_tc.cuh"   // the shared expert's tensor-core adapters (C entries ds41_sh_* below)
 #include "attn.h"
 
@@ -53,6 +55,18 @@ int ds41_attn_project(const ds41a::Fp8Mat* W, const void* x, int rows, void* y, 
 {
     return ds41a::project_rows(*W, (const ds41a::bf16*)x, rows, (ds41a::bf16*)y, ldy, codes, scales, xf, (cudaStream_t)st);
 }
+// project with one weight pass per 32 rows (project_rows_nt): same outputs as ds41_attn_project, bit for bit. scratch: codes u8 [32][K],
+// scales u8 [32][K/32], xf u32 [16K]; needs ds41_attn_set_gv_nt. 0 = ok.
+int ds41_attn_project_nt(const ds41a::Fp8Mat* W, const void* x, int rows, void* y, int ldy, uint8_t* codes, uint8_t* scales, uint32_t* xf, void* st)
+{
+    return ds41a::project_rows_nt(*W, (const ds41a::bf16*)x, rows, (ds41a::bf16*)y, ldy, codes, scales, xf, (cudaStream_t)st);
+}
+// the multi-tile launchers of ds41_attn_gv.cuh (gv_xfrag_nt_launch, gv_gemv_nt_launch) for ds41_attn_project_nt; the tpc / ks of ds41_attn_set_gv apply
+void ds41_attn_set_gv_nt(ds41a::XfragNtFn fn_xfrag_nt, ds41a::GemvFn fn_gemv_nt)
+{
+    ds41a::g_fn_xfrag_nt = fn_xfrag_nt;
+    ds41a::g_fn_gemv_nt = fn_gemv_nt;
+}
 // Decode GEMV switch (a process-wide setting): on = projections at <= 8 rows use the MXFP8 GEMV where the weight has records; tpc / ks = 0 -> defaults.
 // fn_xfrag / fn_gemv: the launchers of ds41_attn_gv.cuh from the rank TU (this TU does not hold the GEMV kernels); also needed by ds41_attn_project.
 void ds41_attn_set_gv(int on, int tpc, int ks, ds41a::XfragFn fn_xfrag, ds41a::GemvFn fn_gemv)
@@ -80,6 +94,9 @@ void ds41_attn_comp_prepack(const ds41a::bf16* src, uint8_t* codes, uint8_t* sca
 // Launch order of that GEMM (default 0 = N tile fastest): 1 = M tile fastest for every launch; 2 = auto, M tile fastest only for a weight of >= 100 MB (ds41a::TC_MF_AUTO_BYTES).
 // Only matters when the weights are much bigger than L2 and M spans several tiles (Engram wkv). Any other nonzero value means 1.
 void ds41_attn_set_tc_mfast(int mode) { ds41a::g_tc_mfast = mode == 2 ? 2 : mode != 0 ? 1 : 0; }
+// The 128 x 128 tile of that GEMM (GR8_DS_ATTN_TC_TILE, default 0): 1 = k_gemm_mx8t_sw, a 3-deep ring of swizzled rows; 2 = k_gemm_persist_ldm_epi_bid,
+// the persistent form of tile 1 (ds41_gemm_persist.cuh). The same output bits. Any other value means 0.
+void ds41_attn_set_tc_tile(int mode) { ds41a::g_tc_tile = mode == 2 ? 2 : mode == 1 ? 1 : 0; }
 // Explicit tensor-core MXFP8 GEMM for other TUs (the indexer's wq_b), one group, independent of ds41_attn_set_tc:
 //   Y[M][N] (bf16, row stride ldy elements) = fp8gemm(A codes [M][K] (row stride lda bytes) + E8M0 scales SA (row stride lsa bytes),
 //                                                      W codes [N][K] + E8M0 scales SW [N][K/32]), all device pointers, async on st.
@@ -112,6 +129,12 @@ void ds41_attn_set_split(int on)
 void ds41_attn_set_win_floor(int pos)
 {
     ds41a::g_win_floor = pos > 0 ? pos : 0;
+}
+// The GEMV row cap (ds41a::g_gv_rows_max), clamped to 8..32: the rank TU sets 32 around the decode / verify step captures (and the eager decode
+// launch) and 8 right after, so prefill chunks of any size keep their path. A captured graph keeps the value it was captured with.
+void ds41_attn_set_gv_rows_max(int max_rows)
+{
+    ds41a::set_gv_rows_max(max_rows);
 }
 // 1 = this layer's wq_b would take the GEMV at `rows` rows (the same switch attn_proj uses), so the idx wq_b can reuse its q_b activation table (S.xf_qr)
 int ds41_attn_gv_ready(const ds41a::Weights* W, int rows)
@@ -156,3 +179,37 @@ void ds41_attn_inv_freqs(int compressed, float* out32)
 // includable there (its device kernels would be defined twice in one binary), so these two are the link-visible names.
 unsigned long long ds41_c2_dispatch_count() { return ds41a::c2_dispatch_count(); }
 bool ds41_c2_trace_on() { return ds41a::c2_trace_on(); }
+
+// Sequence-parallel prefill v2 only. Stock/decode entry points above are unchanged.
+extern "C" {
+void ds41_v2_input_project(const ds41a::Weights* w, ds41a::v2::InputBuf* b, const void* y, int n, int pair, void* st) {
+    if (n) ds41a::v2::attn_proj_own(*w, *b, (const ds41a::bf16*)y, nullptr, nullptr, 0, n, pair != 0, (cudaStream_t)st);
+}
+void ds41_v2_project_rest(const ds41a::Weights* w, ds41a::Cache* c, const ds41a::Scratch* s,
+                         const ds41a::v2::InputBuf* b, int n, int heads, void* st, const int* pos) {
+    ds41a::v2::attn_proj_rest(*w, *c, *s, *b, n, heads, (cudaStream_t)st, pos);
+}
+void ds41_v2_comp_rest(const ds41a::Weights* w, ds41a::Cache* c, const ds41a::Scratch* s,
+                      const ds41a::v2::InputBuf* b, int n, void* st, const int* pos) {
+    ds41a::v2::comp_row_rest(*w, *c, *s, *b, n, 0, (cudaStream_t)st, pos);
+}
+void ds41_v2_output_a(const ds41a::Weights* w, const ds41a::Scratch* s, int n, int heads, void* st, const int* pos) {
+    ds41a::v2::output_a(*w, *s, n, heads, (cudaStream_t)st, pos);
+}
+void ds41_v2_output_pack(const ds41a::Scratch* s, uint8_t* wire, int n, int padded, int heads, void* st) {
+    ds41a::v2::pack_output(*s, wire, n, padded, heads, (cudaStream_t)st);
+}
+void ds41_v2_output_b(const ds41a::Fp8Mat* w, const uint8_t* wire, void* out, int n, uint32_t* xf, void* st) {
+    ds41a::v2::output_b(*w, wire, (ds41a::bf16*)out, n, xf, (cudaStream_t)st);
+}
+void ds41_v2_output_b_split(const ds41a::Fp8Mat* W, const uint8_t* codes, const uint8_t* scales,
+                             void* out, int rows, uint32_t* xf, void* st) {
+    ds41a::v2::output_b_split(*W, codes, scales, (ds41a::bf16*)out, rows, xf, (cudaStream_t)st);
+}
+void ds41_v2_output_sum(const void* parts, void* out, int n, int q, int nr, void* st) {
+    ds41a::v2::sum_output((const ds41a::bf16*)parts, (ds41a::bf16*)out, n, q, nr, (cudaStream_t)st);
+}
+}
+
+// Request-scoped, v2 prefill only; the caller resets this before stock replay/decode.
+extern "C" void ds41_attn_set_pipe(int on) { ds41a::g_attn_pipe = on != 0; }

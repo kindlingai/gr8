@@ -1,6 +1,8 @@
 #!/bin/bash
 # CPU-only tests: shell syntax, the host C++ tests, the Python tests and the Rust crates.
-# Linux with g++ (C++20, ASan), Python 3 with numpy, and cargo (rustup reads frontend/g6front-rs/rust-toolchain.toml).
+# Linux with g++ (C++20, ASan), Python 3 with numpy, and cargo. Engine cargo uses --manifest-path from
+# the repo root, so rustup reads rust-toolchain.toml there. The front end cds into its crate and reads that pin.
+# Keep those channels equal to Dockerfile ARG RUST_VERSION.
 #   .github/ci/cpu-tests.sh [frontend|engine|all]     from any directory; all by default. The CI's cpu-frontend and
 #                                                    cpu-engine jobs run one half each.
 # frontend: the front end, the shim, the launcher and the pseudo engine, with the small engine-side checkers their tests
@@ -18,6 +20,10 @@ step "bash -n"
 git ls-files -z '*.sh' | xargs -0 -n1 bash -n
 
 if [ "$PART" != frontend ]; then
+  step "Rust compiler"
+  rustc -V
+  cargo -V
+
   step "scripts/host_tests.sh"
   scripts/host_tests.sh
 
@@ -29,7 +35,7 @@ if [ "$PART" != frontend ]; then
   python3 -m unittest tools.convert.test_v2
   python3 -m unittest discover -s engine/ref -p 'test_*.py'
   python3 -m unittest discover -s tools/health
-  python3 -m unittest discover -s bench/gate/tests
+  python3 -m unittest discover -s bench/tests
   python3 -m unittest discover -s tools/ngram/tests
   python3 -m unittest discover -s tools/query
   (cd engine/tests && python3 -m unittest test_prefix_reuse)
@@ -46,10 +52,10 @@ if [ "$PART" != frontend ]; then
 
   step "Rust: engine/loader-rs"
   cargo test --locked --manifest-path engine/loader-rs/Cargo.toml
-  step "Rust: engine/kvman-rs"
-  cargo test --locked --manifest-path engine/kvman-rs/Cargo.toml
   step "Rust: engine/knobs-rs"
   cargo test --locked --manifest-path engine/knobs-rs/Cargo.toml
+  step "Rust: the engine workspace (engine/kvman-rs, engine/scheduler-rs, engine/hostcore-rs)"
+  cargo test --locked --workspace --manifest-path engine/Cargo.toml
 fi
 
 [ "$PART" = engine ] && exit 0
@@ -66,9 +72,11 @@ else
 fi
 
 step "Python tests (front end and launcher)"
-# the S2 headers read knobs: link the knob table's C API
+python3 -m unittest discover -s tools/switch/tests -v
+# the S2 headers read knobs and call the S2 scheduling logic: link the knob table's C API and the host Rust
 cargo build --release --locked --quiet --features capi --manifest-path engine/knobs-rs/Cargo.toml
-KNOBS=(engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm)
+cargo build --release --locked --quiet --manifest-path engine/Cargo.toml
+KNOBS=(engine/knobs-rs/target/release/libgr8knobs.a engine/target/release/libg6host.a -lpthread -ldl -lm)
 g++ -std=c++17 -O2 -Wall -Wextra -I engine/runtime \
   engine/runtime/s2/tests/steering_transport_test.cpp -o "$T/steering_transport_test" "${KNOBS[@]}"
 (cd frontend && STEERING_TRANSPORT_CHECK="$T/steering_transport_test" python3 -m unittest tests.test_s2shim tests.test_steering)
@@ -79,5 +87,7 @@ STEERING_BOOT_CHECK="$T/steering_boot_check" python3 -m unittest discover -s too
 
 step "Rust: frontend/g6front-rs"
 (cd frontend/g6front-rs && cargo test --locked)
+cargo build --release --locked --manifest-path frontend/g6front-rs/Cargo.toml
+python3 -m unittest discover -s frontend/tests -p test_ds41_api.py
 step "Rust: frontend/pseudo-engine (and its weights compile)"
 (cd frontend/pseudo-engine && cargo test --locked && cargo run --locked --quiet -- --weights model/responses.toml --check)

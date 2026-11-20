@@ -71,7 +71,7 @@ class EndToEnd(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp(prefix='gr8e2e-')
         self.rel = make_release(os.path.join(self.t, 'rel'))
-        for name, w in (('home', 3), ('down1', 2), ('up1', 4)):   # widths for the experts estimate, with the set id
+        for name, w in (('bit325', 3), ('bit200', 2), ('bit390', 4)):   # widths for the experts estimate, with the set id
             p = manifest(os.path.join(self.rel, 'manifests', f'exlr8-manifest-{name}.json'), name, w)
             with open(p) as f:
                 m = json.load(f)
@@ -82,7 +82,8 @@ class EndToEnd(unittest.TestCase):
         for i in range(TP):
             h = os.path.join(self.t, f'box{i}')
             os.makedirs(os.path.join(h, 'bin'))
-            os.symlink(os.path.join(HERE, 'stubs', 'g6m4'), os.path.join(h, 'bin', 'g6m4'))
+            for binary in ('g6m4', 'g6m4-int4'):
+                os.symlink(os.path.join(HERE, 'stubs', 'g6m4'), os.path.join(h, 'bin', binary))
             self.homes.append(h)
         self.env = {**os.environ, 'PATH': os.path.join(HERE, 'stubs') + os.pathsep + os.environ['PATH'],
                     'GR8_REFUSAL_LINGER': '3', 'GR8_MODEL': 'glm53'}   # three polls' worth; ./gr8 glm53 sets the model
@@ -137,7 +138,7 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual((val('--rank'), val('--s2-epoch'), val('--set-id')), (str(i), str(hs[0]['epoch']), set_id))
             self.assertEqual((val('--v2-dense'), val('--v2'), val('--v2-slices'), val('--v2-widths')),
                              (self.rel, os.path.join(self.rel, 'experts'), os.path.join(self.rel, 'index-slices'),
-                              os.path.join(self.rel, 'manifests', 'exlr8-manifest-home.json')))
+                              os.path.join(self.rel, 'manifests', 'exlr8-manifest-bit325.json')))
             self.assertNotIn('--manifest', a)
             self.assertNotIn('--dflash-pack', a)         # no --drafter: MTP only
             self.assertEqual(val('--serve'), os.path.join(self.homes[i], 's2'))
@@ -146,7 +147,7 @@ class EndToEnd(unittest.TestCase):
         front = json.loads(read(os.path.join(self.homes[0], 'out', 'front.json')))
         self.assertIsNone(front['default_max_tokens'])
         self.assertFalse(front['allow_thinking_off'])   # thinking off stays refused unless ALLOW_THINKING_OFF=1
-        self.assertIsNone(front['undeclared_tool_calls'])   # undeclared calls stay text unless UNDECLARED_TOOL_CALLS=emit
+        self.assertIsNone(front['undeclared_tool_calls'])   # the front end's default, emit, unless UNDECLARED_TOOL_CALLS=text
         # a request through the shim: req.<id> lands in the head's directory only (the head engine sends the bytes on)
         self.assertEqual(self.request(), 6)
         self.assertTrue(any(n.startswith('req.') for n in os.listdir(os.path.join(self.homes[0], 's2'))))
@@ -212,22 +213,22 @@ class EndToEnd(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(h, 'out', 'stub.json')))   # no engine started
 
     def test_a_variant_mismatch_stops_every_box(self):
-        res = self.up_all(extra={2: ['--variant', 'down1']})
+        res = self.up_all(extra={2: ['--variant', 'bit200']})
         for i, (rc, out) in enumerate(res):
             self.assertEqual(rc, 4, f'box {i}:\n{out}')
             self.assertIn('handshake refused: model set id', out)
-            self.assertIn('variant down1 (', out)
-            self.assertIn('variant home (', out)
+            self.assertIn('variant bit200 (', out)
+            self.assertIn('variant bit325 (', out)
         self.assertIn('about 0.6 GB of experts on the busiest rank at TP=4', res[2][1])
 
     def test_a_variant_boots_with_its_widths(self):
-        res = self.up_all(extra={i: ['--variant', 'up1'] for i in range(TP)})
+        res = self.up_all(extra={i: ['--variant', 'bit390'] for i in range(TP)})
         for i, (rc, out) in enumerate(res):
             self.assertEqual(rc, 0, f'box {i}:\n{out}')
         a = self.stub(3)['argv']
-        self.assertEqual(a[a.index('--v2-widths') + 1], os.path.join(self.rel, 'manifests', 'exlr8-manifest-up1.json'))
+        self.assertEqual(a[a.index('--v2-widths') + 1], os.path.join(self.rel, 'manifests', 'exlr8-manifest-bit390.json'))
         st = self.gr8(1, 'status')
-        self.assertEqual(st.stdout.count('variant up1'), TP, st.stdout)
+        self.assertEqual(st.stdout.count('variant bit390'), TP, st.stdout)
 
     def release(self):
         """A fake hub serving a synthetic exlr8 release at two commits (test_hf.py)."""
@@ -253,7 +254,7 @@ class EndToEnd(unittest.TestCase):
         val = lambda f: a[a.index(f) + 1]   # noqa: E731
         self.assertEqual((val('--v2'), val('--v2-slices'), val('--v2-widths')),
                          (os.path.join(rel, 'experts'), os.path.join(rel, 'index-slices'),
-                          os.path.join(rel, 'manifests', 'exlr8-manifest-home.json')))
+                          os.path.join(rel, 'manifests', 'exlr8-manifest-bit325.json')))
         self.assertEqual(os.listdir(os.path.join(rel, 'index-slices', 'tp4', 'k3')), ['rank2.safetensors'])
         self.assertEqual(len({self.stub(i)['argv'][self.stub(i)['argv'].index('--set-id') + 1] for i in range(TP)}), 1)
         self.assertIn(f'{T.RELEASE}@{T.C1[:12]}', res[0][1])
@@ -278,7 +279,7 @@ class EndToEnd(unittest.TestCase):
         val = lambda f: a[a.index(f) + 1]   # noqa: E731
         self.assertEqual((val('--v2'), val('--v2-slices'), val('--v2-widths')),
                          (os.path.join(rel, 'experts'), os.path.join(rel, 'index-slices'),
-                          os.path.join(rel, 'manifests', 'exlr8-manifest-home.json')))
+                          os.path.join(rel, 'manifests', 'exlr8-manifest-bit325.json')))
         self.assertEqual(len({self.stub(i)['argv'][self.stub(i)['argv'].index('--set-id') + 1] for i in range(TP)}), 1)
         self.assertIn(f'{T.RELEASE}@{T.C1[:12]}', res[0][1])
 

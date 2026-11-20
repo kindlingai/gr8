@@ -118,12 +118,14 @@ def make_release(root):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, 'wb') as f:
             f.write(data)
-    for name, w in (('home', lambda p, e, h: 3), ('down1', lambda p, e, h: 2),
-                    ('up1', lambda p, e, h: 3 if p != 'up' else 2)):
+    # the TP=4 and TP=6 defaults and two others; the widths are the fixture's own, not the release's
+    for name, w in (('bit400', lambda p, e, h: 3), ('bit325', lambda p, e, h: 3), ('bit200', lambda p, e, h: 2),
+                    ('bit390', lambda p, e, h: 3 if p != 'up' else 2)):
         put(f'manifests/exlr8-manifest-{name}.json', json.dumps(manifest(w)).encode())
     rnd = numpy.random.default_rng(7)
     for name in ('exlr8-dense-003', 'exlr8-dense-004', 'exlr8-vocab'):
         put(f'dense/{name}.safetensors', rnd.bytes(300_000))
+    put('dense/vision-bf16.safetensors', rnd.bytes(50_000))   # fetched only with image input (GR8_GLM53F_VISION=1)
     for name in hfsource.META_FILES:
         put(name, f'{{"{name}": 1}}'.encode())
     put('README.md', b'fake release\n')
@@ -266,8 +268,42 @@ class HFTests(unittest.TestCase):
         r.fetch_meta()
         return r
 
-    def variant(self, r, name='home'):
+    def variant(self, r, name='bit400'):
         return modelset.resolve_variant(name, r.v2, [r.dir])
+
+    def test_prepare_compact_round_trip(self):
+        import launch
+        dest = os.path.join(self.cache, 'compact-rank1')
+        args = ['prepare', '--no-config', '--model', f'https://huggingface.co/{RELEASE}',
+                '--model-cache', self.cache, '--rank', '1', '--tp', '4', '--variant', 'bit400',
+                '--extra-env', f'GR8_LOAD_COMPACT={dest}']
+        env = {**os.environ, **GLM, 'G6LOAD': hfsource.fetch_ranks().g6load()}
+        cmd = [sys.executable, launch.__file__, *args]
+        for _ in range(2):  # initial prepare, then verify/reuse with an already-complete fetch
+            r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn('halves verified', r.stdout)
+        release = self.release()
+        variant = self.variant(release)
+        # Each dense copy equals the original ranges, in sorted order without holes. The command above also
+        # read every half through the Rust loader's map and checked its checksum against the index slices.
+        for name in os.listdir(dest):
+            if not name.endswith('.g6map'):
+                continue
+            with open(os.path.join(dest, name)) as f:
+                head, *rows = f.read().splitlines()
+            src = os.path.join(release.v2, name[:-6])
+            self.assertEqual(head, f'g6map-v1 {os.path.getsize(src)}')
+            with open(src, 'rb') as original, open(os.path.join(dest, name[:-6]), 'rb') as copy:
+                packed = 0
+                for row in rows:
+                    start, length, offset = map(int, row.split())
+                    self.assertEqual(offset, packed)
+                    original.seek(start)
+                    self.assertEqual(copy.read(length), original.read(length))
+                    packed += length
+                self.assertEqual(copy.read(), b'')
+        self.assertEqual(release.check(4, 1, variant), [])
 
     def test_parse_url(self):
         P = hfsource.parse_url
@@ -284,7 +320,7 @@ class HFTests(unittest.TestCase):
         self.assertEqual(r.commit, C1)
         self.assertEqual(sorted(os.listdir(r.tokenizer)), sorted(hfsource.META_FILES))
         v = self.variant(r)
-        self.assertEqual(r.check(4, 1, v), [f'{RELEASE}@{C1[:12]} rank 1 of TP=4, variant home, is not in the cache yet'])
+        self.assertEqual(r.check(4, 1, v), [f'{RELEASE}@{C1[:12]} rank 1 of TP=4, variant bit400, is not in the cache yet'])
         r.fetch_rank(4, 1, v)
         self.assertEqual(r.check(4, 1, v), [])
         self.assertEqual(sorted(os.listdir(os.path.join(r.slices, 'tp4', 'k3'))), ['rank1.safetensors'])
@@ -296,8 +332,21 @@ class HFTests(unittest.TestCase):
                   for x in self.hub.requests(r'exlr8-layer-003\.k3') if x[2])
         size = os.path.getsize(os.path.join(self.r1, 'experts', 'exlr8-layer-003.k3.safetensors'))
         self.assertLess(got, size * 0.4)
-        self.assertEqual(self.hub.requests(r'exlr8-layer-00\d\.k2'), [])            # home uses K3 only
+        self.assertEqual(self.hub.requests(r'exlr8-layer-00\d\.k2'), [])            # bit400 (fixture widths) uses K3 only
         self.assertTrue(any('GB to fetch' in m for m in self.logs))
+
+    def test_the_vision_tower_only_with_image_input(self):
+        r = self.release()
+        v = self.variant(r)
+        r.fetch_rank(4, 1, v)
+        self.assertEqual(self.hub.requests(r'dense/vision-'), [])
+        r.vision = True       # GR8_GLM53F_VISION=1 after a text-only fetch: the rank is not ready until it has the tower
+        self.assertEqual(r.check(4, 1, v), ['dense/vision-bf16.safetensors: not fetched yet (GR8_GLM53F_VISION=1)'])
+        r.fetch_rank(4, 1, v)
+        self.assertEqual(r.check(4, 1, v), [])
+        with open(os.path.join(self.r1, 'dense', 'vision-bf16.safetensors'), 'rb') as a, \
+                open(os.path.join(r.dir, 'dense', 'vision-bf16.safetensors'), 'rb') as b:
+            self.assertEqual(a.read(), b.read())
 
     def test_a_rerun_fetches_nothing_and_a_variant_adds_its_widths(self):
         r = self.release()
@@ -308,7 +357,7 @@ class HFTests(unittest.TestCase):
         later = self.hub.log[n:]
         self.assertFalse([x for x in later if re.search(r'\.k3\.safetensors|dense/', x[1]) and x[2] and
                           not x[2].startswith('bytes=0-7')], later)                 # only the 8-byte header lengths
-        r.fetch_rank(4, 2, self.variant(r, 'down1'))
+        r.fetch_rank(4, 2, self.variant(r, 'bit200'))
         self.assertTrue(self.hub.requests(r'exlr8-layer-003\.k2'))
         self.assertEqual(r.check(4, 2, self.variant(r)), [])
 
@@ -350,7 +399,7 @@ class HFTests(unittest.TestCase):
                      ['plan', '--from', t4, '--members', 'a,b,d', '--out', p3]):
             subprocess.run([g6layout] + argv + ['--widths', v.path], check=True, capture_output=True)
         lr = hfsource.Release(self.cache, RELEASE, 'main', log=self.logs.append, layout=p3)
-        self.assertEqual(lr.check(3, 1, v), [f'{RELEASE}@{C1[:12]} rank 1 of TP=3, variant home, layout '
+        self.assertEqual(lr.check(3, 1, v), [f'{RELEASE}@{C1[:12]} rank 1 of TP=3, variant bit400, layout '
                                              f'{modelset.sha256_file(p3)[:12]}, is not in the cache yet'])
         n = len(self.hub.log)
         lr.fetch_rank(3, 1, v)
@@ -467,7 +516,7 @@ sys.path[:0] = [sys.argv[1], os.path.dirname(os.path.dirname(sys.argv[1]))]
 import hfsource, modelset
 r = hfsource.Release(sys.argv[2], sys.argv[3], 'main', log=lambda m: None)
 r.fetch_meta()
-v = modelset.resolve_variant('up1', r.v2, [r.dir])
+v = modelset.resolve_variant('bit390', r.v2, [r.dir])
 r.fetch_rank(4, 3, v)
 print(json.dumps(r.check(4, 3, v)))
 """
@@ -503,11 +552,54 @@ class NoNumpyFetchTests(unittest.TestCase):
                 logs = []
                 r = hfsource.Release(os.path.join(self.t, 'c2'), RELEASE, 'main', log=logs.append)
                 r.fetch_meta()
-                r.fetch_rank(4, 0, modelset.resolve_variant('home', r.v2, [r.dir]))
+                r.fetch_rank(4, 0, modelset.resolve_variant('bit400', r.v2, [r.dir]))
         finally:
             hub.close()
         self.assertTrue(any('failed their xxhash64: fetching them again' in m for m in logs), logs)
         same_halves(self.root, r.v2, 3, 4, 0, lambda p: 3)
+
+
+class StaleJournalTests(unittest.TestCase):
+    """A width file deleted by hand while its .fetch journal stays: the next fetch writes its header and halves again.
+    A stub hub and fetch plan, so neither numpy nor bin/g6load is needed."""
+    NAME = 'exlr8-layer-003.k3.safetensors'
+
+    class Hub:
+        repo, rev = 'o/r', 'main'
+
+        def __init__(self, data):
+            self.data, self.gets = data, []
+
+        def tree(self):
+            return {'experts/' + StaleJournalTests.NAME: len(self.data)}
+
+        def get(self, path, lo, n):
+            self.gets.append((lo, n))
+            return self.data[lo:lo + n]
+
+    def test_a_deleted_width_file_is_fetched_again(self):
+        fr = hfsource.fetch_ranks()
+        hn = 40
+        data = hn.to_bytes(8, 'little') + b'{"__metadata__": {}}'.ljust(hn) + bytes(range(256)) * 4
+        hub = self.Hub(data)
+        plan = {'files': [{'name': self.NAME, 'ranges': [[200, 64]]}]}
+        out = tempfile.mkdtemp(prefix='gr8sj-')
+        local = os.path.join(out, self.NAME)
+        with mock.patch.object(fr, 'g6load_run', return_value=plan):
+            fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], log=lambda m: None)
+            self.assertEqual(open(local, 'rb').read(264), data[:264])
+            os.unlink(local)                   # the journal in out/.fetch still lists the ranges
+            self.assertGreater(fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], plan_only=True), 0)
+            fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], log=lambda m: None)
+            with open(local, 'rb') as f:
+                self.assertEqual(f.read(8 + hn), data[:8 + hn])
+                f.seek(200)
+                self.assertEqual(f.read(64), data[200:264])
+            # a rerun with the file in place fetches nothing but the 8-byte header length
+            n = len(hub.gets)
+            self.assertEqual(fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], log=lambda m: None), 0)
+            self.assertEqual(hub.gets[n:], [(0, 8)])
+        shutil.rmtree(out)
 
 
 class KeepAliveTests(unittest.TestCase):
@@ -757,7 +849,7 @@ class DrafterTests(unittest.TestCase):
         import options as opt
         import supervisor as S
         from test_modelset import make_release as local_release
-        rel = local_release(os.path.join(self.t, 'local6'))
+        rel = local_release(os.path.join(self.t, 'local6'), variants=('bit325',))
         base = ['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 7)), '--model', rel]
         logs = []
 

@@ -287,8 +287,8 @@ static Fx make_fx(int NMAX, int RMAX, uint32_t seed, bool realistic = false)
     int zero = 0;
     CK(cudaMalloc(&f.page0, 4));
     CK(cudaMemcpy(f.page0, &zero, 4, cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&f.scratch, Scratch::bytes(RMAX, NMAX)));
-    f.sc = Scratch::carve(f.scratch, RMAX, NMAX);
+    CK(cudaMalloc(&f.scratch, Scratch::bytes(RMAX, NMAX, 0)));
+    f.sc = Scratch::carve(f.scratch, RMAX, NMAX, RMAX, 0);   // one pass (flat): full logit rows up to NMAX
     std::vector<uint8_t> qp((size_t)RMAX * 32 * 64), qe((size_t)RMAX * 32 * 4);
     if (realistic)
         for (int r = 0; r < RMAX * 32; r++) real_row(rng, &qp[(size_t)r * 64], &qe[(size_t)r * 4]);

@@ -18,7 +18,9 @@ use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 use crate::dialect::{self, AnyParser, Dialect};
+use crate::engine::Admit;
 use crate::gen::{think_open, Budget, Generation, Res, Step, StepStats, StopReason};
+use crate::guard;
 use crate::jsonmode;
 use crate::parser::Delta;
 use crate::pyjson::{self, truthy};
@@ -38,20 +40,28 @@ pub struct ApiError {
     pub status: u16,
     pub message: String,
     pub param: Option<String>,
+    /// seconds for the Retry-After response header (the busy guard's 429; PROTOCOL.md `finish`), None elsewhere
+    pub retry_after: Option<u32>,
 }
 
 impl ApiError {
     pub fn new(status: u16, message: &str, param: Option<&str>) -> ApiError {
-        ApiError { status, message: message.to_string(), param: param.map(str::to_string) }
+        ApiError { status, message: message.to_string(), param: param.map(str::to_string), retry_after: None }
+    }
+
+    /// The busy guard's refusal: an OpenAI-shaped 429 body with Retry-After (docs/ENV.md GR8_BUSY_*).
+    pub fn busy(message: &str, retry_after: u32) -> ApiError {
+        ApiError { status: 429, message: message.to_string(), param: None, retry_after: Some(retry_after) }
     }
 
     pub fn bad(message: impl Into<String>, param: Option<&str>) -> ApiError {
-        ApiError { status: 400, message: message.into(), param: param.map(str::to_string) }
+        ApiError { status: 400, message: message.into(), param: param.map(str::to_string), retry_after: None }
     }
 
     fn body(&self) -> Vec<u8> {
         let ty = match self.status {
             404 => "NotFoundError",
+            429 => "RateLimitError",
             500 => "InternalServerError",
             503 => "ServiceUnavailableError",
             _ => "BadRequestError",
@@ -73,7 +83,13 @@ impl ApiError {
     }
 
     fn response(&self) -> Response<HttpBody> {
-        json_response(self.status, self.body())
+        let mut r = json_response(self.status, self.body());
+        if let Some(secs) = self.retry_after {
+            if let Ok(v) = header::HeaderValue::from_str(&secs.to_string()) {
+                r.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+        }
+        r
     }
 
     fn sse(&self) -> Bytes {
@@ -319,10 +335,50 @@ async fn read_json_raw(req: Request<Incoming>) -> Result<(Map<String, Value>, By
     }
 }
 
+/// A nonzero penalty needs an engine whose hello says `"penalties": true`, a think-end boost one that says
+/// `"think_end_boost": true` (PROTOCOL.md). The thinking penalties and the boost apply inside the think block the prompt
+/// leaves open, and the sequence penalty's answer scope outside it, so the frame names its close (`think_end`) when
+/// there is one. A boost or a thinking scope with no open block is dropped.
+fn check_penalties(st: &State, prompt: &[u32], g: &mut crate::wire::GenParams) -> Result<(), ApiError> {
+    if g.think_end_boost.is_some() && !st.engine.think_end_boost() {
+        return Err(ApiError::bad("think_end_boost is not supported by this engine", Some("think_end_boost")));
+    }
+    if (g.seq_thinking.is_some() || g.seq_answer.is_some() || g.seq_guard.is_some()) && !st.engine.sequence_penalty() {
+        return Err(ApiError::bad("sequence_penalty is not supported by this engine", Some("sequence_penalty")));
+    }
+    let named = [
+        ("presence_penalty", g.presence_penalty),
+        ("frequency_penalty", g.frequency_penalty),
+        ("thinking_presence_penalty", g.thinking_presence_penalty),
+        ("thinking_frequency_penalty", g.thinking_frequency_penalty),
+    ];
+    if let Some((k, _)) = named.iter().find(|(_, v)| *v != 0.0) {
+        if !st.engine.penalties() {
+            return Err(ApiError::bad(format!("{k} is not supported by this engine"), Some(k)));
+        }
+    }
+    if g.thinking_presence_penalty != 0.0
+        || g.thinking_frequency_penalty != 0.0
+        || g.think_end_boost.is_some()
+        || g.seq_thinking.is_some()
+        || g.seq_answer.is_some()
+    {
+        g.think_end = match (st.tok.think_start, st.tok.think_end) {
+            (Some(s), Some(e)) if think_open(prompt, s, e) => Some(e),
+            _ => None,
+        };
+        if g.think_end.is_none() {
+            g.think_end_boost = None;
+            g.seq_thinking = None;
+        }
+    }
+    Ok(())
+}
+
 impl State {
-    /// The jinja chat template, which only the glm dialect has.
+    /// The jinja chat template (used by the `glm` and `hf` dialects).
     fn tpl(&self) -> &crate::template::ChatTemplate {
-        self.template.as_ref().expect("a glm-dialect State has a chat template")
+        self.template.as_ref().expect("a template-backed State has a chat template")
     }
 
     fn check_model(&self, body: &Map<String, Value>) -> Result<(), ApiError> {
@@ -336,11 +392,14 @@ impl State {
         }
     }
 
-    fn require_engine(&self) -> Result<(), ApiError> {
-        if self.engine.ready() {
-            Ok(())
-        } else {
-            Err(ApiError::new(503, "engine not connected", None))
+    /// Waits through a scale's hold (`/internal/hold`); then 503 with Retry-After when the engine is not connected.
+    /// The guard counts the request as running for a drain until its route is registered (Generation::start).
+    async fn require_engine(&self) -> Result<Admit, ApiError> {
+        match self.engine.admit().await {
+            Some(a) => Ok(a),
+            None => {
+                Err(ApiError { status: 503, message: "engine not connected".into(), param: None, retry_after: Some(5) })
+            }
         }
     }
 
@@ -369,17 +428,29 @@ pub async fn route(
     req: Request<Incoming>,
     peer: std::net::SocketAddr,
 ) -> Result<Response<HttpBody>, Infallible> {
-    let path = req.uri().path();
+    let path = req.uri().path().to_owned();
     let deep = req.uri().query().is_some_and(|q| q.split('&').any(|x| x == "deep" || x.starts_with("deep=")));
     let m = req.method().clone();
-    let r = match (path, &m) {
+    let r = match (path.as_str(), &m) {
         ("/v1/chat/completions", &Method::POST) => chat(st, req).await,
+        (p, &Method::POST) if st.sessions.is_some() && p.starts_with("/v1/sessions/") && p.ends_with("/forks") => {
+            let id = &p[13..p.len() - 6];
+            session_forks(st, id, req).await
+        }
+        (p, &Method::DELETE) if st.sessions.is_some() && p.starts_with("/v1/sessions/") => {
+            let id = &p[13..];
+            match st.sessions.as_ref().unwrap().delete(id) {
+                Ok(()) => json_value(200, serde_json::json!({"id": id, "deleted": true})),
+                Err(e) => e.response(),
+            }
+        }
         ("/v1/completions", &Method::POST) => completions(st, req).await,
         ("/tokenize", &Method::POST) => tokenize(st, req).await,
         ("/detokenize", &Method::POST) => detokenize(st, req).await,
         ("/v1/models", &Method::GET | &Method::HEAD) => models(st),
         ("/health", &Method::GET | &Method::HEAD) if deep => health_deep(st, peer).await,
         ("/health", &Method::GET | &Method::HEAD) => health(st),
+        ("/internal/hold", &Method::GET | &Method::POST) => hold(st, &req, peer),
         ("/metrics", &Method::GET | &Method::HEAD) => metrics_route(st).await,
         ("/v1/chat/completions" | "/v1/completions" | "/tokenize" | "/detokenize", _) => {
             let mut r = response(405, "text/plain; charset=utf-8", b"405: Method Not Allowed".to_vec());
@@ -396,6 +467,53 @@ pub async fn route(
     Ok(r)
 }
 
+async fn session_forks(st: &'static State, id: &str, req: Request<Incoming>) -> Response<HttpBody> {
+    let (body, _) = match read_json_raw(req).await {
+        Ok(b) => b,
+        Err(e) => return e.response(),
+    };
+    let count = match body.get("count").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()) {
+        Some(n) => n,
+        None => return ApiError::bad("count must be between 1 and 16", Some("count")).response(),
+    };
+    if !(1..=16).contains(&count) {
+        return ApiError::bad("count must be between 1 and 16", Some("count")).response();
+    }
+    let (messages, parent_prompt, mut render, rev) = match st.sessions.as_ref().unwrap().snapshot(id) {
+        Ok(s) => s,
+        Err(e) => return e.response(),
+    };
+    render.insert("messages".into(), Value::Array(messages));
+    render.insert("max_tokens".into(), Value::from(1));
+    let raw = serde_json::to_vec(&render).unwrap_or_default();
+    let candidate = match chat_prepare(st, &render, &raw).await {
+        Ok(c) => c,
+        Err(e) => return e.response(),
+    };
+    let prefix = parent_prompt.iter().zip(&candidate.prompt).take_while(|(a, b)| a == b).count();
+    match st.sessions.as_ref().unwrap().fork(id, count, prefix, rev) {
+        Ok(v) => json_value(200, v),
+        Err(e) => e.response(),
+    }
+}
+
+fn session_render(body: &Map<String, Value>) -> Map<String, Value> {
+    const KEYS: &[&str] = &[
+        "model",
+        "tools",
+        "tool_choice",
+        "chat_template_kwargs",
+        "documents",
+        "reasoning_effort",
+        "thinking",
+        "enable_thinking",
+        "add_generation_prompt",
+        "continue_final_message",
+        "response_format",
+    ];
+    KEYS.iter().filter_map(|&k| body.get(k).map(|v| (k.to_owned(), v.clone()))).collect()
+}
+
 // ---- /v1/chat/completions ----------------------------------------------------------------------------------------
 
 struct ChatReq {
@@ -409,11 +527,18 @@ struct ChatReq {
     budget: u64,
     /// the validated response_format ('text' enforces nothing)
     rf: jsonmode::Rf,
+    /// whether thinking was explicitly turned off for this request
+    thinking_off: bool,
+    /// whether the rendered prompt leaves `<think>` open for the assistant turn
+    prompt_think_open: bool,
+    /// `continue_final_message`: the reply goes on from the prompt's last assistant message
+    cfm_on: bool,
+    admit: Admit,
 }
 
 async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8]) -> Result<ChatReq, ApiError> {
     st.check_model(body)?;
-    st.require_engine()?;
+    let admit = st.require_engine().await?;
     if truthy(body.get("echo")) {
         return Err(ApiError::bad("echo is not supported by the gr8 front end", Some("echo")));
     }
@@ -421,22 +546,37 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
     let rf = jsonmode::parse_response_format(body.get("response_format"), &st.grammars)?;
     let ds = st.dialect == Dialect::Ds41;
-    let (th, ds_effort) = if ds {
-        dialect::resolve_ds(body, st.thinking, st.ds_effort)?
-    } else {
-        (st.tpl().resolve_thinking(body, st.thinking)?, st.ds_effort)
+    let (mut th, ds_effort, hf_enable, ink_effort) = match st.dialect {
+        Dialect::Ds41 => {
+            let (th, e) = dialect::resolve_ds(body, st.thinking, st.ds_effort, st.ds_thinking_default)?;
+            (th, e, None, None)
+        }
+        Dialect::Hf => {
+            let (th, en) = dialect::resolve_hf(body, &st.tpl().levels, st.thinking)?;
+            (th, st.ds_effort, en, None)
+        }
+        Dialect::Inkling => {
+            let (th, e) = dialect::resolve_inkling(body, st.thinking, st.ink_effort.as_ref())?;
+            (th, st.ds_effort, None, e)
+        }
+        Dialect::Glm => (st.tpl().resolve_thinking(body, st.thinking)?, st.ds_effort, None, None),
     };
-    let kw = if ds {
+    let agp_val = body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true));
+    let cfm_val = body.get("continue_final_message").cloned().unwrap_or(Value::Bool(false));
+    let agp_on = truthy(Some(&agp_val));
+    let cfm_on = truthy(Some(&cfm_val));
+    let mut kw = if ds {
         Map::new() // the prompt is rendered by dschat from the messages alone
     } else {
-        build_template_kwargs(
-            body.get("chat_template_kwargs"),
-            body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true)),
-            body.get("continue_final_message").cloned().unwrap_or(Value::Bool(false)),
-            th.effort,
-            body.get("documents"),
-        )?
+        build_template_kwargs(body.get("chat_template_kwargs"), agp_val, cfm_val, th.effort, body.get("documents"))?
     };
+    if let Some(en) = hf_enable {
+        kw.insert("enable_thinking".into(), Value::Bool(en));
+    }
+    // Inkling's template takes the effort as a name or a number, and effort 0 is its thinking off
+    if let Some(e) = ink_effort {
+        kw.insert("reasoning_effort".into(), e);
+    }
     if truthy(body.get("chat_template")) {
         return Err(ApiError::bad("custom chat_template is not supported", Some("chat_template")));
     }
@@ -445,27 +585,62 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         Some(h) => append_hint(body.get("messages"), &h)?,
         None => body.get("messages").cloned().unwrap_or(Value::Array(Vec::new())),
     };
+    // A forced call cannot generate reasoning before its token-zero insert. Use native chat mode unless the
+    // request or its history needs thinking; keep that history's prompt prefix unchanged.
+    if ds
+        && !st.forced_tool_thinking
+        && choice.is_forced()
+        && !cfm_on
+        && !th.off
+        && !dialect::ds_explicit_thinking_on(body)
+        && !dialect::ds_has_prior_reasoning(Some(&messages))
+    {
+        th.off = true;
+    }
     let t0 = std::time::Instant::now();
     let kw_system = kw.clone();
+    let mut images = Vec::new();
     let text = if ds {
         let (agp, cfm) = dialect::ds_gen_flags(body)?;
-        dialect::ds_prompt(Some(&messages), tools.as_ref(), !th.off, ds_effort, agp, cfm)?
+        let (text, im) = dialect::ds_prompt(Some(&messages), tools.as_ref(), !th.off, ds_effort, agp, cfm)?;
+        images = im;
+        text
     } else {
-        let mut text = st.tpl().render(Some(&messages), tools.as_ref(), kw)?;
-        if th.off {
-            text = st.tpl().thinking_off(text, body.get("add_generation_prompt").is_none_or(|v| truthy(Some(v))));
+        // image parts: the template's placeholders and the parts in their order (GLM-5.3-Flash image input)
+        let mut text = if crate::template::has_images(&messages) {
+            let (text, im) = st.tpl().render_images(Some(&messages), tools.as_ref(), kw)?;
+            images = im;
+            text
+        } else {
+            st.tpl().render(Some(&messages), tools.as_ref(), kw)?
+        };
+        // GLM renders its lowest effort with the think block open, and Inkling's effort line says it: only an hf
+        // template's open think block is closed here
+        if th.off && st.dialect == Dialect::Hf {
+            text = dialect::hf_thinking_off(text, agp_on);
         }
         text
     };
+    let hf_prompt_ends_think = st.dialect == Dialect::Hf && !cfm_on && pyjson::py_rstrip(&text).ends_with("<think>");
+    let thinking_off = th.off || (st.dialect == Dialect::Hf && pyjson::py_rstrip(&text).ends_with("</think>"));
     let (t1, chars) = (std::time::Instant::now(), text.len());
-    // the DeepSeek prompt text opens with its BOS, so no special tokens are added to it
+    // The same Tok checkpoint cache serves chat, /tokenize previews and the shorter system-span query.
+    // The DeepSeek prompt text opens with its BOS, so no special tokens are added to it
     let add_special = !ds && truthy(body.get("add_special_tokens"));
     let prompt = st.tok.aencode(text, add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
     let t2 = std::time::Instant::now();
     let system = if ds {
         ds_system_span(st, body.get("messages"), tools.as_ref(), !th.off, ds_effort, &prompt).await
     } else {
-        system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, th.off, &prompt).await
+        system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, &prompt).await
+    };
+    let (prompt, system, spans) = if images.is_empty() {
+        (prompt, system, Vec::new())
+    } else {
+        let model = image_model(st);
+        let (ids, spans, n_spans) = with_images(st, model, &images, &prompt).await?;
+        let system = system.map(|n| crate::vision::expanded_index(&prompt, n as usize, &n_spans, model.token()) as u64);
+        (ids, system, spans)
     };
     log::debug!(
         "chat prompt: {chars} bytes -> {} tokens; template {:.2} ms, encode {:.2} ms, system span {system:?} tokens {:.2} ms",
@@ -482,7 +657,11 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         &st.tok.eos_ids,
         st.tok.vocab_size,
         &st.tok.gen_defaults,
+        &st.penalties,
+        st.boost.as_ref(),
+        st.sequence.as_ref(),
         st.chat_default_max_tokens(prompt.len()),
+        st.clamp_max_tokens,
         st.max_logprobs(),
         true,
     )?;
@@ -492,7 +671,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     }
     // the close a budget puts in is an insert rule too, and a request carries at most one: one that asks for both is
     // refused, while the server's default budget steps aside, as it does for logprobs
-    let budget = match (th.budget, params.gen.logprobs.is_some() || choice.is_forced()) {
+    let budget = match (th.budget_tokens(params.gen.max_tokens), params.gen.logprobs.is_some() || choice.is_forced()) {
         (b, true) if b > 0 && th.budget_explicit => {
             return Err(ApiError::bad(
                 if choice.is_forced() {
@@ -509,21 +688,31 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     if choice.is_forced() && !st.engine.inserts() {
         return Err(ApiError::bad("the engine does not support a forced tool_choice", Some("tool_choice")));
     }
+    check_penalties(st, &prompt, &mut params.gen)?;
+    let tok_think_open = match (st.tok.think_start, st.tok.think_end) {
+        (Some(s), Some(e)) => think_open(&prompt, s, e),
+        _ => false,
+    };
+    // An Inkling prompt ends at `<|end_message|>`: the model opens its own thinking block in the reply.
+    let prompt_think_open = match st.dialect {
+        Dialect::Hf if !cfm_on => hf_prompt_ends_think,
+        Dialect::Inkling => false,
+        _ => tok_think_open,
+    };
     // The template leaves `<think>` open at the end of a chat prompt, so the reply's first token sits in the reasoning
     // span: the forced opener has to follow the close, or the call it opens is reasoning and the parser reads prose.
-    let close = match (st.tok.think_start, st.tok.think_end) {
-        (Some(s), Some(e)) if think_open(&prompt, s, e) => st.tok.think_close.as_slice(),
-        _ => &[],
+    let close = if prompt_think_open { st.tok.think_close.as_slice() } else { &[] };
+    let force = match st.dialect {
+        Dialect::Ds41 => choice.forced_ids_ds(&st.tok, close)?,
+        Dialect::Hf => choice.forced_ids_hf(&st.tok, close)?,
+        Dialect::Inkling => choice.forced_ids_ink(tools.as_ref(), &st.tok, close)?,
+        Dialect::Glm => choice.forced_ids(&st.tok, close)?,
     };
-    let force = if ds { choice.forced_ids_ds(&st.tok, close)? } else { choice.forced_ids(&st.tok, close)? };
     params.gen.system_tokens = system;
     // a JSON mode with no tools: the engine masks the reply to the grammar (after the think close while the prompt leaves
     // the think block open); the extraction after generation still runs. With tools the grammar would forbid a call
     if rf.kind != "text" && tools.is_none() && st.engine.grammars() {
-        let after_token = match (st.tok.think_start, st.tok.think_end) {
-            (Some(start), Some(end)) if think_open(&prompt, start, end) => Some(end),
-            _ => None,
-        };
+        let after_token = if prompt_think_open { st.tok.think_end } else { None };
         params.gen.grammar = Some(crate::wire::GrammarReq {
             kind: if rf.kind == "json_schema" { "json_schema" } else { "json" },
             schema: rf.schema.as_ref().map(Value::to_string),
@@ -532,7 +721,67 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         });
     }
     (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(body, st.steering().as_ref())?;
-    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf })
+    if !spans.is_empty() {
+        // the engine runs image rows only through its prefill chunks, which prompt logprobs and steering do not use
+        if params.gen.prompt_logprobs.is_some() {
+            return Err(ApiError::bad("images cannot be combined with prompt_logprobs", Some("prompt_logprobs")));
+        }
+        if params.gen.steering_profile.is_some() {
+            return Err(ApiError::bad("images cannot be combined with steering", Some("messages")));
+        }
+        params.gen.images = std::sync::Arc::new(spans);
+    }
+    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf, thinking_off, prompt_think_open, cfm_on, admit })
+}
+
+fn image_err(e: crate::vision::VisionError) -> ApiError {
+    ApiError::bad(e.0, Some("messages"))
+}
+
+/// The image processor and image token of the served model: DeepSeek-V4.1's, Inkling-2-Small's, else GLM-5.3-Flash's
+/// (an engine without a vision tower refuses images before any is used).
+fn image_model(st: &State) -> crate::vision::Model {
+    match st.dialect {
+        Dialect::Ds41 => crate::vision::Model::Ds41,
+        Dialect::Inkling => crate::vision::Model::Ink2,
+        _ => crate::vision::Model::Glm5v,
+    }
+}
+
+/// The request's images (blocks in prompt order) -> the prompt with each placeholder token grown to its span, the
+/// spans for the engine, and each span's length. Decoding and resizing run off the async threads.
+async fn with_images(
+    st: &'static State,
+    model: crate::vision::Model,
+    images: &[Value],
+    prompt: &[u32],
+) -> Result<(Vec<u32>, Vec<crate::vision::Span>, Vec<usize>), ApiError> {
+    use crate::vision;
+    if !st.engine.vision() {
+        return Err(ApiError::bad("this engine takes no images", Some("messages")));
+    }
+    let b64: Vec<String> =
+        images.iter().map(|b| vision::block_b64(b).map(str::to_string)).collect::<Result<_, _>>().map_err(image_err)?;
+    vision::check_budget(&b64).map_err(image_err)?;
+    let prepared =
+        tokio::task::spawn_blocking(move || b64.iter().map(|s| model.prepare_b64(s)).collect::<Result<Vec<_>, _>>())
+            .await
+            .map_err(|e| ApiError::new(500, &e.to_string(), None))?
+            .map_err(image_err)?;
+    let n_spans: Vec<usize> = prepared.iter().map(|p| p.n_span).collect();
+    let (ids, pos) = vision::expand(prompt, &n_spans, model.token()).map_err(image_err)?;
+    let spans = prepared
+        .into_iter()
+        .zip(pos)
+        .map(|(p, pos)| vision::Span {
+            pos,
+            vit_h: p.vit_h,
+            vit_w: p.vit_w,
+            rgb_b64: vision::b64_encode(&p.rgb),
+            key: p.key,
+        })
+        .collect();
+    Ok((ids, spans, n_spans))
 }
 
 /// Append a one-line instruction after the last user or tool message (vLLM's chat-ml injection shape).
@@ -574,7 +823,6 @@ async fn system_span(
     tools: Option<&Value>,
     mut kw: Map<String, Value>,
     add_special: bool,
-    thinking_off: bool,
     prompt: &[u32],
 ) -> Option<u64> {
     let lead: Vec<Value> = messages?
@@ -588,10 +836,7 @@ async fn system_span(
     }
     kw.insert("add_generation_prompt".into(), Value::Bool(false));
     kw.insert("continue_final_message".into(), Value::Bool(false));
-    let mut text = st.tpl().render(Some(&Value::Array(lead)), tools, kw).ok()?;
-    if thinking_off {
-        text = st.tpl().thinking_off(text, false);
-    }
+    let text = st.tpl().render(Some(&Value::Array(lead)), tools, kw).ok()?;
     let ids = st.tok.aencode(text, add_special).await.ok()?;
     Some(ids.iter().zip(prompt).take_while(|(a, b)| a == b).count() as u64)
 }
@@ -619,25 +864,96 @@ async fn ds_system_span(
 }
 
 async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {
-    let (body, raw) = match read_json_raw(req).await {
+    let (mut body, raw) = match read_json_raw(req).await {
         Ok(b) => b,
         Err(e) => return e.response(),
     };
+    let mut session: Option<(String, bool, Vec<Value>)> = None;
+    let create = st.sessions.is_some()
+        && body.get("session").and_then(Value::as_object).and_then(|v| v.get("create")) == Some(&Value::Bool(true));
+    if let Some(store) = &st.sessions {
+        if create && body.contains_key("session_id") {
+            return ApiError::bad("session.create and session_id are exclusive", Some("session")).response();
+        }
+        if let Some(id) = body.get("session_id").and_then(Value::as_str).map(str::to_owned) {
+            let append = match body.get("append_messages").and_then(Value::as_array) {
+                Some(a) if !a.is_empty() => a.clone(),
+                _ => {
+                    return ApiError::bad("append_messages must be a nonempty array", Some("append_messages"))
+                        .response()
+                }
+            };
+            let model = body.get("model").and_then(Value::as_str);
+            let (messages, render) = match store.begin(&id, &append, model) {
+                Ok(m) => m,
+                Err(e) => return e.response(),
+            };
+            for (k, v) in render {
+                body.entry(k).or_insert(v);
+            }
+            body.insert("messages".into(), Value::Array(messages));
+            session = Some((id, false, append));
+        } else if create {
+            let messages = match body.get("messages").and_then(Value::as_array) {
+                Some(a) => a.clone(),
+                None => return ApiError::bad("messages must be an array", Some("messages")).response(),
+            };
+            session = Some((String::new(), true, messages));
+        }
+    }
     let cr = match chat_prepare(st, &body, &raw).await {
         Ok(c) => c,
-        Err(e) => return e.response(),
+        Err(e) => {
+            if let Some((id, false, _)) = &session {
+                st.sessions.as_ref().unwrap().abort(id, false);
+            }
+            return e.response();
+        }
     };
+    if let Some((id, true, messages)) = &mut session {
+        *id = st.sessions.as_ref().unwrap().create(
+            messages.clone(),
+            cr.prompt.clone(),
+            body.get("model").and_then(Value::as_str).unwrap_or(&st.model_name).to_owned(),
+            session_render(&body),
+        );
+    }
     let rid = new_id("chatcmpl");
-    let include_reasoning = body.get("include_reasoning").is_none_or(|v| truthy(Some(v)));
+    // thinking off withholds the reasoning, whatever the model still writes in its think block
+    let include_reasoning = !cr.thinking_off && body.get("include_reasoning").is_none_or(|v| truthy(Some(v)));
     let choice_value = cr.choice.as_value();
     let content_first = match (st.tok.think_start, st.tok.think_end) {
         (Some(start), Some(end)) => !think_open(&cr.prompt, start, end),
         _ => false,
     };
+    let prompt_think_open = cr.prompt_think_open;
+    let thinking_off = cr.thinking_off;
+    // the repeated-tool-call guard (guard.rs): GLM's parser, tools offered, no forced call (that is the client's own)
+    let guard_on = body.get("tool_repeat_guard").filter(|v| !v.is_null()).map_or(st.guard.on, |v| truthy(Some(v)));
+    let mut guard = (st.dialect == Dialect::Glm && cr.tools.is_some() && cr.force.is_empty())
+        .then(|| guard::Guard::new(st.guard, guard_on, body.get("messages")))
+        .flatten();
+    let guard_names = guard.as_ref().map(guard::Guard::names).unwrap_or_default();
     let new_parser = || {
         let p = AnyParser::new(st.dialect, cr.tools.as_ref(), &choice_value, include_reasoning)
-            .emit_undeclared(st.emit_undeclared);
-        if content_first {
+            .emit_undeclared(st.emit_undeclared)
+            .guard_names(guard_names.clone());
+        if st.dialect == Dialect::Hf {
+            if prompt_think_open {
+                p.in_think()
+            } else if thinking_off {
+                p.content_first()
+            } else {
+                p
+            }
+        } else if st.dialect == Dialect::Inkling {
+            // the reply names its own blocks; only a continued message starts inside one (its text)
+            if cr.cfm_on {
+                p.content_first()
+            } else {
+                p
+            }
+        } else if content_first {
             p.content_first()
         } else {
             p
@@ -647,12 +963,35 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let stream = truthy(body.get("stream"));
     // the GLM reasoning parser forces skip_special_tokens=False (vLLM parser_engine.adjust_request)
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);
+    gen.admit = Some(cr.admit);
     if truthy(body.get("return_step_stats")) {
         gen.want_step_stats();
     }
+    if guard.is_some() {
+        gen.keep_reply();
+    }
     let rf = cr.rf;
-    if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
-        if think_open(&gen.prompt, start, end) {
+    if st.dialect == Dialect::Inkling {
+        // The model opens its thinking block itself (`<|message_model|><|content_thinking|>`, two tokens), so the
+        // budget counts from the reply's start and is at least 3: the close then lands inside the block. A reply that
+        // ended its thinking earlier has emitted `<|end_message|>`, and the rule does not fire.
+        let limit = usize::try_from(cr.budget).unwrap_or(usize::MAX);
+        let on = !thinking_off && !cr.cfm_on && cr.force.is_empty() && limit > 0 && !st.tok.think_close.is_empty();
+        if let Some(end) = st.tok.think_end.filter(|_| on) {
+            let limit = limit.max(3);
+            if st.engine.inserts() {
+                gen.params.gen.insert = Some(InsertRule {
+                    after_tokens: limit as u64 - 1,
+                    unless_emitted: Some(end),
+                    tokens: st.tok.think_close.clone(),
+                });
+                gen.thinking(end, None);
+            } else {
+                gen.thinking(end, Some(Budget { limit, close: &st.tok.think_close }));
+            }
+        }
+    } else if prompt_think_open {
+        if let Some(end) = st.tok.think_end {
             let limit = usize::try_from(cr.budget).unwrap_or(usize::MAX);
             if limit > 0 && !st.tok.think_close.is_empty() && st.engine.inserts() {
                 // the engine puts the close in place of the budget-th reply token itself: no second run
@@ -675,25 +1014,94 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         gen.params.gen.insert = Some(InsertRule { after_tokens: 0, unless_emitted: None, tokens: cr.force.clone() });
     }
     if stream {
-        let (sse, resp) = Sse::open();
-        tokio::spawn(async move { chat_stream(st, body, gen, parser, rf, sse).await });
+        // the engine's refusal (the busy guard's HTTP 429, PROTOCOL.md finish.status) and any error before the first
+        // streamed event must be an HTTP status, not an SSE event after the 200 is out: the response starts only once
+        // the engine answered something (PROTOCOL.md "the front end fails them with HTTP 500 / a stream error chunk")
+        if let Err(e) = gen.start(&st.engine) {
+            if let Some((id, created, _)) = &session {
+                st.sessions.as_ref().unwrap().abort(id, *created);
+            }
+            return e.response();
+        }
+        let pre = match gen.next().await {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some((id, created, _)) = &session {
+                    st.sessions.as_ref().unwrap().abort(id, *created);
+                }
+                return e.response();
+            }
+        };
+        if pre.as_ref().is_some_and(|s| !s.ids.is_empty()) {
+            if let Some((id, _, _)) = &session {
+                st.sessions.as_ref().unwrap().ready(id);
+            }
+        }
+        let session_parser = session.as_ref().map(|_| new_parser());
+        let (sse, mut resp) = Sse::open();
+        if let Some((id, _, _)) = &session {
+            if let Ok(v) = header::HeaderValue::from_str(id) {
+                resp.headers_mut().insert("x-session-id", v);
+            }
+        }
+        tokio::spawn(
+            async move { chat_stream(st, body, gen, parser, guard, rf, sse, pre, session, session_parser).await },
+        );
         return resp;
     }
     let created = now_secs();
     // a second parser watches the reply as it arrives, so a closed call block ends the generation (chat_full parses the
-    // whole text afterwards, which reads the same call)
-    let mut watch = (st.dialect == Dialect::Ds41).then(new_parser);
-    if let Err(e) = run_to_end(st, &mut gen, watch.as_mut()).await {
+    // whole text afterwards, which reads the same call), and the guard reads a held call before the reply ends
+    let mut watch = (st.dialect == Dialect::Ds41 || guard.is_some()).then(new_parser);
+    if let Err(e) = run_to_end(st, &mut gen, watch.as_mut(), guard.as_mut()).await {
+        if let Some((id, created, _)) = &session {
+            st.sessions.as_ref().unwrap().abort(id, *created);
+        }
         return e.response();
     }
-    chat_full(st, &body, &gen, parser, &rf, created)
+    let resp = chat_full(st, &body, &gen, parser, &rf, created, session.as_ref().map(|x| x.0.as_str()));
+    if let Some((id, made, append)) = &session {
+        if let Some(message) = response_message(&resp) {
+            st.sessions.as_ref().unwrap().finish(
+                id,
+                if *made { &[] } else { append },
+                message,
+                gen.prompt.clone(),
+                session_render(&body),
+            );
+        } else {
+            st.sessions.as_ref().unwrap().abort(id, *made);
+        }
+    }
+    resp
 }
 
-async fn run_to_end(st: &State, gen: &mut Generation, mut watch: Option<&mut AnyParser>) -> Result<(), ApiError> {
+fn response_message(resp: &Response<HttpBody>) -> Option<Value> {
+    let HttpBody::Full(Some(bytes)) = resp.body() else { return None };
+    let v: Value = serde_json::from_slice(bytes).ok()?;
+    v.get("choices")?.as_array()?.first()?.get("message").cloned()
+}
+
+async fn run_to_end(
+    st: &State,
+    gen: &mut Generation,
+    mut watch: Option<&mut AnyParser>,
+    mut guard: Option<&mut guard::Guard>,
+) -> Result<(), ApiError> {
     gen.start(&st.engine)?;
     while let Some(step) = gen.next().await? {
         if let Some(w) = watch.as_deref_mut() {
             let finished = step.finish_reason.is_some();
+            if finished {
+                if let (Some(g), Some(p)) = (guard.as_deref_mut(), w.glm_mut()) {
+                    p.delta(&step.text, false);
+                    if guard::take_back(gen, p, g).await? {
+                        continue; // the reply goes on from before the call
+                    }
+                    p.delta("", true);
+                    continue;
+                }
+            }
             w.delta(&step.text, finished);
             if !finished && w.call_closed() {
                 gen.end_now();
@@ -718,6 +1126,7 @@ fn chat_full(
     mut parser: AnyParser,
     rf: &jsonmode::Rf,
     created: u64,
+    session_id: Option<&str>,
 ) -> Response<HttpBody> {
     let res = &gen.res;
     let mut p = parser.parse_full(&res.text);
@@ -804,6 +1213,9 @@ fn chat_full(
         c.raw("prompt_token_ids", b"null");
     }
     c.raw("kv_transfer_params", b"null");
+    if let Some(id) = session_id {
+        c.str("session_id", id);
+    }
     if !warnings.is_empty() {
         let w = c.key("warnings");
         w.push(b'[');
@@ -865,8 +1277,12 @@ async fn chat_stream(
     body: Map<String, Value>,
     mut gen: Generation,
     mut parser: AnyParser,
+    mut guard: Option<guard::Guard>,
     rf: jsonmode::Rf,
     sse: Sse,
+    mut pre: Option<Step>,
+    session: Option<(String, bool, Vec<Value>)>,
+    mut session_parser: Option<AnyParser>,
 ) {
     let created = now_secs();
     let so = body.get("stream_options").and_then(Value::as_object);
@@ -879,16 +1295,24 @@ async fn chat_stream(
     let mut tools_streamed = false;
     let json_mode = rf.kind != "text";
     let mut held_content = String::new(); // JSON mode: content is withheld until the end, then extracted
+    let mut committed = false;
     let r: Result<(), ApiError> = async {
-        gen.start(&st.engine)?;
+        // the engine request is already started and its first frame is `pre` (the handler held the HTTP response back
+        // for it, so a refusal arrives as the status); None = the engine finished without a token
         loop {
             // a client that goes away while nothing is being sent (prefill, held-back text) still cancels at once
-            let step = tokio::select! {
-                biased;
-                _ = sse.0.closed() => return Ok(()),
-                s = gen.next() => s?,
+            let step = match pre.take() {
+                Some(s) => Some(s),
+                None => tokio::select! {
+                    biased;
+                    _ = sse.0.closed() => return Ok(()),
+                    s = gen.next() => s?,
+                },
             };
             let Some(step) = step else { break };
+            if !step.ids.is_empty() {
+                if let Some((id, _, _)) = &session { st.sessions.as_ref().unwrap().ready(id); }
+            }
             if first {
                 first = false;
                 let mut o = Vec::with_capacity(256);
@@ -900,6 +1324,7 @@ async fn chat_stream(
                 if ret_ids {
                     ids_json(c.key("prompt_token_ids"), &gen.prompt);
                 }
+                if let Some((id, _, _)) = &session { c.str("session_id", id); }
                 if continuous {
                     usage(c.key("usage"), gen.res.prompt_tokens, 0, None, false, false, None, None);
                 }
@@ -909,6 +1334,25 @@ async fn chat_stream(
                 }
             }
             let last = step.finish_reason.is_some();
+            // the guard: the final text goes to the parser short of `finished`, so a held call stays held while the
+            // guard reads it. Taken back, the reply goes on. Otherwise an empty final step lets the call out
+            let step = match (last, guard.as_mut(), parser.glm_mut()) {
+                (true, Some(g), Some(_)) => {
+                    let pre = Step { text: step.text.clone(), ids: step.ids.clone(), logprobs: step.logprobs.clone(), ..Default::default() };
+                    if chat_step(st, &gen, &mut parser, &pre, &sse, created, lp_k, ret_ids, as_ids, continuous,
+                                 &mut tools_streamed, json_mode, &mut held_content, &rf)
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    if guard::take_back(&mut gen, parser.glm_mut().unwrap(), g).await? {
+                        continue;
+                    }
+                    Step { finish_reason: step.finish_reason, stop_reason: step.stop_reason, ..Default::default() }
+                }
+                _ => step,
+            };
             if chat_step(st, &gen, &mut parser, &step, &sse, created, lp_k, ret_ids, as_ids, continuous,
                          &mut tools_streamed, json_mode, &mut held_content, &rf)
                 .await
@@ -929,8 +1373,22 @@ async fn chat_stream(
                 break;
             }
         }
+        gen.finish_stats().await;
+        if let Some((id, made, append)) = &session {
+            if let Some(p) = session_parser.as_mut() {
+                let parsed = p.parse_full(&gen.res.text);
+                let mut message = Map::new();
+                message.insert("role".into(), Value::String("assistant".into()));
+                message.insert("content".into(), parsed.content.map(Value::String).unwrap_or(Value::Null));
+                if !parsed.calls.is_empty() {
+                    message.insert("tool_calls".into(), Value::Array(parsed.calls.into_iter().map(|(id, name, arguments)|
+                        serde_json::json!({"id": id, "type": "function", "function": {"name": name, "arguments": arguments}})).collect()));
+                }
+                st.sessions.as_ref().unwrap().finish(id, if *made { &[] } else { append }, Value::Object(message), gen.prompt.clone(), session_render(&body));
+                committed = true;
+            }
+        }
         if include_usage {
-            gen.finish_stats().await;
             let res = &gen.res;
             let mut o = Vec::with_capacity(256);
             let mut c = head(&mut o, &gen.id, "chat.completion.chunk", created, &st.model_name);
@@ -953,6 +1411,11 @@ async fn chat_stream(
         Ok(())
     }
     .await;
+    if !committed {
+        if let Some((id, made, _)) = &session {
+            st.sessions.as_ref().unwrap().abort(id, *made);
+        }
+    }
     if let Err(e) = r {
         if sse.send(e.sse()).await.is_err() {
             return;
@@ -1107,7 +1570,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
     };
     let prep = async {
         st.check_model(&body)?;
-        st.require_engine()?;
+        let admit = st.require_engine().await?;
         for k in ["echo", "suffix"] {
             if truthy(body.get(k)) {
                 return Err(ApiError::bad(format!("`{k}` is not supported by the gr8 front end"), Some(k)));
@@ -1123,14 +1586,19 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
             &st.tok.eos_ids,
             st.tok.vocab_size,
             &st.tok.gen_defaults,
+            &st.penalties,
+            st.boost.as_ref(),
+            st.sequence.as_ref(),
             Some(16),
+            st.clamp_max_tokens,
             st.max_logprobs(),
             false,
         )?;
         (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(&body, st.steering().as_ref())?;
-        Ok((prompt, params))
+        check_penalties(st, &prompt, &mut params.gen)?;
+        Ok((prompt, params, admit))
     };
-    let (prompt, params) = match prep.await {
+    let (prompt, params, admit) = match prep.await {
         Ok(x) => x,
         Err(e) => return e.response(),
     };
@@ -1138,16 +1606,25 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
     let skip_special = body.get("skip_special_tokens").is_none_or(|v| truthy(Some(v)));
     let stream = truthy(body.get("stream"));
     let mut gen = Generation::new(&st.tok, rid, prompt, params, skip_special, !stream);
+    gen.admit = Some(admit);
     if truthy(body.get("return_step_stats")) {
         gen.want_step_stats();
     }
     if stream {
+        // the busy guard's refusal and any error before the first streamed event must be an HTTP status (see chat)
+        if let Err(e) = gen.start(&st.engine) {
+            return e.response();
+        }
+        let pre = match gen.next().await {
+            Ok(p) => p,
+            Err(e) => return e.response(),
+        };
         let (sse, resp) = Sse::open();
-        tokio::spawn(async move { completions_stream(st, body, gen, sse).await });
+        tokio::spawn(async move { completions_stream(st, body, gen, sse, pre).await });
         return resp;
     }
     let created = now_secs();
-    if let Err(e) = run_to_end(st, &mut gen, None).await {
+    if let Err(e) = run_to_end(st, &mut gen, None, None).await {
         return e.response();
     }
     completions_full(st, &body, &gen, created)
@@ -1208,7 +1685,13 @@ fn completions_full(st: &State, body: &Map<String, Value>, gen: &Generation, cre
     json_response(200, o)
 }
 
-async fn completions_stream(st: &'static State, body: Map<String, Value>, mut gen: Generation, sse: Sse) {
+async fn completions_stream(
+    st: &'static State,
+    body: Map<String, Value>,
+    mut gen: Generation,
+    sse: Sse,
+    mut pre: Option<Step>,
+) {
     let created = now_secs();
     let so = body.get("stream_options").and_then(Value::as_object);
     let include_usage = so.is_some_and(|s| truthy(s.get("include_usage")));
@@ -1218,13 +1701,16 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
     let lp_k = gen.params.gen.logprobs;
     let (mut offset, mut first) = (0usize, true);
     let r: Result<(), ApiError> = async {
-        gen.start(&st.engine)?;
+        // the engine request is already started and its first frame is `pre` (see chat_stream)
         loop {
             // a client that goes away while nothing is being sent (prefill, held-back text) still cancels at once
-            let step = tokio::select! {
-                biased;
-                _ = sse.0.closed() => return Ok(()),
-                s = gen.next() => s?,
+            let step = match pre.take() {
+                Some(s) => Some(s),
+                None => tokio::select! {
+                    biased;
+                    _ = sse.0.closed() => return Ok(()),
+                    s = gen.next() => s?,
+                },
             };
             let Some(step) = step else { break };
             let finished = step.finish_reason.is_some();
@@ -1282,8 +1768,8 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
                 return Ok(());
             }
         }
+        gen.finish_stats().await;
         if include_usage {
-            gen.finish_stats().await;
             let res = &gen.res;
             let mut o = Vec::with_capacity(256);
             let mut c = head(&mut o, &gen.id, "text_completion", created, &st.model_name);
@@ -1335,25 +1821,88 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
             }
             if st.dialect == Dialect::Ds41 {
                 // the same effort, thinking switch and prompt text as a chat request, so the counts agree
-                let (th, effort) = dialect::resolve_ds(&body, st.thinking, st.ds_effort)?;
+                let (mut th, effort) = dialect::resolve_ds(&body, st.thinking, st.ds_effort, st.ds_thinking_default)?;
                 let tools = normalize_tools(body.get("tools"))?;
                 let (agp, cfm) = dialect::ds_gen_flags(&body)?;
-                let text = dialect::ds_prompt(body.get("messages"), tools.as_ref(), !th.off, effort, agp, cfm)?;
-                st.tok.aencode(text, false).await.map_err(|e| ApiError::new(500, &e, None))?
+                if body.contains_key("tool_choice") {
+                    let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
+                    if !st.forced_tool_thinking
+                        && choice.is_forced()
+                        && !cfm
+                        && !th.off
+                        && !dialect::ds_explicit_thinking_on(&body)
+                        && !dialect::ds_has_prior_reasoning(body.get("messages"))
+                    {
+                        th.off = true;
+                    }
+                }
+                let (text, images) =
+                    dialect::ds_prompt(body.get("messages"), tools.as_ref(), !th.off, effort, agp, cfm)?;
+                let ids = st.tok.aencode(text, false).await.map_err(|e| ApiError::new(500, &e, None))?;
+                if images.is_empty() {
+                    ids
+                } else {
+                    // the span lengths come from the images' headers; the pixels are not built
+                    use crate::vision;
+                    let b64: Vec<&str> =
+                        images.iter().map(vision::block_b64).collect::<Result<_, _>>().map_err(image_err)?;
+                    vision::check_budget(&b64).map_err(image_err)?;
+                    let n_spans: Vec<usize> = b64
+                        .iter()
+                        .map(|s| vision::Model::Ds41.n_span_b64(s))
+                        .collect::<Result<_, _>>()
+                        .map_err(image_err)?;
+                    vision::expand(&ids, &n_spans, vision::IMAGE_TOKEN_ID).map_err(image_err)?.0
+                }
             } else {
                 // the same effort and the same refusals as a chat request, so the counts agree
-                let th = st.tpl().resolve_thinking(&body, st.thinking)?;
+                let (th, hf_enable, ink_effort) = match st.dialect {
+                    Dialect::Hf => {
+                        let (th, en) = dialect::resolve_hf(&body, &st.tpl().levels, st.thinking)?;
+                        (th, en, None)
+                    }
+                    Dialect::Inkling => {
+                        let (th, e) = dialect::resolve_inkling(&body, st.thinking, st.ink_effort.as_ref())?;
+                        (th, None, e)
+                    }
+                    _ => (st.tpl().resolve_thinking(&body, st.thinking)?, None, None),
+                };
                 let agp_on = truthy(Some(&agp));
-                let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
-                let tools = normalize_tools(body.get("tools"))?;
-                let mut text = st.tpl().render(body.get("messages"), tools.as_ref(), kw)?;
-                if th.off {
-                    text = st.tpl().thinking_off(text, agp_on);
+                let mut kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
+                if let Some(en) = hf_enable {
+                    kw.insert("enable_thinking".into(), Value::Bool(en));
                 }
-                st.tok
+                if let Some(e) = ink_effort {
+                    kw.insert("reasoning_effort".into(), e);
+                }
+                let tools = normalize_tools(body.get("tools"))?;
+                let msgs = body.get("messages").cloned().unwrap_or(Value::Null);
+                let (mut text, images) = if crate::template::has_images(&msgs) {
+                    st.tpl().render_images(Some(&msgs), tools.as_ref(), kw)?
+                } else {
+                    (st.tpl().render(Some(&msgs), tools.as_ref(), kw)?, Vec::new())
+                };
+                if th.off && st.dialect == Dialect::Hf {
+                    text = dialect::hf_thinking_off(text, agp_on);
+                }
+                let ids = st
+                    .tok
                     .aencode(text, truthy(body.get("add_special_tokens")))
                     .await
-                    .map_err(|e| ApiError::new(500, &e, None))?
+                    .map_err(|e| ApiError::new(500, &e, None))?;
+                if images.is_empty() {
+                    ids
+                } else {
+                    // the span lengths come from the images' headers, without building the pixels
+                    use crate::vision;
+                    let b64: Vec<&str> =
+                        images.iter().map(vision::block_b64).collect::<Result<_, _>>().map_err(image_err)?;
+                    vision::check_budget(&b64).map_err(image_err)?;
+                    let model = image_model(st);
+                    let n_spans: Vec<usize> =
+                        b64.iter().map(|s| model.n_span_b64(s)).collect::<Result<_, _>>().map_err(image_err)?;
+                    vision::expand(&ids, &n_spans, model.token()).map_err(image_err)?.0
+                }
             }
         } else if let Some(Value::String(p)) = body.get("prompt") {
             let add_special = body.get("add_special_tokens").is_none_or(|v| truthy(Some(v)));
@@ -1508,6 +2057,23 @@ async fn health_deep(st: &State, peer: std::net::SocketAddr) -> Response<HttpBod
     }
 }
 
+/// /internal/hold (localhost only; the supervisor's `scale`): POST `?seconds=N` holds new requests up to N s while the
+/// engine is replaced (0 releases them). Both methods answer the hold and the request counts.
+fn hold(st: &State, req: &Request<Incoming>, peer: std::net::SocketAddr) -> Response<HttpBody> {
+    if !peer.ip().is_loopback() {
+        return json_value(403, serde_json::json!({"error": "/internal/hold answers localhost only"}));
+    }
+    if req.method() == Method::POST {
+        let secs = req.uri().query().and_then(|q| q.split('&').find_map(|x| x.strip_prefix("seconds=")));
+        match secs.and_then(|s| s.parse::<u64>().ok()) {
+            Some(n) => st.engine.hold(n),
+            None => return json_value(400, serde_json::json!({"error": "POST /internal/hold?seconds=N"})),
+        }
+    }
+    let (hold, running, waiting) = st.engine.counts();
+    json_value(200, serde_json::json!({"hold": hold, "running": running, "waiting": waiting}))
+}
+
 /// One JSON line to a supervisor's control port, one JSON line back.
 async fn ask_supervisor(addr: &str, msg: &str) -> Result<Value, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1520,7 +2086,13 @@ async fn ask_supervisor(addr: &str, msg: &str) -> Result<Value, String> {
 
 async fn metrics_route(st: &State) -> Response<HttpBody> {
     match st.engine.metrics(Duration::from_secs(5)).await {
-        Ok(snap) => response(200, "text/plain; charset=utf-8", metrics::render(&snap, &st.model_name).into_bytes()),
+        Ok(snap) => {
+            let front = metrics::Front {
+                guard_retries: guard::RETRIES.load(std::sync::atomic::Ordering::Relaxed),
+                guard_given_up: guard::GIVEN_UP.load(std::sync::atomic::Ordering::Relaxed),
+            };
+            response(200, "text/plain; charset=utf-8", metrics::render(&snap, &st.model_name, front).into_bytes())
+        }
         Err(e) => {
             response(503, "text/plain; charset=utf-8", format!("engine metrics unavailable: {}\n", e.0).into_bytes())
         }
@@ -1618,5 +2190,419 @@ mod steering_health_tests {
             serde_json::json!([{"profile":"en-zh","digest":"a".repeat(12),"layers":78},
                                                                  {"profile":"zh-en","digest":"b".repeat(12),"layers":77}])
         );
+    }
+}
+
+#[cfg(test)]
+mod http_tokenize_chat_tests {
+    //! HTTP-level: a multi-turn DS41 prompt goes through /tokenize and then /v1/chat/completions on the real router.
+    //! The ids each endpoint produces must equal the sequential encode, and the checkpoint cache must be reused.
+    use std::sync::{Arc, Mutex};
+
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream, UnixListener};
+
+    use super::*;
+    use crate::engine::Engine;
+    use crate::wire::FrameReader;
+
+    fn frame(v: Value) -> Vec<u8> {
+        let b = serde_json::to_vec(&v).unwrap();
+        let mut out = (b.len() as u32).to_be_bytes().to_vec();
+        out.extend(b);
+        out
+    }
+
+    /// A PROTOCOL.md engine that records each generate frame and answers it with `reply`, ending at `length`.
+    async fn fake_engine(reply: Vec<u32>) -> (Arc<Engine>, Arc<Mutex<Vec<Value>>>) {
+        // /tmp, not temp_dir(): macOS runners have a long temp_dir and a socket path must fit SUN_LEN (104 bytes)
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::path::PathBuf::from(format!("/tmp/g6f-{}-{n}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let gens = Arc::new(Mutex::new(Vec::new()));
+        let g2 = gens.clone();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            wr.write_all(&frame(json!({"type": "hello", "version": 1, "max_model_len": 1 << 20}))).await.unwrap();
+            let mut r = FrameReader::new(rd);
+            while let Ok(Some(f)) = r.next().await {
+                let v: Value = serde_json::from_slice(&f).unwrap();
+                if v["type"] != "generate" {
+                    continue;
+                }
+                g2.lock().unwrap().push(v.clone());
+                let n = (v["max_tokens"].as_u64().unwrap() as usize).min(reply.len());
+                let id = v["id"].clone();
+                wr.write_all(&frame(json!({"type": "tokens", "id": id, "ids": &reply[..n]}))).await.unwrap();
+                let fin = json!({"type": "finish", "id": id, "reason": "length", "stop_id": null,
+                                 "cached_tokens": 0, "completion_tokens": n});
+                wr.write_all(&frame(fin)).await.unwrap();
+            }
+        });
+        let engine = Engine::new(path.to_string_lossy().into_owned());
+        engine.start();
+        for _ in 0..500 {
+            if engine.ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(engine.ready(), "the fake engine did not connect");
+        (engine, gens)
+    }
+
+    /// One HTTP/1.1 POST with Connection: close; the status and the JSON body.
+    async fn post(addr: std::net::SocketAddr, path: &str, body: &Value) -> (u16, Value) {
+        let (status, payload) = post_raw(addr, path, body).await;
+        (status, serde_json::from_slice(&payload).unwrap_or(Value::Null))
+    }
+
+    async fn post_raw(addr: std::net::SocketAddr, path: &str, body: &Value) -> (u16, Vec<u8>) {
+        let b = serde_json::to_vec(body).unwrap();
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            b.len()
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.write_all(&b).await.unwrap();
+        let mut raw = Vec::new();
+        s.read_to_end(&mut raw).await.unwrap();
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+        let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let mut payload = raw[split + 4..].to_vec();
+        if head.contains("transfer-encoding: chunked") {
+            let (mut out, mut rest) = (Vec::new(), &payload[..]);
+            loop {
+                let eol = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+                let n = usize::from_str_radix(std::str::from_utf8(&rest[..eol]).unwrap().trim(), 16).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&rest[eol + 2..eol + 2 + n]);
+                rest = &rest[eol + 4 + n..];
+            }
+            payload = out;
+        }
+        (status, payload)
+    }
+
+    /// The prompt text both handlers render for a DS41 request without tools (dialect::resolve_ds + ds_prompt).
+    fn prompt_text(st: &State, body: &Value) -> String {
+        let body = body.as_object().unwrap();
+        let (th, effort) = dialect::resolve_ds(body, st.thinking, st.ds_effort, st.ds_thinking_default).unwrap();
+        let (agp, cfm) = dialect::ds_gen_flags(body).unwrap();
+        dialect::ds_prompt(body.get("messages"), None, !th.off, effort, agp, cfm).unwrap().0
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tokenize_then_chat_reuses_turn_checkpoints_with_exact_ids() {
+        let mut tok = crate::tok::prefix_tests::fixture(true);
+        assert!(tok.cache_on_for_test());
+        tok.use_single_think_close();
+        let dir = std::env::temp_dir().join(format!("g6front-http-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tok.tk.save(dir.join("tokenizer.json"), false).unwrap();
+        let grammars = crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap();
+        let reply: Vec<u32> = "answer".bytes().map(|b| tok.tk.token_to_id(&(b as char).to_string()).unwrap()).collect();
+        let (engine, gens) = fake_engine(reply).await;
+        let st: &'static State = Box::leak(Box::new(State {
+            tok,
+            template: None,
+            dialect: Dialect::Ds41,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine,
+            served: vec!["deepseek-v4.1-flash".into()],
+            model_name: "deepseek-v4.1-flash".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: true,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars,
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+            sessions: None,
+        }));
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+
+        let (off_status, off_body) = post_raw(addr, "/v1/sessions/absent/forks", &json!({"count": 1})).await;
+        assert_eq!((off_status, off_body.as_slice()), (404, b"404: Not Found".as_slice()));
+        let base = json!({"model": st.model_name, "messages": [{"role": "user", "content": "same"}]});
+        let mut with_session = base.clone();
+        with_session["session"] = json!({"create": true});
+        let a = post_raw(addr, "/tokenize", &base).await;
+        let b = post_raw(addr, "/tokenize", &with_session).await;
+        assert_eq!(a, b, "knob off: existing route bytes must not change");
+
+        let system = "system tools schema: read files, run commands, edit code\n".repeat(120);
+        let mut messages = vec![json!({"role": "system", "content": system})];
+        let mut last_hits = st.tok.cache_hits_for_test();
+        for turn in 0..4 {
+            messages.push(json!({"role": "user", "content": format!("turn {turn}: {}", "a b c d word ".repeat(80))}));
+            let req = json!({"model": "deepseek-v4.1-flash", "messages": messages.clone()});
+            let want = st.tok.encode_seq_for_test(&prompt_text(st, &req));
+
+            let (code, v) = post(addr, "/tokenize", &req).await;
+            assert_eq!(code, 200, "/tokenize turn {turn}: {v}");
+            let ids: Vec<u32> = v["tokens"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+            assert_eq!(ids, want, "/tokenize turn {turn} ids differ from the sequential encode");
+            let hits = st.tok.cache_hits_for_test();
+            if turn > 0 {
+                assert!(hits > last_hits, "/tokenize turn {turn} did not reuse an earlier turn's checkpoint");
+            }
+            last_hits = hits;
+
+            let mut chat = req.clone();
+            chat["max_tokens"] = json!(6);
+            let (code, v) = post(addr, "/v1/chat/completions", &chat).await;
+            assert_eq!(code, 200, "chat turn {turn}: {v}");
+            assert_eq!(v["usage"]["prompt_tokens"].as_u64().unwrap() as usize, want.len());
+            let sent: Vec<u32> = gens.lock().unwrap().last().unwrap()["prompt"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(sent, want, "chat turn {turn}: engine prompt differs from the sequential encode");
+            let hits = st.tok.cache_hits_for_test();
+            assert!(hits > last_hits, "chat turn {turn} did not hit the prompt /tokenize cached");
+            last_hits = hits;
+            let content = v["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+            messages.push(json!({"role": "assistant", "content": content}));
+        }
+        assert_eq!(gens.lock().unwrap().len(), 4);
+        eprintln!("HTTP_TOKENIZE_CHAT turns=4 cache_hits={last_hits}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_http_lifecycle() {
+        let tok = crate::tok::prefix_tests::fixture(true);
+        let dir = std::env::temp_dir().join(format!("g6front-session-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tok.tk.save(dir.join("tokenizer.json"), false).unwrap();
+        let grammars = crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap();
+        let reply: Vec<u32> = "answer".bytes().map(|b| tok.tk.token_to_id(&(b as char).to_string()).unwrap()).collect();
+        let (engine, gens) = fake_engine(reply).await;
+        let st: &'static State = Box::leak(Box::new(State {
+            tok,
+            template: None,
+            dialect: Dialect::Ds41,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine,
+            served: vec!["model".into()],
+            model_name: "model".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: true,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars,
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+            sessions: Some(crate::sessions::Sessions::new(Duration::from_secs(60))),
+        }));
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+        let (status, made) = post(addr, "/v1/chat/completions", &json!({
+            "model":"model", "session":{"create":true}, "messages":[{"role":"user","content":"base"}], "max_tokens":6
+        })).await;
+        assert_eq!(status, 200, "{made}");
+        let parent = made["session_id"].as_str().unwrap();
+        let (status, forked) = post(addr, &format!("/v1/sessions/{parent}/forks"), &json!({"count":3})).await;
+        assert_eq!(status, 200, "{forked}");
+        assert!(forked["prefix_tokens"].as_u64().unwrap() > 0);
+        let ids = forked["fork_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 3);
+        let (status, first) = post(addr, "/v1/chat/completions", &json!({
+            "model":"model", "session_id":ids[0], "append_messages":[{"role":"user","content":"branch A"}], "max_tokens":6
+        })).await;
+        assert_eq!(status, 200, "{first}");
+        assert_eq!(first["session_id"], ids[0]);
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        sock.write_all(
+            format!("DELETE /v1/sessions/{parent} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut deleted = Vec::new();
+        sock.read_to_end(&mut deleted).await.unwrap();
+        assert!(String::from_utf8_lossy(&deleted).contains("200 OK"), "{}", String::from_utf8_lossy(&deleted));
+        let (status, second) = post(addr, "/v1/chat/completions", &json!({
+            "model":"model", "session_id":ids[1], "append_messages":[{"role":"user","content":"branch B"}], "max_tokens":6
+        })).await;
+        assert_eq!(status, 200, "{second}");
+        assert_eq!(gens.lock().unwrap().len(), 3);
+        let (status, unknown) = post(addr, "/v1/sessions/missing/forks", &json!({"count":1})).await;
+        assert_eq!(status, 404, "{unknown}");
+        let (status, streamed) = post_raw(
+            addr,
+            "/v1/chat/completions",
+            &json!({
+                "model":"model", "session":{"create":true}, "messages":[{"role":"user","content":"stream"}],
+                "max_tokens":6, "stream":true
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let stream_text = String::from_utf8(streamed).unwrap();
+        assert!(stream_text.contains("\"session_id\":\"sess-"), "{stream_text}");
+        assert!(stream_text.contains("data: [DONE]"), "{stream_text}");
+    }
+
+    /// The literal-content gate: every case in `literal_golden.json` was tokenized by the release's own tokenizer
+    /// (`frontend/tests/literal_golden.py`), so these ids are what the model was trained to see. Each one goes
+    /// through the real router on /v1/chat/completions, and the prompt the engine receives must equal them id for id
+    /// -- rendering and encoding together, not just the encode. Skipped unless the release is at hand:
+    /// GR8_TEST_TOKENIZER_DIR=<the release directory> cargo test --release
+    #[tokio::test]
+    async fn literal_content_golden_ids_through_the_http_path() {
+        let Some(dir) = gr8knobs::TEST_TOKENIZER_DIR.get() else {
+            eprintln!("GR8_TEST_TOKENIZER_DIR not set; skipping");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let golden: Value = serde_json::from_str(include_str!("literal_golden.json")).unwrap();
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer_config.json")).unwrap()).unwrap();
+        let declared = &cfg["auto_map"]["AutoTokenizer"];
+        let declared = declared.as_str().or_else(|| declared.get(0).and_then(|v| v.as_str()));
+        if declared != golden["auto_map"].as_str() {
+            eprintln!(
+                "GR8_TEST_TOKENIZER_DIR declares {declared:?}, not the {:?} literal_golden.json was built from; skipping",
+                golden["auto_map"].as_str()
+            );
+            return;
+        }
+
+        let tok = crate::tok::Tok::load(&dir).unwrap();
+        let spellings = tok.literal_spellings();
+        assert!(spellings.is_some(), "the release declares its own tokenizer but literal content stayed off");
+        let template = crate::template::ChatTemplate::load(&dir, tok.eos_token.clone(), tok.pad_token.clone())
+            .unwrap()
+            .with_literal_content(spellings);
+        let grammars = crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap();
+        let reply = tok.tk.encode("ok", false).unwrap().get_ids().to_vec();
+        let (engine, gens) = fake_engine(reply).await;
+        let st: &'static State = Box::leak(Box::new(State {
+            tok,
+            template: Some(template),
+            dialect: Dialect::Glm,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine,
+            served: vec!["literal-golden".into()],
+            model_name: "literal-golden".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: true,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars,
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+            sessions: None,
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+
+        let cases = golden["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for c in cases {
+            let name = c["name"].as_str().unwrap();
+            let mut req = json!({"model": "literal-golden", "messages": c["request"]["messages"], "max_tokens": 1});
+            if c["request"]["tools"].as_array().is_some_and(|t| !t.is_empty()) {
+                req["tools"] = c["request"]["tools"].clone();
+            }
+            let (code, v) = post(addr, "/v1/chat/completions", &req).await;
+            assert_eq!(code, 200, "{name}: {v}");
+            let want: Vec<u32> =
+                c["ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+            let sent: Vec<u32> = gens.lock().unwrap().last().unwrap()["prompt"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
+            let at = sent.iter().zip(&want).position(|(a, b)| a != b);
+            assert_eq!(
+                sent,
+                want,
+                "{name}: the prompt the engine received is not the release's own tokenization \
+                 ({} ids against {}, first difference at {at:?})",
+                sent.len(),
+                want.len()
+            );
+            assert_eq!(v["usage"]["prompt_tokens"].as_u64().unwrap() as usize, want.len(), "{name}: usage");
+            eprintln!("LITERAL_GOLDEN {name} ids={} exact", want.len());
+        }
+        assert_eq!(gens.lock().unwrap().len(), cases.len());
     }
 }

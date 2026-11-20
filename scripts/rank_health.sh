@@ -4,7 +4,7 @@
 # OPTIONS are ./gr8's (./gr8 knobs): --peers, --ips, --ips2, --proxy-cpu, --work-dir, @FILE. The probe reaches the boxes
 # over ssh by their PEERS names and needs IPS and IPS2 set (it does not discover them).
 # Exit 0 = every rank admitted; 3 = refused (one line per refusal with a named reason); 2 = setup problem.
-# The JSON is what `bench/gate/gate.py run --health` records. PROBE_ARGS="--min-clock-mhz 1800 ..." sets thresholds
+# The JSON is what `bench/bench.py --health` keeps in its report. PROBE_ARGS="--min-clock-mhz 1800 ..." sets thresholds
 # (tools/health/README.md).
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)

@@ -5,6 +5,7 @@
 //                 && /tmp/test_prefix_reuse        (scripts/build.sh builds and runs it; engine/tests/test_prefix_reuse.py
 //                 runs it under ASan/UBSan and pins the g6m4.cu hook order)
 #include "prefix_reuse.h"
+#include "cp_pf_tail.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -64,8 +65,51 @@ static int request(PrefixReuse& r, const std::vector<int>& prompt, const std::ve
     return skip;
 }
 
+// Shared vector table: keep fields and rows identical to kvman-rs/src/reuse.rs::tests.
+static void grid64_vectors()
+{
+    struct Case {
+        int grid; bool strict, noend, mtp;
+        int pf_end, valid, written_end, hist_len, prompt_len, lcp, limit, want_skip;
+        const char* want_why;
+    };
+    const Case cases[] = {
+        {64, false, false, false, 15086, 15150, 15151, 15151, 19668, 15151, 19667, 15040, "hit"},
+        {64, false, false, true, 15086, 15150, 15151, 15151, 19668, 15151, 19667, 15040, "hit"},
+        {64, false, false, false, 999, 1030, 1031, 1031, 2192, 191, 2191, 128, "hit"},
+        {64, false, false, false, 999, 1030, 1031, 1031, 2192, 192, 2191, 192, "hit"},
+        {64, false, false, false, 999, 1030, 1031, 1031, 2192, 193, 2191, 192, "hit"},
+        {64, false, false, false, 999, 1030, 1031, 1031, 2192, 194, 2191, 192, "hit"},
+        {64, false, false, true, 999, 1030, 1031, 1031, 2192, 191, 2191, 128, "hit"},
+        {64, false, false, true, 999, 1030, 1031, 1031, 2192, 192, 2191, 128, "hit"},
+        {64, false, false, true, 999, 1030, 1031, 1031, 2192, 193, 2191, 192, "hit"},
+        {64, false, false, true, 999, 1030, 1031, 1031, 2192, 194, 2191, 192, "hit"},
+        {64, false, false, false, 999, 1030, 1031, 1031, 2000, 63, 1999, 0, "grid"},
+        {64, false, false, true, 999, 1030, 1031, 1031, 2000, 64, 1999, 0, "grid"},
+        {64, false, false, false, 999, 1030, 1031, 1031, 2000, 64, 1999, 64, "hit"},
+        {64, false, false, true, 999, 1030, 1031, 1031, 2000, 65, 1999, 64, "hit"},
+        {64, false, true, false, 8099, 8162, 8163, 8163, 8100, 8100, 8099, 8099, "hit"},
+        {64, false, true, true, 8099, 8162, 8163, 8163, 8100, 8100, 8099, 8099, "hit"},
+        {64, false, true, false, 8099, 8162, 8163, 8163, 8090, 8090, 8089, 8064, "hit"},
+        {64, false, true, true, 8099, 8162, 8163, 8163, 8090, 8090, 8089, 8064, "hit"},
+    };
+    for (const auto& c : cases)
+    {
+        PrefixReuse q;
+        q.grid = c.grid; q.strict = c.strict; q.noend = c.noend;
+        q.pf_end = c.pf_end; q.valid = c.valid; q.written_end = q.dirty_end = c.written_end;
+        q.history.assign(c.hist_len, 1);
+        std::vector<int> prompt(c.prompt_len, 2);
+        std::fill_n(prompt.begin(), c.lcp, 1);
+        CHECK(q.begin(prompt, c.limit, c.mtp) == c.want_skip);
+        CHECK(!strcmp(q.why, c.want_why) && q.lcp == c.lcp);
+        if (!c.want_skip) CHECK(q.dirty_end == 0);
+    }
+}
+
 int main()
 {
+    grid64_vectors();
     for (int K : {0, 4})
     {
         const bool mtp = K > 0;
@@ -313,6 +357,38 @@ int main()
         request(m, b0, toks(32, 66), 32, K);
         CHECK(request(m, cat(head(b0, 3000), toks(3500, 67)), toks(32, 68), 32, K) == 0 && !strcmp(m.why, "grid"));
     }
+    // A page-aligned grid preserves the prefill-only clamp across multiple warm turns.
+    for (int K : {0, 4})
+    {
+        PrefixReuse q; q.grid = 64;
+        const std::vector<int> pi3 = toks(15087, 55);
+        CHECK(request(q, pi3, toks(64, 56), 64, K) == 0);
+        CHECK(q.pf_end == 15086);
+        const std::vector<int> pi4 = cat(q.history, toks(4517, 57));
+        CHECK(request(q, pi4, toks(64, 58), 64, K) == 15040 && !strcmp(q.why, "hit"));
+        CHECK(q.pf_end == (int)pi4.size() - 1);
+        const std::vector<int> pi5 = cat(q.history, toks(9000, 59));
+        CHECK(request(q, pi5, toks(8, 60), 8, K) == 19648 && !strcmp(q.why, "hit"));
+        CHECK(q.pf_end == (int)pi5.size() - 1);
+        const std::vector<int> miss = cat(head(q.history, 63), toks(40000, 61));
+        CHECK(q.dirty_end > 0);
+        CHECK(q.begin(miss, (int)miss.size() - 1, K > 0) == 0 && !strcmp(q.why, "grid"));
+        CHECK(q.dirty_end == 0);
+    }
+    // Staging sends only rows below start, including an exact replay's partial final page.
+    for (int k : {0, 1, 2, 512, 513, 600})
+    {
+        const int start = 64 * k, np = (start + 63) / 64;
+        CHECK(np == k);
+        for (int lp = 0; lp <= np + 2; ++lp)
+        {
+            const int rows = cp_pf_rows(lp, 64, start);
+            CHECK(rows == (lp < np ? 64 : 0));
+            CHECK(rows % 2 == 0);
+        }
+    }
+    for (int lp = 0; lp <= 515; ++lp)
+        CHECK(cp_pf_rows(lp, 64, 32805) == (lp < 512 ? 64 : lp == 512 ? 37 : 0));
     printf("%s (%d failures)\n", fails ? "FAIL" : "PASS prefix_reuse unit cases", fails);
     return fails ? 1 : 0;
 }

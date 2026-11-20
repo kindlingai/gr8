@@ -11,6 +11,7 @@ how this launcher waits or checks.
 """
 import hashlib
 import ipaddress
+import math
 import os
 import re
 import socket
@@ -136,11 +137,16 @@ def parse(argv, environ=None):
     environ = os.environ if environ is None else environ
     warnings = []
     argv = renamed_argv(argv, warnings)
-    cmd, at, args, switches = {}, None, [], set()
+    cmd, at, args, switches, named = {}, None, [], set(), None
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a.startswith('@'):
+        if a == '--named-model':    # ./gr8 <model> passes the name it was given: that is the model (#244)
+            i += 1
+            if i >= len(argv):
+                raise OptionError('--named-model needs a value')
+            named = argv[i]
+        elif a.startswith('@'):
             if at:
                 raise OptionError('one @FILE only')
             at = a[1:]
@@ -188,6 +194,14 @@ def parse(argv, environ=None):
                 break
         else:
             values[k], origin[k] = dflt, 'default'
+    # The name ./gr8 was given is the model. A GR8_MODEL elsewhere that names another one is kept for validate() to
+    # refuse: up, check, prepare and show-config stop on it, and down, status, logs and health read the last boot.
+    conflict = None
+    if named:
+        conflict = next(((where, d['GR8_MODEL']) for where, d in (
+            ('on the command line', cmd), (f'in the config file {path}', filev), ('in the environment', environ))
+            if d.get('GR8_MODEL') and d['GR8_MODEL'] != named), None)
+        values['GR8_MODEL'], origin['GR8_MODEL'] = named, f'./gr8 {named}'
     # The mode comes from the strongest source that names one.
     for src, d in (('command line', cmd), ('file', filev), ('environment', environ)):
         has_p, has_m = bool(d.get('PEERS')), bool(d.get('MENTAT'))
@@ -218,7 +232,15 @@ def parse(argv, environ=None):
     for k, v in models.MODELS[model].defaults if model else ():
         if origin[k] == 'default':
             values[k], origin[k] = v, f'{model} default'
+    tp_eff = values.get('TP') or (str(len(split_list(values.get('PEERS')))) if values.get('PEERS') else None)
+    for k, v in models.MODELS[model].tp_defaults.get(tp_eff, {}).items() if model else ():
+        if k not in origin:
+            raise OptionError(f'{model} TP={tp_eff} default: unknown option {k}')
+        if origin[k] in ('default', f'{model} default'):
+            values[k], origin[k] = v, f'{model} TP={tp_eff} default'
     opts = Options(values, origin, path, args, switches, warnings)
+    opts.named, opts.model_conflict = named, conflict
+    opts.argv = list(argv)   # as given (old names renamed): `scale` boots the same options plus its own
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
     for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'GR8_WORK_DIR', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT',
@@ -233,6 +255,17 @@ def parse(argv, environ=None):
     return opts
 
 
+def extra_env_value(o, name):
+    """name's value in --extra-env, '' when it is not set there. engine_args.sh applies the last assignment, so this
+    does too."""
+    value = ''
+    for word in (o.get('EXTRA_ENV') or '').split():
+        key, sep, v = word.partition('=')
+        if sep and key == name:
+            value = v
+    return value
+
+
 def looks_remote(model):
     """A Hugging Face source is an https:// URL. Anything else is a local path."""
     return model.startswith('https://')
@@ -242,11 +275,162 @@ def mode(o):
     return 'peers' if o.get('PEERS') else 'mentat'
 
 
+def penalty_spec_error(spec):
+    """Why `spec` is not a penalty spec (the front end's sampling.rs PenaltySpec::parse), or None. A part is
+    `[+]A[*M]`, an amount and a multiplier; the spec is one part (the base) or a comma list of base=, thinking=,
+    greedy=, nongreedy=, greedy.thinking=, nongreedy.thinking= and temperature= parts, each once (greedy.base= is
+    greedy=). Every combination of the operator's parts must resolve within -2..2 at every temperature from 0 to 2."""
+    def part(v):
+        v = v.strip()
+        add, star, mul = v.partition('*')
+        add, mul = add.strip(), mul.strip()
+        a, m = 0.0, None
+        if add or not star:
+            try:
+                a = float(add)
+            except ValueError:
+                return None, f'{add!r} is not a number'
+            if math.isnan(a) or math.isinf(a):
+                return None, f'{add!r} is not a number'
+        if star:
+            try:
+                m = float(mul)
+            except ValueError:
+                return None, f'{mul!r} is not a multiplier'
+            if math.isnan(m) or math.isinf(m) or m < 0:
+                return None, f'multiplier {mul!r}: want a finite number, 0 or more'
+        return (a, m), None
+    names = {'base': 'base', 'thinking': 'thinking', 'greedy': 'greedy', 'greedy.base': 'greedy', 'nongreedy': 'nongreedy',
+             'nongreedy.base': 'nongreedy', 'greedy.thinking': 'greedy.thinking', 'nongreedy.thinking': 'nongreedy.thinking',
+             'temperature': 'temperature'}
+    parts = {k: (0.0, None) for k in set(names.values())}
+    if '=' not in spec:
+        parts['base'], err = part(spec)
+        if err:
+            return err
+    else:
+        seen = set()
+        for item in spec.split(','):
+            key, sep, value = item.partition('=')
+            key = names.get(key.strip())
+            if not sep or key is None:
+                return (f'{item.strip()!r}: want base=, thinking=, greedy=, nongreedy=, greedy.thinking=, '
+                        'nongreedy.thinking= or temperature=')
+            if key in seen:
+                return f'{key} is given twice'
+            seen.add(key)
+            parts[key], err = part(value)
+            if err:
+                return err
+    def factor(k):
+        return 1.0 if parts[k][1] is None else parts[k][1]
+    (ba, _), (ta, _), (xa, xb) = parts['base'], parts['thinking'], parts['temperature']
+    for cond in ('greedy', 'nongreedy'):
+        ga, gta = parts[cond][0], parts[cond + '.thinking'][0]
+        rest_out = (ba + ga) * factor('base') * factor(cond)
+        rest_in = rest_out + (ta + gta) * factor('thinking') * factor(cond + '.thinking')
+        # (rest + A T) * (B T) is a quadratic in T: its extremes on 0..2 are at the ends or at its vertex
+        ts = [0.0, 2.0]
+        if xb is not None and xb and xa:
+            ts += [-r / (2 * xa) for r in (rest_out, rest_in, rest_in - rest_out)]
+        for t in (t for t in ts if 0 <= t <= 2):
+            def stage(rest):
+                return (rest + xa * t) * (1.0 if xb is None else xb * t)
+            out, inside = stage(rest_out), stage(rest_in)
+            if not all(-2 <= x <= 2 for x in (out, inside, inside - out)):
+                return (f'resolves to {out:g} outside the think block and {inside:g} inside for a {cond} request at '
+                        f'temperature {t:g}; every total and the difference must be in -2..2')
+    return None
+
+
+def limit_error(value):
+    """Why `value` is not a token limit (the front end's sampling.rs Limit::parse), or None: N tokens, Fx a fraction
+    0 to 1 of the request's max_tokens, or N|Fx, whichever comes first."""
+    want = f'{value!r}: want a token count, a fraction like 0.5x, or both like 16384|0.5x'
+    n, sep, f = value.partition('|')
+    if sep:
+        if not re.fullmatch(r'[0-9]+', n.strip()):
+            return want
+        if int(n) == 0:
+            return f'{value!r}: a pair needs a token count above 0'
+    elif value.strip().endswith('x'):
+        f = value
+    elif re.fullmatch(r'[0-9]+', value.strip()):
+        return None
+    else:
+        return want
+    f = f.strip()
+    if not f.endswith('x'):
+        return want
+    try:
+        v = float(f[:-1])
+    except ValueError:
+        return want
+    if not 0 <= v <= 1:
+        return f'{value!r}: want a fraction from 0x to 1x'
+    return None
+
+
+def boost_spec_error(spec):
+    """Why `spec` is not a think-end boost spec (the front end's sampling.rs BoostSpec::parse), or None:
+    start=S,per1k=P,max=M, S a limit_error() limit (16384, 0.5x or 16384|0.5x), P 0 or more, M 0 to 20, each key once."""
+    seen = set()
+    for part in spec.split(','):
+        key, sep, value = part.partition('=')
+        key, value = key.strip(), value.strip()
+        if not sep or key not in ('start', 'per1k', 'max'):
+            return f'{part.strip()!r}: want start=, per1k= or max='
+        if key in seen:
+            return f'{key} is given twice'
+        seen.add(key)
+        if key == 'start':
+            err = limit_error(value)
+            if err:
+                return f'start={err}'
+            continue
+        lo, hi = (0, math.inf) if key == 'per1k' else (0, 20)
+        try:
+            v = float(value)
+        except ValueError:
+            return f'{key}={value!r} is not a number'
+        if math.isnan(v) or not lo <= v <= hi:
+            return f'{key}={value}: want {lo} to {hi}'
+    return None
+
+
+def seq_spec_error(spec):
+    """Why `spec` is not a sequence penalty spec (the front end's sampling.rs SeqSpec::parse), or None:
+    thinking=M:B:N:C,answer=M:B:N:C,guard=M:B:N:C, M 0 or more, B 1 or more, N 1 or more, C 0 to 20, each scope once."""
+    seen = set()
+    for part in spec.split(','):
+        key, sep, value = part.partition('=')
+        key = key.strip()
+        if not sep or key not in ('thinking', 'answer', 'guard'):
+            return f'{part.strip()!r}: want thinking=, answer= or guard='
+        if key in seen:
+            return f'{key} is given twice'
+        seen.add(key)
+        v = [x.strip() for x in value.split(':')]
+        if len(v) != 4:
+            return f'{key}={value.strip()!r}: want mult:base:min:cap'
+        try:
+            m, b, c = float(v[0]), float(v[1]), float(v[3])
+        except ValueError:
+            return f'{key}: a value is not a number'
+        if not v[2].isdigit() or not (m >= 0 and b >= 1 and int(v[2]) >= 1 and 0 <= c <= 20):
+            return f'{key}={value.strip()}: want mult >= 0, base >= 1, min >= 1 and cap 0 to 20'
+    return None
+
+
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
     if not o.get('GR8_MODEL'):
         raise OptionError(f'no model: set GR8_MODEL to {models.CHOICES}, in the config file or the environment, or '
                           'run ./gr8 <model> (./gr8 models lists them)')
+    if getattr(o, 'model_conflict', None):
+        where, other = o.model_conflict
+        raise OptionError(f'./gr8 {o.named} names the model, and GR8_MODEL={other} {where} names another: remove that '
+                          f'GR8_MODEL, or run ./gr8 {other}')
     model = models.of(o)
     tp = o.get('TP')
     if tp is None:
@@ -270,8 +454,8 @@ def validate(o):
         raise OptionError(f'--drafter {o.get("DRAFTER")}: want https://huggingface.co/<org>/<repo>[@rev]')
     if not model.drafter and (o.get('DRAFTER') or o.get('DFLASH') == '1'):
         raise OptionError(f'--drafter, --dflash 1: {model.name} has no DFlash2 drafter')
-    if o.get('DRAFTER') and tp not in ('4', '6'):
-        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 (split) and TP=6 (replicated) only, not TP={tp}')
+    if o.get('DRAFTER') and tp not in ('4', '6', '2', '1'):
+        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4, TP=2 and TP=1 (split) and TP=6 (replicated) only, not TP={tp}')
     if not str(o.get('DEFAULT_MAX_TOKENS')).isdigit():
         raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = fit SHARE_LIMIT)')
     effort = o.get('DEFAULT_REASONING_EFFORT')
@@ -284,24 +468,59 @@ def validate(o):
     elif effort == 'none' and not model.thinking_off:
         raise OptionError('--default-reasoning-effort none: GLM 5.3 cannot turn thinking off (use low, or '
                           '--default-thinking-budget)')
-    elif effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
-        raise OptionError(f'--default-reasoning-effort {effort}: want minimal, low, medium, high, xhigh or max')
-    if o.get('CHUNK') is not None and model.name != 'ds41':
+    elif effort not in (None, 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
+        raise OptionError(f'--default-reasoning-effort {effort}: want none, minimal, low, medium, high, xhigh or max')
+    if o.get('CHUNK') is not None and 'CHUNK' not in model.serve_options:
         raise OptionError(f'--chunk: ds41 only (the prompt rows a step of the DeepSeek serve path); ./gr8 {model.name} sets its own')
-    if o.get('EAGER') is not None and model.name != 'ds41':
+    if o.get('EAGER') is not None and 'EAGER' not in model.serve_options:
         raise OptionError(f'--eager: ds41 only (the DeepSeek serve path runs eagerly without --graph); ./gr8 {model.name} always captures')
-    if any(w.startswith(('GR8_DS_', 'GR8_DS41_')) for w in (o.get('EXTRA_ENV') or '').split()) and model.name != 'ds41':
+    if o.get('EXACT') is not None and 'EXACT' not in model.serve_options:
+        raise OptionError(f'--exact: ds41 only (the DeepSeek prefill path); ./gr8 {model.name} has one')
+    if o.get('EXACT') not in (None, '0', '1'):
+        raise OptionError(f'--exact {o.get("EXACT")}: want 0 (the release stack, v2 prefill) or 1 (exact output)')
+    if any(w.startswith(prefix) and prefix not in model.engine_prefixes
+           for w in (o.get('EXTRA_ENV') or '').split()
+           for prefix in {p for m in models.MODELS.values() for p in m.engine_prefixes}):
         raise OptionError(f'--extra-env names a GR8_DS_* variable: those are DeepSeek-V4.1 engine variables, and '
                           f'./gr8 {model.name} serves another model')
     if o.get('GRAMMAR') not in ('0', '1'):
         raise OptionError(f'--grammar {o.get("GRAMMAR")}: want 0 or 1')
-    if o.get('ALLOW_THINKING_OFF') not in ('0', '1'):
-        raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
+    for k in ('ALLOW_THINKING_OFF', 'CLAMP_MAX_TOKENS'):
+        if o.get(k) not in ('0', '1'):
+            raise OptionError(f'--{k.lower().replace("_", "-")} {o.get(k)}: want 0 or 1')
     if o.get('UNDECLARED_TOOL_CALLS') not in ('text', 'emit'):
         raise OptionError(f'--undeclared-tool-calls {o.get("UNDECLARED_TOOL_CALLS")}: want text or emit')
-    if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
-        raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
-                          '(0 = no limit)')
+    for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY'):
+        err = penalty_spec_error(str(o.get(k)))
+        if err:
+            raise OptionError(f'--{k.lower().replace("_", "-")} {o.get(k)}: {err}')
+    if o.get('DEFAULT_THINK_END_BOOST') is not None:
+        err = boost_spec_error(o.get('DEFAULT_THINK_END_BOOST'))
+        if err:
+            raise OptionError(f'--default-think-end-boost {o.get("DEFAULT_THINK_END_BOOST")}: {err}')
+    if o.get('DEFAULT_SEQUENCE_PENALTY') is not None:
+        err = seq_spec_error(o.get('DEFAULT_SEQUENCE_PENALTY'))
+        if err:
+            raise OptionError(f'--default-sequence-penalty {o.get("DEFAULT_SEQUENCE_PENALTY")}: {err}')
+    if o.get('FORCED_TOOL_THINKING') not in ('0', '1'):
+        raise OptionError(f'--forced-tool-thinking {o.get("FORCED_TOOL_THINKING")}: want 0 or 1')
+    if o.get('LITERAL_CONTENT') not in ('0', '1'):
+        raise OptionError(f'--literal-content {o.get("LITERAL_CONTENT")}: want 0 or 1')
+    if o.get('TOOL_REPEAT_GUARD') not in ('0', '1'):
+        raise OptionError(f'--tool-repeat-guard {o.get("TOOL_REPEAT_GUARD")}: want 0 or 1')
+    if not (str(o.get('TOOL_REPEAT_GUARD_REPEATS')).isdigit() and int(o.get('TOOL_REPEAT_GUARD_REPEATS')) >= 1):
+        raise OptionError(f'--tool-repeat-guard-repeats {o.get("TOOL_REPEAT_GUARD_REPEATS")}: want a whole number from 1')
+    if not str(o.get('TOOL_REPEAT_GUARD_RETRIES')).isdigit():
+        raise OptionError(f'--tool-repeat-guard-retries {o.get("TOOL_REPEAT_GUARD_RETRIES")}: want a whole number')
+    try:
+        gt = float(o.get('TOOL_REPEAT_GUARD_TEMPERATURE'))
+    except (TypeError, ValueError):
+        gt = math.nan
+    if not 0 <= gt <= 2:
+        raise OptionError(f'--tool-repeat-guard-temperature {o.get("TOOL_REPEAT_GUARD_TEMPERATURE")}: want a number from 0 to 2')
+    err = limit_error(str(o.get('DEFAULT_THINKING_BUDGET')))
+    if err:
+        raise OptionError(f'--default-thinking-budget {err} (0 = no limit)')
     share = o.get('SHARE_LIMIT')
     if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) % 64 == 0):
         # the engine takes any multiple of a KV page (64 tokens) and makes it a decode bucket boundary (context_buckets.h)
@@ -319,6 +538,22 @@ def validate(o):
         raise OptionError('--v2 needs --v2-slices')
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
+    if o.get('S2_SHARED_WATERFILL') not in (None, '0', '1'):
+        raise OptionError(f'--s2-shared-waterfill {o.get("S2_SHARED_WATERFILL")}: want 0 or 1')
+    if o.get('S2_SHARED_WATERFILL') == '1' and model.uniform_rows:
+        raise OptionError('--s2-shared-waterfill 1: DS41 shared steps require uniform rows (glm53 and glm53f only)')
+    if o.get('S2_SHARED_WF_MARGIN') is not None:
+        try:
+            wfm = float(o.get('S2_SHARED_WF_MARGIN'))
+        except ValueError:
+            wfm = -1.0
+        if not math.isfinite(wfm) or wfm < 0.0:
+            raise OptionError(f'--s2-shared-wf-margin {o.get("S2_SHARED_WF_MARGIN")}: want a finite nonnegative number')
+    for key in ('KV4_FOLD', 'KV4_TC'):
+        if o.get(key) not in (None, '0', '1'):
+            raise OptionError(f'--{key.lower().replace("_", "-")} {o.get(key)}: want 0 or 1')
+    if o.get('KV4_FOLD') == '1' and (not model.kv4_fold or o.get('KV_FORMAT') != 'int4' or o.get('KVB') == 'fp8'):
+        raise OptionError('--kv4-fold 1 requires glm53 with --kv-format int4 and BF16 kv_b')
     if o.get('KVB') not in (None, 'bf16', 'fp8'):
         raise OptionError(f'--kvb {o.get("KVB")}: want bf16 or fp8')
     # a release boot sets V2_DENSE, or --model names a release (resolve_model sets V2_DENSE after this); the engine refuses
@@ -372,6 +607,8 @@ def validate(o):
         if o.get('IPS'):
             raise OptionError('--shape ring takes no --ips/--ips2: the engine finds its devices by name (--ring-devs) '
                               'and bootstraps over the LAN')
+    if tp == '1' and (o.get('IPS') or o.get('IPS2')):
+        raise OptionError('--tp 1 takes no --ips/--ips2: one box has no fabric, and the engine bootstraps over the LAN')
     if o.get('RING_DEVS') and len(split_list(o.get('RING_DEVS'))) != 4:
         raise OptionError(f'--ring-devs {o.get("RING_DEVS")}: want four devices')
     if mode(o) == 'peers' and len(split_list(o.get('PEERS'))) != int(tp):
@@ -383,24 +620,46 @@ def validate(o):
         raise OptionError('IPS and IPS2 go together')
     for k in ('CONTROL_PORT', 'PORT', 'PROXY_CPU', 'JOIN_TIMEOUT'):
         o.int(k)
+    if o.get('MAX_MODEL_LEN') is not None:
+        n = o.int('MAX_MODEL_LEN')
+        max_positions = models.release_metadata(model, o.get('MODEL_DIR') or o.get('MODEL'))['max_positions']
+        if n < 1 or (max_positions and n > max_positions):
+            raise OptionError(f'--max-model-len {n}: want 1 to {max_positions}, the model\'s max positions')
+        if o.get('CAP') is not None and n > o.int('CAP'):
+            raise OptionError(f'--max-model-len {n}: more than CAP {o.int("CAP")}, the KV pool a request comes from')
     stores = kv_stores(o)
     cache = o.get('FLASH_CACHE')
     if cache not in (None, 'off', 'aligned', 'terminal'):
         raise OptionError(f'--flash-cache {cache}: want off, aligned or terminal')
-    if cache not in (None, 'off') and model.name != 'glm53f':
+    if cache not in (None, 'off') and not model.checkpoint_cache:
         raise OptionError(f'--flash-cache: Flash session checkpoints are glm53f only, not {model.name}')
     budget = o.get('FLASH_STATE_BUDGET_MIB')
     if budget is not None and not (str(budget).isdigit() and int(budget) >= 1):
         raise OptionError(f'--flash-state-budget-mib {budget}: want a whole number of MiB from 1')
-    if model.name == 'glm53f' and stores:
+    if model.checkpoint_cache and cache == 'terminal' and o.get('DFLASH') == '1':
+        raise OptionError('--flash-cache terminal with --dflash 1: the drafter takes aligned checkpoints only (a terminal '
+                          "checkpoint's KDA state is not cold-exact)")
+    if model.checkpoint_cache and stores:
         if cache in (None, 'off'):
             raise OptionError('--kv-store on glm53f holds Flash session checkpoints: it needs --flash-cache aligned or terminal')
         if len(stores) > 1:
             raise OptionError('--flash-cache keeps its checkpoints in one store: give one --kv-store')
-        if any(t['persist'] for t in stores):
-            raise OptionError('--flash-cache: Flash checkpoints do not persist across boots (persist=on)')
+        if any(t['persist'] for t in stores) and cache == 'terminal':
+            raise OptionError('--flash-cache terminal: persist=on keeps cold-exact (aligned) checkpoints only')
     elif stores and o.get('REUSE') == '0':
         raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
+    grid = o.get('REUSE_GRID')
+    if grid is not None:
+        # a positive multiple of a KV page; the engine (g6m4.cu) also refuses one larger than --prefill at start
+        if not (str(grid).isdigit() and (grid == '0' or (int(grid) % 64 == 0 and 64 <= int(grid) <= 65536))):
+            raise OptionError(f'--reuse-grid {grid}: want 0, or a multiple of 64 from 64 to 65536 (at most --prefill)')
+        if grid != '0':
+            if model.engine_profile != 'glm':
+                raise OptionError(f'--reuse-grid: the GLM-5.3 prefix-reuse grid; ./gr8 {model.name} has none')
+            if o.get('REUSE') == '0':
+                raise OptionError('--reuse-grid needs REUSE (on by default)')
+            if '0' in (extra_env_value(o, 'GR8_REUSE_ALIGN'), extra_env_value(o, 'G6_REUSE_ALIGN')):
+                raise OptionError('--reuse-grid conflicts with GR8_REUSE_ALIGN=0')
     if stores:
         if any(t['host'] == 'auto' for t in stores) and mode(o) == 'peers':
             raise OptionError('--kv-store remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
@@ -413,6 +672,8 @@ def validate(o):
         raise OptionError(f'--kv-format int4: {model.name} has an fp8 KV build only')
     if o.get('KV_FORMAT') not in (None, 'fp8', 'int4'):
         raise OptionError(f'--kv-format {o.get("KV_FORMAT")}: want fp8 or int4')
+    if o.get("DISPRAM") not in (None, "0", "1"):
+        raise OptionError(f'--dispram {o.get("DISPRAM")}: want 0 or 1')
     if o.get('KV_SHARE_WHEN') not in (None, 'idle', 'always'):
         raise OptionError(f'--kv-share-when {o.get("KV_SHARE_WHEN")}: want idle or always')
     if o.get('KV_KEEP') not in (None, 'system', 'sessions', 'all'):
@@ -450,6 +711,7 @@ def deprecated_kv(values, origin, warnings):
 #   remote:HOST:PORT|remote:auto,size=N(M|G|T)[,keep=RULE][,name=NAME][,cache=NAME][,group=NAME[,cap=N(M|G|T)][,weight=N]]
 # A YAML store file says the same things (kv_store_file), with these key names: {kind: {one-line key: YAML key}}
 KV_KEYS = {'cache': {'kind': 'kind', 'floor': 'floor'},
+           'mem': {'size': 'size_per_rank', 'keep': 'keep', 'name': 'name', 'cache': 'cache'},
            'ssd': {'size': 'size_per_rank', 'persist': 'persist', 'keep': 'keep', 'name': 'name', 'cache': 'cache'},
            'remote': {'size': 'size_per_rank', 'keep': 'keep', 'name': 'name', 'cache': 'cache', 'group': 'group',
                       'cap': 'cap_per_rank', 'weight': 'weight'}}
@@ -472,7 +734,7 @@ class KvError(OptionError):
 
 def kv_parse(v):
     """KV_STORE's one-line form parsed and checked: (caches {NAME: {'kind', 'floor'}}, stores in cascade order
-    [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size', 'persist', 'keep', 'name', 'cache',
+    [{'text', 'store', 'kind': 'ssd' | 'remote' | 'mem', 'path', 'host', 'port', 'size', 'persist', 'keep', 'name', 'cache',
     'group', 'cap', 'weight', 'settings': [(key, value) as written]}]). keep None = KV_KEEP; name defaults to the kind.
     Raises KvError naming the entry."""
     caches, stores = {}, []
@@ -502,14 +764,14 @@ def kv_parse(v):
             continue
         where = ('tier', len(stores))
         m = re.fullmatch(r'ssd:(.+)', head) or re.fullmatch(r'remote:([^:,]+)(?::(\d+))?', head)
-        if not m or (head.startswith('remote:auto') and m.group(2)):
-            raise KvError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto', where)
-        t = {'text': text, 'store': head, 'kind': 'ssd' if head.startswith('ssd:') else 'remote', 'path': None,
+        if (not m and head != 'mem:') or (head.startswith('remote:auto') and m.group(2)):
+            raise KvError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT, remote:auto or mem:', where)
+        t = {'text': text, 'store': head, 'kind': 'mem' if head == 'mem:' else 'ssd' if head.startswith('ssd:') else 'remote', 'path': None,
              'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None, 'name': None, 'cache': None,
              'group': None, 'cap': None, 'weight': None, 'settings': settings}
         if t['kind'] == 'ssd':
             t['path'] = m.group(1)
-        else:
+        elif t['kind'] == 'remote':
             t['host'], t['port'] = m.group(1), m.group(2)
         for k, x in settings:
             if k == 'persist' and t['kind'] != 'ssd':
@@ -540,7 +802,7 @@ def kv_parse(v):
             raise KvError(f'--kv-store {text}: cap= and weight= need group=', where)
         stores.append(t)
     # an unnamed store is named for its kind, or kind-N when its kind repeats
-    unnamed = {k: [t for t in stores if t['kind'] == k and not t['name']] for k in ('ssd', 'remote')}
+    unnamed = {k: [t for t in stores if t['kind'] == k and not t['name']] for k in ('ssd', 'remote', 'mem')}
     for k, ts in unnamed.items():
         for n, t in enumerate(ts, 1):
             t['auto'] = k if len(ts) == 1 else f'{k}-{n}'
@@ -603,7 +865,7 @@ def kv_yaml(caches, stores):
     for t in stores:
         given = dict(t['settings'])
         tier = {KV_KEYS[t['kind']][k]: given[k] for k in ('keep', 'name', 'cache') if k in given}
-        store = {('path' if t['kind'] == 'ssd' else 'address'): t['store'].split(':', 1)[1]}
+        store = {} if t['kind'] == 'mem' else {('path' if t['kind'] == 'ssd' else 'address'): t['store'].split(':', 1)[1]}
         store.update({KV_KEYS[t['kind']][k]: value(k, x) for k, x in t['settings'] if k not in ('keep', 'name', 'cache')})
         head = '- '
         for k, x in tier.items():
@@ -764,13 +1026,15 @@ def kv_store_text(text, path='-'):
         if 'store' not in t:
             fail(where, 'no store')
         store = want(f'{where}.store', t['store'], dict)
-        if len(store) != 1 or next(iter(store)) not in ('ssd', 'remote'):
-            fail(f'{where}.store', 'want one of ssd: or remote:')
+        if len(store) != 1 or next(iter(store)) not in ('ssd', 'remote', 'mem'):
+            fail(f'{where}.store', 'want one of ssd:, remote: or mem:')
         kind, s = next(iter(store.items()))
         where_s = f'{where}.store.{kind}'
         address = 'path' if kind == 'ssd' else 'address'
         on_store = {y: k for k, y in KV_KEYS[kind].items() if y not in ('keep', 'name', 'cache')}
         keys(where_s, want(where_s, s, dict), (address, *on_store))
+        if kind == 'mem':
+            s = dict(s, address='')
         if address not in s:
             fail(where_s, f'no {address}')
         settings = [(f'{where}.{y}', k, t[y]) if y in ('keep', 'name', 'cache') else (f'{where_s}.{y}', k, s[y])
@@ -862,12 +1126,14 @@ def resolve_peers(o):
 
 # ---- the engine plan: scripts/engine_args.sh --------------------------------------------------------------------------
 def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id='',
-                kv_store=None, kv_rows=None):
+                kv_store=None, kv_rows=None, dispram_bytes=0):
     """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..]} from scripts/engine_args.sh.
     The defaults give the canonical template, with every per-box value as a placeholder. kv_store, kv_rows: this box's
     KV_STORE and KV_ROWS with the KV node resolved (remote:GB names none)."""
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'GR8_MODEL': models.of(o).name, 'TP': o.get('TP'),
            'SET_ID': set_id}
+    if dispram_bytes and int(dispram_bytes) > 0:
+        env['DISPRAM_BYTES'] = str(int(dispram_bytes))
     for k in ENGINE_KNOBS + ['S2PORT', 'READY_TMO']:
         if o.get(k) is not None:
             env[k] = o.get(k)
@@ -922,7 +1188,7 @@ def canonical(o, plan, members, variant=None, ring=''):
     variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count. ring: --shape ring
     with mentat, the ring this box planned from mentat's claim (mentat.ring_text), so every box must have the same."""
     c = {'tp': o.get('TP'), 'shape': o.get('SHAPE'), 'mode': mode(o), 'fabric_port': str(FABRIC_PORT)}
-    if models.of(o) is not models.GLM53:   # GLM-5.3's lines stay as they were, so a mixed upgrade still agrees
+    if not models.of(o).legacy_identity:   # GLM-5.3's lines stay as they were, so a mixed upgrade still agrees
         c['model'] = models.of(o).name
     if members:
         c['peers'] = ','.join(members)
@@ -935,6 +1201,8 @@ def canonical(o, plan, members, variant=None, ring=''):
     # names it. DFLASH and PF_OWN decide which pack files a rank needs.
     for k in ('CAP', 'DFLASH', 'PF_OWN'):
         c[k] = plan['knobs'].get(k, '')
+    if o.get('MAX_MODEL_LEN'):   # the head's shim takes it; by name, so a box with another limit is refused
+        c['MAX_MODEL_LEN'] = o.get('MAX_MODEL_LEN')
     if variant:
         c['variant'] = variant.name
         c['variant.sha256'] = variant.sha256 or ''

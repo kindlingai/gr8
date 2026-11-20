@@ -20,7 +20,7 @@ use crate::json::Json;
 use crate::plan::{Gen, Op, Plan};
 use crate::records;
 use crate::sha256::Sha256;
-use crate::v2plan::{Builder, Tensor, V2Image};
+use crate::v2plan::{self, Builder, Tensor, V2Image};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_void};
 use std::ops::Range;
@@ -454,7 +454,8 @@ impl Release {
 
 // ---------------------------------------------------------------------------------------------------- planner
 
-/// Release tensors that are not part of the text model: skipped on purpose.
+/// Release tensors the engine does not load: skipped on purpose (the DSpark layers' gate.bias_vl; the main layers' is
+/// bound as router.bias_vl).
 fn skipped(name: &str) -> bool {
     name.ends_with(".bias_vl")
 }
@@ -478,6 +479,7 @@ fn nbytes(dtype: &str, shape: &[i64]) -> u64 {
 /// rows past `valid` are padding (weight 0, scale PAD_SCALE).
 #[derive(Clone, Debug)]
 pub struct EngramSlice {
+    pub col_shard: bool,
     pub layer: usize,
     pub rows: usize,
     pub part: usize,
@@ -486,6 +488,44 @@ pub struct EngramSlice {
     pub dim: usize,
     pub sdim: usize,
     pub segs: Vec<EngramSeg>,
+}
+
+// Column sizes from our engine/engram/hash_consts.h, checked against it by the test below.
+const ENGRAM_COLUMNS: [[usize; 24]; 2] = [
+    [16000057, 16000079, 16000081, 16000097, 16000121, 16000129, 16000133, 16000183, 16000189, 16000207, 16000211, 16000253, 16000277, 16000289, 16000307, 16000321, 16000339, 16000381, 16000393, 16000399, 16000403, 16000409, 16000447, 16000463],
+    [16000477, 16000487, 16000499, 16000507, 16000511, 16000573, 16000609, 16000627, 16000667, 16000669, 16000693, 16000697, 16000711, 16000729, 16000759, 16000769, 16000781, 16000799, 16000813, 16000819, 16000841, 16000877, 16000879, 16000889],
+];
+
+fn column_ranges(sizes: &[usize; 24], nr: usize, rank: usize) -> Vec<(usize, usize)> {
+    let mut first = 0;
+    let mut ranges = Vec::new();
+    for (j, &n) in sizes.iter().enumerate() {
+        if j % nr == rank { ranges.push((first, first + n)); }
+        first += n;
+    }
+    ranges
+}
+
+fn engram_ranges(layer: usize, rows: usize, nr: usize, rank: usize, col: bool) -> Result<Vec<(usize, usize)>, String> {
+    if nr == 0 || rank >= nr { return Err("engram: invalid rank/tp".into()); }
+    if !col {
+        let part = rows.div_ceil(nr);
+        let first = (rank * part).min(rows);
+        return Ok(vec![(first, (first + part).min(rows))]);
+    }
+    let e = match layer { 1 => 0, 14 => 1, _ => return Err(format!("engram: column sharding has no constants for layer {layer}")) };
+    if rows != ENGRAM_COLUMNS[e].iter().sum::<usize>() {
+        return Err(format!("engram: layer {layer} row count {rows} differs from the hash columns"));
+    }
+    Ok(column_ranges(&ENGRAM_COLUMNS[e], nr, rank))
+}
+
+// File boundaries need not coincide with columns; each intersection is one consecutive run.
+fn intersect_engram(ranges: &[(usize, usize)], row0: usize, n: usize) -> Vec<(usize, usize)> {
+    ranges.iter().filter_map(|&(first, end)| {
+        let (a, b) = (first.max(row0), end.min(row0 + n));
+        (a < b).then_some((a, b))
+    }).collect()
 }
 
 /// Rows [row0, row0 + rows) of a table, in one split file: the weights at `w_off`, the scales at `s_off` (absolute).
@@ -513,6 +553,30 @@ pub struct Opts {
     pub experts: Option<usize>,
     /// leave out the G.* tensors
     pub no_globals: bool,
+    /// plan from manifests/exlr8-manifest-NAME.json: its layers with numeric widths load exlr8 trellis experts
+    /// (GR8_DS_MANIFEST); None = every layer native
+    pub manifest: Option<String>,
+    /// the decode head as MXFP8 records, G.lm_head.mx.gv, in place of the BF16 ones (GR8_DS41_HEAD_MX); false = BF16
+    pub head_mx: bool,
+}
+
+/// Blocks of 128 in an expert (2304 wide): the exlr8 v2 halves of a DS41 layer.
+const NH_DS41: usize = 18;
+
+/// The trellis layers of a release manifest: those whose first gate entry is a width (a number), with their widths.
+fn trellis_layers(dir: &str, name: &str) -> Result<BTreeMap<usize, v2plan::Widths>, String> {
+    let path = format!("{dir}/manifests/exlr8-manifest-{name}.json");
+    let man = v2plan::width_manifest(&path)?;
+    let mut out = BTreeMap::new();
+    for (k, e) in man.get("layers").and_then(Json::obj).ok_or(format!("{path}: no layers"))? {
+        let l: usize = k.parse().map_err(|_| format!("{path}: layer {k}"))?;
+        let first = e.get("gate").and_then(Json::arr).and_then(|g| g.first()).and_then(Json::arr).and_then(|r| r.first());
+        if first.and_then(Json::int).is_none() {
+            continue;
+        }
+        out.insert(l, v2plan::widths_nh(&man, l, NH_DS41)?.ok_or(format!("{path}: layer {l}"))?);
+    }
+    Ok(out)
 }
 
 /// The byte ranges of the release a rank reads: (path relative to the release, offset, bytes).
@@ -526,6 +590,8 @@ struct Planner<'a> {
     nr: usize,
     rank: usize,
     opts: Opts,
+    trellis: BTreeMap<usize, v2plan::Widths>,
+    slices: Option<v2plan::Slices>,
 }
 
 impl Planner<'_> {
@@ -786,7 +852,15 @@ impl Planner<'_> {
         // the MoE block
         self.bf16_mat(&format!("{p}.router.w"), &t("ffn.gate"), None, true)?;
         self.vector(format!("{p}.router.bias"), &t("ffn.gate.bias"))?;
+        // image rows select with gate.bias_vl (DS41 vision, kernels/ds_router.cuh); the DSpark layers never see an image row
+        if l < MTP0 && self.rel.has(&t("ffn.gate.bias_vl")) {
+            self.vector(format!("{p}.router.bias_vl"), &t("ffn.gate.bias_vl"))?;
+        }
         let n_exp = self.rel.dims(&t("ffn.gate"))?[0];
+        if self.trellis.contains_key(&l) {
+            self.trellis_experts(l)?;
+            return self.layer_tail(pre, &p);
+        }
         let i_sh = self.rel.dims(&t("ffn.shared_experts.w1"))?[0];
         let sl = inter_slice(i_sh, self.nr, self.rank)?;
         if sl.len() % BLK != 0 {
@@ -797,6 +871,30 @@ impl Planner<'_> {
         self.mx(&format!("{p}.sh.w2"), &t("ffn.shared_experts.w2"), None, Some(sl))?;
         let n_exp = self.opts.experts.map_or(n_exp, |m| m.min(n_exp));
         self.routed(&p, pre, n_exp)?;
+        self.layer_tail(pre, &p)
+    }
+
+    /// Layer l's experts as exlr8 trellis (the manifest gave it numeric widths): the tr3.* tensors of the 128-blocks
+    /// this rank owns, routed and shared, built from the width files and the index slices (src/v2plan.rs).
+    fn trellis_experts(&mut self, l: usize) -> Result<(), String> {
+        let (nr, rank, dir) = (self.nr, self.rank, self.rel.dir.clone());
+        let slices = self.slices.as_ref().ok_or("trellis layers without index slices")?;
+        let first = self.b.segs.len();
+        v2plan::v2_layer(&mut self.b, l, &self.trellis[&l], slices, &|l, k| v2plan::width_file(&dir, l, k),
+                         &|e| Ok(v2plan::formula_halves_nh(e, l, nr, rank, NH_DS41)))?;
+        // the fetch list: the width-file ranges those tensors copy
+        let runs: Vec<(String, u64, u64)> = self.b.segs[first..].iter().filter(|g| g.op == Op::Copy)
+            .map(|g| (self.b.files[g.file].clone(), g.file_off, g.nbytes)).collect();
+        for (path, off, n) in runs {
+            let rel = path.strip_prefix(&format!("{dir}/")).unwrap_or(&path).to_string();
+            self.reads.entry(rel).or_default().push((off, n));
+        }
+        Ok(())
+    }
+
+    /// The rest of a layer after its experts: the DSpark heads and the Engram weights a layer has.
+    fn layer_tail(&mut self, pre: &str, p: &str) -> Result<(), String> {
+        let t = |s: &str| format!("{pre}{s}");
         // DSpark layers: the first one joins the trunk, the last one carries the output heads
         if self.rel.has(&t("main_norm.weight")) {
             self.vector(format!("{p}.main_norm"), &t("main_norm.weight"))?;
@@ -832,12 +930,47 @@ impl Planner<'_> {
             return Err(format!("head has {} rows, not a multiple of {VTILE}", dims[0]));
         }
         let tiles = vocab_tiles(dims[0] / VTILE, self.nr, self.rank);
-        self.bf16_mat("G.lm_head", "head", Some(tiles.start * VTILE..tiles.end * VTILE), true)
+        let rows = tiles.start * VTILE..tiles.end * VTILE;
+        // GR8_DS41_HEAD_MX=1: the decode head as MXFP8 records, G.lm_head.mx.gv, which build_ds41 binds ahead of the BF16
+        // records. Rounded (records::mxfp8_quantize, round to nearest): the logits change.
+        let mx = self.opts.head_mx;
+        self.bf16_mat("G.lm_head", "head", Some(rows.clone()), !mx)?;
+        if mx {
+            self.head_mx(rows)?;
+        }
+        Ok(())
     }
 
-    /// Engram tables a rank serves: global rows [rank * part, ...) of every table, with part = ceil(n / nr) (the
-    /// reference's sharding, ParallelEngramEmbedding), as runs of the release's split files.
-    fn engram(&mut self) -> Result<Vec<EngramSlice>, String> {
+    /// G.lm_head.mx.gv [n/16][k/32][528] of the release's BF16 head rows `rows`, in stripes of whole 16-row tiles.
+    fn head_mx(&mut self, rows: Range<usize>) -> Result<(), String> {
+        let (s, _, k) = self.rel.bf16("head")?;
+        let n = rows.len();
+        if n % 16 != 0 || k % 32 != 0 {
+            return Err(format!("head: {n} rows x {k} inputs do not make MXFP8 records"));
+        }
+        let per = ((16usize << 20) / (k * 2) / 16).max(1) * 16;
+        let mut stripes: Vec<(u64, Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>)> = Vec::new();
+        let mut a = 0;
+        while a < n {
+            let b = (a + per).min(n);
+            let (s2, r0, m) = (s.clone(), rows.start + a, b - a);
+            stripes.push(((m / 16 * (k / 32) * 528) as u64, Box::new(move || {
+                let raw = s2.read((r0 * k * 2) as u64, (m * k * 2) as u64)?;
+                let w: Vec<f32> =
+                    raw.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect();
+                let (codes, scales) = records::mxfp8_quantize(&w, k);
+                Ok(records::mxfp8_record(&codes, &scales, k))
+            })));
+            a = b;
+        }
+        eprintln!("GR8_DS41_HEAD_MX=1: G.lm_head.mx.gv = {n} head rows x {k} as MXFP8 records ({} bytes)", n / 16 * (k / 32) * 528);
+        self.gen_striped("G.lm_head", "G.lm_head.mx.gv".into(), "u8", vec![(n / 16) as i64, (k / 32) as i64, 528], stripes);
+        Ok(())
+    }
+
+    /// Engram table runs: columns j % nr == rank by default; optional legacy contiguous global rows.
+    /// Both layouts keep the original global IDs and intersect the release's split files.
+    fn engram(&mut self, col_shard: bool) -> Result<Vec<EngramSlice>, String> {
         let mut out = Vec::new();
         let tables: Vec<(usize, Vec<Arc<StFile>>)> = self.rel.engram.iter().map(|(&l, v)| (l, v.clone())).collect();
         for (layer, parts) in tables {
@@ -856,20 +989,19 @@ impl Planner<'_> {
                 files.push((f.clone(), rows, w.shape[0], w.start, s.start));
                 rows += w.shape[0];
             }
-            let part = rows.div_ceil(self.nr);
-            let first = (self.rank * part).min(rows);
-            let valid = part.min(rows - first);
+            let ranges = engram_ranges(layer, rows, self.nr, self.rank, col_shard)?;
             let mut segs = Vec::new();
             for (f, row0, n, w0, s0) in files {
-                let (a, b) = (first.max(row0), (first + valid).min(row0 + n));
-                if a >= b {
-                    continue;
+                for (a, b) in intersect_engram(&ranges, row0, n) {
+                    let (w_off, s_off) = (w0 + ((a - row0) * dim) as u64, s0 + ((a - row0) * sdim) as u64);
+                    self.note(&f, [(w_off, ((b - a) * dim) as u64), (s_off, ((b - a) * sdim) as u64)]);
+                    segs.push(EngramSeg { path: f.path.clone(), row0: a, rows: b - a, w_off, s_off });
                 }
-                let (w_off, s_off) = (w0 + ((a - row0) * dim) as u64, s0 + ((a - row0) * sdim) as u64);
-                self.note(&f, [(w_off, ((b - a) * dim) as u64), (s_off, ((b - a) * sdim) as u64)]);
-                segs.push(EngramSeg { path: f.path.clone(), row0: a, rows: b - a, w_off, s_off });
             }
-            out.push(EngramSlice { layer, rows, part, first, valid, dim, sdim, segs });
+            let valid = ranges.iter().map(|&(a,b)| b-a).sum();
+            let part = if col_shard { valid } else { rows.div_ceil(self.nr) };
+            let first = ranges.first().map_or(rows, |&(a,_)| a);
+            out.push(EngramSlice { col_shard, layer, rows, part, first, valid, dim, sdim, segs });
         }
         Ok(out)
     }
@@ -886,6 +1018,7 @@ pub struct Ds41Plan {
 /// the plan also checks that every tensor of the release's layer and vocabulary files is either in the plan or
 /// skipped on purpose (the vision routing bias).
 pub fn plan(dir: &str, nr: usize, rank: usize, opts: &Opts) -> Result<Ds41Plan, String> {
+    if gr8knobs::KV4_FOLD.get() { return Err("GR8_KV4_FOLD=1 is for GLM-5.3 G6_KV4 only".into()); }
     plan_from(&Release::open(dir)?, nr, rank, opts)
 }
 
@@ -893,7 +1026,13 @@ pub fn plan_from(rel: &Release, nr: usize, rank: usize, opts: &Opts) -> Result<D
     if nr == 0 || nr > O_GROUPS || rank >= nr {
         return Err(format!("rank {rank} of {nr}: attention splits {O_GROUPS} O-groups, so 1 <= nr <= {O_GROUPS}"));
     }
-    let mut p = Planner { b: Builder::new(), rel, used: BTreeSet::new(), reads: BTreeMap::new(), nr, rank, opts: opts.clone() };
+    let trellis = match &opts.manifest {
+        Some(m) if m != "native" => trellis_layers(&rel.dir, m)?,
+        _ => BTreeMap::new(),
+    };
+    let slices = if trellis.is_empty() { None } else { Some(v2plan::Slices::open(&rel.dir, nr, &[rank])?) };
+    let mut p = Planner { b: Builder::new(), rel, used: BTreeSet::new(), reads: BTreeMap::new(), nr, rank, opts: opts.clone(),
+                          trellis, slices };
     let n_main = rel.dense.keys().filter(|&&l| l < MTP0).count();
     if rel.dense.keys().copied().take(n_main).ne(0..n_main) {
         return Err(format!("{}: the main layers are not 0..{n_main}", rel.dir));
@@ -908,7 +1047,7 @@ pub fn plan_from(rel: &Release, nr: usize, rank: usize, opts: &Opts) -> Result<D
         let pre = if l < MTP0 { format!("layers.{l}.") } else { format!("mtp.{}.", l - MTP0) };
         p.layer(l, &pre)?;
     }
-    let engram = p.engram()?;
+    let engram = p.engram(gr8knobs::DS_ENGRAM_COL_SHARD.get())?;
     if opts.layers.is_none() && opts.experts.is_none() && !opts.no_globals {
         let mut missing: Vec<String> = rel.names().into_iter().filter(|n| !p.used.contains(n) && !skipped(n)).collect();
         if !missing.is_empty() {
@@ -949,7 +1088,7 @@ pub fn plan_from(rel: &Release, nr: usize, rank: usize, opts: &Opts) -> Result<D
     let (b, reads) = (p.b, p.reads);
     let bytes = b.cur.div_ceil(4096) * 4096;
     let plan = Plan::from_segs(b.files, b.segs, b.mems, b.gens, bytes)?;
-    Ok(Ds41Plan { img: V2Image { rank, tensors: b.tensors, bytes, plan }, engram, reads })
+    Ok(Ds41Plan { img: V2Image { rank, tensors: b.tensors, bytes, plan, cache: None }, engram, reads })
 }
 
 // ---------------------------------------------------------------------------------------------------- mx4g records
@@ -1040,6 +1179,10 @@ pub fn size_report(img: &V2Image, engram: &[EngramSlice]) -> String {
     let dsp: u64 = img.tensors.iter().filter(|t| kind(&t.name) != t.name && t.name[1..4].parse::<usize>().is_ok_and(|l| l >= MTP0)).map(|t| t.nbytes).sum();
     out += &format!("  DSpark layers (L040+): {:.3} GiB of the data\n", gib(dsp));
     for e in engram {
+        if e.col_shard {
+            out += &format!("  engram L{:03}: column-sharded {} of {} rows in {} runs, {:.3} GiB\n", e.layer, e.valid, e.rows, e.segs.len(), gib(e.bytes()));
+            continue;
+        }
         out += &format!("  engram L{:03}: rows {}..{} of {} (part {}, pad {}) in {} split files, {:.3} GiB\n", e.layer, e.first,
                         e.first + e.valid, e.rows, e.part, e.part - e.valid, e.segs.len(), gib(e.bytes()));
     }
@@ -1186,7 +1329,8 @@ fn manifest_json(img: &V2Image, shas: &[String], nr: usize) -> String {
     let mut out = format!("{{\n \"align\": 4096,\n \"format\": \"g6pack-v1\",\n \"model\": \"deepseek-v4.1-flash-1017\",\n \"pack_bytes\": {},\n \"rank\": {},\n \"tp\": {},\n \"tensors\": [", img.bytes, img.rank, nr);
     for (i, t) in img.tensors.iter().enumerate() {
         let shape: Vec<String> = t.shape.iter().map(i64::to_string).collect();
-        out += &format!("{}\n  {{\"dtype\": {}, \"name\": {}, \"nbytes\": {}, \"offset\": {}, \"sha256\": \"{}\", \"shape\": [{}]}}",
+        let xf = t.expert_format.as_deref().map_or(String::new(), |x| format!(", \"expert_format\": {}", q(x)));
+        out += &format!("{}\n  {{\"dtype\": {}, \"name\": {}, \"nbytes\": {}, \"offset\": {}, \"sha256\": \"{}\", \"shape\": [{}]{xf}}}",
                         if i > 0 { "," } else { "" }, q(&t.dtype), q(&t.name), t.nbytes, t.offset, shas[i], shape.join(", "));
     }
     out + "\n ]\n}\n"
@@ -1215,7 +1359,7 @@ pub fn reads_json(reads: &Reads) -> String {
     format!("{{\"files\": {{\n{}\n}}}}\n", files.join(",\n"))
 }
 
-/// The Engram tables a rank serves, as JSON (g6engram-v2): per table its rows, part, first, valid, dim, sdim and the
+/// The Engram tables a rank serves, as JSON (g6engram-v3-col or legacy g6engram-v2): per table its rows, part, first, valid, dim, sdim and the
 /// split-file runs (path, row0, rows, w_off, s_off: absolute byte offsets of the run's first row).
 pub fn engram_json(engram: &[EngramSlice], nr: usize, rank: usize) -> String {
     let tables: Vec<String> = engram.iter().map(|e| {
@@ -1224,13 +1368,14 @@ pub fn engram_json(engram: &[EngramSlice], nr: usize, rank: usize) -> String {
         format!("  {{\"layer\": {}, \"rows\": {}, \"part\": {}, \"first\": {}, \"valid\": {}, \"dim\": {}, \"sdim\": {}, \"segs\": [{}]}}",
                 e.layer, e.rows, e.part, e.first, e.valid, e.dim, e.sdim, segs.join(", "))
     }).collect();
-    format!("{{\"format\": \"g6engram-v2\", \"tp\": {nr}, \"rank\": {rank}, \"tables\": [\n{}\n]}}\n", tables.join(",\n"))
+    let format = if engram.iter().any(|e| e.col_shard) { "g6engram-v3-col" } else { "g6engram-v2" };
+    format!("{{\"format\": \"{format}\", \"tp\": {nr}, \"rank\": {rank}, \"tables\": [\n{}\n]}}\n", tables.join(",\n"))
 }
 
 // ---------------------------------------------------------------------------------------------------- C interface
 
 /// Plans rank `rank`'s image at TP `nr` from the release under `release_dir` (src/ds41.rs). Writes the image's
-/// manifest (sha256 fields zero) to `out_manifest` and the Engram tables the rank serves (g6engram-v2) to
+/// manifest (sha256 fields zero) to `out_manifest` and the Engram tables the rank serves (v3-col by default, v2 for contiguous rows) to
 /// `out_engram`. Returns a handle for g6l_plan_load, g6l_plan_read and g6l_plan_free, or NULL with a message in `err`.
 ///
 /// # Safety
@@ -1241,13 +1386,27 @@ pub unsafe extern "C" fn g6l_ds41_plan(release_dir: *const c_char, nr: u32, rank
     let t0 = Instant::now();
     let arg = |p, what| crate::cstr(p).ok_or(format!("g6l_ds41_plan: no {what}"));
     let r = (|| {
-        let p = plan(&arg(release_dir, "release dir")?, nr as usize, rank as usize, &Opts::default())?;
+        let opts = Opts {
+            manifest: gr8knobs::DS_MANIFEST.get().map(str::to_string),
+            head_mx: gr8knobs::DS41_HEAD_MX.get(),
+            ..Opts::default()
+        };
+        let p = plan(&arg(release_dir, "release dir")?, nr as usize, rank as usize, &opts)?;
         let out = arg(out_manifest, "output manifest")?;
         let zeros = vec!["0".repeat(64); p.img.tensors.len()];
         std::fs::write(&out, manifest_json(&p.img, &zeros, nr as usize)).map_err(|e| format!("{out}: {e}"))?;
         let out = arg(out_engram, "Engram output")?;
         std::fs::write(&out, engram_json(&p.engram, nr as usize, rank as usize)).map_err(|e| format!("{out}: {e}"))?;
-        Ok::<_, String>(p.img)
+        // GR8_GEN_CACHE (gencache.rs): the key binds the engine binary, the planned manifest (tensor names, offsets,
+        // sizes), the plan options and the release directory (its name carries the release revision).
+        let mut img = p.img;
+        let rd = arg(release_dir, "release dir")?;
+        let mf = opts.manifest.clone().unwrap_or_default();
+        let key_text = format!("ds41 release={rd} nr={nr} rank={rank} head_mx={} manifest={:?}\n{}\n{}",
+                               opts.head_mx, opts.manifest, manifest_json(&img, &zeros, nr as usize),
+                               crate::gencache::source_identity(&[&rd, &mf]));
+        img.cache = crate::gencache::GenCache::from_env(&key_text);
+        Ok::<_, String>(img)
     })();
     match r {
         Ok(img) => Box::into_raw(Box::new((img, t0))) as *mut c_void,
@@ -1255,5 +1414,97 @@ pub unsafe extern "C" fn g6l_ds41_plan(release_dir: *const c_char, nr: u32, rank
             crate::write_err(err, errlen, &e);
             std::ptr::null_mut()
         }
+    }
+}
+
+#[cfg(test)]
+mod col_shard_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn columns_match_engine_constants() {
+        // Avoid a silently divergent second list of the column sizes.
+        let header = include_str!("../../engram/hash_consts.h");
+        let section = header.split("// prime[e]").nth(1).unwrap().split("// offset[e]").next().unwrap();
+        let data = section.split_once('\n').unwrap().1;
+        let numbers: Vec<usize> = data.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).map(|s| s.parse().unwrap()).collect();
+        assert_eq!(numbers, ENGRAM_COLUMNS.concat());
+        for (e, layer) in [1,14].into_iter().enumerate() {
+            let rows = ENGRAM_COLUMNS[e].iter().sum();
+            for nr in [1,2,3,4,5,6,8,24,25] {
+                let mut spans = Vec::new();
+                for rank in 0..nr { spans.extend(engram_ranges(layer, rows, nr, rank, true).unwrap()); }
+                spans.sort();
+                let mut next=0;
+                for (a,b) in spans { assert_eq!(a,next); next=b; }
+                assert_eq!(next,rows);
+            }
+            assert!(engram_ranges(layer,rows-1,4,0,true).is_err());
+        }
+    }
+
+    fn split_file(path: &str, rows: usize) -> Arc<StFile> {
+        let wb=rows*256; let sb=rows*8;
+        let header=format!(r#"{{"engram.embed.record":{{"dtype":"I64","shape":[8],"data_offsets":[0,64]}},"engram.embed.fp8":{{"dtype":"U8","shape":[{rows},256],"data_offsets":[64,{}]}},"engram.embed.e8m0":{{"dtype":"U8","shape":[{rows},8],"data_offsets":[{},{}]}}}}"#,64+wb,64+wb,64+wb+sb);
+        let mut f=std::fs::File::create(path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();f.write_all(header.as_bytes()).unwrap();
+        for n in [exlr8::MXFP8,rows as i64,256,0,0,0,0,0] { f.write_all(&n.to_le_bytes()).unwrap(); }
+        f.set_len(8+header.len() as u64+64+(wb+sb) as u64).unwrap();
+        Arc::new(StFile::open(path).unwrap())
+    }
+
+    #[test]
+    fn planner_column_runs_and_off_json() {
+        let dir=std::env::temp_dir().join(format!("gr8-colshard-loader-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tables=BTreeMap::new();
+        for (e,layer) in [1,14].into_iter().enumerate() {
+            let rows: usize=ENGRAM_COLUMNS[e].iter().sum();
+            let cuts=[0,19_000_007,77_000_003,160_000_001,299_000_011,rows];
+            let mut parts=Vec::new();
+            for i in 0..cuts.len()-1 { parts.push(split_file(dir.join(format!("L{layer}-p{i}")).to_str().unwrap(), cuts[i+1]-cuts[i])); }
+            tables.insert(layer,parts);
+        }
+        let rel=Release {dir:dir.to_str().unwrap().into(),dense:BTreeMap::new(),vocab:tables[&1][0].clone(),experts:BTreeMap::new(),engram:tables,hid:5120,inter:2304};
+        for rank in 0..4 {
+            let mut p=Planner {b:Builder::new(),rel:&rel,used:BTreeSet::new(),reads:BTreeMap::new(),nr:4,rank,opts:Opts::default(),trellis:BTreeMap::new(),slices:None};
+            for col in [false,true] {
+                let tables=p.engram(col).unwrap();
+                let json=engram_json(&tables,4,rank);
+                let parsed=crate::json::parse(&json).unwrap();
+                assert_eq!(parsed.get("format").unwrap().str().unwrap(),if col {"g6engram-v3-col"} else {"g6engram-v2"});
+                for (e,t) in tables.iter().enumerate() {
+                    let ranges=engram_ranges(t.layer,t.rows,4,rank,col).unwrap();
+                    assert_eq!(ranges.len(),if col {6} else {1});
+                    let mut si=0;
+                    for &(a,b) in &ranges {
+                        let mut next=a;
+                        while next<b {
+                            let run=&t.segs[si];assert_eq!(run.row0,next);assert!(run.rows>0 && next+run.rows<=b);
+                            let mut file_first=0;
+                            for f in &rel.engram[&t.layer] {
+                                let wi=f.info("engram.embed.fp8").unwrap();let ss=f.info("engram.embed.e8m0").unwrap();
+                                if f.path==run.path {
+                                    assert_eq!(run.w_off,wi.start+((next-file_first)*256) as u64);
+                                    assert_eq!(run.s_off,ss.start+((next-file_first)*8) as u64);
+                                    assert!(next+run.rows<=file_first+wi.shape[0]);break;
+                                }
+                                file_first+=wi.shape[0];
+                            }
+                            next+=run.rows;si+=1;
+                        }
+                    }
+                    assert_eq!(si,t.segs.len());
+                    assert_eq!(t.valid,ranges.iter().map(|(a,b)|b-a).sum());
+                    if col { assert_eq!(t.part,t.valid);assert_eq!(t.valid,(rank..24).step_by(4).map(|j|ENGRAM_COLUMNS[e][j]).sum()); }
+                }
+                std::fs::write(dir.join(format!("rank{rank}-{}.json",if col {"on"} else {"off"})),json).unwrap();
+            }
+        }
+        // Literal byte oracle for the pre-existing serializer (spacing and final newline included).
+        let t=EngramSlice{col_shard:false,layer:1,rows:7,part:2,first:2,valid:2,dim:256,sdim:8,segs:vec![EngramSeg{path:"table".into(),row0:2,rows:2,w_off:512,s_off:16}]};
+        assert_eq!(engram_json(&[t],4,1),"{\"format\": \"g6engram-v2\", \"tp\": 4, \"rank\": 1, \"tables\": [\n  {\"layer\": 1, \"rows\": 7, \"part\": 2, \"first\": 2, \"valid\": 2, \"dim\": 256, \"sdim\": 8, \"segs\": [{\"path\": \"table\", \"row0\": 2, \"rows\": 2, \"w_off\": 512, \"s_off\": 16}]}\n]}\n");
+        println!("PASS loader TP4 all ranks both layers: six column ranges, split offsets, off literal JSON; artifacts {}",dir.display());
     }
 }

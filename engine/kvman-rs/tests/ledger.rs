@@ -1,4 +1,4 @@
-//! The host ledger (src/ledger.rs, D-331 M7): a crash at every write of every ownership phase leaves a book that
+//! The host ledger (src/ledger.rs): a crash at every write of every ownership phase leaves a book that
 //! balances and recovers; a stalled borrower is fenced off; many parties at once never credit a byte twice.
 
 use g6kvman::ledger::{Book, Ledger, Phase, Side};
@@ -33,6 +33,7 @@ fn fresh(file: &std::path::Path) -> Book {
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "release kvman-ledger has no crash points")]
 fn a_crash_at_every_phase_leaves_a_book_that_balances_and_recovers() {
     let d = dir("crash");
     let file = d.join("ledger");

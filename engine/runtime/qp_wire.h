@@ -76,23 +76,6 @@ inline unsigned long long tag(int layer, int S, int E, int qp_ctx, int form = 0)
            ((unsigned long long)(layer & 0xff) << 40) |
            ((unsigned long long)(S & 0xf) << 36) | ((unsigned long long)(E & 0xf) << 32) | (unsigned long long)(unsigned)qp_ctx;
 }
-// g6m4 boot refusals of the rolling-pack env, before any fabric / CUDA work. "" = ok, else the die message.
-// pf_qp: GR8_PF_OWN=4 with --prefill; roll / wire_e: the GR8_PF_QP_ROLL / GR8_PF_QP_WIRE_E values; qp_ctx: GR8_PF_QP_CTX
-// ("" unset); wire_e_set: GR8_PF_QP_WIRE_E counts as set; qp_pack: --qp-pack given.
-inline std::string roll_env_refusal(bool pf_qp, int roll, bool wire_e_set, int wire_e, const char* qp_ctx, bool qp_pack)
-{
-    if (wire_e_set && roll <= 0) return "GR8_PF_QP_WIRE_E is set but GR8_PF_QP_ROLL is not (the wire ring exists only with ROLL)";
-    if (roll <= 0) return "";
-    if (!pf_qp) return "GR8_PF_QP_ROLL needs GR8_PF_OWN=4 and --prefill";
-    if (wire_e < 1 || wire_e > max_entries()) return "GR8_PF_QP_WIRE_E: 1.." + std::to_string(max_entries()) + " (unset = 1)";
-    if (qp_pack) return "GR8_PF_QP_ROLL: no --qp-pack (the rolling pack is built from this rank's pack + the partner's half by RDMA)";
-    // without it the QO key table would be sized at the cap, and every request would run OWN=4
-    if (!qp_ctx || !*qp_ctx) return "GR8_PF_QP_ROLL needs GR8_PF_QP_CTX (the QO key / RoPE table size, in positions)";
-    char* end = nullptr;
-    const long v = std::strtol(qp_ctx, &end, 10);
-    if (*end || qp_ctx[0] < '1' || qp_ctx[0] > '9' || v <= 0 || v > 0x7fffffffL)
-        return std::string("GR8_PF_QP_CTX='") + qp_ctx + "': a positive decimal position count";
-    return "";
-}
+// g6m4's boot refusals of the rolling-pack env are engine/scheduler-rs src/options.rs roll_env_refusal.
 }   // namespace qw
 }   // namespace g6rt

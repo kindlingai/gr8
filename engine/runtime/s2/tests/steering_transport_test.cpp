@@ -137,7 +137,7 @@ static void dispatch() {
         ++calls; return std::vector<int>(3,1);
     };
     h.prefill=[&](const Slot&,const Payload& p,uint32_t,uint32_t){CHECK(p.steering==on.steering);++prefills;};
-    Dispatch d(sessions,24,h); d.track_rows();
+    Dispatch d(sessions,24,h); d.track_rows(true);
     d.begin(0,0,st::cache_namespace(on.steering)); d.begin(1,0);
     Slot slot; slot.key=g0.key; slot.run=g0.run;
     d.prefill(slot,sessions.payload(on),0,4); CHECK(prefills==1);

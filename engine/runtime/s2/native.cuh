@@ -417,6 +417,13 @@ public:
         for (int k = 1; k <= solo_kmax; ++k) mains.insert({k + 1, s2::row_class(k + 1)});   // s2_batch.h round_all, KStop::solo
         for (int M = 1; M <= N * (K + 1); ++M) drafts.insert(M);
         if (K >= 2) for (int M = 1; M <= N; ++M) chains.insert(M);
+        if (knob::s2_shared_waterfill()) {
+            const int depth = knob::ngram() ? std::max(K, 7) : K;
+            for (int M = 1; M <= std::min(g6rt::MX, N * (depth + 1)); ++M) {
+                mains.insert({M, s2::row_class(K + 1)});
+                drafts.insert(M);
+            }
+        }
         for (const auto& mc : mains) require(mc.first <= g6rt::MX, "main step rows exceed G6_MX");
         for (int M : drafts) require(M <= g6rt::MX, "draft step rows exceed G6_MX");
         const auto t0 = std::chrono::steady_clock::now();
@@ -465,23 +472,22 @@ public:
             fprintf(stderr,"# s2 boot capture: GR8_CP_STEP_ROWS=%d: %zu main keys wider than that at the buckets past R not captured\n",
                 cp_rows,cp_skipped);
     }
-    DispatchHooks hooks() {
-        DispatchHooks h{
-            [&](bool draft,int ctx){return g6rt::bucket_of(draft?c_.draft.d:c_.main,ctx);},
-            [&](int old,int next){mode(old,next);},
-            [&](const Launch& l){return launch(l);},
-            [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows){prefill(s,p,first,rows);},
-            [&](int row,bool target,int k){
-                require(row >= 0 && row < lp_rows_, "logprob row outside the last main step");
-                return g6rt::lp_row(lp_,row,target,k);
-            }
-        };
-        h.gm_on = c_.main.gm_on_host; h.gm_bits = c_.main.gm_bits_host; h.gm_words = c_.main.gm_words;
-        h.draft_lp = [&](int row) {
-            require(row >= 0 && row < dlp_rows_, "draft logprob row outside the last draft step");
-            return dlp_[row];
-        };
-        return h;
+    // the step calls of the module's table (g6m4.cu)
+    int on_bucket(bool draft,int ctx){return g6rt::bucket_of(draft?c_.draft.d:c_.main,ctx);}
+    void on_mode(int old,int next){mode(old,next);}
+    std::vector<int> on_launch(const Launch& l){return launch(l);}
+    void on_prefill(const Slot& s,const Payload& p,uint32_t first,uint32_t rows){prefill(s,p,first,rows);}
+    g6rt::LpRow on_logprob(int row,bool target,int k){
+        require(row >= 0 && row < lp_rows_, "logprob row outside the last main step");
+        return g6rt::lp_row(lp_,row,target,k);
+    }
+    float on_draft_lp(int row) {
+        require(row >= 0 && row < dlp_rows_, "draft logprob row outside the last draft step");
+        return dlp_[row];
+    }
+    void grammar(g6s2_module_ops& o) const {
+        o.gm_on = c_.main.gm_on_host; o.gm_bits = c_.main.gm_bits_host; o.gm_words = c_.main.gm_words;
+        o.pen_rows = c_.main.pen_rows_host; o.pen_sess = c_.main.pen_sess_host;
     }
     void synchronize() { fence(); }
 };

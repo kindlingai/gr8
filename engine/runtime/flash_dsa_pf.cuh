@@ -443,7 +443,10 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
                 gv.a.slot = dslot::Slot{};
 #endif
                 gv.a.x = S.q_a_n + static_cast<size_t>(m0 + c0) * QA;
+                gv.a.ldx = QA;
                 gv.a.y = S.q_b + static_cast<size_t>(m0 + c0) * (h * 256);
+                // a GEMV bound for pre-rotated input (GR8_GLM53F_DSA_QB_ROT) reads xa, not x
+                if (!gv.rot) dtr::launch_rot(gv.a.x, gv.a.ldx, gv.a.suh[0], const_cast<u32*>(gv.a.xa), gv.a.K, cr, st);
                 dtr::launch(gv, st);
             }
         }
@@ -472,6 +475,7 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
             s.index_k = S.idx_k + static_cast<size_t>(m0) * IDXK;
             s.index_weight = S.idx_w + static_cast<size_t>(m0) * IDXW;
             s.index_gate = S.idx_g + static_cast<size_t>(m0) * geom::IDX_DIM;
+            s.raw_sess = P.rsess + m0;
             G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
             G6RT_CK(cudaMemcpyAsync(S.attn_p1 + static_cast<size_t>(m0) * (h * 256), y.ab.args.output,
                                     static_cast<size_t>(r) * h * 256 * sizeof(__half), cudaMemcpyDeviceToDevice, st));
@@ -484,6 +488,7 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
         s.rows = M; s.context = context;
         s.q_b = S.q_b; s.kv_a = S.kv_a; s.positions = P.pos;
         s.index_q = S.idx_q; s.index_k = S.idx_k; s.index_weight = S.idx_w; s.index_gate = S.idx_g;
+        s.raw_sess = P.rsess;
         if (transport) {
             G6FlashPoolOwner owner{m.rank, transport, flash_pool_publish, flash_pool_receive};
             G6RT_CK(g6_attn_bind_prefill_run_owned(S.pf[i], &y.ab, &s, st, &owner));
@@ -525,7 +530,10 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
             gv.a.slot = dslot::Slot{};
 #endif
             gv.a.x = attn_out + static_cast<size_t>(m0) * (h * 256);
+            gv.a.ldx = h * 256;
             gv.a.y = P.part[0] + static_cast<size_t>(m0) * HID;
+            // a GEMV bound for pre-rotated input (GR8_GLM53F_DSA_OPROJ_ROT, the default at 2+ rows) reads xa, not x
+            if (!gv.rot) dtr::launch_rot(gv.a.x, gv.a.ldx, gv.a.suh[0], const_cast<u32*>(gv.a.xa), gv.a.K, r, st);
             dtr::launch(gv, st);
         }
     }

@@ -94,6 +94,20 @@ __device__ __forceinline__ void publish(const g6::FabricDev& f, int c, u64 seq, 
     }
 }
 
+// publish without a ticket: for a separate one-CTA launch, stream-ordered after every CTA that stored into the send
+// slot has exited (the DS41 v2 wire, runtime/ds41_v2.cuh). Thread 0 fences and rings doorbell[c] = seq.
+__device__ __forceinline__ void publish_after(const g6::FabricDev& f, int c, u64 seq)
+{
+    if (threadIdx.x == 0)
+    {
+        u64* xr = f.xt ? xt_rec(f, (seq - 1) / f.ncoll, c) : nullptr;
+        if (xr) xr[g6::XT_PUB] = xt_now();
+        __threadfence_system();
+        st_release_sys(reinterpret_cast<u64*>(f.doorbell) + c, seq);
+        if (xr) { xr[g6::XT_DB] = xt_now(); xr[g6::XT_SEQ] = seq; }
+    }
+}
+
 #ifdef PF_RNPUB
 // PF_RNPUB: publish once per cluster instead of once per CTA. Call from all threads of every CTA of a cluster kernel
 // whose cluster ended with a cluster barrier (barrier.cluster arrive.release / wait.acquire) after its last store into
@@ -861,12 +875,20 @@ struct SampleRow
 };
 __host__ __device__ __forceinline__ bool topp_on(const SampleRow& s) { return s.inv_temp > 0.f && s.top_p > 0.f && s.top_p < 1.f; }
 
-// Gumbel noise for vocab id v: u in (0,1) from the top 24 bits; g = -log(-log(u)).
+// u in (0,1) from the top 24 bits of a Philox word: (k + 0.5) / 2^24. k + 0.5 is not exact in a float for k >= 2^23, and
+// k = 0xFFFFFF rounds up to 2^24, u = 1.0: gumbel() would return +inf and a uniform random token win the row (1 in 2^24
+// per vocab id). That one value is held to the largest float below 1; every other k gives the same u as before.
+// engine/kernels/tests/sampler_u01_test.cu checks every k.
+__host__ __device__ __forceinline__ float u01_top24(uint32_t x)
+{
+    return fminf(((float)(x >> 8) + 0.5f) * (1.f / 16777216.f), 0x1.fffffep-1f);
+}
+
+// Gumbel noise for vocab id v: u = u01_top24(x); g = -log(-log(u)).
 __host__ __device__ __forceinline__ float gumbel(const SampleRow& s, int v)
 {
     const uint32_t x = philox_x((uint32_t)v, (uint32_t)s.pos, (uint32_t)s.draw, 0x67364c75u, s.seed_lo, s.seed_hi);
-    const float u = ((float)(x >> 8) + 0.5f) * (1.f / 16777216.f);
-    return -logf(-logf(u));
+    return -logf(-logf(u01_top24(x)));
 }
 __host__ __device__ __forceinline__ float sample_score(const SampleRow& s, float logit, int v)
 {
@@ -877,7 +899,7 @@ __host__ __device__ __forceinline__ float sample_score(const SampleRow& s, float
 __host__ __device__ __forceinline__ float uniform01(const SampleRow& s)
 {
     const uint32_t x = philox_x(0u, (uint32_t)s.pos, (uint32_t)s.draw, 0x3c6ef372u, s.seed_lo, s.seed_hi);
-    return ((float)(x >> 8) + 0.5f) * (1.f / 16777216.f);
+    return u01_top24(x);
 }
 
 // Per-row record each rank contributes to the head all-gather (32 bytes).

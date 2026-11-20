@@ -1,9 +1,12 @@
 # Working on this repo
 
-gr8 serves the full GLM 5.3 on three, four or six GB10 boxes, and every change has to keep its numbers. Most of what follows is
+gr8 serves GLM-5.3, GLM-5.3-Flash and DeepSeek-V4.1-Flash on GB10 boxes, and every change has to keep its numbers. Most of what follows is
 about proving a change does, before it lands.
 
 If you're an agent working here, read this whole file first. If you're a person, the same rules apply to you.
+If you're an agent installing or starting gr8 for someone, read [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) first: ask
+whether they want to install [Kindling OS](https://github.com/kindlingai/kindling-spark-os) (explaining what they get
+and what is involved) and ask its setup questions before you change a box or boot.
 
 ## How changes land
 
@@ -18,6 +21,64 @@ The rules, short:
 
 Before anything leaves your machine, scrub it: no IP addresses, hostnames, box names, usernames, keys or paths from
 your own setup. The config examples use placeholders for a reason.
+
+## Releases
+
+`main` is the single integration branch for pull requests: do not keep long-lived model or topology branches, and do
+not ship recipes as patch stacks on top of an older commit. A protected fast-forward-only `stable` branch tracks the
+newest `main` commit that passes the nightly gate (wrong results anywhere or a speed regression on `gr8`'s default
+`GLM-5.3` `TP=4` setup block `stable`; a failed night rolls forward a fix first, bisecting and reverting only if
+needed, and after two failed nights only fixes for the failure or reverts merge). After `v1.0`, numbered
+`vMAJOR.MINOR.PATCH` releases are immutable annotated tags cut only from `stable` after the full harness gate (`PATCH`
+for compatible fixes, `MINOR` for compatible features and validated default speedups, `MAJOR` for breaking changes),
+and every release updates its GitHub Release, [`CHANGELOG.md`](CHANGELOG.md), [`releases/<tag>.json`](releases/README.md),
+and [`README.md#building-on-gr8`](README.md#building-on-gr8) with `Breaking changes` (`None.` when compatible) plus any
+default or cache-key changes.
+Deployable tuned recipes live in standalone repositories, pin an immutable `v*` tag or an exact merged `main`/`stable`
+commit SHA by submodule or `ghcr.io/kindlingai/gr8` `@sha256:<digest>` (never a moving branch or floating tag such as
+`:latest`, `:main`, or `:stable`), and record their engine pin in `kindling.json` for the `README.md` freshness
+column; a tuned recipe that gets slower on a candidate `stable` commit or `v*` tag does not block it and simply keeps
+its prior pin until re-tuned. Full rules: [RELEASING.md](RELEASING.md).
+
+## Keeping docs and recipes current
+
+Update the matching items in the same PR as a change (or during each `v*` release cycle):
+
+- [ ] **README features in plain language:** When a user-visible capability, default, or workflow lands or changes,
+      update [README.md](README.md) ([What gr8 does today](README.md#what-gr8-does-today),
+      [Models and install](README.md#models-and-install), [Running it](README.md#running-it)) with a short, easy
+      explanation and any rollback flag.
+- [ ] **Instructions for agents building on gr8:** Keep [README.md](README.md#building-on-gr8) (including the current
+      `v*` release and digest example), [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md), [docs/DEPLOY.md](docs/DEPLOY.md),
+      [frontend/README.md](frontend/README.md), and [RELEASING.md](RELEASING.md) accurate whenever flags, endpoints,
+      container paths, or pinning rules change.
+- [ ] **Recipe graphics as recipes improve:** When a recipe's measured numbers or `kindling.json` improve, redraw its
+      speed card (`python3 bench/gif.py card <recipe>/kindling.json --out <recipe>/docs/card.png` from a `gr8` checkout,
+      and [`docs/cards/make.sh`](docs/cards/make.sh) from [`recipes.json`](recipes.json) for `gr8`'s README cards, plus
+      [`docs/cards/switch_card.py`](docs/cards/switch_card.py) from `docs/cards/switching.json` when model-switching
+      times change).
+- [ ] **Release notes, changelog, and version spec on every release:** For every `v*` tag, publish the GitHub Release
+      and update [`CHANGELOG.md`](CHANGELOG.md), [`releases/<tag>.json`](releases/README.md), and
+      [`README.md#building-on-gr8`](README.md#building-on-gr8) with highlights and measured numbers, `Breaking changes`,
+      default or cache-key changes, verified commit SHA and image digest, and toolchain/Dockerfile sync notes
+      ([RELEASING.md](RELEASING.md#required-github-release-sections-and-in-repo-release-records)).
+- [ ] **Recipe table links and dates:** Keep [`recipes.json`](recipes.json) and the
+      [README.md](README.md#all-recipes) recipe section current — repository links, measurement dates, and each recipe's
+      pinned engine freshness against the newest release and `stable`.
+- [ ] **Recipe pins bumped to the newest release:** After each `v*` tag, test the standalone recipes against the new
+      release and open pin-bump PRs where correctness and speed hold, leaving any recipe that measures slower on its
+      prior pin until re-tuned ([RELEASING.md](RELEASING.md#4-how-recipes-pin-gr8)).
+- [ ] **Model pages' benchmark numbers with dates:** Keep [docs/GLM-5.3.md](docs/GLM-5.3.md),
+      [docs/FLASH.md](docs/FLASH.md), [docs/DEEPSEEK.md](docs/DEEPSEEK.md), and [docs/SWITCHING.md](docs/SWITCHING.md)
+      aligned with measured numbers, exact boot conditions, and measurement dates (`YYYY-MM-DD`).
+- [ ] **KNOBS.md and KNOWN-ISSUES.md:** Update [KNOBS.md](KNOBS.md) (and [docs/ENV.md](docs/ENV.md) or
+      [docs/SETTINGS.md](docs/SETTINGS.md) when engine settings change) whenever options or how they combine change, and
+      add or close entries in [KNOWN-ISSUES.md](KNOWN-ISSUES.md) as bugs are found or fixed.
+- [ ] **Breaking-change list:** Call out any breaking change (CLI/knobs, HTTP API/protocol, weights/steering schema, or
+      128 GB GB10 runtime/numerical contract) with exact before/after migration steps in the PR and in the release's
+      `Breaking changes` section ([RELEASING.md](RELEASING.md#3-breaking-changes-and-release-notes)).
+- [ ] **CREDITS.md:** Add or extend contributor entries in [CREDITS.md](CREDITS.md) and keep
+      [README.md](README.md#credits) in sync whenever contributions land ([Contributor credit](#contributor-credit)).
 
 ## Contributor credit
 
@@ -38,9 +99,10 @@ On a GB10 with CUDA 13:
 
 g6m4 takes its width from `--ips`, m4sim from `--tp N` or the rank packs in `--packs DIR`. Each width is compiled as
 its own build was (`engine/runtime/build_m4.sh`), so one build covers every topology. `scripts/build.sh` also runs
-`tr3_e4m3_test` when a GPU is visible. g6m4 links the S2 page allocator from
-`engine/kvman-rs`, which build.sh builds with cargo. Where cargo is missing, build that crate (and `engine/loader-rs`)
-first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
+`tr3_e4m3_test` when a GPU is visible. g6m4 links the host Rust (the S2 page allocator, scheduler and planner) as one
+staticlib, `engine/target/release/libg6host.a`, which build.sh builds with cargo from the workspace `engine/Cargo.toml`.
+Where build.sh cannot run cargo, build it first with `cargo build --release --manifest-path engine/Cargo.toml`, plus
+`engine/loader-rs` and `engine/knobs-rs` (`--features capi`) with their own manifests.
 
 ## Test
 
@@ -76,28 +138,16 @@ The light gates, on the target topology:
 
 1. both builds compile, and the change's own test passes;
 2. one boot serves: `./gr8 glm53 smoke` passes every case;
-3. KL against main's reference on fixed sequences is within the boot-to-boot range, an 87K-token needle is found, and
-   pbench 8K/32K prefill and prose decode are within noise of `main` or better.
+3. `./gr8 glm53 bench --baseline <main's report>` passes: the smoke test, the correctness checks, and decode and
+   prefill no slower than `main` beyond noise ([bench/README.md](bench/README.md)).
 
-`bench/gate/gate.py` runs all of 3 the same way on every build ([bench/gate/README.md](bench/gate/README.md)):
+Run `main` once on the same boxes with the same options and keep its JSON report as the baseline:
 
-    python3 bench/gate/gate.py run --url http://127.0.0.1:8100 --topology tp4 --commit <sha> --boot b1 \
-        --kl-ref bench/gate/refs/tp4.json --health $GR8_WORK_DIR/out/rank_health.json
-    python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp4.json
+    ./gr8 glm53 bench --json main.json                   # on main
+    ./gr8 glm53 bench --baseline main.json --json pr.json  # on the change
 
-`--health` wants the rank health probe's result for this boot: run `scripts/rank_health.sh` with `./gr8`'s options
-before `./gr8 glm53 up` (the probe refuses a box with a model booted). It needs `PEERS`, `IPS` and `IPS2` set, and
-passwordless ssh from the head to every box. Without them, `gate.py run --no-health` runs, but its
-records do not count for `baseline` or `check`.
-
-`./gr8 glm53 bench --tag <name>` runs pbench alone. Numbers for the README come from RigMark 1.0.0 at `reasoning_effort`
-low, GPU clocks capped at 2200 MHz.
-
-## kindling.json
-
-`kindling.json` is the README's results table in a form a program can read. When a PR changes the table, it changes
-`kindling.json` in the same PR, with the same numbers and rounding. Leave out a number that wasn't measured; don't
-write 0 or an estimate. Check it parses: `python3 -m json.tool kindling.json`.
+`--health` keeps the rank health probe's result for this boot in the report: run `scripts/rank_health.sh` with
+`./gr8`'s options before `./gr8 glm53 up` (the probe refuses a box with a model booted).
 
 ## Things worth knowing
 

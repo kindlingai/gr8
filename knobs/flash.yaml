@@ -642,3 +642,15 @@ knobs:
     doc: >-
       Flash MoE router: warps per CTA of the router GEMV (one output channel per warp). Each warp sums in the same order
       at any width.
+  GR8_GLM53F_VISION:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = with --serve and --prefill, a release that has dense/vision-bf16.safetensors loads the vision tower at boot,
+      before the KV pool is sized, and the engine takes requests with images (hello `vision`, docs/FLASH-VISION.md).
+      The launcher then fetches that file too. Without it the engine serves text only. 0 (the default) never loads the
+      tower and the engine runs the text-only code. The tower costs about 1.1 GB of weights and its workspace on every
+      rank, so image input is opt-in.

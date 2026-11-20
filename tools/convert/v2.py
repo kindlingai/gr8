@@ -346,9 +346,12 @@ def v1_bits_of(src, l):
 
 # ---------------------------------------------------------------------------------------------- writing
 def kmix_word(gw, uw, dk, hs):
-    """tr3.kmix entry of one expert on one rank: 0 when every owned fc1 unit has width dk."""
+    """tr3.kmix entry of one expert on one rank: 0 when every owned fc1 unit has width dk. The word packs 8 bits per
+    block in one int64, so mixed widths fit at most 8 blocks (all 16 at TP=1 do not)."""
     if all(gw[h] == dk and uw[h] == dk for h in hs):
         return 0
+    if len(hs) > 8:
+        raise ValueError(f'{len(hs)} blocks of one expert on a rank with mixed widths; tr3.kmix holds at most 8')
     v = 0
     for b, h in enumerate(hs):
         v |= int(gw[h]) << (8 * b) | int(uw[h]) << (8 * b + 4)

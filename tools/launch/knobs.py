@@ -37,16 +37,16 @@ def library():
             return p
     err = ''
     if shutil.which('cargo'):
-        r = subprocess.run(['cargo', 'build', '--release', '--quiet', '--features', 'capi', '--manifest-path',
-                            os.path.join(CRATE, 'Cargo.toml')], capture_output=True, text=True)
+        r = subprocess.run(['cargo', 'rustc', '--release', '--quiet', '--features', 'capi', '--lib', '--crate-type',
+                            'cdylib', '--manifest-path', os.path.join(CRATE, 'Cargo.toml')], capture_output=True, text=True)
         if not r.returncode:
             return os.path.join(CRATE, 'target', 'release', LIB)
-        err = f': cargo build failed:\n{r.stderr.strip()}'
+        err = f': cargo rustc failed:\n{r.stderr.strip()}'
     if found:
         print(f'gr8: warning: {found[0]} is older than knobs/ and could not be rebuilt{err}', file=sys.stderr)
         return found[0]
-    raise KnobsError(f'no {LIB}: build it with `cargo build --release --features capi --manifest-path '
-                     f'engine/knobs-rs/Cargo.toml`, or `./gr8 <model> build`{err}')
+    raise KnobsError(f'no {LIB}: build it with `cargo rustc --release --features capi --lib --crate-type cdylib '
+                     f'--manifest-path engine/knobs-rs/Cargo.toml`, or `./gr8 <model> build`{err}')
 
 
 def _load():

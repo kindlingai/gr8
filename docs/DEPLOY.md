@@ -8,10 +8,20 @@ can be checked. The commands name `glm53`; for GLM-5.3-Flash, `glm53f`.
 
 ## Before you start
 
+If you are an agent installing or starting gr8 for someone, read [FIRST-BOOT.md](FIRST-BOOT.md) first: ask whether they
+want [Kindling OS](https://github.com/kindlingai/kindling-spark-os) on the boxes (and tell them what they get and what
+is involved) before asking the setup questions. Kindling OS is optional — it installs beside DGX OS without wiping it,
+frees about 2 GiB of host/unified RAM for gr8 via a 64 KiB-page kernel (plus another 2 GiB from the GPU display carveout
+via `dispramd` for `dispram`-aware clients), and runs `mentatd` out of the box; on bare metal under Kindling OS, keep
+`MODEL_CACHE`, `GR8_WORK_DIR` and `ds41` releases under `/srv` or `/home` (or pass `--mounts /opt` to `setup.sh`),
+because `/opt` is otherwise in the RAM overlay.
+
 Set up every box as the README's [What you need](../README.md#what-you-need) says: one GB10 box per rank with nothing
 else holding much memory, a RoCE v2 fabric with two rails (a switch, or at TP=3 or 4 a ring of direct cables), TCP
-ports 7340 and 7341 open between the boxes, and about 90 GB of disk for the model. Turn proactive memory compaction
-off on every box, as root, once (it holds across reboots; `vm.compaction_proactiveness=20` undoes it):
+ports 7340 and 7341 open between the boxes (and 7343 for `./gr8 <model> scale` with a persisted KV store), and about
+90 GB of disk for the model. Turn proactive memory compaction
+off on every box, as root, once (on DGX OS `/etc/sysctl.d/` holds across reboots, and `vm.compaction_proactiveness=20`
+undoes it; on Kindling OS run `sysctl -w` at boot or put the file in a site layer):
 
     echo 'vm.compaction_proactiveness = 0' > /etc/sysctl.d/90-gr8-no-proactive-compaction.conf
     sysctl -w vm.compaction_proactiveness=0
@@ -32,15 +42,20 @@ downloads anything.
 | name | model | `MODEL` | TP | `DRAFTER` |
 |---|---|---|---|---|
 | `glm53` | GLM-5.3 | `https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4` | 3, 4, 5 or 6 | TP=4: `https://huggingface.co/incoai/GLM-5.3-DFlash2` |
-| `glm53f` | GLM-5.3-Flash ([FLASH.md](FLASH.md)) | `https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4` | 2, 3 or 4 | none |
+| `glm53f` | GLM-5.3-Flash ([FLASH.md](FLASH.md)) | `https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4` | 1, 2, 3 or 4 | TP=1, 2 and 4: `https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2` |
+| `ds41` | DeepSeek-V4.1-Flash-1017 ([DEEPSEEK-BOOT.md](DEEPSEEK-BOOT.md), [FIRST-BOOT.md](FIRST-BOOT.md)) | a local copy of `https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native`, read in place | 4 | none |
 
-`./gr8 models` lists each model's release and the values `--tp` and `--variant` take. Each box fetches only its own part
-of the release into its model cache: the first `up` downloads it (about 90 GB at TP=4, 35 minutes at 40 MB/s), and later
-boots load from the cache in about a minute. `prepare` with the same options downloads ahead of time, and is never
+`./gr8 models` lists each model's release and the values `--tp` and `--variant` take. For the GLM models each box
+fetches only its own part of the release into its model cache: the first `up` downloads it (about 90 GB at TP=4, 35
+minutes at 40 MB/s), and GLM-5.3's later boots at TP=4 have their engines ready in about 71 s (measured 2026-11-06, [FIRST-BOOT.md](FIRST-BOOT.md)).
+[SWITCHING.md](SWITCHING.md) records warm-start waits and per-rank load times for a mixed TP=4 ring with DGX Spark
+and PCIe Gen4 NVMe boxes. (`ds41` is the exception in the table
+above: it is read in place from a local copy you fetch yourself, and it has no variants — see
+[DEEPSEEK-BOOT.md](DEEPSEEK-BOOT.md).) `prepare` with the same options downloads ahead of time, and is never
 required. On bare metal a Hugging Face `MODEL` needs `MODEL_CACHE`, a local directory for this box's part; the container
 sets its own. `MODEL` may also be a local copy of the release, used in place.
 
-`DRAFTER` is optional: without it, TP=4 drafts with MTP only. TP=3, 5 and 6 leave it out, since its 8 KV heads do not
+`DRAFTER` is optional: without it, TP=4 (and Flash's TP=2 and TP=1) drafts with MTP only. TP=3, 5 and 6 leave it out, since its 8 KV heads do not
 split three, five or six ways (TP=6 runs its whole body on every box with `DFLASH=1`). Its licence (CC BY-NC-ND 4.0)
 forbids sharing a converted copy, so each box downloads the drafter and converts its own rank.
 
@@ -89,8 +104,8 @@ checkout on every box: then `./gr8 glm53 up` alone is enough. Then, on the head 
 
 ## Docker Compose
 
-Nothing to build or clone: CI publishes the image, `ghcr.io/kindlingai/gr8`, with the engine for every TP width and both
-models. On every box, with Docker Compose and the NVIDIA container toolkit (DGX OS has both):
+Nothing to build or clone: CI publishes the image, `ghcr.io/kindlingai/gr8`, with the engine for every TP width and all
+three models. On every box, with Docker Compose and the NVIDIA container toolkit (DGX OS has both):
 
     mkdir -p ~/gr8 && cd ~/gr8
     curl -fsSLO https://raw.githubusercontent.com/kindlingai/gr8/main/docker/compose.yaml

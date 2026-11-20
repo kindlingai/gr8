@@ -1,8 +1,10 @@
 # What is GLM 5.3-specific, and what is not
 
-gr8 was written for one model, GLM 5.3 (full), on GB10 boxes: three to six ranks. Nothing here is a plug-in model
-interface. This page is a map for porting: it lists every place the model is baked in, roughly in the order you would
-meet them. It also lists the parts that do not depend on the model.
+gr8 now serves GLM-5.3, GLM-5.3-Flash and DeepSeek-V4.1-Flash. The launcher has a
+[declarative model registry](ADDING-A-MODEL.md); the engine still contains architecture-specific
+code. This page maps the original GLM-5.3 assumptions. Follow [HOST-CORE.md](HOST-CORE.md)
+(R6d–R11) for the engine module roadmap, and [ADDING-A-MODEL.md](ADDING-A-MODEL.md)
+for the complete porting checklist.
 
 GLM 5.3 as gr8 sees it: hidden 6144; 78 layers: 0-2 are dense MLP (intermediate 12288) and 3-77 are MoE with 256
 routed experts, top-8, expert intermediate 2048, plus one shared expert (2048); one MTP layer (index 78); MLA attention

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import modelset as M  # noqa: E402
 
 
-def make_release(d, set_id='ab' * 32, variants=('home',), tokenizer=True):
+def make_release(d, set_id='ab' * 32, variants=('bit325',), tokenizer=True):
     """A local exlr8 release with what the launcher reads: dense/exlr8-vocab.safetensors, a width manifest per variant
     carrying the weight set id, empty experts/ and index-slices/, and the tokenizer files at the root."""
     for sub in ('dense', 'manifests', 'experts', 'index-slices'):
@@ -49,7 +49,7 @@ class ReleaseTests(unittest.TestCase):
         other = shutil.copytree(self.rel, os.path.join(self.t, 'copy'))
         self.assertEqual(M.release_set(other, 4).id, ms.id)
         self.assertNotEqual(M.release_set(self.rel, 3).id, ms.id)
-        with open(os.path.join(other, 'manifests', 'exlr8-manifest-home.json'), 'w') as f:
+        with open(os.path.join(other, 'manifests', 'exlr8-manifest-bit325.json'), 'w') as f:
             json.dump({'set_id': 'cd' * 32}, f)
         self.assertNotEqual(M.release_set(other, 4).id, ms.id)
         with open(os.path.join(self.rel, 'chat_template.jinja'), 'a') as f:
@@ -58,7 +58,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn('chat_template.jinja', M.check_tokenizer(ms)[0])
 
     def test_refusals(self):
-        os.unlink(os.path.join(self.rel, 'manifests', 'exlr8-manifest-home.json'))
+        os.unlink(os.path.join(self.rel, 'manifests', 'exlr8-manifest-bit325.json'))
         with self.assertRaises(M.ModelError) as e:
             M.release_set(self.rel, 4)
         self.assertIn('no width manifest with a set_id', str(e.exception))

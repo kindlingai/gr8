@@ -10,17 +10,23 @@ mod dsparser;
 mod engine;
 mod gen;
 mod grammar;
+mod guard;
+mod hfparser;
+mod inkparser;
 mod jsonmode;
+mod literal;
 mod logprobs;
 mod metrics;
 mod parser;
 mod pyjson;
 mod sampling;
+mod sessions;
 mod template;
 mod thinking;
 mod tok;
 mod tool_choice;
 mod util;
+mod vision;
 mod wire;
 
 use std::net::SocketAddr;
@@ -43,6 +49,12 @@ pub struct State {
     pub dialect: dialect::Dialect,
     /// ds41: the reasoning effort (1..=100) for a request that names none
     pub ds_effort: u32,
+    /// ds41: thinking for requests with no explicit switch or effort (`none` disables the server default)
+    pub ds_thinking_default: bool,
+    /// Keep the server's thinking mode for forced DeepSeek tool choices (rollback to the old prompt).
+    pub forced_tool_thinking: bool,
+    /// inkling: `--default-reasoning-effort`, a level name or a number from 0.0 to 0.99; None is the template's 0.9
+    pub ink_effort: Option<serde_json::Value>,
     pub engine: Arc<engine::Engine>,
     pub served: Vec<String>,
     pub model_name: String,
@@ -54,15 +66,27 @@ pub struct State {
     pub default_max_tokens: u64,
     /// the tokens (prompt + max_tokens) a request may take and still share decode steps; 0: no such limit
     pub share_tokens: u64,
+    /// a max_tokens past the room the context leaves is cut to that room instead of refused
+    pub clamp_max_tokens: bool,
     /// reasoning_effort and thinking_budget for a request that names none
     pub thinking: thinking::Defaults,
     /// the grammar compiler for response_format json_schema
     pub grammars: grammar::Grammars,
-    /// `--undeclared-tool-calls emit`: a call to a tool the request did not declare comes back as a call, not text
+    /// `--undeclared-tool-calls emit` (the default): a call to a tool the request did not declare comes back as a call;
+    /// `text` keeps it in the content
     pub emit_undeclared: bool,
+    /// the repeated-tool-call guard's settings (`--tool-repeat-guard*`; a request's `tool_repeat_guard` wins)
+    pub guard: guard::Config,
+    /// the server-default penalties (`--default-presence-penalty`, `--default-frequency-penalty`)
+    pub penalties: sampling::Penalties,
+    /// the server-default think-end boost (`--default-think-end-boost`); None = off
+    pub boost: Option<sampling::BoostSpec>,
+    /// the server-default sequence penalty (`--default-sequence-penalty`); None = off
+    pub sequence: Option<sampling::SeqSpec>,
     pub started: u64,
     /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
     pub supervisor: Option<String>,
+    pub sessions: Option<sessions::Sessions>,
 }
 
 struct Args {
@@ -82,20 +106,36 @@ struct Args {
     share_tokens: u64,
     max_connections: usize,
     default_effort: Option<String>,
-    default_budget: u64,
+    default_budget: sampling::Limit,
     allow_thinking_off: bool,
+    forced_tool_thinking: bool,
+    /// 0 turns off the literal-content encode a release declares (`literal.rs`), back to the stock whole-string encode
+    literal_content: bool,
+    clamp_max_tokens: bool,
     emit_undeclared: bool,
     supervisor: Option<String>,
+    penalties: sampling::Penalties,
+    boost: Option<sampling::BoostSpec>,
+    sequence: Option<sampling::SeqSpec>,
+    guard: guard::Config,
+    session_idle_seconds: u64,
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
-                  [--dialect glm|ds41|auto] [--served-model-name NAME ...] [--max-model-len N]
+                  [--dialect glm|ds41|hf|inkling|auto] [--served-model-name NAME ...] [--max-model-len N]
                   [--reasoning-fields both|reasoning|reasoning_content]
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
-                  [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100)]
-                  [--default-thinking-budget N] [--allow-thinking-off]
+                  [--session-idle-seconds N]
+                  [--default-reasoning-effort none|minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100;
+                   inkling: or a number 0.0-0.99)]
+                  [--default-thinking-budget N, Fx or N|Fx] [--allow-thinking-off] [--clamp-max-tokens]
+                  [--default-presence-penalty SPEC] [--default-frequency-penalty SPEC]
+                  [--default-think-end-boost start=S,per1k=P,max=M] [--default-sequence-penalty SPEC]
+                  [--forced-tool-thinking 0|1] [--literal-content 0|1]
+                  [--tool-repeat-guard 0|1] [--tool-repeat-guard-repeats N] [--tool-repeat-guard-temperature F]
+                  [--tool-repeat-guard-retries N]
                   [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
 
 fn parse_args() -> Result<Args, String> {
@@ -116,10 +156,18 @@ fn parse_args() -> Result<Args, String> {
         share_tokens: 0,
         max_connections: 512,
         default_effort: None,
-        default_budget: 0,
+        default_budget: sampling::Limit::Tokens(0),
         allow_thinking_off: false,
-        emit_undeclared: false,
+        forced_tool_thinking: false,
+        literal_content: true,
+        clamp_max_tokens: false,
+        emit_undeclared: true,
         supervisor: None,
+        penalties: sampling::Penalties::default(),
+        boost: None,
+        sequence: None,
+        guard: guard::Config::default(),
+        session_idle_seconds: 3600,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -159,15 +207,80 @@ fn parse_args() -> Result<Args, String> {
                 a.max_connections =
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--max-connections: not a number")?
             }
+            "--session-idle-seconds" => {
+                a.session_idle_seconds =
+                    next(&mut i, &flag, inline)?.parse().map_err(|_| "--session-idle-seconds: not a number")?;
+                if a.session_idle_seconds == 0 {
+                    return Err("--session-idle-seconds: want 1 or more".into());
+                }
+            }
             "--default-reasoning-effort" => {
                 a.default_effort = Some(next(&mut i, &flag, inline)?) // checked once the dialect is known
             }
             "--dialect" => a.dialect = dialect::Dialect::parse_flag(&next(&mut i, &flag, inline)?)?,
             "--default-thinking-budget" => {
                 a.default_budget =
-                    next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
+                    sampling::Limit::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?
             }
             "--allow-thinking-off" => a.allow_thinking_off = true,
+            "--clamp-max-tokens" => a.clamp_max_tokens = true,
+            "--forced-tool-thinking" => {
+                a.forced_tool_thinking = match next(&mut i, &flag, inline)?.as_str() {
+                    "1" => true,
+                    "0" => false,
+                    _ => return Err("--forced-tool-thinking: want 0 or 1".into()),
+                }
+            }
+            "--literal-content" => {
+                a.literal_content = match next(&mut i, &flag, inline)?.as_str() {
+                    "1" => true,
+                    "0" => false,
+                    _ => return Err("--literal-content: want 0 or 1".into()),
+                }
+            }
+            "--tool-repeat-guard" => {
+                a.guard.on = match next(&mut i, &flag, inline)?.as_str() {
+                    "1" => true,
+                    "0" => false,
+                    _ => return Err("--tool-repeat-guard: want 0 or 1".into()),
+                }
+            }
+            "--tool-repeat-guard-repeats" | "--tool-repeat-guard-retries" => {
+                let v: u32 = next(&mut i, &flag, inline)?.parse().map_err(|_| format!("{flag}: not a whole number"))?;
+                if flag == "--tool-repeat-guard-repeats" {
+                    if v == 0 {
+                        return Err("--tool-repeat-guard-repeats: want 1 or more".into());
+                    }
+                    a.guard.repeats = v
+                } else {
+                    a.guard.retries = v
+                }
+            }
+            "--tool-repeat-guard-temperature" => {
+                let v: f64 = next(&mut i, &flag, inline)?.parse().map_err(|_| format!("{flag}: not a number"))?;
+                if !v.is_finite() || !(0.0..=2.0).contains(&v) {
+                    return Err(format!("{flag}: want a number in [0, 2]"));
+                }
+                a.guard.temperature = v
+            }
+            "--default-sequence-penalty" => {
+                a.sequence =
+                    Some(sampling::SeqSpec::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?)
+            }
+            "--default-think-end-boost" => {
+                a.boost = Some(
+                    sampling::BoostSpec::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?,
+                )
+            }
+            "--default-presence-penalty" | "--default-frequency-penalty" => {
+                let spec =
+                    sampling::PenaltySpec::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?;
+                if flag == "--default-presence-penalty" {
+                    a.penalties.presence = spec
+                } else {
+                    a.penalties.frequency = spec
+                }
+            }
             "--undeclared-tool-calls" => {
                 a.emit_undeclared = match next(&mut i, &flag, inline)?.as_str() {
                     "text" => false,
@@ -258,64 +371,137 @@ async fn serve(args: Args) -> Result<(), String> {
     })
     .await
     .map_err(|e| e.to_string())??;
+    if !args.literal_content {
+        tok.without_literal_content(); // --literal-content 0: the stock whole-string encode, as before this release
+    }
     let dialect = args.dialect.unwrap_or_else(|| {
         dialect::Dialect::detect(&PathBuf::from(&args.model_dir), tok.tk.token_to_id("｜DSML｜").is_some())
     });
+    let mut ink_effort = None;
+    let mut ds_thinking_default = true;
     let (template, thinking_defaults, ds_effort) = match dialect {
         dialect::Dialect::Glm => {
             let template = template::ChatTemplate::load(
                 &PathBuf::from(&args.model_dir),
                 tok.eos_token.clone(),
                 tok.pad_token.clone(),
-            )?;
+            )?
+            .with_literal_content(tok.literal_spellings());
             let effort = args.default_effort.as_deref().map(thinking::parse_default_effort).transpose()?;
             log::info!(
                 "dialect glm: tokenizer + template loaded in {:.0} ms (vocab {}); reasoning efforts the template names: \
-                 {:?}; default effort {:?}, default thinking budget {}, thinking off {}",
+                 {:?}; default effort {:?}, default thinking budget {}, thinking off allowed{}",
                 t0.elapsed().as_secs_f64() * 1e3,
                 tok.vocab_size,
                 template.levels,
                 effort,
                 args.default_budget,
-                if args.allow_thinking_off { "allowed" } else { "refused" }
+                if args.allow_thinking_off { " (--allow-thinking-off is no longer needed)" } else { "" }
             );
-            let d = thinking::Defaults { effort, budget: args.default_budget, allow_off: args.allow_thinking_off };
+            // thinking off renders the lowest effort and withholds the reasoning; --allow-thinking-off is still accepted
+            let d = thinking::Defaults { effort, budget: args.default_budget, allow_off: true };
             (Some(template), d, dialect::DS_DEFAULT_EFFORT)
         }
         dialect::Dialect::Ds41 => {
             // the prompt comes from dschat.rs (the release's encoding.py ported); thinking closes with the one
-            // `</think>` token; thinking off is native, so it needs no flag
+            // `</think>` token; thinking off is native, so it needs no flag; a request with no top_p samples at 0.95 (Tok::use_ds41_sampling_defaults)
             tok.use_single_think_close();
+            tok.use_ds41_sampling_defaults();
             let effort = match args.default_effort.as_deref() {
                 Some(e) => dialect::parse_ds_default_effort(e)?,
-                None => dialect::DS_DEFAULT_EFFORT,
+                None => Some(dialect::DS_DEFAULT_EFFORT),
             };
+            ds_thinking_default = effort.is_some();
+            let effort = effort.unwrap_or(dialect::DS_DEFAULT_EFFORT);
             log::info!(
                 "dialect ds41: tokenizer loaded in {:.0} ms (vocab {}, eos {:?}); default reasoning effort {effort}, \
-                 default thinking budget {}, thinking off allowed",
+                 default thinking {ds_thinking_default}, default thinking budget {}, thinking off allowed, default top_p {}",
                 t0.elapsed().as_secs_f64() * 1e3,
                 tok.vocab_size,
                 tok.eos_ids,
-                args.default_budget
+                args.default_budget,
+                tok.gen_defaults.get("top_p").map_or("1.0".to_string(), |v| v.to_string())
             );
             let d = thinking::Defaults { effort: None, budget: args.default_budget, allow_off: true };
             (None, d, effort)
         }
+        dialect::Dialect::Hf => {
+            let template = template::ChatTemplate::load(
+                &PathBuf::from(&args.model_dir),
+                tok.eos_token.clone(),
+                tok.pad_token.clone(),
+            )?
+            .hf()
+            .with_literal_content(tok.literal_spellings());
+            tok.think_close = tok.encode("</think>", false)?;
+            let effort = args.default_effort.as_deref().map(thinking::parse_default_effort).transpose()?;
+            log::info!(
+                "dialect hf: tokenizer + template loaded in {:.0} ms (vocab {}, eos {:?}); reasoning efforts the \
+                 template names: {:?}; default effort {:?}, default thinking budget {}, thinking off allowed",
+                t0.elapsed().as_secs_f64() * 1e3,
+                tok.vocab_size,
+                tok.eos_ids,
+                template.levels,
+                effort,
+                args.default_budget,
+            );
+            let d = thinking::Defaults { effort, budget: args.default_budget, allow_off: true };
+            (Some(template), d, dialect::DS_DEFAULT_EFFORT)
+        }
+        dialect::Dialect::Inkling => {
+            // the model's own template reads content-part lists, so no `.hf()`; the reply names its blocks with
+            // control tokens (inkparser.rs); thinking off is the template's effort 0, so it needs no flag
+            let template = template::ChatTemplate::load(
+                &PathBuf::from(&args.model_dir),
+                tok.eos_token.clone(),
+                tok.pad_token.clone(),
+            )?
+            .single_text()
+            .with_literal_content(tok.literal_spellings());
+            tok.use_inkling_thinking()?;
+            tok.add_tokenizer_eos();
+            ink_effort = args.default_effort.as_deref().map(dialect::parse_inkling_default_effort).transpose()?;
+            log::info!(
+                "dialect inkling: tokenizer + template loaded in {:.0} ms (vocab {}, eos {:?}); image placeholder {}; \
+                 default effort {}, default thinking budget {}, thinking off allowed",
+                t0.elapsed().as_secs_f64() * 1e3,
+                tok.vocab_size,
+                tok.eos_ids,
+                template.image_mark,
+                ink_effort.as_ref().map_or("the template's (0.9)".to_string(), |v| v.to_string()),
+                args.default_budget,
+            );
+            let d = thinking::Defaults { effort: None, budget: args.default_budget, allow_off: true };
+            (Some(template), d, dialect::DS_DEFAULT_EFFORT)
+        }
     };
+    if args.penalties != sampling::Penalties::default() {
+        log::info!(
+            "default penalties: presence {:?}, frequency {:?}",
+            args.penalties.presence,
+            args.penalties.frequency
+        );
+    }
     let served = args.served.unwrap_or_else(|| match dialect {
         dialect::Dialect::Glm => vec!["glm-5.3".into(), "glm53".into()],
         dialect::Dialect::Ds41 => vec!["deepseek-v4.1-flash".into()],
+        dialect::Dialect::Hf => vec![dialect::hf_served_name(std::path::Path::new(&args.model_dir))],
+        dialect::Dialect::Inkling => dialect::inkling_served_names(std::path::Path::new(&args.model_dir)),
     });
-    if args.emit_undeclared {
-        log::info!("calls to tools a request did not declare come back as tool calls (--undeclared-tool-calls emit)");
+    if !args.emit_undeclared {
+        log::info!("calls to tools a request did not declare stay text (--undeclared-tool-calls text)");
     }
     let engine = engine::Engine::new(args.engine_sock.clone());
     let grammars = grammar::Grammars::load(&PathBuf::from(&args.model_dir), tok.vocab_size)?;
+    let sessions_on = gr8knobs::SESSIONS.get();
     let st: &'static State = Box::leak(Box::new(State {
         tok,
         template,
         dialect,
         ds_effort,
+        ds_thinking_default,
+        forced_tool_thinking: args.forced_tool_thinking,
+        ink_effort,
         engine: engine.clone(),
         model_name: served[0].clone(),
         served,
@@ -325,11 +511,17 @@ async fn serve(args: Args) -> Result<(), String> {
         max_model_len_override: args.max_model_len,
         default_max_tokens: args.default_max_tokens,
         share_tokens: args.share_tokens,
+        clamp_max_tokens: args.clamp_max_tokens,
         thinking: thinking_defaults,
         grammars,
         emit_undeclared: args.emit_undeclared,
+        guard: args.guard,
+        penalties: args.penalties,
+        boost: args.boost,
+        sequence: args.sequence,
         started: util::now_secs(),
         supervisor: args.supervisor,
+        sessions: sessions_on.then(|| sessions::Sessions::new(std::time::Duration::from_secs(args.session_idle_seconds))),
     }));
     engine.start();
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)

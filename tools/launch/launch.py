@@ -4,6 +4,11 @@
     up [OPTIONS] [@FILE]       start this box's supervisor in the background and follow it until the cluster serves
     down                       stop every box of the last boot (or this box alone)
     restart [OPTIONS]          down, then up
+    scale --tp N --peers LIST [--drain-timeout S] [OPTIONS]   change the serving cluster's width and members: every
+                               new box makes its files ready while the cluster serves, new requests wait while the
+                               running ones finish (at most S seconds, 300 by default), then the new member list boots
+                               and the KV store's sessions carry over. The head stays first in LIST; a box new to the
+                               cluster runs `up --tp N --peers LIST` once the scale has started
     status                     every box: its state, the engine, MemAvailable; the head's shim, front end and /health
     health                     this box alone, in one line: exit 0 when its supervisor reports the cluster serving
                                (and, on the head, the front end's /health answers 200), else 1. A readiness check for
@@ -165,16 +170,19 @@ def cmd_down(argv):
     else:
         print('no handshake on this box: stopping this box only')
     pid = supervisor_running(out)
+    # the supervisor gives its engine quit_wait for an orderly quit (120 s when the quit stores the pool), as it
+    # recorded at its start (a store given only on the up command line)
+    qw = sv.recorded_quit_wait(out, o) if pid else sv.quit_wait(o)   # a dead supervisor's file is stale
     if pid and pid > 0:
         os.kill(pid, signal.SIGTERM)
-        for _ in range(300):
+        for _ in range(300 + 10 * qw):
             if not supervisor_running(out):
                 break
             time.sleep(0.1)
         else:
             print(f'the supervisor (pid {pid}) did not stop; killing it')
             os.kill(pid, signal.SIGKILL)
-    stopped = sv.stop_local(home, lambda s: print(s))
+    stopped = sv.stop_local(home, lambda s: print(s), qw)
     print(f'this box: {"stopped" if pid or stopped else "nothing was running"}')
     return 0
 
@@ -211,6 +219,78 @@ def cmd_status(argv):
     print(f'API     {url}/v1 ' + ('answers (/health 200)' if code == 200 else
                                   f'/health {code}: not ready' if code else 'answers nothing'))
     return 0
+
+
+def cmd_scale(argv):
+    """Send `scale` to the head, then follow it in the head's status until it is done (0) or failed (1)."""
+    drain, rest = '300', []
+    it = iter(argv)
+    for a in it:
+        if a == '--drain-timeout':
+            drain = next(it, '')
+        elif a.startswith('--drain-timeout='):
+            drain = a.partition('=')[2]
+        else:
+            rest.append(a)
+    if not drain.replace('.', '', 1).isdigit():
+        print('gr8: --drain-timeout S: seconds', file=sys.stderr)
+        return 2
+    o = parse(rest, check=False)
+    words = []
+    for k in ('TP', 'PEERS'):
+        if o.origin.get(k) != 'command line':
+            print('gr8: scale needs --tp N and --peers LIST (the new member list, the head first)', file=sys.stderr)
+            return 2
+    for k, v in o.values.items():   # the options this command names: the head adds them to the boot's own
+        if o.origin.get(k) == 'command line' and k not in ('GR8_WORK_DIR', 'GR8_MODEL', 'MENTAT') and v is not None:
+            words += [opt.flag_of(k), v]
+    m = members_of(o)
+    if not m:
+        print('gr8: no handshake on this box: run scale on a box of the serving cluster', file=sys.stderr)
+        return 1
+    head = m[0][0]
+    try:
+        r = rpc(m, head, {'t': 'scale', 'argv': words, 'drain_timeout': float(drain)}, timeout=30)
+    except OSError as e:
+        print(f'gr8: the head {head} does not answer ({e})', file=sys.stderr)
+        return 1
+    if r.get('t') != 'ok':
+        print(f'gr8: scale refused: {r.get("error") or r}', file=sys.stderr)
+        return 1
+    sid = r['id']
+    print(f'scale {sid} started on the head {head}')
+    if r.get('joiners'):
+        print(f'on {", ".join(r["joiners"])} run now: ./gr8 {o.get("GR8_MODEL")} up --tp {o.get("TP")} --peers '
+              f'{o.get("PEERS")} (with the cluster\'s other options)')
+    said, quiet = None, 0
+    while True:
+        time.sleep(1)
+        try:
+            s = rpc(m, head, {'t': 'status'}, timeout=5)
+            quiet = 0
+        except OSError as e:
+            quiet += 1
+            if quiet > 120:
+                print(f'gr8: the head {head} stopped answering ({e})', file=sys.stderr)
+                return 1
+            continue
+        sc = s.get('scale') or {}
+        if sc.get('id') != sid:
+            continue
+        now = (sc.get('phase'), s.get('state'))
+        if now != said:
+            said = now
+            print(f'{time.strftime("%H:%M:%S")} scale {sc["phase"]}, head {s.get("state")}')
+        if sc['phase'] == 'done' and s.get('state') == 'serving':
+            print(f'serving TP={len(sc["members"])} on {",".join(sc["members"])}; requests waited {sc.get("pause_s")}s '
+                  f'(drain {sc.get("drain_s")}s)')
+            print('for later boots, put these in every box\'s config (the scale changed the running cluster only):')
+            for line in r.get('config') or []:
+                print(f'  {line}')
+            return 0
+        if sc['phase'] == 'failed':
+            print(f'gr8: scale failed: {sc.get("error")}', file=sys.stderr)
+            return 1
 
 
 def cmdline(pid, proc='/proc'):
@@ -410,6 +490,24 @@ def cmd_check(argv):
     return 1 if fails else 0
 
 
+def prepare_compact(o, rank, variant):
+    """An opt-in prepare step, never a boot-time rewrite. Use the same local directory assignment as the engine."""
+    directory = os.environ.get('GR8_LOAD_COMPACT', os.environ.get('G6_LOAD_COMPACT', ''))
+    # engine_args.sh splits EXTRA_ENV on whitespace, normalizes legacy names and applies the last assignment.
+    for word in (o.get('EXTRA_ENV') or '').split():
+        key, sep, value = word.partition('=')
+        if sep and key in ('GR8_LOAD_COMPACT', 'G6_LOAD_COMPACT'):
+            directory = value
+    if not directory:
+        return
+    if not variant.path or not o.get('V2_SLICES'):
+        raise modelset.ModelError('GR8_LOAD_COMPACT prepare needs an exlr8 v2 release with index slices and a width manifest')
+    import fetch_ranks
+    result = fetch_ranks.compact_rank(o.get('V2'), directory, o.get('V2_SLICES'), int(o.get('TP')), rank,
+                                      variant.path, o.get('LAYOUT'))
+    print(f'compact copies: {result["checked"]} halves verified in {directory}')
+
+
 def cmd_prepare(argv):
     o = parse(argv)
     rank = int(o.get('RANK')) if o.get('RANK') else next((int(a) for a in o.args if a.isdigit()), None)
@@ -440,6 +538,8 @@ def cmd_prepare(argv):
             if getattr(ms.drafter, 'pins', False) or ms.drafter.check(rank):
                 ms.drafter.fetch_rank(rank)
             bad += ms.drafter.check(rank)
+        if not bad:
+            prepare_compact(o, rank, variant)
     except (modelset.ModelError, OSError, RuntimeError) as e:
         print(f'gr8: {e}', file=sys.stderr)
         return 1
@@ -523,6 +623,13 @@ def main(argv):
         print(__doc__)
         return 0
     cmd, rest = argv[0], argv[1:]
+    if cmd == 'model-get':
+        try:
+            print(models.query(rest))
+            return 0
+        except ValueError as e:
+            print(f'gr8: {e}', file=sys.stderr)
+            return 2
     if cmd == 'supervise':
         sv.main(parse(rest))
     if cmd == 'get':   # one effective option: KV_FORMAT for ./gr8 glm53 build, PORT for smoke and bench
@@ -538,7 +645,7 @@ def main(argv):
         cmd_down(rest)
         return cmd_up(rest)
     f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'health': cmd_health, 'logs': cmd_logs,
-         'show-config': cmd_show_config,
+         'show-config': cmd_show_config, 'scale': cmd_scale,
          'check': cmd_check, 'prepare': cmd_prepare, 'knobs': cmd_knobs}.get(cmd)
     if not f:
         print(f'gr8: unknown command {cmd}\n{__doc__}', file=sys.stderr)

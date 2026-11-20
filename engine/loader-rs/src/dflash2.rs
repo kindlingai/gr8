@@ -28,7 +28,7 @@ use std::os::unix::fs::FileExt;
 
 pub const VERSION: &str = "g6dflash2-v1";
 pub const CLASSES: [&str; 5] = ["fc", "attn", "mlp", "conv", "sel"];
-/// Replicated packs (an nr that does not split the KV heads: TP=6) keep o_proj / down_proj as this split's K-slices (TP4).
+/// Replicated packs (an nr that does not split the KV heads: TP=6, TP=3) keep o_proj / down_proj as this split's K-slices (TP4).
 pub const REF_NR: usize = 4;
 const ALIGN: u64 = 4096;
 
@@ -505,7 +505,7 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
 }
 
 /// g6load dflash2: --src DIR (config.json + model.safetensors) --out DIR [--nr 4] [--ranks 0,1] [--bf16 conv,sel].
-/// --nr 6: the replicated layout, one pack per rank of TP=6. The model (dims_of) from the config's hidden size.
+/// --nr 6 or 3: the replicated layout, one pack per rank. The model (dims_of) from the config's hidden size.
 /// Prints one JSON line per rank.
 pub fn main(src: &str, out: &str, nr: usize, ranks: Option<&str>, bf16: &str) -> Result<(), String> {
     let cp = format!("{src}/config.json");

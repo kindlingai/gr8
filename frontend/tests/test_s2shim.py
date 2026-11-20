@@ -111,6 +111,90 @@ class UnitTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 g6s2shim.parse_ready(bad)
 
+    def test_build_request_images(self):
+        import base64
+        T = g6s2shim.IMAGE_TOKEN
+        rgb = base64.b64encode(bytes(14 * 14 * 3)).decode()          # a 1 x 1 patch grid: span 1 * 2 + 2 = 4
+        im = {'pos': 1, 'vit_h': 1, 'vit_w': 1, 'key': '0123456789abcdef', 'rgb': rgb}
+        prompt = [5, T, T, T, T, 6]
+        body, err = g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [im]}, 0)
+        self.assertIsNone(err)
+        head = body.split(b'\n')[0]
+        self.assertTrue(head.endswith(b' img 1:1:1:0123456789abcdef:' + rgb.encode()), head[:120])
+        # no images: the header is byte-identical to a request without the key
+        self.assertEqual(g6s2shim.build_request({'prompt': [5, 6], 'max_tokens': 4, 'images': []}, 0),
+                         g6s2shim.build_request({'prompt': [5, 6], 'max_tokens': 4}, 0))
+        two = [5, T, T, T, T, T, T, T, T]
+        self.assertIsNone(g6s2shim.build_request({'prompt': two, 'max_tokens': 4,
+                                                  'images': [im, {**im, 'pos': 5}]}, 0)[1])
+        bad = [
+            {**im, 'pos': 2},                       # runs past the span / onto a text token
+            {**im, 'vit_h': 0},
+            {**im, 'vit_w': 3073},
+            {**im, 'vit_h': 40, 'vit_w': 120},      # span over 1024
+            {**im, 'key': 'XYZ'},
+            {**im, 'rgb': rgb[:-4]},                # wrong size
+            {**im, 'rgb': rgb[:-1] + '!'},
+            {**im, 'pos': True},
+        ]
+        for b in bad:
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [b]}, 0)[1], b)
+        overlap = {'prompt': two, 'max_tokens': 4, 'images': [im, {**im, 'pos': 3}]}
+        self.assertIsNotNone(g6s2shim.build_request(overlap, 0)[1])
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [im] * 17}, 0)[1])
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [im],
+                                                     'prompt_logprobs': 0}, 0)[1])
+        # GLM-5.3-Flash geometry (vision.s2 says glm5v): <|image|> rows, one per 2 x 2 patches, 16 to 8000
+        G = g6s2shim.GLM5V_IMAGE_TOKEN
+        g = {'pos': 2, 'vit_h': 8, 'vit_w': 8, 'key': '0123456789abcdef',
+             'rgb': base64.b64encode(bytes(8 * 8 * 14 * 14 * 3)).decode()}
+        gp = [5, 154830] + [G] * 16 + [154831, 6]
+        body, err = g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [g]}, 0, None, 'glm5v')
+        self.assertIsNone(err)
+        self.assertTrue(body.split(b'\n')[0].endswith(b' img 2:8:8:0123456789abcdef:' + g['rgb'].encode()))
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [g]}, 0)[1])   # DS41's token
+        for b in ({**g, 'pos': 1}, {**g, 'vit_h': 6, 'vit_w': 6}, {**g, 'vit_h': 7}, {**g, 'vit_h': 2, 'vit_w': 16002}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [b]}, 0, None, 'glm5v')[1], b)
+        self.assertEqual(g6s2shim.image_span(178, 178, 'glm5v'), 7921)
+        # Inkling-2-Small geometry (vision.s2 says ink2): <|unused_200054|> rows, one per 2 x 2 patches of 20 px, 1 to 6400
+        K = g6s2shim.INK2_IMAGE_TOKEN
+        self.assertEqual(K, 200054)
+        before = (g6s2shim.MODEL_NAME, g6s2shim.VOCAB, g6s2shim.EOS_IDS)
+        self.assertIsNone(g6s2shim.set_model('inkling-2-small', 201024, (200006, 199999)))   # the launcher's identity
+        self.addCleanup(g6s2shim.set_model, *before)
+        import hashlib
+        b1 = bytes(40 * 40 * 3)                                                     # 40 x 40 px = 4800 B: one token
+        h1 = hashlib.sha256(b1).hexdigest()[:16]
+        k1 = {'pos': 2, 'vit_h': 2, 'vit_w': 2, 'key': h1, 'rgb': base64.b64encode(b1).decode()}
+        kp = [5, 200005, K, 6]
+        body, err = g6s2shim.build_request({'prompt': kp, 'max_tokens': 4, 'images': [k1]}, 0, None, 'ink2')
+        self.assertIsNone(err)
+        self.assertTrue(body.split(b'\n')[0].endswith(f' img 2:2:2:{h1}:'.encode() + k1['rgb'].encode()))
+        b6 = bytes(80 * 120 * 3)                                                    # 80 x 120 px: six tokens
+        h6 = hashlib.sha256(b6).hexdigest()[:16]
+        k6 = {'pos': 2, 'vit_h': 4, 'vit_w': 6, 'key': h6, 'rgb': base64.b64encode(b6).decode()}
+        kp6 = [5, 200005] + [K] * 6 + [6]
+        body, err = g6s2shim.build_request({'prompt': kp6, 'max_tokens': 4, 'images': [k6]}, 0, None, 'ink2')
+        self.assertIsNone(err)
+        self.assertTrue(body.split(b'\n')[0].endswith(f' img 2:4:6:{h6}:'.encode() + k6['rgb'].encode()))
+        rgb14 = base64.b64encode(bytes(4 * 6 * 14 * 14 * 3)).decode()
+        for b in ({**k6, 'vit_h': 3}, {**k6, 'vit_w': 5}, {**k6, 'vit_h': 0}, {**k6, 'rgb': rgb14},   # odd sides, 14 px bytes
+                  {**k6, 'pos': 1},                                                 # <|content_image|> is not an image row
+                  {**k6, 'vit_h': 162, 'vit_w': 160}):                              # over 6400 tokens
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': kp6, 'max_tokens': 4, 'images': [b]}, 0, None, 'ink2')[1], b)
+        wrong = [5, 200005] + [G] * 6 + [6]                                         # another model's image token
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': wrong, 'max_tokens': 4, 'images': [k6]}, 0, None, 'ink2')[1])
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': kp6, 'max_tokens': 4, 'images': [k6]}, 0, None, 'glm5v')[1])
+        self.assertEqual(g6s2shim.image_span(160, 160, 'ink2'), 6400)
+        self.assertEqual(g6s2shim.image_span(108, 192, 'ink2'), 5184)
+        self.assertIsNone(g6s2shim.image_span(2, 12802, 'ink2'))
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            for text, want in (('glm5v\n', 'glm5v'), ('1\n', 'ds41'), ('ink2\n', 'ink2')):
+                with open(f'{d}/vision.s2', 'w') as fh:
+                    fh.write(text)
+                self.assertEqual(g6s2shim.vision_model(f'{d}/vision.s2'), want)
+
     def test_build_request(self):
         body, err = g6s2shim.build_request({'prompt': [5, 6, 7], 'max_tokens': 9, 'temperature': 0.5, 'top_p': 0.9,
                                             'seed': 3, 'min_tokens': 4, 'stop_ids': [2, 2, 8]}, 11)
@@ -167,6 +251,62 @@ class UnitTests(unittest.TestCase):
                     {'prompt': [1], 'max_tokens': 4, 'stop_ids': [-3]}, {'prompt': [1], 'max_tokens': 4, 'top_p': 2.0},
                     {'prompt': [1], 'max_tokens': 4, 'temperature': float('nan')}):
             self.assertIsNotNone(g6s2shim.build_request(bad, 0)[1], bad)
+
+    def test_build_request_penalties(self):
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'presence_penalty': 1.5, 'frequency_penalty': -0.5}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 pen 1.5 -0.5 0.0 0.0 -1\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'frequency_penalty': 2, 'logprobs': 1}, 0)
+        self.assertIn(b' top_p 1.0 pen 0.0 2.0 0.0 0.0 -1 lp 1\n', body)
+        # the thinking penalties, with the think block's close
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'thinking_presence_penalty': 1.5,
+                                          'thinking_frequency_penalty': -0.25, 'think_end': 154842}, 0)
+        self.assertIn(b' top_p 1.0 pen 0.0 0.0 1.5 -0.25 154842\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'thinking_presence_penalty': 1.5, 'think_end': None}, 0)
+        self.assertIn(b' pen 0.0 0.0 1.5 0.0 -1\n', body)
+        # the think-end boost: after pen, which carries the close even with every penalty 0
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'think_end': 154842,
+                                            'think_end_boost': {'start': 4096, 'per1k': 2, 'max': 10}}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 pen 0.0 0.0 0.0 0.0 154842 boost 4096 2.0 10.0\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'presence_penalty': 1, 'think_end': 5,
+                                          'think_end_boost': {'start': 0, 'per1k': 0.5, 'max': 1.5}, 'logprobs': 1}, 0)
+        self.assertIn(b' pen 1.0 0.0 0.0 0.0 5 boost 0 0.5 1.5 lp 1\n', body)
+        self.assertNotIn(b' boost ', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4,
+                                                              'think_end_boost': {'start': 1, 'per1k': 0, 'max': 10}}, 0)[0])
+        for bad in ({'start': -1, 'per1k': 2, 'max': 10}, {'start': 1, 'per1k': -1, 'max': 10}, {'start': 1, 'per1k': 1, 'max': 21},
+                    {'start': 'x', 'per1k': 1, 'max': 1}, {'per1k': 1, 'max': 1}, 'start=1', {'start': True, 'per1k': 1, 'max': 1}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'think_end_boost': bad}, 0)[1], bad)
+        # the sequence penalty's scopes, after boost
+        sp = {'thinking': {'mult': 0.8, 'base': 1.75, 'min': 4, 'cap': 6}, 'answer': {'mult': 1, 'base': 1.75, 'min': 12, 'cap': 6},
+              'guard': {'mult': 1, 'base': 2, 'min': 1, 'cap': 8, 'avoid': [154822, 3, 4]}}
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': sp, 'logprobs': 0}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 seqt 0.8:1.75:4:6.0 seqa 1.0:1.75:12:6.0 seqg 1.0:2.0:1:8.0:154822,3,4 lp 0\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': {'thinking': sp['thinking']}}, 0)
+        self.assertIn(b' seqt 0.8:1.75:4:6.0\n', body)
+        self.assertNotIn(b'seqg', body)
+        # with the think block's close, pen carries it for the scopes even with every penalty 0; the scopes' min stays
+        # out of min_tokens
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'think_end': 154842,
+                                          'sequence_penalty': {'thinking': sp['thinking']}}, 0)
+        self.assertIn(b' min 0 ', body)
+        self.assertIn(b' top_p 1.0 pen 0.0 0.0 0.0 0.0 154842 seqt 0.8:1.75:4:6.0\n', body)
+        self.assertNotIn(b'seq', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': {
+            'thinking': dict(sp['thinking'], mult=0)}}, 0)[0])
+        for bad in ('x', {'thinking': dict(sp['thinking'], base=0.5)}, {'thinking': dict(sp['thinking'], min=0)},
+                    {'thinking': dict(sp['thinking'], cap=21)}, {'guard': dict(sp['guard'], avoid=[])},
+                    {'guard': dict(sp['guard'], avoid=[g6s2shim.VOCAB])}, {'guard': {'mult': 1, 'base': 2, 'min': 1, 'cap': 8}}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': bad}, 0)[1], bad)
+        # all zero, null or absent: no field
+        for kw in ({}, {'presence_penalty': 0, 'frequency_penalty': 0.0}, {'presence_penalty': None},
+                   {'thinking_presence_penalty': 0, 'think_end': 5}):
+            self.assertNotIn(b' pen ', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, **kw}, 0)[0], kw)
+        for kw in ({'presence_penalty': 2.5}, {'frequency_penalty': -2.01}, {'presence_penalty': 'x'},
+                   {'presence_penalty': float('nan')}, {'thinking_frequency_penalty': 2.5},
+                   {'thinking_presence_penalty': 1, 'think_end': -1}, {'thinking_presence_penalty': 1, 'think_end': 'x'},
+                   {'thinking_presence_penalty': 1, 'think_end': g6s2shim.VOCAB}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, **kw}, 0)[1], kw)
 
     def test_build_request_insert(self):
         rule = {'after_tokens': 7, 'unless_emitted': 154842, 'tokens': [198, 154842, 271]}
@@ -484,6 +624,7 @@ class RequestMetrics(S2Base):
         c.send(gen('r1', prompt, max_tokens=n))
         await asyncio.sleep(0.4)                    # mid-request: held pages differ from the reservation
         mid = await self.metrics(c, 2)
+        self.assertGreater(mid['spec']['drafts'], 0)                 # the counters move while the request decodes
         self.assertGreater(mid['kv']['active_tokens'], 0)
         self.assertEqual(mid['kv']['active_tokens'] % 64, 0)
         self.assertGreater(mid['kv']['reserved_tokens'], mid['kv']['active_tokens'])
@@ -501,8 +642,15 @@ class RequestMetrics(S2Base):
         self.assertEqual(lat['itl_count'], n - 1)                    # the tokens after the first
         self.assertGreater(lat['itl_sum'], 0)
         self.assertLessEqual(lat['itl_sum'], lat['decode_sum'] + 1e-6)
-        self.assertEqual(m['kv']['active_tokens'], 0)                # the run is back in the pool
-        self.assertEqual(m['kv']['reserved_tokens'], 0)
+        # The run is back in the pool. The engine rewrites status.s2 after it writes the run's end line, so a
+        # metrics request right after the finish frame can still see the old pages: poll until the pool drains.
+        kv, seq, deadline = m['kv'], 4, time.monotonic() + 2
+        while (kv['active_tokens'] or kv['reserved_tokens']) and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+            kv = (await self.metrics(c, seq))['kv']
+            seq += 1
+        self.assertEqual(kv['active_tokens'], 0)
+        self.assertEqual(kv['reserved_tokens'], 0)
 
     async def test_finish_frames_carry_each_requests_share_of_the_metrics(self):
         c = await self.client()
@@ -639,6 +787,21 @@ class DeepSeekIdentity(S2Base):
         self.assertFalse(os.path.exists(self.sock))
 
 
+class BusyTests(S2Base):
+    FAKE = ('--busy-max-tokens', '17', '--busy-retry', '9')
+
+    async def test_a_busy_refusal_is_an_error_finish_with_status_429(self):
+        c = await self.client()
+        c.send(gen('b', max_tokens=17))
+        c.send(gen('ok', max_tokens=8))
+        ids, fin, _ = await c.wait('b')
+        self.assertEqual((ids, fin['reason'], fin['status'], fin['retry_after']), ([], 'error', 429, 9))
+        self.assertIn('retry after 9 s', fin['message'])
+        ids, fin, _ = await c.wait('ok')
+        self.assertEqual((len(ids), fin['reason']), (8, 'length'))
+        self.assertNotIn('status', fin)
+
+
 class QueueTests(S2Base):
     FAKE = ('--sessions', '2')
 
@@ -695,6 +858,21 @@ class MaxLenTests(S2Base):
         self.assertEqual(fin['reason'], 'error')
         self.assertIn('too long', fin['message'])
         c.send(gen('fit', prompt=list(range(100)), max_tokens=100))
+        self.assertEqual((await c.wait('fit'))[1]['reason'], 'length')
+
+
+class CapRowsTests(S2Base):
+    SHIM = ('--cap-rows', '6400')
+
+    async def test_one_request_is_held_to_cap_rows_in_a_larger_pool(self):
+        c = await self.client()
+        self.assertEqual(c.hello['max_model_len'], 6400 - 4)
+        c.send(gen('over', prompt=list(range(6396)), max_tokens=1))
+        _, fin, _ = await c.wait('over')
+        self.assertEqual(fin['reason'], 'error')
+        self.assertIn('too long', fin['message'])
+        self.assertNotIn('6396', self.fake_log())  # refused before an engine request file
+        c.send(gen('fit', prompt=list(range(6395)), max_tokens=1))
         self.assertEqual((await c.wait('fit'))[1]['reason'], 'length')
 
 
@@ -779,3 +957,24 @@ class SilentEngine(S2Base):
         m = await asyncio.wait_for(c.metrics.get(), 5)
         self.assertEqual(m['requests']['running'], 0)
         self.assertEqual(m['requests']['finished'], {'error': 1})
+
+
+class ModelMetadataTests(unittest.TestCase):
+    def test_no_silent_glm_default_for_new_model(self):
+        self.assertEqual(g6s2shim.model_metadata('glm-5.3-g6', None, None, None),
+                         (154880, [154820, 154827, 154829]))
+        with self.assertRaisesRegex(ValueError, 'metadata missing'):
+            g6s2shim.model_metadata('new-model', None, None, None)
+        with self.assertRaisesRegex(ValueError, 'metadata missing'):
+            g6s2shim.model_metadata('new-model', 32000, None, None)
+        self.assertEqual(g6s2shim.model_metadata('new-model', 32000, [1], None), (32000, [1]))
+
+    def test_release_metadata_and_cli_precedence(self):
+        import json
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            Path(t, 'config.json').write_text(json.dumps({'text_config': {'vocab_size': 32000, 'eos_token_id': 1}}))
+            Path(t, 'generation_config.json').write_text(json.dumps({'eos_token_id': [2, 3]}))
+            self.assertEqual(g6s2shim.model_metadata('new-model', None, None, t), (32000, [2, 3]))
+            self.assertEqual(g6s2shim.model_metadata('new-model', 64000, [5], t), (64000, [5]))

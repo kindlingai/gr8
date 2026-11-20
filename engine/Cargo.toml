@@ -1,0 +1,14 @@
+# The engine's host Rust: one staticlib, target/release/libg6host.a, holds the S2 page allocator (kvman-rs) and the S2
+# scheduling logic (scheduler-rs), so the engine links one copy of std and the two crates call each other as Rust.
+# knobs-rs and loader-rs keep their own builds: the launcher, the front end and the tests use them on their own.
+[workspace]
+resolver = "2"
+members = ["hostcore-rs", "kvman-rs", "scheduler-rs"]
+exclude = ["knobs-rs", "loader-rs"]
+
+[profile.release]
+opt-level = 3
+panic = "abort"        # a panic must not unwind into the C++ engine
+
+# dev keeps unwind: kvman-rs has a #[should_panic] test, and the pool recovers a poisoned lock
+

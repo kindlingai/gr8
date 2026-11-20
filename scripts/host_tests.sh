@@ -11,10 +11,26 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # the build's object cache (engine/runtime/nvcc_cache.sh, #32), with g++ standing in for nvcc
 bash "$REPO/engine/runtime/tests/nvcc_cache_test.sh"
+# the DS41 build knobs -> nvcc flags (scripts/ds41_build_flags.sh: GR8_DS_TRUNK_BF16)
+bash "$REPO/engine/runtime/tests/ds41_build_flags_test.sh"
+# v2 communication width sweeps: host-only request selection and validation.
+for test in test_ds41_v2_l20_tail test_ds41_v2_send_ffn_opt test_ds41_v2_bf16_tc; do
+  g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/tests/$test.cpp" -o "$T/$test"
+  "$T/$test"
+done
+g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/tests/test_ds41_v2_width.cpp" -o "$T/test_ds41_v2_width"
+"$T/test_ds41_v2_width"
+# v2 attention pipeline: bounded request diagnostics, including default off.
+g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/tests/test_ds41_v2_attn_pipe.cpp" -o "$T/test_ds41_v2_attn_pipe"
+"$T/test_ds41_v2_attn_pipe"
 # Inactive steering contracts/profile loader: CPU only, no CUDA or Rust dependencies.
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_test.cpp" \
   "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_test"
 "$T/steering_test" "$REPO/engine/runtime/tests/fixtures/steering_contract.json"
+# Native GLP (GGUF) steering input: conformance gates, manifest synthesis, directory parity.
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_glp_test.cpp" \
+  "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_glp_test"
+"$T/steering_glp_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/fabric_mtu_test.cpp" -o "$T/fabric_mtu_test"
 "$T/fabric_mtu_test"
 # the proxy's collective order (engine/comms/fabric_order.h): a plan that publishes out of numeric order stalls without
@@ -33,24 +49,45 @@ python3 "$REPO/engine/comms/tests/relay_loop_test.py"
 # the fabric pool (engine/comms/fabric_pool.h, #154): boot, groups and their ports over loopback, no leaked descriptor
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_pool_test.cpp" -o "$T/fabric_pool_test"
 "$T/fabric_pool_test"
-# the Rust page allocator (engine/kvman-rs) that s2/pool.h wraps, built here where cargo is on the PATH
-KV=$REPO/engine/kvman-rs/target/release/libg6kvman.a
+# the host Rust (engine/Cargo.toml): the page allocator s2/pool.h wraps (engine/kvman-rs) and the S2 scheduling logic
+# (engine/scheduler-rs) in one library, built here where cargo is on the PATH
+HL=$REPO/engine/target/release/libg6host.a
 # and the knob table's C API (engine/knobs-rs), which every test that reads a knob links
 KN=$REPO/engine/knobs-rs/target/release/libgr8knobs.a
 if command -v cargo > /dev/null 2>&1; then
-  cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
+  cargo build --release --quiet --manifest-path "$REPO/engine/Cargo.toml"
   cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
 fi
-[ -f "$KV" ] || { echo "no $KV: cargo build --release --manifest-path engine/kvman-rs/Cargo.toml"; exit 1; }
+[ -f "$HL" ] || { echo "no $HL: cargo build --release --manifest-path engine/Cargo.toml"; exit 1; }
 [ -f "$KN" ] || { echo "no $KN: cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml"; exit 1; }
-KVLIB=("$KV" "$KN" -lpthread -ldl -lm)
-KNOBS=("$KN" -lpthread -ldl -lm)
+KVLIB=("$HL" "$KN" -lpthread -ldl -lm)
+KNOBS=("$KN" "$HL" -lpthread -ldl -lm)
 # the knob table: its C++ header over the C API
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/knobs-rs" "$REPO/engine/knobs-rs/tests/header_test.cpp" "${KNOBS[@]}" \
   -o "$T/knobs_header_test"
 "$T/knobs_header_test"
+# INT4 attention: knob validation, padded query permutation and stable live-slot compaction.
+g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_s6_kv4_host.cpp" "${KNOBS[@]}" -o "$T/test_s6_kv4_host"
+g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -pthread \
+  -I "$REPO/engine" "$REPO/engine/tests/test_dispram_host.cpp" "${KNOBS[@]}" -o "$T/test_dispram_host"
+"$T/test_dispram_host"
+"$T/test_s6_kv4_host"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/grammar_request_test.cpp" -o "$T/grammar_request_test" "${KNOBS[@]}"
 "$T/grammar_request_test"
+# presence / frequency penalties (engine/runtime/penalty.h): the head kernel's row logic against a plain count, and the
+# tables s2/dispatch.h writes before a main step (the sampling row, the new tokens, a slot's reset)
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/penalty_test.cpp" -o "$T/penalty_test" "${KNOBS[@]}"
+"$T/penalty_test"
+# DS41 image requests: the img header fields, the prompt checks, the image digest in the cache namespace and the control protocol
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/image_request_test.cpp" -o "$T/image_request_test" "${KNOBS[@]}"
+"$T/image_request_test"
+# a grant with DS41 images through the Rust scheduler: the slot keeps images + image_digest, and both change the state digest
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/image_state_test.cpp" -o "$T/image_state_test" "${KNOBS[@]}"
+"$T/image_state_test"
+# DS41 image rows in the Engram ring of a prefix-cache entry and a GR8_DS_PARK resume: equal to the live ring (gaps 0..3)
+g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -I "$REPO/engine/runtime" \
+  "$REPO/engine/runtime/s2/tests/ds41_engram_ring_test.cpp" -o "$T/ds41_engram_ring_test"
+"$T/ds41_engram_ring_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_round_test.cpp" -o "$T/batch_round_test" "${KNOBS[@]}"
 "$T/batch_round_test"
 # K = 0 (no draft head): a Batch runs no DRAFT or CHAIN step and never writes past St::d, and a Driver serves requests
@@ -64,10 +101,46 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # the n-gram table as a draft source (GR8_NGRAM, #56): the table file, chains, the round choice, exact output
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_ngram_test.cpp" -o "$T/batch_ngram_test" "${KNOBS[@]}"
 "$T/batch_ngram_test" 2>/dev/null    # the GR8_MTP_LPLOG case prints its round lines
+# the facade over the Rust planner: its SpecLen against spec_len.h's, a hook that calls back, slots out of range
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/planner_facade_test.cpp" -o "$T/planner_facade_test" "${KNOBS[@]}"
+"$T/planner_facade_test"
+# the build's description (module_info.h) in each model's shape
+# (the serving shapes: build_m4.sh's -DDEC_S2 and widths, DS41 at 48 rows; and a TP6 build's defaults)
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48" \
+         "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=6" "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=1"; do
+  g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/module_info_test.cpp" -o "$T/module_info_test" "${KVLIB[@]}"
+  "$T/module_info_test"
+done
+# engine/scheduler-rs against transcripts recorded from the C++ it replaced, in each model's shape (the module's slots
+# and caps decide which configs the scheduler takes)
+# under the sanitizers in the default shape only: the 32-slot DS41 shape took 13 minutes there on CI's runner
+for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  if [ -z "$f" ]; then opt="-O1 -g -fsanitize=address,undefined"; else opt="-O2"; fi
+  g++ -std=c++17 $opt -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rs_vectors_test.cpp" -o "$T/scheduler_rs_vectors_test" "${KVLIB[@]}"
+  "$T/scheduler_rs_vectors_test" 2> >(grep -v '^# s2 GR8_CP_STEP_ROWS=' >&2)   # the driver section's cap lines
+done
+# the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -ffp-contract=off -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
+"$T/batch_replay_test" "$T/replay.log"
+GR8_S2_REPLAY_LOG="$T/env.log" "$T/batch_replay_test"   # the knob set as well: record() moves the log, wraps once
+# the planner's floating-point state with and without contracted multiply-adds (g++ contracts C++ under every -std; x86
+# needs -mfma to have them): batch_replay_test writes the log uncontracted (-ffp-contract=off above), so
+# the off replay keeps every learned estimate bit for bit and the fast one must still ask for every step the log has
+FMA=""; [ "$(uname -m)" = x86_64 ] && FMA="-mfma"
+for c in off fast; do
+  g++ -std=c++17 -O2 -Wall -ffp-contract=$c $([ $c = fast ] && echo $FMA) -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/round_replay.cpp" -o "$T/round_replay_$c" "${KNOBS[@]}"
+done
+"$T/round_replay_off" "$T/replay.log"
+"$T/round_replay_fast" --steps-only "$T/replay.log"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/ngram_lookup_check.cpp" -o "$T/ngram_lookup_check" "${KNOBS[@]}"
 (cd "$REPO/tools/ngram/tests" && NGRAM_LOOKUP_CHECK="$T/ngram_lookup_check" python3 -m unittest -q test_ngram.ExportTest)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflreuse_test.cpp" -o "$T/batch_dflreuse_test" "${KNOBS[@]}"
 "$T/batch_dflreuse_test"
+# GLM-5.3-Flash, DFlash2 with session checkpoints (#340): the prefill taps' owner and the drafter's start after a
+# checkpoint hit (s2/flash_dfl_window.h), driving a Batch through an agent's turns at 32K and 128K
+g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_dfl_window_test.cpp" \
+  -o "$T/flash_dfl_window_test" "${KVLIB[@]}"
+"$T/flash_dfl_window_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_insert_test.cpp" -o "$T/batch_insert_test" "${KNOBS[@]}"
 "$T/batch_insert_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstop_test.cpp" -o "$T/batch_kstop_test" "${KNOBS[@]}"
@@ -79,6 +152,10 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 python3 "$REPO/tools/s2_dsel_table.py" --selftest
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstopb_test.cpp" -o "$T/batch_kstopb_test" "${KNOBS[@]}"
 "$T/batch_kstopb_test" 2>/dev/null
+# GR8_DS_SESS_DRAFTS (s2/ds41_sess_drafts.h): a DS41 shared round's drafts a session by its active count (rows a session at 1, 5, 6, 8, 9, 10, 11, 16
+# sessions), draft launches of at most 6 sessions, and 1..5 sessions plan the same steps and tokens as the knob off
+g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_ds41_sessdrafts_test.cpp" -o "$T/batch_ds41_sessdrafts_test" "${KNOBS[@]}"
+"$T/batch_ds41_sessdrafts_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstop_mtp_test.cpp" -o "$T/batch_kstop_mtp_test" "${KNOBS[@]}"
 "$T/batch_kstop_mtp_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/capture_barrier_test.cpp" -o "$T/capture_barrier_test" "${KNOBS[@]}"
@@ -89,6 +166,10 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/pool_conc_replay_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_grow_test.cpp" "${KVLIB[@]}" -o "$T/driver_grow_test"
 "$T/driver_grow_test"
+# the facade over the Rust driver: a hook's exception and the driver's refusals, hooks reading it back, the state view,
+# a moved Driver
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_facade_test.cpp" -o "$T/driver_facade_test" "${KVLIB[@]}"
+"$T/driver_facade_test"
 # the scheduler's own prefill choice (fewest prompt rows first, with a deferral bound): no pool, no CUDA
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_fair_test.cpp" -o "$T/scheduler_fair_test" "${KNOBS[@]}"
 "$T/scheduler_fair_test"
@@ -103,6 +184,24 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 # Config::tail_first (GR8_S2_TAIL_FIRST): a ready prompt tail before any prefill, no decode round forced after it
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_tail_first_test.cpp" -o "$T/scheduler_tail_first_test" "${KNOBS[@]}"
 "$T/scheduler_tail_first_test"
+# Config::park (GR8_DS_PARK=1): a finished DS41 session parks its slot, a follow-up that extends it resumes that slot and
+# prefills only the delta, a new chat with no free slot evicts the oldest parked slot; knob off traces as before (TRACE_OFF)
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_park_test.cpp" -o "$T/scheduler_park_test" "${KNOBS[@]}"
+"$T/scheduler_park_test"
+# GR8_DS_PARK: evicting a parked slot never evicts the grant's own cache snapshot (Ds41PrefixCache::capture keep), BF16 and FP4;
+# with GR8_DS_CACHE_REPLACE, PARK=1 frees and keeps the snapshots PARK=0 does (Ds41SnapSlots park, evict_parked, resume)
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/ds41_park_evict_test.cpp" -o "$T/ds41_park_evict_test" "${KVLIB[@]}"
+"$T/ds41_park_evict_test"
+# and with the sibling rule off (GR8_DS_CACHE_REPLACE=0, both dedup settings): PARK=1 frees and keeps what PARK=0 does
+GR8_DS_CACHE_REPLACE=0 "$T/ds41_park_evict_test"
+GR8_DS_CACHE_REPLACE=0 GR8_DS_CACHE_DEDUP=0 "$T/ds41_park_evict_test"
+GR8_DS_CACHE_DEFER_REPLACE=0 "$T/ds41_park_evict_test"
+# Multi-turn fallback, tight 32-slot churn and sibling lifecycle in deferred and rollback modes.
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/test_ds41_prefix_cache.cpp" -o "$T/test_ds41_prefix_cache" "$HL" "$KN" -lpthread -ldl -lm
+"$T/test_ds41_prefix_cache"
+GR8_DS_CACHE_DEFER_REPLACE=0 "$T/test_ds41_prefix_cache"
+GR8_DS_CACHE_REPLACE=0 "$T/test_ds41_prefix_cache"
+GR8_DS_CACHE_DEDUP=0 "$T/test_ds41_prefix_cache"
 # the Driver's prefill quanta: the shortest prompt first, owed quanta, decode rounds between them
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_prefill_quantum_test.cpp" -o "$T/driver_prefill_quantum_test" "${KNOBS[@]}"
 "$T/driver_prefill_quantum_test" > /dev/null
@@ -115,7 +214,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 "$T/cp_rows_test" 2> >(grep -v '^# s2 GR8_CP_STEP_ROWS=' >&2)   # the driver's cap transition lines, thousands here
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
 STORES=("mem:" "ssd:$T/store")
-NODE=$REPO/engine/kvman-rs/target/release/kvman-remote
+NODE=$REPO/engine/target/release/kvman-remote
 if [ -x "$NODE" ]; then   # a small unlocked node on loopback (RLIMIT_MEMLOCK in a container is usually 8 MiB)
   "$NODE" --gb 0.05 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --ready "$T/node.json" > "$T/node.log" 2>&1 &
   NODE_PID=$!
@@ -134,6 +233,13 @@ fi
 "$T/pool_stash_test" "${STORES[@]}"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_namespace_test.cpp" "${KVLIB[@]}" -o "$T/pool_namespace_test"
 "$T/pool_namespace_test" "${STORES[@]}"
+g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" \
+  "$REPO/engine/runtime/s2/tests/kv_state_desc_test.cpp" "${KVLIB[@]}" -o "$T/kv_state_desc_test"
+# the Inkling-2-Small descriptor: 8 page planes, 40 rings, 192 convolution histories, 8 staging pages; a slot round trip
+g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" \
+  "$REPO/engine/runtime/s2/tests/ink2_kv_state_test.cpp" "${KVLIB[@]}" -o "$T/ink2_kv_state_test"
+"$T/ink2_kv_state_test"
+"$T/kv_state_desc_test"
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
 [ -n "${LAZY_PID:-}" ] && kill "$LAZY_PID"
 # a pool tier on a group lease that grows into the node's grant, gives a segment back when another cluster asks, and
@@ -153,6 +259,55 @@ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/run
 # ranks of different control builds refuse at bootstrap (CONTROL_VERSION in the agreement and the frame magic)
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_version_test.cpp" -o "$T/control_version_test" "${KNOBS[@]}"
 "$T/control_version_test"
+# the control links in Rust (engine/scheduler-rs src/control) against the C++ they replaced: every frame, decode,
+# refusal, gate step and agreement diff in each model's shape, and the bytes on the links of a TP3 boot through a
+# recording relay (the workers' readers log the head's close at the end)
+for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra -pthread $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_vectors_test.cpp" -o "$T/control_vectors_test" "${KNOBS[@]}"
+  "$T/control_vectors_test"
+done
+# the S2 files (commands, requests, ready.s2, the agreement, status.s2) and the trace against transcripts of the C++
+# they came from, in each model's shape
+for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -pthread $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/service_vectors_test.cpp" -o "$T/service_vectors_test" "${KVLIB[@]}"
+  "$T/service_vectors_test" 2> >(grep -v '^# s2 trace: cannot write ' >&2)
+done
+# the head's admission decisions (s2/admit.h) against transcripts of the C++, in each model's shape
+for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra -pthread $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/admit_vectors_test.cpp" -o "$T/admit_vectors_test" "${KVLIB[@]}"
+  "$T/admit_vectors_test"
+done
+# g6m4's option parse (scheduler-rs options.rs behind engine_options.h) over the launcher's lists and one mutation per
+# refusal (scripts/check_args.py writes the cases), in each model's shape and GLM's serving one; then every refusal
+# reached in some shape
+i=0
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_KV4=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/options_vectors_test.cpp" -o "$T/options_vectors_test" "${KVLIB[@]}"
+  "$T/options_vectors_test" "$REPO/engine/runtime/s2/tests/options_cases.txt" --dump > "$T/options_$i.txt" || { tail -1 "$T/options_$i.txt"; exit 1; }
+  tail -1 "$T/options_$i.txt"
+  i=$((i + 1))
+done
+python3 "$REPO/scripts/check_options_coverage.py" "$REPO/engine/scheduler-rs/src/options.rs" "$T"/options_*.txt
+# the S2 runtime signatures (scheduler-rs signature.rs) over a seeded sweep of their inputs, against transcripts of
+# g6m4.cu's builders
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/signature_vectors_test.cpp" -o "$T/signature_vectors_test" "${KVLIB[@]}"
+"$T/signature_vectors_test"
+# the fabric plan (fabric_plan.h) over a seeded sweep of its inputs, in each model's shape, GLM's serving one, and the
+# widths only some paths take (the Flash pool owner at TP2, the three-rank ring's stripe at TP3)
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DDEC_S2 -DG6_NR=3" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=3" \
+         "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=2" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/fabric_plan_vectors_test.cpp" -o "$T/fabric_plan_vectors_test" "${KVLIB[@]}"
+  "$T/fabric_plan_vectors_test"
+done
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_wire_test.cpp" -o "$T/control_wire_test" "${KNOBS[@]}"
+"$T/control_wire_test" 2> >(grep -v '^g6ctl: control recv failed: ret=0 ' >&2)
+# DS41 ranks that disagree on an agree-scope knob refuse at bootstrap (knob::signature() in the DS41 runtime signature):
+# GR8_DS_COMP_FP4 [1,1,0,1] refuses, [1,1,1,1] and [0,0,0,0] boot
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/ds41_agree_knobs_test.cpp" -o "$T/ds41_agree_knobs_test" "${KNOBS[@]}"
+"$T/ds41_agree_knobs_test" "$REPO/engine/runtime/g6m4.cu"
+# DS41 and Flash ranks that loaded different vision towers (one without the file, or another file) refuse at bootstrap
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/agree_vision_test.cpp" -o "$T/agree_vision_test" "${KNOBS[@]}"
+"$T/agree_vision_test" "$REPO/engine/runtime/g6m4.cu"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_state_test.cpp" "${KVLIB[@]}" -o "$T/steering_state_test"
 "$T/steering_state_test"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_transport_test.cpp" -o "$T/steering_transport_test" "${KNOBS[@]}"
@@ -173,12 +328,26 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/h
 # Flash KDA state rollback across accepted prefixes, and each session's slots and ring (s2/flash_ring.h).
 g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_ring.cpp" -o "$T/test_flash_ring" "${KNOBS[@]}"
 "$T/test_flash_ring"
+# Flash checkpoints with persist=on (s2/flash_ckpt_index.h): the index and token files round trip, damaged or foreign
+# files start empty, FlashIndex::adopt's rules, and an entry a capture dropped does not come back after a crash
+g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_ckpt_index_test.cpp" -o "$T/flash_ckpt_index_test"
+TMPDIR="$T" "$T/flash_ckpt_index_test"
+# ranks that took back different persisted entries agree at the bootstrap (agree_lines) at TP=1, 2 and 4, and wait for
+# a rank that checks its entries for longer than the socket timeout
+g++ -std=c++17 -O1 -g -Wall -Wextra -pthread -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_ckpt_agree_test.cpp" -o "$T/flash_ckpt_agree_test" "${KNOBS[@]}"
+TMPDIR="$T" "$T/flash_ckpt_agree_test"
+# GR8_KV_REWIDTH for Flash (s2/flash_ckpt_rewidth.h): four ranks' persisted checkpoints rewritten to TP=2, 1 and back
+# to 4 over loopback kvman-peer servers; each rank's KDA state equals the canonical state sharded at the new width
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_rewidth_test.cpp" -o "$T/flash_rewidth_test" "${KVLIB[@]}"
+TMPDIR="$T" "$T/flash_rewidth_test" "$REPO/engine/target/release/kvman-peer"
 # the KDA carry mode (Args::src per row: the ring, and several sessions in one step) on the CPU model of k_kda_core.
 # Bit for bit across the kernel's M paths, so no FMA contraction (the host compiler would contract each path its own way).
 g++ -std=c++17 -O2 -ffp-contract=off -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/kda_carry_cpu_test.cpp" -o "$T/kda_carry_cpu_test" "${KNOBS[@]}"
 "$T/kda_carry_cpu_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp2_test.cpp" -o "$T/control_tp2_test" "${KNOBS[@]}"
 "$T/control_tp2_test"
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp1_test.cpp" -o "$T/control_tp1_test" "${KNOBS[@]}"
+"$T/control_tp1_test"
 # FLASH_CAP_POLICY=borrow-idle's rule (s2/flash_lend.h) and the ACK's room (Ack::room): lend once idle, recall before a
 # request that needs the chunks, the head admits within the least room over the ranks
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/flash_lend_test.cpp" -o "$T/flash_lend_test" "${KNOBS[@]}"
@@ -186,6 +355,21 @@ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/run
 # GR8_S2_ADMIT_HOLD=1: ADMIT files that land inside a held admission join the held boundary
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/admit_hold_drain_test.cpp" "${KVLIB[@]}" -o "$T/admit_hold_drain_test"
 (cd "$T" && "$T/admit_hold_drain_test" 2>/dev/null)
+# the calls the service makes on a model module (ModuleOps) and its plain pool calls, as std::function hooks and as a
+# table, against transcripts recorded from the C++ service, in each model's shape
+for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra -pthread -ffp-contract=off $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/module_calls_test.cpp" \
+    -o "$T/module_calls_test" "${KVLIB[@]}"
+  "$T/module_calls_test" 2>/dev/null
+done
+# the same, and the ADMIT_HOLD drain, under ASan and UBSan: the head's control thread is Rust and calls back into the
+# C++ host table and pool policy inside every commit
+g++ -std=c++17 -O1 -g -Wall -Wextra -pthread -ffp-contract=off -fsanitize=address,undefined -I "$REPO/engine/runtime" \
+  "$REPO/engine/runtime/s2/tests/module_calls_test.cpp" -o "$T/module_calls_test_asan" "${KVLIB[@]}"
+"$T/module_calls_test_asan" 2>/dev/null
+g++ -std=c++17 -O1 -g -Wall -pthread -fsanitize=address,undefined -I "$REPO/engine/runtime" \
+  "$REPO/engine/runtime/s2/tests/admit_hold_drain_test.cpp" "${KVLIB[@]}" -o "$T/admit_hold_drain_test_asan"
+(cd "$T" && "$T/admit_hold_drain_test_asan" 2>/dev/null)
 # DeepSeek-V4.1-Flash-1017 geometry (engine/model_geom_ds41.h) against the release's config.json
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/ds41_geom_dump.cpp" -o "$T/ds41_geom_dump"
 (cd "$REPO/engine/tests" && DS41_GEOM_DUMP="$T/ds41_geom_dump" python3 -m unittest -q test_ds41_geom)
@@ -223,8 +407,15 @@ g++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -pthread -I "$REPO/engine/eng
 "$T/engram_wide_test" "$T/engram_wide"
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/engram" "$REPO/engine/engram/tests/test_rowstore.cpp" -o "$T/engram_rowstore_test"
 "$T/engram_rowstore_test" "$T/engram_rowstore" 262144
+g++ -std=c++17 -O2 -Wall -Wextra -pthread "$REPO/engine/engram/tests/test_uring.cpp" -o "$T/engram_uring_test"
+"$T/engram_uring_test"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/engram/tests/test_boot.cpp" -o "$T/engram_boot_test" "${KNOBS[@]}"
 "$T/engram_boot_test"
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine" "$REPO/engine/engram/tests/test_col_shard.cpp" -o "$T/engram_col_shard_test" "${KNOBS[@]}"
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine" "$REPO/engine/engram/tests/test_sparse.cpp" -o "$T/engram_sparse_test" "${KNOBS[@]}"
+"$T/engram_sparse_test" "$T/engram_sparse"
+mkdir -p "$T/engram_col_shard"
+"$T/engram_col_shard_test" "$T/engram_col_shard"
 # the W-row wkv's activation quantizer needs cuda_fp8.h, so it runs where the CUDA headers are
 if [ -f /usr/local/cuda/include/cuda_fp8.h ]; then
   g++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -I "$REPO/engine/engram" -I /usr/local/cuda/include \
@@ -241,6 +432,22 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/kernels/tests/ds_ro_host_test.cpp" -o "$T
 # DS41 W4096: RO_MAX 4096 is the largest prefill width, and the RoScratch tile capacity holds the 4096-row plan
 g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/kernels" "$REPO/engine/tests/test_ds41_w4096.cpp" -o "$T/test_ds41_w4096"
 "$T/test_ds41_w4096"
+# v2 (the launcher default): geometry/order, the fallback decision (which settings run v2, which the old range A), stock bootstrap coverage and isolated fabric/tail.
+for name in test_ds41_v2 test_ds41_v2_walk test_ds41_v2_plan; do
+  g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -DG6_NR=4 -DDEC_S2 -I "$REPO/engine" "$REPO/engine/tests/$name.cpp" -o "$T/$name" "${KVLIB[@]}"
+  "$T/$name"
+done
+# the bounded-replay split (runtime/ds41_pf_split.h), off and with GR8_DS_PF_L20_TAIL=1 (layer 20 in range B, its ca row hoisted)
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/test_ds41_pf_split.cpp" -o "$T/test_ds41_pf_split"
+"$T/test_ds41_pf_split" > "$T/pf_split.log" || { cat "$T/pf_split.log"; exit 1; }
+tail -1 "$T/pf_split.log"
+# the two-lane W prefill contract (runtime/ds41_lanes.h): schedules, fabric tables, scheduler; again with GR8_DS_PF_L20_TAIL=1
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/runtime" -I "$REPO/engine/comms" -I "$REPO/engine/kernels" \
+  "$REPO/engine/tests/test_ds41_lanes.cpp" -o "$T/test_ds41_lanes" "${KNOBS[@]}"
+"$T/test_ds41_lanes" > "$T/lanes.log" || { cat "$T/lanes.log"; exit 1; }
+tail -1 "$T/lanes.log"
+"$T/test_ds41_lanes" l20 > "$T/lanes_l20.log" || { cat "$T/lanes_l20.log"; exit 1; }
+tail -1 "$T/lanes_l20.log"
 # DS41 shifted-mHC trunk (engine/mhc/ds_cpu.h) against the torch reference; it needs torch, so it skips without it
 if python3 -c "import torch, numpy" 2>/dev/null; then
   bash "$REPO/engine/runtime/tests/ds_mhc_cpu_test.sh" "$T/ds_mhc_cpu_test"
@@ -250,11 +457,28 @@ fi
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
 # Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
 python3 "$REPO/engine/tests/test_flash_serve_prefill_check.py"
+python3 "$REPO/engine/tests/test_flash_serve_waterfill.py"
 # the top-k selection
 g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test" "${KNOBS[@]}"
 "$T/pf_peer_stage_test"
 g++ -std=c++17 -O2 -I "$REPO/engine/kernels" "$REPO/engine/tests/test_topk.cpp" -o "$T/test_topk" "${KNOBS[@]}"
 "$T/test_topk"
+# DS41 S2 host tests: prefill admission, its two lanes, 32-session steps, the 32-session 64K config, the DSpark round,
+# prefix reuse rows with drafts off (a forced tool call's insert rule at MTP 0)
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" -I "$REPO/engine/comms" "$REPO/engine/runtime/s2/tests/ds41_prefill_test.cpp" -o "$T/ds41_prefill_test" "${KNOBS[@]}"
+"$T/ds41_prefill_test"
+for t in ds41_park_miss_test ds41_prefill_lanes_test ds41_s32_step_test s32_64k_mtp8_test batch_ds41_dspark_test ds41_reuse_mtp0_test; do
+  g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" -I "$REPO/engine/runtime/s2" -I "$REPO/engine" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/$t" "${KVLIB[@]}"
+  "$T/$t" > "$T/$t.out" 2>&1 || { cat "$T/$t.out"; exit 1; }
+done
+# the S2 layer in the Flash build's shape (s2_batch.h's Flash cost model, its slot count): the model-generic tests again
+for t in batch_dflash_test batch_dflreuse_test batch_draftpar_test batch_dsel_test batch_dselmodel_test batch_insert_test \
+         batch_kstop_test batch_kstopb_test batch_kstop_mtp_test batch_ngram_test batch_round_test batch_replay_test \
+         driver_grow_test driver_prefill_quantum_test scheduler_fair_test scheduler_rounds_test scheduler_r_test \
+         scheduler_tail_first_test cp_rows_test grammar_request_test kv_plan_test; do
+  g++ -std=c++17 -O1 -Wall -pthread -DG6_MODEL_FLASH=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/flash_$t" "${KVLIB[@]}"
+  (cd "$T" && "$T/flash_$t" > "$T/flash_$t.out" 2>&1) || { cat "$T/flash_$t.out"; echo "flash build: $t failed"; exit 1; }
+done
 # the control channel: sync and idle peers (the socketpair cases; the silent-peer case needs a network
 # namespace)
 for t in control_sync_test control_idle_test; do
@@ -271,5 +495,24 @@ g++ -std=c++17 -O2 "$REPO/engine/runtime/tests/flash_dsa_full_schedule_test.cpp"
 "$T/flash_dsa_full_schedule_test"
 g++ -std=c++17 -O2 "$REPO/engine/tests/test_flash_pool_owner.cpp" -o "$T/test_flash_pool_owner" "${KNOBS[@]}"
 "$T/test_flash_pool_owner"
+# the Inkling-2-Small CPU reference: state across chunks, speculative rollback, the image token, the rank split, the vision tower
+g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_ink2_cpu_ref.cpp" -o "$T/test_ink2_cpu_ref"
+"$T/test_ink2_cpu_ref"
+# the miniature Inkling-2-Small checkpoint of the GPU tests (trunk + MTP drafter, with and without the vision tower) against the
+# loader's plans of 1, 4, 6 ranks
+GL=$REPO/engine/loader-rs/target/release/libg6load.a
+if command -v cargo > /dev/null 2>&1; then
+  cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
+fi
+[ -f "$GL" ] || { echo "no $GL: cargo build --release --manifest-path engine/loader-rs/Cargo.toml"; exit 1; }
+g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_ink2_mini_ckpt.cpp" "$REPO/engine/loader/g6pack.cpp" "$GL" \
+  -lpthread -ldl -lm -o "$T/test_ink2_mini_ckpt"
+"$T/test_ink2_mini_ckpt"
+# the Inkling-2-Small router, plan, quantizers and tensor-core operand maps on the CPU
+g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/kernels/tests/ink2_moe_host_test.cpp" -o "$T/ink2_moe_host_test"
+"$T/ink2_moe_host_test"
+# the Inkling-2-Small geometry: constants, layer lists, per-rank slices; config.json when GR8_TEST_INK2_METADATA_DIR is set
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_INK2=1 -I "$REPO/engine" "$REPO/engine/tests/test_ink2_geom.cpp" -o "$T/test_ink2_geom" "${KNOBS[@]}"
+"$T/test_ink2_geom"
 # the bare environment reads the knob table replaced, and the table against the tree
 python3 "$REPO/tools/env_lint.py"

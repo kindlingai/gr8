@@ -84,21 +84,24 @@ update, on every box (with the files fetched by URL, fetch `compose.yaml` again 
 Every box must run the same image: the boxes compare their engine builds before loading, and refuse to boot with a mix.
 To stay on one build, set `GR8_IMAGE=ghcr.io/kindlingai/gr8:sha-<commit>` in `docker/.env` on every box.
 
-`bench` (bench/pbench.py) appends its results to `out/pbench-results.jsonl` in the home volume.
+`bench` (bench/bench.py) writes its JSON report to `/tmp` in the container; `--json /var/lib/gr8/home/out/NAME.json`
+keeps it in the home volume.
 
 ## Settings
 
 `docker/.env` holds the launcher's options, one `KEY=value` per line: compose passes every line into the container, and
-the launcher owns every default. `GR8_MODEL` has none: it names the model, `glm53` (GLM-5.3) or `glm53f`
-(GLM-5.3-Flash), and `MODEL` must be a release of that model. Without it the container exits 2 at once, naming the
-line to add. `docker run --rm --entrypoint /opt/gr8/gr8 ghcr.io/kindlingai/gr8 models` lists each model's release, TP
-sizes and variants. Three more lines are for compose itself:
+the launcher owns every default. `GR8_MODEL` has none: it names the model, `glm53` (GLM-5.3), `glm53f`
+(GLM-5.3-Flash) or `ds41` (DeepSeek-V4.1-Flash-1017), and `MODEL` must be a release of that model. For `ds41`, `MODEL`
+is a local copy of the release mounted into the container ([DEPLOY.md](../docs/DEPLOY.md), "The two settings"). Without
+`GR8_MODEL` the container exits 2 at once, naming the line to add. `docker run --rm --entrypoint /opt/gr8/gr8 ghcr.io/kindlingai/gr8 models` lists each model's release, TP
+sizes and variants. Six more lines are for compose itself (the last two only with `docker/model-loader.yaml`):
 
 | variable | default | |
 |---|---|---|
 | `GR8_IMAGE` | `ghcr.io/kindlingai/gr8:latest` | the image |
 | `GR8_CACHE` | the `cache` volume | this box's part of the model: a host directory instead, owned by uid 1000 |
 | `GR8_HOME` | the `home` volume | logs and state (`out/`, `s2/`, `run/`): a host directory instead, owned by uid 1000, and not a bare-metal `GR8_WORK_DIR` (its `bin/` is a build) |
+| `GR8_STOP_GRACE` | `30s` | how long docker waits for the container to stop before it kills it: `150s` with a `persist=on` ssd `KV_STORE` that keeps sessions ([SWITCHING.md](../docs/SWITCHING.md)) |
 | `MODEL_LOADER_STORE` | `/var/lib/model-loader` | with `docker/model-loader.yaml`: model-loader's store on this box |
 | `MODEL_LOADER_IMAGE` | `ghcr.io/kindlingai/model-loader:latest` | with `docker/model-loader.yaml`: the image whose `model-loader -check` gr8's start waits on |
 

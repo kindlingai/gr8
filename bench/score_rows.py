@@ -5,7 +5,7 @@ python3 bench/score_rows.py ROWS OUT.jsonl [--url http://127.0.0.1:8100] [--k 20
 
 ROWS: a .npy integer array [rows][len], a .json list of token-id lists, or a raw little-endian int32 file with
 --len L. Each row is sent as a token-id prompt with max_tokens=1, temperature 0 and prompt_logprobs=k (the gate
-harness's KL path, bench/gate/kl.py). OUT gets one JSON line per row: {"row", "n", "lp": [logprob of the actual token
+harness's KL path, bench/gr8bench/kl.py). OUT gets one JSON line per row: {"row", "n", "lp": [logprob of the actual token
 at positions 1..n-1], "top": [[[id, logprob] x k] per position 1..n-1]}. The actual token's logprob is exact even
 outside the top k. --raw writes {"row", "prompt_logprobs": the server's list unchanged} instead (entry 0 null, entry j
 keyed by token id: the actual token plus ranks 1..k). OUT is written as OUT.tmp and renamed when every row is in. A

@@ -51,6 +51,10 @@ struct G6Attn {
     // kpool indexer (attn/flash_attn.cu): the pool gate projection of the rows, FP16 [rows,128] = x @ compress_gate^T,
     // and the pool position bias, BF16 [4,128] (index_kpool_compress_ape). indices is [rows,g6kv::SEL] (kvfmt.h).
     const void *index_gate, *index_ape;
+    // the raw index rows' ring (kvfmt.h), [g6kv::RAW_SESS][g6kv::RAW_RING][g6kv::IDX_RAW], owned by the binding; raw_sess:
+    // device [rows], the S2 session of each row (its ring), nullptr = session 0
+    void* index_raw;
+    const int* raw_sess;
 #endif
 #if defined(G6_CP) && G6_CP
     // context-parallel KV. cp_nr = 0: replicated (today's semantics). cp_nr > 0: this rank SCORES only
@@ -107,6 +111,8 @@ struct G6AttnStepCell;
 //   q, rope   fp32 [M][H][512], [M][H][64]: absorbed query of the head group being computed (g6_attn_cp_qabs: my own)
 //   part      fp32 partial of one head group: c [M][H][512], m [M][H], l [M][H]   (M * H * 514 floats)
 //   part_all  fp32 [cp_nr] partials of MY head group in shard order 0..cp_nr-1
+// Flash (flash_attn.cu): cand_all is u64 [cp_nr][M][g6kv::TOP_POOLS] pool candidates (a list in any order), q is
+// [M][H][512] with no rope (nullptr), a partial is M * H * 514 floats as above.
 // front: validate (graph form), append owned/replicated pages, absorb my heads (-> g6_attn_cp_qabs)
 extern "C" int g6a_cp_front(const G6Attn*,const G6AttnStepCell* cell,void* scratch,size_t bytes,void* stream);
 // index: full-index layers: local top-2048 over my score-owned keys -> cand_all[cp_rank]; shared layers: copy the reused

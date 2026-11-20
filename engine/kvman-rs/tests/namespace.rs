@@ -162,7 +162,7 @@ fn a_stored_non_stock_run_restores_only_in_its_namespace() {
     p.take_hit(hit.skip, hit.age, Some(hit.tier), 192, 256).unwrap();
     assert_ne!(p.digest(), before);
     assert!(p.io_pending() > 0, "the restore copies are queued");
-    assert!(p.stash().unwrap().entries(0).is_empty(), "an evicted entry leaves its tier on restore");
+    assert_eq!(p.stash().unwrap().entries(0).len(), 1, "an evicted entry stays in its tier on restore");
 }
 
 #[test]

@@ -203,9 +203,9 @@ int main(int argc, char** argv)
     Scratch sc;
     {
         void* mem;
-        CK(cudaMalloc(&mem, Scratch::bytes(R, N)));
-        CK(cudaMemset(mem, 0xAB, Scratch::bytes(R, N)));
-        sc = Scratch::carve(mem, R, N);
+        CK(cudaMalloc(&mem, Scratch::bytes(R, N, 0)));
+        CK(cudaMemset(mem, 0xAB, Scratch::bytes(R, N, 0)));
+        sc = Scratch::carve(mem, R, N, R, 0);   // one pass (flat): the harness reads the full logit rows
     }
     const uint8_t* fq_pk = up<uint8_t>(rd("q_pk"));
     const uint8_t* fq_ex = up<uint8_t>(rd("q_ex"));

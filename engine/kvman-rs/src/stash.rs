@@ -26,8 +26,13 @@
 //!   When a run retires, the longest prefix it holds, within its span, that shared_after conversations started with
 //!   goes to the first tier that keeps shared prefixes, unless a tier has it already. The tier writes that prefix once, every later hit reads it, and it stays until
 //!   its tier needs the room. An SSD tier's index keeps the counts across restarts.
-//! - A hit on an evicted run takes the run out of its tier, a hit on a shared prefix leaves the prefix there. Either way
-//!   the blocks go back into the grant's first pages.
+//! - A hit leaves its entry in its tier, the most recently used, and the blocks go back into the grant's first pages.
+//!   The grant remembers it (pool.rs Kept::from): its pages below the hit's full pages are byte copies of the entry's.
+//! - Write only new blocks (c21, "extend in place"): an evicted run below R is stored up to its storable rows (the
+//!   grid cell below min(valid, pf_end), the most a later hit restores, reuse.rs), and a run that continues the stored
+//!   run it came from, and holds all of it, replaces that entry: the new entry keeps the old one's base and blocks below
+//!   the copied pages and writes only the pages past them. The old entry's drop record is synced first, the new one's
+//!   add record commits at io_done.
 //! - Each call's copies, in order: Moves and Spills as placement made them (a Move reads a slot before a later copy
 //!   reuses the slot), then Restores (a restore writes a page a spill of the same call may still have to read). Until
 //!   the engine has run the copies and called io_done(), the pool refuses reserve, take and grow (Error::PendingIo).
@@ -48,7 +53,7 @@
 use crate::pool::{Kept, PAGE};
 use crate::reuse::Finished;
 use crate::tier::SlotAlloc;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -101,12 +106,14 @@ pub const BURST: i64 = 4096;
 
 /// What of a page a copy moves. Full: one pool page of every layer (below R). Own: past R, physical page `page` of the
 /// sharded attention caches and their indexer keys (this rank's shard). Rep(i): past R, logical page `page`'s
-/// replicated parts (the unsharded bindings), the i-th of a block's per_slot.
+/// replicated parts (the unsharded bindings), the i-th of a block's per_slot. State(i): the i-th boundary-state block
+/// (`0 .. state_blocks`) at `st.valid`, with `page` naming the model's source or destination state handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
     Full,
     Own,
     Rep(u32),
+    State(u32),
 }
 
 /// One copy for the engine. A page is one pool page of every layer, a slot one block of a tier's store.
@@ -140,8 +147,10 @@ pub struct Entry {
     /// times the conversation continued a run before this one was stored
     pub hits: u32,
     pub tail: Option<Tail>,
-    /// the cache identity of the run (pool::Namespace). Prefix kinds and index entries are always stock; an evicted
-    /// non-stock run is stored whole (no base) and matches only its own namespace
+    /// boundary-state blocks at the end of `slots` (0 for page-only entries and Prefix bases)
+    pub state: u32,
+    /// The cache identity of the run. Shared system entries are stock; boundary-state siblings
+    /// may share a private page-only Prefix base within their exact namespace.
     pub namespace: crate::pool::Namespace,
 }
 
@@ -152,7 +161,9 @@ impl Entry {
     }
     /// The pages it can restore below R.
     pub fn below(&self) -> usize {
-        self.base.map_or(0, |b| b.1) + self.slots.len() - self.tail.map_or(0, |t| (t.own + t.rep) as usize)
+        self.base.map_or(0, |b| b.1) + self.slots.len()
+            - self.state as usize
+            - self.tail.map_or(0, |t| (t.own + t.rep) as usize)
     }
 }
 
@@ -194,6 +205,8 @@ pub struct Tier {
     slots: u64,
     entries: Vec<Entry>, // least recently used first
     index: Option<Index>,
+    // the index records every entry, not only prefixes (a KV-node lease that outlives a restart, persist=lease)
+    whole: bool,
     stats: TierStats,
     policy: Policy,
 }
@@ -227,6 +240,11 @@ pub struct Stash {
     grid: u64,
     next_id: u64,
     pin: Vec<u64>,
+    // index runs whose base is not loaded yet (tier, entry): their slots stay claimed until a later tier brings the
+    // base (evict() moves an entry on to a later tier) or loaded() drops them
+    waiting: Vec<(usize, Entry)>,
+    // index records add_tier dropped (slots past the tier or taken twice); loaded() reports them
+    bad_records: usize,
     pub index_errors: u64,
     // the write limit: blocks per 1000 pages computed (0 = none), and the credit in thousandths of a block
     limit_milli: u64,
@@ -237,6 +255,15 @@ pub struct Stash {
     // tail_place: the pool's place with it, so a tail's shard pages are read out of a run's list (pool.rs page classes)
     tail: Option<(u32, u32)>,
     tail_place: u32,
+    // the pool's reuse grid (Rules::grid, 0 = none): a hit restores at most min(valid, pf_end) cut to it (storable)
+    reuse_grid: u64,
+    // standalone boundary-state mode (g6kv_stash): reuse rules, trailing state blocks per entry, MTP lookahead, and
+    // per-entry access times when a remote group head queries coldest_ages
+    rules: crate::reuse::Rules,
+    state_blocks: u32,
+    state_mtp: bool,
+    ages_on: bool,
+    seen: std::collections::HashMap<u64, std::time::Instant>,
 }
 
 const FNV: u64 = 14695981039346656037;
@@ -264,13 +291,32 @@ impl Stash {
             grid: if grid == 0 { GRID } else { grid },
             next_id: 1,
             pin: Vec::new(),
+            waiting: Vec::new(),
+            bad_records: 0,
             index_errors: 0,
             limit_milli: 0,
             credit: 0,
             dedupe: true,
             tail: None,
             tail_place: 0,
+            reuse_grid: grid,
+            rules: crate::reuse::Rules::default(),
+            state_blocks: 0,
+            state_mtp: true,
+            ages_on: false,
+            seen: std::collections::HashMap::new(),
         }
+    }
+
+    /// The rows of a run's finished state a stored entry can give back to a hit other than an exact replay: with a
+    /// reuse grid, min(valid, pf_end) cut to it (reuse.rs begin), else valid. The pages past them would be computed
+    /// again by the next turn's prefill, so a tier stores no more.
+    pub fn storable(&self, st: &Finished) -> u64 {
+        let valid = st.valid.max(0) as u64;
+        if self.reuse_grid == 0 {
+            return valid;
+        }
+        valid.min(st.pf_end.max(0) as u64) / self.reuse_grid * self.reuse_grid
     }
 
     /// A tier after the others. With an index, its committed shared prefixes come back (in commit order).
@@ -281,16 +327,48 @@ impl Stash {
             slots,
             entries: Vec::new(),
             index: None,
+            whole: false,
             stats: TierStats::default(),
             policy: Policy::default(),
         };
-        if let Some((ix, loaded)) = index {
+        if let Some((mut ix, loaded)) = index {
+            // a run stored on a prefix comes back only with its prefix, in this tier or any other (evict() moves an
+            // entry on to a LATER tier, so a base can be in a tier added after the run's). The records come in write
+            // order, and a compaction or a move can write a base after the runs on it, so the runs wait for passes
+            // until their base is in. A run whose base is in no tier so far keeps its slots claimed and waits for the
+            // later tiers (retry_waiting); loaded() drops what never finds its base
+            let mut ids: HashSet<u64> = self.tiers.iter().flat_map(|x| &x.entries).map(|e| e.id).collect();
+            let mut wait: Vec<Entry> = Vec::new();
             for e in loaded {
                 if e.slots.iter().all(|&s| s < slots) && t.alloc.claim(&e.slots) {
                     self.next_id = self.next_id.max(e.id + 1);
-                    t.entries.push(e);
+                    wait.push(e);
+                } else {
+                    // slots past the tier or taken twice: its record goes, so no later boot reads blocks reused since
+                    self.bad_records += 1;
+                    if ix.drop(e.id).is_err() {
+                        self.index_errors += 1;
+                    }
                 }
             }
+            loop {
+                let before = wait.len();
+                let mut rest = Vec::new();
+                for e in wait {
+                    if e.base.is_some_and(|b| !ids.contains(&b.0)) {
+                        rest.push(e);
+                    } else {
+                        ids.insert(e.id);
+                        t.entries.push(e);
+                    }
+                }
+                wait = rest;
+                if wait.is_empty() || wait.len() == before {
+                    break;
+                }
+            }
+            let ti = self.tiers.len();
+            self.waiting.extend(wait.into_iter().map(|e| (ti, e)));
             // the counts live in the first index
             if !self.tiers.iter().any(|x| x.index.is_some()) {
                 for (&k, &c) in &ix.counts {
@@ -301,10 +379,69 @@ impl Stash {
             t.index = Some(ix);
         }
         self.tiers.push(t);
+        self.retry_waiting();
+    }
+
+    // the waiting runs whose base is now in some tier join their tier, until a pass places none
+    fn retry_waiting(&mut self) {
+        let mut ids: HashSet<u64> = self.tiers.iter().flat_map(|x| &x.entries).map(|e| e.id).collect();
+        loop {
+            let before = self.waiting.len();
+            for (ti, e) in std::mem::take(&mut self.waiting) {
+                if e.base.is_some_and(|b| !ids.contains(&b.0)) {
+                    self.waiting.push((ti, e));
+                } else {
+                    ids.insert(e.id);
+                    self.tiers[ti].entries.push(e);
+                }
+            }
+            if self.waiting.is_empty() || self.waiting.len() == before {
+                break;
+            }
+        }
+    }
+
+    /// After the last add_tier: the index runs whose base came back in no tier are dropped (slots freed, records
+    /// gone), so no later boot reads blocks reused since.
+    /// A tier whose index is not whole (keep=system now) drops the runs an earlier whole index recorded: it never
+    /// journals their lifecycle, so a kept one could later point at reused blocks. Returns how many records were
+    /// dropped: by these two rules, plus the ones add_tier dropped for slots past the tier or taken twice.
+    pub fn loaded(&mut self) -> usize {
+        let mut unjournaled = 0;
+        for t in self.tiers.iter_mut().filter(|t| t.index.is_some() && !t.whole) {
+            let (gone, keep): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut t.entries).into_iter().partition(|e| !e.kind.prefix());
+            t.entries = keep;
+            unjournaled += gone.len();
+            for e in gone {
+                t.alloc.release(&e.slots);
+                if t.index.as_mut().is_some_and(|ix| ix.drop(e.id).is_err()) {
+                    self.index_errors += 1;
+                }
+            }
+        }
+        let gone = std::mem::take(&mut self.waiting);
+        for (ti, e) in &gone {
+            let t = &mut self.tiers[*ti];
+            t.alloc.release(&e.slots);
+            if let Some(ix) = &mut t.index {
+                if ix.drop(e.id).is_err() {
+                    self.index_errors += 1;
+                }
+            }
+        }
+        gone.len() + unjournaled + std::mem::take(&mut self.bad_records)
     }
 
     pub fn tiers(&self) -> usize {
         self.tiers.len()
+    }
+
+    /// Tier t's index records every entry it stores (evicted runs too, with their base and tail), so a KV-node lease
+    /// that the node held over a restart comes back with its sessions. Prefixes only by default.
+    pub fn index_whole(&mut self, t: usize) {
+        if let Some(x) = self.tiers.get_mut(t) {
+            x.whole = x.index.is_some();
+        }
     }
 
     pub fn set_policy(&mut self, t: usize, p: Policy) {
@@ -526,21 +663,24 @@ impl Stash {
 
     /// The rows of a system span of `span` tokens that a tier can hold: cut to the grid, 0 when shorter than a cell.
     pub fn span_rows(&self, span: u32, prompt_len: usize) -> u64 {
-        let s = (span as u64).min(prompt_len.saturating_sub(1) as u64);
+        let mtp = usize::from(self.state_mtp);
+        let s = (span as u64).min(prompt_len.saturating_sub(mtp) as u64);
         s / self.grid * self.grid
     }
 
     /// Counts a request that starts a conversation toward every grid-cell prefix of its prompt, up to its system span
     /// (rows, from span_rows) when it has one. Returns how many prefixes it counted.
     pub(crate) fn count(&mut self, prompt: &[i32], continuing: bool, span: Option<u64>) -> u32 {
-        if !self.counting() || continuing || prompt.len() < 2 {
+        let mtp = usize::from(self.state_mtp);
+        if !self.counting() || continuing || prompt.len() < 1 + mtp {
             return 0;
         }
-        let end = span.map_or(prompt.len() - 1, |s| s as usize);
+        let max_s = prompt.len() - mtp;
+        let end = span.map_or(max_s, |s| (s as usize).min(max_s));
         let cells: Vec<usize> = (1..).map(|i| i * self.grid as usize).take_while(|&s| s <= end).collect();
         for &s in &cells {
             self.clock += 1;
-            let key = prefix_key(&prompt[..s + 1]);
+            let key = prefix_key(&prompt[..s + mtp]);
             let c = self.counts.entry(key).or_insert((0, 0));
             c.0 += 1;
             c.1 = self.clock;
@@ -606,10 +746,18 @@ impl Stash {
                 }
                 n = n.min(below_pages);
             }
+            let mut from = None;
+            if tail == 0 {
+                // the rows a later hit can restore (storable): the pages past them are written again by its prefill
+                let cut = self.storable(&st);
+                st.valid = cut as i32;
+                n = n.min(pages(cut));
+                from = k.from;
+            }
             if n == 0 {
                 continue;
             }
-            self.store_tail(Kind::Evicted, 0, st, &k.list[..n], &k.list, k.hits, resident, tail as u32, k.namespace);
+            self.store_tail(Kind::Evicted, 0, st, &k.list[..n], &k.list, k.hits, resident, tail as u32, k.namespace, from);
         }
     }
 
@@ -618,19 +766,24 @@ impl Stash {
         self.tiers
             .iter()
             .flat_map(|t| &t.entries)
-            .filter(|e| e.kind.prefix() && e.slots.len() <= max_pages && history.starts_with(&e.st.history))
-            .max_by_key(|e| (e.slots.len(), e.id))
-            .map(|e| (e.id, e.slots.len()))
+            .filter(|e| e.namespace == crate::pool::STOCK_NAMESPACE && e.kind.prefix() && e.below() > 0 && e.below() <= max_pages && history.starts_with(&e.st.history))
+            .max_by_key(|e| (e.below(), e.id))
+            .map(|e| (e.id, e.below()))
     }
 
     // the longest grid-cell prefix of `st`, within `max_pages`, that a run still in the pool also holds: its rows
     fn resident_prefix(&self, st: &Finished, max_pages: usize, resident: &[&[i32]]) -> u64 {
         let g = self.grid;
-        let top = (st.valid.max(0) as u64).min(st.history.len() as u64 - 1).min(max_pages as u64 * PAGE);
+        let mtp = usize::from(self.state_mtp);
+        let top = (st.valid.max(0) as u64).min(st.history.len().saturating_sub(mtp) as u64).min(max_pages as u64 * PAGE);
         let mut s = top / g * g;
         while s >= g {
-            let n = s as usize + 1;
-            if resident.iter().any(|r| r.len() > n && r[..n] == st.history[..n]) {
+            let n = s as usize + mtp;
+            let shares = resident.iter().any(|r| {
+                let enough = if self.state_mtp { r.len() > n } else { r.len() >= n };
+                enough && r[..n] == st.history[..n]
+            });
+            if shares {
                 return s;
             }
             s -= g;
@@ -639,12 +792,13 @@ impl Stash {
     }
 
     fn store(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32], hits: u32, resident: &[&[i32]]) {
-        self.store_tail(kind, key, st, pages, pages, hits, resident, 0, crate::pool::STOCK_NAMESPACE)
+        self.store_tail(kind, key, st, pages, pages, hits, resident, 0, crate::pool::STOCK_NAMESPACE, None)
     }
 
     // store() for a run past R whose tail is `tail` logical pages after `pages` (the pages below R). `full` is the
     // run's whole list: its tail lives at the list positions past `pages` — the shard pages this rank holds (the
-    // (below + j)-th page of the list below place) and the drafter's pages (one per logical tail page)
+    // (below + j)-th page of the list below place) and the drafter's pages (one per logical tail page). `from`: the
+    // run's provenance (pool.rs Kept::from), so an evicted run extends the entry it came from (extend)
     #[allow(clippy::too_many_arguments)]
     fn store_tail(
         &mut self,
@@ -657,6 +811,7 @@ impl Stash {
         resident: &[&[i32]],
         tail: u32,
         namespace: crate::pool::Namespace,
+        from: Option<(u64, usize)>,
     ) {
         // a run that starts with a stored prefix stores only the pages after it. Else a prefix another run in the pool
         // holds becomes one, stored once, when a tier takes it
@@ -667,6 +822,11 @@ impl Stash {
                 t.stats.refused_pages += pages.len() as u64;
             }
             return;
+        }
+        if let (Kind::Evicted, Some((eid, p)), 0) = (kind, from, tail) {
+            if self.extend(eid, p, key, &st, pages, hits, namespace) {
+                return;
+            }
         }
         let stock = namespace == crate::pool::STOCK_NAMESPACE;
         let mut base = if kind == Kind::Evicted && stock { self.shared_base(&st.history, pages.len()) } else { None };
@@ -727,10 +887,95 @@ impl Stash {
         self.next_id += 1;
         let tier = &mut self.tiers[t];
         tier.stats.spilled_pages += n as u64;
-        tier.entries.push(Entry { id, kind, key, st, slots, base, hits, tail, namespace });
-        if kind.prefix() && tier.index.is_some() {
+        tier.entries.push(Entry { id, kind, key, st, slots, base, hits, tail, state: 0, namespace });
+        if tier.index.is_some() && (kind.prefix() || tier.whole) {
             self.commits.push((t, id));
         }
+    }
+
+    // Extend in place: the run's pages [0, p) are byte copies of stored run eid's pages [0, p). The run must also
+    // match eid's full history; if eid ends mid-page, the first page past p is rewritten. The run replaces eid in
+    // eid's tier: eid's base and blocks below p, then new blocks for pages [p, n) only. Returns false for the usual way
+    // (eid gone or moved on, pinned by this call's hit, another namespace, a tail, or not covered by the copies). True
+    // also when nothing is written: no page past p (eid stays as it is), or its tier refused or had no room (eid stays).
+    #[allow(clippy::too_many_arguments)]
+    fn extend(
+        &mut self,
+        eid: u64,
+        p: usize,
+        key: u64,
+        st: &Finished,
+        pages: &[u32],
+        hits: u32,
+        namespace: crate::pool::Namespace,
+    ) -> bool {
+        let n = pages.len();
+        let Some(te) = self.tiers.iter().position(|t| t.entries.iter().any(|e| e.id == eid)) else { return false };
+        let e = self.tiers[te].entries.iter().find(|e| e.id == eid).expect("found");
+        let b = e.base.map_or(0, |b| b.1);
+        let cut = self.storable(&e.st) as usize;
+        let m = (cut + 1).min(e.st.history.len());
+        let ok = e.kind == Kind::Evicted
+            && e.tail.is_none()
+            && e.namespace == namespace
+            && !self.pin.contains(&eid)
+            // A grid-off hit may stop mid-page. Its last partial page must be rewritten,
+            // while the full pages before it still come from eid unchanged.
+            && p >= cut / PAGE as usize
+            && p <= e.below()
+            && p >= b
+            && p <= n
+            && st.history.len() >= m
+            && st.history[..m] == e.st.history[..m];
+        if !ok {
+            return false;
+        }
+        if n == p {
+            return true;
+        }
+        let base = e.base;
+        let pinned = self.pin.len();
+        self.pin.push(eid);
+        self.pin.extend(base.map(|b| b.0));
+        let placed = self.try_place(te, Kind::Evicted, n - p, st.valid.max(0) as u64, hits);
+        self.pin.truncate(pinned);
+        let new = match placed {
+            Ok(slots) => slots,
+            Err(refused) => {
+                if refused {
+                    self.tiers[te].stats.refused += 1;
+                    self.tiers[te].stats.refused_pages += (n - p) as u64;
+                }
+                return true;
+            }
+        };
+        // eid leaves: its drop record reaches the disk before any of its slots is reused (its blocks below p are the new
+        // entry's, whose add record commits at io_done; a crash in between loses this session, never names reused blocks)
+        let tier = &mut self.tiers[te];
+        let i = tier.entries.iter().position(|e| e.id == eid).expect("pinned through the placement");
+        let old = tier.entries.remove(i);
+        if let (true, Some(ix)) = (tier.whole, &mut tier.index) {
+            if ix.drop(eid).is_err() {
+                self.index_errors += 1;
+            }
+        }
+        self.commits.retain(|c| *c != (te, eid));
+        let keep = p - b;
+        // an entry stored past its storable rows (an older engine): those blocks go
+        tier.alloc.release(&old.slots[keep..]);
+        let t = te as u32;
+        self.io.extend(pages[p..].iter().zip(&new).map(|(&page, &slot)| Io::Spill { tier: t, page, slot, part: Part::Full }));
+        let mut slots = old.slots[..keep].to_vec();
+        slots.extend(new);
+        let id = self.next_id;
+        self.next_id += 1;
+        let tier = &mut self.tiers[te];
+        tier.stats.spilled_pages += (n - p) as u64;
+        tier.entries.push(Entry { id, kind: Kind::Evicted, key, st: st.clone(), slots, base, hits, tail: None, state: 0, namespace });
+        if tier.index.is_some() && tier.whole {
+            self.commits.push((te, id));
+        }
+        true
     }
 
     // a prefix entry of its own (no base): its id, or None when no tier takes it
@@ -751,6 +996,7 @@ impl Stash {
             base: None,
             hits,
             tail: None,
+            state: 0,
             namespace: crate::pool::STOCK_NAMESPACE,
         });
         if tier.index.is_some() {
@@ -764,21 +1010,12 @@ impl Stash {
     fn place(&mut self, start: usize, kind: Kind, n: usize, rows: u64, hits: u32) -> Option<(usize, Vec<u64>)> {
         let mut refused = None;
         for t in start..self.tiers.len() {
-            if !self.tiers[t].keep.takes(kind) {
-                continue;
-            }
-            if n as u64 > self.tiers[t].slots {
-                self.tiers[t].stats.oversize += 1;
-                self.tiers[t].stats.oversize_last = n as u64;
-                continue;
-            }
-            if !self.tiers[t].admits(kind, rows, hits) || !self.writable() {
-                refused.get_or_insert(t);
-                continue;
-            }
-            if self.make_room(t, n) {
-                self.charge(n);
-                return Some((t, self.tiers[t].alloc.alloc(n).expect("room made")));
+            match self.try_place(t, kind, n, rows, hits) {
+                Ok(slots) => return Some((t, slots)),
+                Err(true) => {
+                    refused.get_or_insert(t);
+                }
+                Err(false) => {}
             }
         }
         if let Some(t) = refused {
@@ -788,12 +1025,42 @@ impl Stash {
         None
     }
 
+    // tier t's slots for n blocks, when its keep and policy take the entry and it can make room. Err(true): the policy or
+    // the write limit refused it; Err(false): the tier does not keep the kind, is too small, or is full of pinned entries
+    fn try_place(&mut self, t: usize, kind: Kind, n: usize, rows: u64, hits: u32) -> Result<Vec<u64>, bool> {
+        if !self.tiers[t].keep.takes(kind) {
+            return Err(false);
+        }
+        if n as u64 > self.tiers[t].slots {
+            self.tiers[t].stats.oversize += 1;
+            self.tiers[t].stats.oversize_last = n as u64;
+            return Err(false);
+        }
+        if !self.tiers[t].admits(kind, rows, hits) || !self.writable() {
+            return Err(true);
+        }
+        if self.make_room(t, n) {
+            self.charge(n);
+            return Ok(self.tiers[t].alloc.alloc(n).expect("room made"));
+        }
+        Err(false)
+    }
+
+    // evicts tier t's least recently used unpinned entries until n slots are free. Leaves first: the oldest entry no
+    // entry uses as its base, so a shared base leaves after the runs on it; else the oldest unpinned one
     fn make_room(&mut self, t: usize, n: usize) -> bool {
         if self.tiers[t].alloc.free() < n as u64 {
             self.tiers[t].stats.full += 1;
         }
         while self.tiers[t].alloc.free() < n as u64 {
-            let Some(i) = self.tiers[t].entries.iter().position(|e| !self.pin.contains(&e.id)) else { return false };
+            let bases: HashSet<u64> = self.tiers.iter().flat_map(|x| &x.entries).filter_map(|e| e.base.map(|b| b.0)).collect();
+            let entries = &self.tiers[t].entries;
+            let unpinned = |e: &&Entry| !self.pin.contains(&e.id);
+            let pick = entries
+                .iter()
+                .position(|e| unpinned(&e) && !bases.contains(&e.id))
+                .or_else(|| entries.iter().position(|e| unpinned(&e)));
+            let Some(i) = pick else { return false };
             let e = self.tiers[t].entries.remove(i);
             self.evict(t, e);
         }
@@ -802,8 +1069,9 @@ impl Stash {
 
     // e leaves tier t for the next tier that keeps its kind, or is dropped. Tier t frees e's slots after queueing the move.
     fn evict(&mut self, t: usize, e: Entry) {
+        let whole = self.tiers[t].whole;
         if let Some(ix) = &mut self.tiers[t].index {
-            if e.kind.prefix() && ix.drop(e.id).is_err() {
+            if (e.kind.prefix() || whole) && ix.drop(e.id).is_err() {
                 self.index_errors += 1;
             }
         }
@@ -823,7 +1091,7 @@ impl Stash {
                 }));
                 let to = &mut self.tiers[u];
                 to.stats.moved_in_pages += new.len() as u64;
-                if e.kind.prefix() && to.index.is_some() {
+                if to.index.is_some() && (e.kind.prefix() || to.whole) {
                     self.commits.push((u, e.id));
                 }
                 self.tiers[u].entries.insert(0, Entry { slots: new, ..e.clone() });
@@ -849,6 +1117,11 @@ impl Stash {
                 all.into_iter().partition(|e| e.base.is_some_and(|b| b.0 == id));
             self.tiers[t].entries = keep;
             for e in gone {
+                if let (true, Some(ix)) = (self.tiers[t].whole, &mut self.tiers[t].index) {
+                    if ix.drop(e.id).is_err() {
+                        self.index_errors += 1;
+                    }
+                }
                 self.tiers[t].alloc.release(&e.slots);
                 self.tiers[t].stats.dropped += 1;
                 self.tiers[t].stats.dropped_pages += e.slots.len() as u64;
@@ -873,17 +1146,16 @@ impl Stash {
         self.tiers.iter().flat_map(|t| &t.entries).find(|e| e.id == id).map(|e| &e.st.history[..])
     }
 
-    /// A hit's entry, for a grant: an evicted run leaves its tier (its slots stay held until restore() queues the
-    /// copies), a shared prefix stays, pinned against this call's placements, and becomes the most recently used.
+    /// A hit's entry, for a grant: it stays in its tier (an evicted run too: the grant's run, stored later, extends it
+    /// in place), pinned with its base against this call's placements, and becomes the most recently used. No index
+    /// record changes, so a crash before the run is stored again still finds the entry.
     pub(crate) fn begin_restore(&mut self, t: usize, id: u64) -> Entry {
         let tier = &mut self.tiers[t];
         let i = tier.entries.iter().position(|e| e.id == id).expect("found by the caller");
         let e = tier.entries.remove(i);
         tier.stats.hits += 1;
-        if e.kind.prefix() {
-            tier.entries.push(e.clone());
-            self.pin.push(id);
-        }
+        tier.entries.push(e.clone());
+        self.pin.push(id);
         self.pin.extend(e.base.map(|b| b.0));
         e
     }
@@ -904,7 +1176,7 @@ impl Stash {
             self.tiers[u].stats.restored_pages += b as u64;
         }
         let tier = t as u32;
-        let below = e.slots.len() - e.tail.map_or(0, |x| (x.own + x.rep) as usize);
+        let below = e.slots.len() - e.state as usize - e.tail.map_or(0, |x| (x.own + x.rep) as usize);
         let own = &e.slots[..below];
         let n = own.len().min(pages.len().saturating_sub(b));
         self.io.extend(own.iter().zip(&pages[b..b + n]).map(|(&slot, &page)| Io::Restore {
@@ -943,10 +1215,811 @@ impl Stash {
             restored += shard.len() + cap as usize;
         }
         self.tiers[t].stats.restored_pages += restored as u64;
-        if e.kind == Kind::Evicted {
-            self.tiers[t].alloc.release(&e.slots);
-        }
         self.pin.clear();
+    }
+
+    /// Configures trailing boundary-state blocks (`Part::State(0..state_blocks)`) and MTP 1-token lookahead for
+    /// standalone `g6kv_stash` engines (slot-slab or hybrid recurrent/rolling-state models).
+    pub fn set_state_mode(&mut self, state_blocks: u32, mtp: bool) {
+        self.state_blocks = state_blocks;
+        self.state_mtp = mtp;
+    }
+
+    pub fn state_blocks(&self) -> u32 {
+        self.state_blocks
+    }
+
+    pub fn state_mtp(&self) -> bool {
+        self.state_mtp
+    }
+
+    pub fn set_rules(&mut self, rules: crate::reuse::Rules) {
+        self.rules = rules;
+        self.reuse_grid = rules.grid.max(0) as u64;
+        if rules.grid > 0 {
+            self.grid = rules.grid as u64;
+        }
+    }
+
+    pub fn earn_pages(&mut self, pages: u64) {
+        self.earn(pages);
+    }
+
+    pub fn io_pending_count(&self) -> usize {
+        self.io.len()
+    }
+
+    pub fn take_pending_io(&mut self) -> Vec<Io> {
+        self.take_io()
+    }
+
+    pub fn finish_io(&mut self) -> io::Result<()> {
+        if self.ages_on {
+            let now = std::time::Instant::now();
+            let mut live = HashSet::new();
+            for tier in &self.tiers {
+                for e in &tier.entries {
+                    self.seen.entry(e.id).or_insert(now);
+                    live.insert(e.id);
+                }
+            }
+            self.seen.retain(|id, _| live.contains(id));
+        }
+        self.io_done()
+    }
+
+    pub fn entry_info(&self, id: u64) -> Option<(u32, &Entry)> {
+        self.tiers.iter().enumerate().find_map(|(t, tier)| tier.entries.iter().find(|e| e.id == id).map(|e| (t as u32, e)))
+    }
+
+    pub fn has_entry(&self, id: u64) -> bool {
+        self.tiers.iter().any(|t| t.entries.iter().any(|e| e.id == id))
+    }
+
+    /// Drops stored entry `id` when no other entry depends on it as a prefix base.
+    pub fn drop_entry(&mut self, id: u64) -> Result<bool, crate::pool::Error> {
+        if self.pending() {
+            return Err(crate::pool::Error::PendingIo);
+        }
+        if self.tiers.iter().flat_map(|t| &t.entries).any(|e| e.base.is_some_and(|b| b.0 == id)) {
+            return Ok(false);
+        }
+        let Some(t) = self.tiers.iter().position(|t| t.entries.iter().any(|e| e.id == id)) else {
+            return Ok(false);
+        };
+        let i = self.tiers[t].entries.iter().position(|e| e.id == id).expect("found");
+        let e = self.tiers[t].entries.remove(i);
+        let whole = self.tiers[t].whole;
+        if let Some(ix) = &mut self.tiers[t].index {
+            if (e.kind.prefix() || whole) && ix.drop(e.id).is_err() {
+                self.index_errors += 1;
+            }
+        }
+        self.commits.retain(|c| *c != (t, e.id));
+        self.tiers[t].alloc.release(&e.slots);
+        Ok(true)
+    }
+
+    /// Counts a stock prompt toward shared-prefix promotion unless it continues a resident or stored conversation.
+    pub fn count_admission(
+        &mut self,
+        prompt: &[i32],
+        span: Option<u32>,
+        namespace: crate::pool::Namespace,
+        resident_continuing: bool,
+    ) -> u32 {
+        if namespace != crate::pool::STOCK_NAMESPACE {
+            return 0;
+        }
+        let continuing = resident_continuing || self.continues_stored(prompt);
+        let s = span.map(|sp| self.span_rows(sp, prompt.len()));
+        self.count(prompt, continuing, s)
+    }
+
+    /// Finds the best stored hit for `prompt` under `rules` and `namespace`.
+    /// When `state_blocks > 0`, page-only `Kind::Prefix` bases (`e.state == 0`) are skipped as standalone hits, and
+    /// entries with boundary state (`e.state > 0`) match only at their exact `e.st.valid` boundary.
+    pub fn match_state(&self, prompt: &[i32], limit: i32, namespace: crate::pool::Namespace) -> crate::pool::Hit {
+        let mut best = crate::pool::Hit::default();
+        for t in 0..self.tiers() {
+            for e in self.entries(t) {
+                if self.state_blocks > 0 && e.state == 0 {
+                    continue;
+                }
+                if e.namespace != namespace {
+                    if best.skip == 0 {
+                        best.why = crate::reuse::Why::Namespace;
+                    }
+                    continue;
+                }
+                let mut b = crate::reuse::begin(&self.rules, &e.st, prompt, limit, self.state_mtp);
+                if e.state > 0 && b.skip > 0 && b.skip != e.st.valid {
+                    b.skip = 0;
+                    b.why = crate::reuse::Why::NoLcp;
+                }
+                if b.skip <= 0 {
+                    if best.skip == 0 && b.lcp >= best.lcp {
+                        best.lcp = b.lcp;
+                        best.why = b.why;
+                    }
+                    continue;
+                }
+                let tier = t as u32;
+                if b.skip > best.skip || (best.stored && b.skip == best.skip && tier == best.tier && e.id > best.age) {
+                    best = crate::pool::Hit {
+                        skip: b.skip,
+                        lcp: b.lcp,
+                        why: crate::reuse::Why::Stored,
+                        age: e.id,
+                        stored: true,
+                        tier,
+                    };
+                }
+            }
+        }
+        best
+    }
+
+    /// Queues `Io::Restore` copies for stored entry `id` in tier `t` into `pages[0..e.below())` (`Part::Full`) and
+    /// `state_handle` (`Part::State(0..e.state)`). Returns `(valid, hits, full_pages_restored)`.
+    pub fn restore_entry(
+        &mut self,
+        t: usize,
+        id: u64,
+        pages: &[u32],
+        state_handle: u32,
+    ) -> Result<(i32, u32, usize), crate::pool::Error> {
+        if self.pending() {
+            return Err(crate::pool::Error::PendingIo);
+        }
+        let Some(found) = self.find(t, id) else {
+            return Err(crate::pool::Error::NotRetained);
+        };
+        if self.state_blocks > 0 && found.state == 0 {
+            return Err(crate::pool::Error::NoHit);
+        }
+        if pages.len() < found.below() {
+            return Err(crate::pool::Error::BadArgument);
+        }
+        let e = self.begin_restore(t, id);
+        if self.ages_on {
+            let now = std::time::Instant::now();
+            self.seen.insert(id, now);
+            if let Some((b, _)) = e.base {
+                self.seen.insert(b, now);
+            }
+        }
+        let full = e.below();
+        let b = e.base.map_or(0, |b| b.1);
+        if let Some((base, _)) = e.base {
+            let (u, slots) = self.locate(base).expect("a base outlives the runs on it");
+            let copies: Vec<Io> = slots[..b]
+                .iter()
+                .zip(&pages[..b])
+                .map(|(&slot, &page)| Io::Restore { tier: u as u32, slot, page, part: Part::Full })
+                .collect();
+            self.io.extend(copies);
+            self.tiers[u].stats.restored_pages += b as u64;
+        }
+        let own_pages = full - b;
+        let tier = t as u32;
+        self.io.extend(e.slots[..own_pages].iter().zip(&pages[b..full]).map(|(&slot, &page)| Io::Restore {
+            tier,
+            slot,
+            page,
+            part: Part::Full,
+        }));
+        let st_slots = &e.slots[own_pages..own_pages + e.state as usize];
+        self.io.extend(st_slots.iter().enumerate().map(|(i, &slot)| Io::Restore {
+            tier,
+            slot,
+            page: state_handle,
+            part: Part::State(i as u32),
+        }));
+        self.tiers[t].stats.restored_pages += (own_pages + e.state as usize) as u64;
+        self.pin.clear();
+        Ok((e.st.valid, e.hits, full))
+    }
+
+    fn sole_prefix_in_tier(&self, te: usize, bid: u64, only_dep: u64, keep_id: Option<u64>) -> bool {
+        if keep_id == Some(bid) || self.pin.contains(&bid) {
+            return false;
+        }
+        let Some(be) = self.tiers[te].entries.iter().find(|e| e.id == bid) else {
+            return false;
+        };
+        if be.kind != Kind::Prefix || be.state != 0 || be.base.is_some() {
+            return false;
+        }
+        !self
+            .tiers
+            .iter()
+            .flat_map(|t| &t.entries)
+            .any(|e| e.id != only_dep && e.base.is_some_and(|b| b.0 == bid))
+    }
+
+    fn pin_with_keep(&mut self, extra: &[u64], keep_id: Option<u64>) -> Vec<u64> {
+        let saved = std::mem::take(&mut self.pin);
+        let mut next = saved.clone();
+        next.extend_from_slice(extra);
+        if let Some(kid) = keep_id {
+            next.push(kid);
+            if let Some(kb) = self.tiers.iter().flat_map(|t| &t.entries).find(|e| e.id == kid).and_then(|e| e.base) {
+                next.push(kb.0);
+            }
+        }
+        self.pin = next;
+        saved
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn extend_state(
+        &mut self,
+        eid: u64,
+        p: usize,
+        st: &Finished,
+        pages: &[u32],
+        state_handle: u32,
+        hits: u32,
+        namespace: crate::pool::Namespace,
+        keep_id: Option<u64>,
+    ) -> Option<Option<u64>> {
+        let n = pages.len();
+        let Some(te) = self.tiers.iter().position(|t| t.entries.iter().any(|e| e.id == eid)) else {
+            return None;
+        };
+        let e = self.tiers[te].entries.iter().find(|e| e.id == eid).expect("found");
+        let absorb = e.base.is_some_and(|(bid, b)| {
+            self.sole_prefix_in_tier(te, bid, eid, keep_id)
+                && self.tiers[te].entries.iter().find(|x| x.id == bid).is_some_and(|x| x.slots.len() == b)
+        });
+        let b = if absorb { 0 } else { e.base.map_or(0, |b| b.1) };
+        let cut = if self.state_blocks > 0 { e.st.valid.max(0) as usize } else { self.storable(&e.st) as usize };
+        let m = (cut + usize::from(self.state_mtp)).min(e.st.history.len());
+        let ok = e.kind == Kind::Evicted
+            && e.tail.is_none()
+            && e.namespace == namespace
+            && !self.pin.contains(&eid)
+            && keep_id != Some(eid)
+            && p >= cut / PAGE as usize
+            && p <= e.below()
+            && p >= b
+            && p <= n
+            && st.valid >= e.st.valid
+            && st.history.len() >= m
+            && st.history[..m] == e.st.history[..m];
+        if !ok {
+            return None;
+        }
+        let need = (n - p) + self.state_blocks as usize;
+        if need == 0 && st.valid == e.st.valid {
+            return Some(Some(eid));
+        }
+        let base = if absorb { None } else { e.base };
+        let orig_base_id = e.base.map(|x| x.0);
+        let mut extra = vec![eid];
+        if let Some(bid) = orig_base_id {
+            extra.push(bid);
+        }
+        let saved_pin = self.pin_with_keep(&extra, keep_id);
+        let placed = self.try_place(te, Kind::Evicted, need, st.valid.max(0) as u64, hits);
+        self.pin = saved_pin;
+        let new = match placed {
+            Ok(slots) => slots,
+            Err(refused) => {
+                if refused {
+                    self.tiers[te].stats.refused += 1;
+                    self.tiers[te].stats.refused_pages += need as u64;
+                }
+                return Some(Some(eid));
+            }
+        };
+        let mut prefix_slots = Vec::new();
+        if absorb {
+            let bid = orig_base_id.expect("absorb has base");
+            let tier = &mut self.tiers[te];
+            let bi = tier.entries.iter().position(|x| x.id == bid).expect("pinned");
+            let b_old = tier.entries.remove(bi);
+            if let Some(ix) = &mut tier.index {
+                if ix.drop(bid).is_err() {
+                    self.index_errors += 1;
+                }
+            }
+            self.commits.retain(|c| *c != (te, bid));
+            prefix_slots = b_old.slots;
+        }
+        let tier = &mut self.tiers[te];
+        let i = tier.entries.iter().position(|x| x.id == eid).expect("pinned");
+        let old = tier.entries.remove(i);
+        if let (true, Some(ix)) = (tier.whole, &mut tier.index) {
+            if ix.drop(eid).is_err() {
+                self.index_errors += 1;
+            }
+        }
+        self.commits.retain(|c| *c != (te, eid));
+        let old_b = old.base.map_or(0, |x| x.1);
+        let keep_own = p - old_b;
+        tier.alloc.release(&old.slots[keep_own..]);
+        let t = te as u32;
+        let new_pages = n - p;
+        self.io.extend(pages[p..].iter().zip(&new[..new_pages]).map(|(&page, &slot)| Io::Spill {
+            tier: t,
+            page,
+            slot,
+            part: Part::Full,
+        }));
+        self.io.extend(new[new_pages..].iter().enumerate().map(|(k, &slot)| Io::Spill {
+            tier: t,
+            page: state_handle,
+            slot,
+            part: Part::State(k as u32),
+        }));
+        let mut slots = prefix_slots;
+        slots.extend_from_slice(&old.slots[..keep_own]);
+        slots.extend(new);
+        let id = self.next_id;
+        self.next_id += 1;
+        let tier = &mut self.tiers[te];
+        tier.stats.spilled_pages += need as u64;
+        tier.entries.push(Entry {
+            id,
+            kind: Kind::Evicted,
+            key: 0,
+            st: st.clone(),
+            slots,
+            base,
+            hits,
+            tail: None,
+            state: self.state_blocks,
+            namespace,
+        });
+        if tier.index.is_some() && tier.whole {
+            self.commits.push((te, id));
+        }
+        Some(Some(id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sibling_share_state(
+        &mut self,
+        eid: u64,
+        p: usize,
+        st: &Finished,
+        pages: &[u32],
+        state_handle: u32,
+        hits: u32,
+        keep_id: Option<u64>,
+        namespace: crate::pool::Namespace,
+    ) -> Option<Option<u64>> {
+        let n = pages.len();
+        if p == 0 {
+            return None;
+        }
+        let te = self.tiers.iter().position(|t| t.entries.iter().any(|e| e.id == eid))?;
+        let e = self.tiers[te].entries.iter().find(|e| e.id == eid).expect("found");
+        let cut = e.st.valid.max(0) as usize;
+        let m = (cut + usize::from(self.state_mtp)).min(e.st.history.len());
+        let ok = e.kind == Kind::Evicted
+            && e.tail.is_none()
+            && e.namespace == namespace
+            && p == e.below()
+            && p <= n
+            && st.valid >= e.st.valid
+            && st.history.len() >= m
+            && st.history[..m] == e.st.history[..m];
+        if !ok {
+            return None;
+        }
+        let existing_base = e.base;
+        // Moving owned immutable pages into the existing same-tier base avoids rewriting the
+        // intermediate prefix when a prompt boundary already shares an earlier request's pages.
+        // Do not mutate a base with rolling state or divergent tokens.
+        if let Some((bid, b)) = existing_base {
+            let base = self.tiers[te].entries.iter().find(|x| x.id == bid)?;
+            if b < p && (base.state != 0 || base.base.is_some() || base.below() != b
+                || base.namespace != namespace || !st.history.starts_with(&base.st.history)) {
+                return None;
+            }
+        }
+        let share_pages = p;
+        let need = (n - share_pages) + self.state_blocks as usize;
+        let mut extra = vec![eid];
+        if let Some((bid, _)) = existing_base {
+            extra.push(bid);
+        }
+        let saved_pin = self.pin_with_keep(&extra, keep_id);
+        let placed = self.try_place(te, Kind::Evicted, need, st.valid.max(0) as u64, hits);
+        self.pin = saved_pin;
+        let new = match placed {
+            Ok(slots) => slots,
+            Err(refused) => {
+                if refused {
+                    self.tiers[te].stats.refused += 1;
+                    self.tiers[te].stats.refused_pages += need as u64;
+                }
+                return Some(None);
+            }
+        };
+        let base = match existing_base {
+            Some((bid, b)) => {
+                if b < p {
+                    let tier = &mut self.tiers[te];
+                    let ei = tier.entries.iter().position(|x| x.id == eid).expect("pinned");
+                    let added: Vec<_> = tier.entries[ei].slots.drain(..p - b).collect();
+                    tier.entries[ei].base = Some((bid, p));
+                    let updated_e = tier.entries[ei].clone();
+                    let base = tier.entries.iter_mut().find(|x| x.id == bid).expect("pinned");
+                    base.slots.extend(added);
+                    let rows = p * PAGE as usize;
+                    base.st = Finished { history: st.history[..rows + usize::from(self.state_mtp)].to_vec(),
+                        valid: rows as i32, written_end: rows as i32, pf_end: rows as i32 };
+                    base.key = prefix_key(&base.st.history);
+                    if let Some(ix) = &mut tier.index {
+                        if ix.add(base).is_err() { self.index_errors += 1; }
+                        if tier.whole && ix.add(&updated_e).is_err() { self.index_errors += 1; }
+                    }
+                }
+                Some((bid, p))
+            },
+            None => {
+                let s = p as u64 * PAGE;
+                let hlen = (s as usize + usize::from(self.state_mtp)).min(st.history.len());
+                let fin = Finished {
+                    history: st.history[..hlen].to_vec(),
+                    valid: s as i32,
+                    written_end: s as i32,
+                    pf_end: s as i32,
+                };
+                let bkey = prefix_key(&fin.history);
+                let bid = self.next_id;
+                self.next_id += 1;
+                let tier = &mut self.tiers[te];
+                let ei = tier.entries.iter().position(|x| x.id == eid).expect("pinned");
+                let b_slots = tier.entries[ei].slots[..p].to_vec();
+                tier.entries[ei].slots.drain(..p);
+                tier.entries[ei].base = Some((bid, p));
+                let updated_e = tier.entries[ei].clone();
+                let b_entry = Entry {
+                    id: bid,
+                    kind: Kind::Prefix,
+                    key: bkey,
+                    st: fin,
+                    slots: b_slots,
+                    base: None,
+                    hits: 0,
+                    tail: None,
+                    state: 0,
+                    namespace,
+                };
+                tier.entries.insert(ei, b_entry.clone());
+                if let Some(ix) = &mut tier.index {
+                    if ix.add(&b_entry).is_err() {
+                        self.index_errors += 1;
+                    }
+                    if tier.whole && ix.add(&updated_e).is_err() {
+                        self.index_errors += 1;
+                    }
+                }
+                Some((bid, p))
+            }
+        };
+        let t = te as u32;
+        let new_pages = n - share_pages;
+        self.io.extend(pages[share_pages..].iter().zip(&new[..new_pages]).map(|(&page, &slot)| Io::Spill {
+            tier: t,
+            page,
+            slot,
+            part: Part::Full,
+        }));
+        self.io.extend(new[new_pages..].iter().enumerate().map(|(k, &slot)| Io::Spill {
+            tier: t,
+            page: state_handle,
+            slot,
+            part: Part::State(k as u32),
+        }));
+        let id = self.next_id;
+        self.next_id += 1;
+        let tier = &mut self.tiers[te];
+        tier.stats.spilled_pages += need as u64;
+        tier.entries.push(Entry {
+            id,
+            kind: Kind::Evicted,
+            key: 0,
+            st: st.clone(),
+            slots: new,
+            base,
+            hits,
+            tail: None,
+            state: self.state_blocks,
+            namespace,
+        });
+        if tier.index.is_some() && tier.whole {
+            self.commits.push((te, id));
+        }
+        Some(Some(id))
+    }
+
+    /// Captures a session snapshot (`Kind::Evicted`) into the tiers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_entry(
+        &mut self,
+        mut st: Finished,
+        pages: &[u32],
+        state_handle: u32,
+        hits: u32,
+        namespace: crate::pool::Namespace,
+        from: Option<(u64, usize)>,
+        keep_from: bool,
+        keep_id: Option<u64>,
+        resident: &[&[i32]],
+    ) -> Result<Option<u64>, crate::pool::Error> {
+        if self.pending() {
+            return Err(crate::pool::Error::PendingIo);
+        }
+        let stock = namespace == crate::pool::STOCK_NAMESPACE;
+        if stock {
+            self.forget(&st);
+        }
+        if st.valid <= 0 {
+            return Ok(None);
+        }
+        if self.state_blocks == 0 {
+            let cut = self.storable(&st);
+            st.valid = cut as i32;
+            if st.valid <= 0 {
+                return Ok(None);
+            }
+        }
+        let full_pages = if self.state_blocks > 0 {
+            (st.valid as u64 / PAGE) as usize
+        } else {
+            self::pages(st.valid as u64)
+        };
+        if pages.len() < full_pages {
+            return Err(crate::pool::Error::BadArgument);
+        }
+        let pages = &pages[..full_pages];
+        let rows = st.valid as u64;
+        if !self.tiers.iter().any(|t| t.keep.takes(Kind::Evicted) && t.admits(Kind::Evicted, rows, hits)) {
+            if let Some(t) = self.tiers.iter_mut().find(|t| t.keep.takes(Kind::Evicted)) {
+                t.stats.refused += 1;
+                t.stats.refused_pages += (pages.len() + self.state_blocks as usize) as u64;
+            }
+            return Ok(None);
+        }
+        if let Some((eid, p)) = from {
+            if keep_from && self.state_blocks > 0 {
+                if let Some(res) = self.sibling_share_state(eid, p, &st, pages, state_handle, hits, keep_id, namespace) {
+                    return Ok(res);
+                }
+            } else if !keep_from {
+                if let Some(res) = self.extend_state(eid, p, &st, pages, state_handle, hits, namespace, keep_id) {
+                    return Ok(res);
+                }
+            }
+        }
+        let mut base = if stock { self.shared_base(&st.history, pages.len()) } else { None };
+        if stock && base.is_none() && self.dedupe {
+            let s = self.resident_prefix(&st, pages.len(), resident);
+            if s > 0 && s.is_multiple_of(PAGE) {
+                let hlen = (s as usize + usize::from(self.state_mtp)).min(st.history.len());
+                let fin = Finished {
+                    history: st.history[..hlen].to_vec(),
+                    valid: s as i32,
+                    written_end: s as i32,
+                    pf_end: s as i32,
+                };
+                let key = prefix_key(&fin.history);
+                let b_pages = (s / PAGE) as usize;
+                let saved_pin = self.pin_with_keep(&[], keep_id);
+                let put_id = self.put(Kind::Prefix, key, fin, &pages[..b_pages], 0);
+                self.pin = saved_pin;
+                if let Some(id) = put_id {
+                    base = Some((id, b_pages));
+                }
+            }
+        }
+        let own = &pages[base.map_or(0, |b| b.1)..];
+        let need = own.len() + self.state_blocks as usize;
+        if need == 0 {
+            return Ok(None);
+        }
+        let mut extra = Vec::new();
+        if let Some((bid, _)) = base {
+            extra.push(bid);
+        }
+        let saved_pin = self.pin_with_keep(&extra, keep_id);
+        let placed = self.place(0, Kind::Evicted, need, rows, hits);
+        self.pin = saved_pin;
+        let Some((t, slots)) = placed else { return Ok(None) };
+        let tier = t as u32;
+        self.io.extend(own.iter().zip(&slots[..own.len()]).map(|(&page, &slot)| Io::Spill {
+            tier,
+            page,
+            slot,
+            part: Part::Full,
+        }));
+        self.io.extend(slots[own.len()..].iter().enumerate().map(|(k, &slot)| Io::Spill {
+            tier,
+            page: state_handle,
+            slot,
+            part: Part::State(k as u32),
+        }));
+        let id = self.next_id;
+        self.next_id += 1;
+        let tier = &mut self.tiers[t];
+        tier.stats.spilled_pages += need as u64;
+        tier.entries.push(Entry {
+            id,
+            kind: Kind::Evicted,
+            key: 0,
+            st,
+            slots,
+            base,
+            hits,
+            tail: None,
+            state: self.state_blocks,
+            namespace,
+        });
+        if tier.index.is_some() && tier.whole {
+            self.commits.push((t, id));
+        }
+        Ok(Some(id))
+    }
+
+    /// Promotes a shared system prefix (`shared_after` conversations) in standalone `g6kv_stash` mode.
+    /// When `state_blocks > 0`, an exact boundary (`st.valid == s`) promotes `Kind::Shared` with boundary state so any
+    /// matching prompt restores it standalone; a longer run (`st.valid > s`) promotes `Kind::Prefix` (`state = 0`, full
+    /// pages only) so later conversations deduplicate those prefix pages without reading stale rolling state.
+    pub fn promote_state(
+        &mut self,
+        st: &Finished,
+        pages: &[u32],
+        state_handle: u32,
+        rows_max: u64,
+        span: Option<u32>,
+        keep_id: Option<u64>,
+    ) -> Result<(), crate::pool::Error> {
+        if self.pending() {
+            return Err(crate::pool::Error::PendingIo);
+        }
+        let span_rows = span.map(|sp| self.span_rows(sp, st.history.len()));
+        if self.state_blocks == 0 {
+            let saved_pin = self.pin_with_keep(&[], keep_id);
+            self.promote(pages, st, rows_max, span_rows);
+            self.pin = saved_pin;
+            return Ok(());
+        }
+        if !self.counting() || st.valid <= 0 || st.history.is_empty() {
+            return Ok(());
+        }
+        let g = self.grid;
+        let mtp = usize::from(self.state_mtp);
+        let top = (st.valid as u64).min(st.history.len().saturating_sub(mtp) as u64).min(rows_max).min(pages.len() as u64 * PAGE);
+        let mut s = top.min(span_rows.unwrap_or(u64::MAX)) / g * g;
+        while s >= g {
+            if !s.is_multiple_of(PAGE) {
+                s -= g;
+                continue;
+            }
+            let key = prefix_key(&st.history[..s as usize + mtp]);
+            if self.count_of(key) >= self.shared_after {
+                let exact = st.valid as u64 == s;
+                let already = self.tiers.iter().flat_map(|t| &t.entries).any(|e| {
+                    e.namespace == crate::pool::STOCK_NAMESPACE && e.kind.prefix() && e.key == key && (!exact || e.state > 0)
+                });
+                if already {
+                    return Ok(());
+                }
+                let n_pages = (s / PAGE) as usize;
+                let fin = Finished {
+                    history: st.history[..s as usize + mtp].to_vec(),
+                    valid: s as i32,
+                    written_end: s as i32,
+                    pf_end: s as i32,
+                };
+                if exact {
+                    let need = n_pages + self.state_blocks as usize;
+                    let saved_pin = self.pin_with_keep(&[], keep_id);
+                    let placed = self.place(0, Kind::Shared, need, s, 0);
+                    self.pin = saved_pin;
+                    if let Some((t, slots)) = placed {
+                        let tier = t as u32;
+                        self.io.extend(pages[..n_pages].iter().zip(&slots[..n_pages]).map(|(&page, &slot)| Io::Spill {
+                            tier,
+                            page,
+                            slot,
+                            part: Part::Full,
+                        }));
+                        self.io.extend(slots[n_pages..].iter().enumerate().map(|(k, &slot)| Io::Spill {
+                            tier,
+                            page: state_handle,
+                            slot,
+                            part: Part::State(k as u32),
+                        }));
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        let tier = &mut self.tiers[t];
+                        tier.stats.spilled_pages += need as u64;
+                        tier.entries.push(Entry {
+                            id,
+                            kind: Kind::Shared,
+                            key,
+                            st: fin,
+                            slots,
+                            base: None,
+                            hits: 0,
+                            tail: None,
+                            state: self.state_blocks,
+                            namespace: crate::pool::STOCK_NAMESPACE,
+                        });
+                        if tier.index.is_some() {
+                            self.commits.push((t, id));
+                        }
+                    }
+                } else {
+                    let saved_pin = self.pin_with_keep(&[], keep_id);
+                    let _ = self.put(Kind::Prefix, key, fin, &pages[..n_pages], 0);
+                    self.pin = saved_pin;
+                }
+                return Ok(());
+            }
+            s -= g;
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> u64 {
+        fn mix64(mut h: u64, v: u64) -> u64 {
+            for i in 0..8 {
+                h ^= (v >> (8 * i)) & 0xff;
+                h = h.wrapping_mul(1099511628211);
+            }
+            h
+        }
+        self.fold(FNV, mix64)
+    }
+
+    pub fn coldest_ages(&mut self, t: usize, per_seg: u64, most: usize) -> Vec<u64> {
+        if t >= self.tiers() {
+            return Vec::new();
+        }
+        self.ages_on = true;
+        let now = std::time::Instant::now();
+        let mut live = HashSet::new();
+        for tier in &self.tiers {
+            for e in &tier.entries {
+                self.seen.entry(e.id).or_insert(now);
+                live.insert(e.id);
+            }
+        }
+        self.seen.retain(|id, _| live.contains(id));
+        let mut at = self.seen.clone();
+        for tier in &self.tiers {
+            for e in &tier.entries {
+                if let Some((b, _)) = e.base {
+                    let u = self.seen[&e.id];
+                    if let Some(v) = at.get_mut(&b) {
+                        *v = (*v).max(u);
+                    }
+                }
+            }
+        }
+        crate::remote::coldest_ages(
+            &self.give_order(t),
+            |id| at.get(&id).map_or(0, |u| now.duration_since(*u).as_millis() as u64),
+            per_seg,
+            self.stats(t).map_or(0, |x| x.free_slots),
+            most,
+        )
+    }
+
+    fn summary_line(t: usize, e: &Entry) -> String {
+        if e.state == 0 {
+            format!("{t} {} {:x} {} {:x}", e.id, e.key, e.st.valid, slots_hash(&e.slots))
+        } else {
+            format!("{t} {} {:x} {} {:x} s{}", e.id, e.key, e.st.valid, slots_hash(&e.slots), e.state)
+        }
     }
 
     /// The entries loaded from indexes, one line each. Every rank compares these lines at boot.
@@ -954,7 +2027,8 @@ impl Stash {
         let mut s = String::new();
         for (t, tier) in self.tiers.iter().enumerate() {
             for e in &tier.entries {
-                s += &format!("{t} {} {:x} {} {:x}\n", e.id, e.key, e.st.valid, slots_hash(&e.slots));
+                s += &Self::summary_line(t, e);
+                s.push('\n');
             }
         }
         for (k, c) in &self.counts {
@@ -970,10 +2044,10 @@ impl Stash {
         self.clock = self.counts.values().map(|c| c.1).max().unwrap_or(0);
         for t in 0..self.tiers.len() {
             let all = std::mem::take(&mut self.tiers[t].entries);
-            let line = |e: &Entry| format!("{t} {} {:x} {} {:x}", e.id, e.key, e.st.valid, slots_hash(&e.slots));
             let mut kept: Vec<(usize, Entry)> = Vec::new();
             for e in all {
-                match want.iter().position(|w| *w == line(&e)) {
+                let line = Self::summary_line(t, &e);
+                match want.iter().position(|w| *w == line) {
                     Some(i) => kept.push((i, e)),
                     None => {
                         if let Some(ix) = &mut self.tiers[t].index {
@@ -987,6 +2061,26 @@ impl Stash {
             }
             kept.sort_by_key(|k| k.0);
             self.tiers[t].entries = kept.into_iter().map(|k| k.1).collect();
+        }
+        // Agreement on a dependent record alone is insufficient: its base must also survive.
+        loop {
+            let ids: HashSet<u64> = self.tiers.iter().flat_map(|t| &t.entries).map(|e| e.id).collect();
+            let mut removed = false;
+            for tier in &mut self.tiers {
+                let all = std::mem::take(&mut tier.entries);
+                for e in all {
+                    if e.base.is_some_and(|b| !ids.contains(&b.0)) {
+                        if let Some(ix) = &mut tier.index {
+                            if ix.drop(e.id).is_err() { self.index_errors += 1; }
+                        }
+                        tier.alloc.release(&e.slots);
+                        removed = true;
+                    } else {
+                        tier.entries.push(e);
+                    }
+                }
+            }
+            if !removed { break; }
         }
         self.next_id = self.tiers.iter().flat_map(|t| &t.entries).map(|e| e.id + 1).max().unwrap_or(1);
     }
@@ -1003,6 +2097,9 @@ impl Stash {
                 h = mix(mix(h, e.kind as u64), e.hits as u64);
                 if let Some((id, n)) = e.base {
                     h = mix(mix(h, id), n as u64);
+                }
+                if e.state != 0 {
+                    h = mix(h, e.state as u64);
                 }
                 // stock entries keep the pre-namespace digest; a non-stock one folds in every namespace byte
                 if e.namespace != crate::pool::STOCK_NAMESPACE {
@@ -1051,7 +2148,7 @@ pub struct Index {
     pub counts: BTreeMap<u64, (u32, u64)>,
 }
 
-const MAGIC: &str = "g6kv-index 1";
+const MAGIC: &str = "g6kv-index 2";
 
 fn fnv_bytes(b: &[u8]) -> u64 {
     b.iter().fold(FNV, |h, &x| (h ^ x as u64).wrapping_mul(1099511628211))
@@ -1119,6 +2216,31 @@ fn encode_add(e: &Entry) -> Vec<u8> {
     p
 }
 
+// record 4: every field of an entry (an index that keeps evicted runs, Stash::index_whole).
+// record 5: record 4 plus trailing u32 boundary-state block count (`e.state > 0`).
+fn encode_entry(e: &Entry) -> Vec<u8> {
+    let mut p = encode_add(e);
+    p[0] = if e.state == 0 { 4 } else { 5 };
+    p.push(match e.kind {
+        Kind::Evicted => 0,
+        Kind::Shared => 1,
+        Kind::Prefix => 2,
+    });
+    let (b, bp) = e.base.map_or((u64::MAX, 0), |b| (b.0, b.1 as u64));
+    put_u64(&mut p, b);
+    put_u64(&mut p, bp);
+    put_u32(&mut p, e.hits);
+    let t = e.tail.unwrap_or(Tail { logical: 0, own: 0, rep: 0 });
+    for x in [t.logical, t.own, t.rep] {
+        put_u32(&mut p, x);
+    }
+    p.extend_from_slice(&e.namespace);
+    if e.state != 0 {
+        put_u32(&mut p, e.state);
+    }
+    p
+}
+
 enum Record {
     Add(Entry),
     Drop(u64),
@@ -1127,15 +2249,16 @@ enum Record {
 
 fn decode(p: &[u8]) -> Option<Record> {
     let mut c = Cursor(p);
-    match c.take(1)?[0] {
-        1 => {
+    let tag = c.take(1)?[0];
+    match tag {
+        1 | 4 | 5 => {
             let (id, key) = (c.u64()?, c.u64()?);
             let (valid, written_end, pf_end) = (c.u32()? as i32, c.u32()? as i32, c.u32()? as i32);
             let n = c.u32()? as usize;
             let history = (0..n).map(|_| c.u32().map(|t| t as i32)).collect::<Option<Vec<_>>>()?;
             let n = c.u32()? as usize;
             let slots = (0..n).map(|_| c.u64()).collect::<Option<Vec<_>>>()?;
-            Some(Record::Add(Entry {
+            let mut e = Entry {
                 id,
                 kind: Kind::Shared,
                 key,
@@ -1144,13 +2267,100 @@ fn decode(p: &[u8]) -> Option<Record> {
                 base: None,
                 hits: 0,
                 tail: None,
+                state: 0,
                 namespace: crate::pool::STOCK_NAMESPACE,
-            }))
+            };
+            if tag == 4 || tag == 5 {
+                e.kind = match c.take(1)?[0] {
+                    0 => Kind::Evicted,
+                    1 => Kind::Shared,
+                    2 => Kind::Prefix,
+                    _ => return None,
+                };
+                let (b, bp, hits) = (c.u64()?, c.u64()?, c.u32()?);
+                e.base = (b != u64::MAX).then_some((b, bp as usize));
+                e.hits = hits;
+                let (logical, own, rep) = (c.u32()?, c.u32()?, c.u32()?);
+                // a tail always has logical pages (own and rep count parts of them), so logical 0 is no tail
+                e.tail = (logical > 0).then_some(Tail { logical, own, rep });
+                e.namespace.copy_from_slice(c.take(crate::pool::NAMESPACE_BYTES)?);
+                if tag == 5 {
+                    let state = c.u32()?;
+                    let tail_slots = e.tail.map_or(0, |t| (t.own + t.rep) as usize);
+                    if state == 0 || e.slots.len() < state as usize + tail_slots {
+                        return None;
+                    }
+                    e.state = state;
+                }
+            }
+            Some(Record::Add(e))
         }
         2 => Some(Record::Drop(c.u64()?)),
         3 => Some(Record::Count(c.u64()?, c.u32()?, c.u64()?)),
         _ => None,
     }
+}
+
+/// The live entries of an index's records (in least recently used first order), its counts, the records read and the
+/// bytes they took (a torn or bad record ends the log there).
+fn replay(body: &[u8]) -> (BTreeMap<u64, Entry>, Vec<u64>, BTreeMap<u64, (u32, u64)>, u64, usize) {
+    let mut live: BTreeMap<u64, Entry> = BTreeMap::new();
+    let mut counts: BTreeMap<u64, (u32, u64)> = BTreeMap::new();
+    let mut order: Vec<u64> = Vec::new();
+    let (mut good, mut records) = (0usize, 0u64);
+    let mut c = Cursor(body);
+    while let Some(n) = c.u32() {
+        let (Some(sum), Some(p)) = (c.u64(), c.take(n as usize)) else { break };
+        if fnv_bytes(p) != sum {
+            break;
+        }
+        match decode(p) {
+            Some(Record::Add(e)) => {
+                order.retain(|&i| i != e.id);
+                order.push(e.id);
+                live.insert(e.id, e);
+            }
+            Some(Record::Drop(id)) => {
+                live.remove(&id);
+                order.retain(|&i| i != id);
+            }
+            Some(Record::Count(k, n, clock)) => {
+                counts.insert(k, (n, clock));
+            }
+            None => break,
+        }
+        records += 1;
+        good = body.len() - c.0.len();
+    }
+    (live, order, counts, records, good)
+}
+
+/// An index file's compat line, its live entries (least recently used first) and its prefix counts; None without the
+/// index header (rewidth.rs reads another width's index this way).
+pub fn read_index(raw: &[u8]) -> Option<(String, Vec<Entry>, BTreeMap<u64, (u32, u64)>)> {
+    let nl = raw.iter().position(|&b| b == b'\n')?;
+    let compat = std::str::from_utf8(&raw[..nl]).ok()?.strip_prefix(MAGIC)?.strip_prefix(' ')?.to_string();
+    let (live, order, counts, _, _) = replay(&raw[nl + 1..]);
+    Some((compat, order.iter().filter_map(|i| live.get(i).cloned()).collect(), counts))
+}
+
+/// Writes `dir`/index whole: the header for `compat`, then `entries` in order and the counts, through a temporary file,
+/// synced, then renamed over the index.
+pub fn write_index(dir: &Path, compat: &str, entries: &[Entry], counts: &BTreeMap<u64, (u32, u64)>) -> io::Result<()> {
+    let path = dir.join("index");
+    let tmp = path.with_extension("tmp");
+    let mut f = File::create(&tmp)?;
+    let mut b = format!("{MAGIC} {compat}\n").into_bytes();
+    for e in entries {
+        b.extend(frame(&encode_entry(e)));
+    }
+    for (&k, &(n, clock)) in counts {
+        b.extend(frame(&encode_count(k, n, clock)));
+    }
+    f.write_all(&b)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    File::open(dir)?.sync_all()
 }
 
 impl Index {
@@ -1168,31 +2378,9 @@ impl Index {
         let mut order: Vec<u64> = Vec::new();
         let (mut good, mut records) = (0usize, 0u64);
         if raw.starts_with(head.as_bytes()) {
-            good = head.len();
-            let mut c = Cursor(&raw[good..]);
-            while let Some(n) = c.u32() {
-                let (Some(sum), Some(p)) = (c.u64(), c.take(n as usize)) else { break };
-                if fnv_bytes(p) != sum {
-                    break;
-                }
-                match decode(p) {
-                    Some(Record::Add(e)) => {
-                        order.retain(|&i| i != e.id);
-                        order.push(e.id);
-                        live.insert(e.id, e);
-                    }
-                    Some(Record::Drop(id)) => {
-                        live.remove(&id);
-                        order.retain(|&i| i != id);
-                    }
-                    Some(Record::Count(k, n, clock)) => {
-                        counts.insert(k, (n, clock));
-                    }
-                    None => break,
-                }
-                records += 1;
-                good = raw.len() - c.0.len();
-            }
+            let n;
+            (live, order, counts, records, n) = replay(&raw[head.len()..]);
+            good = head.len() + n;
         } else if !raw.is_empty() {
             // another model, layout, block format or engine build wrote it: its blocks are not this engine's
             let old = raw.split(|&b| b == b'\n').next().unwrap_or_default();
@@ -1254,7 +2442,7 @@ impl Index {
 
     pub fn add(&mut self, e: &Entry) -> io::Result<()> {
         self.live.insert(e.id, e.clone());
-        self.append(&encode_add(e))
+        self.append(&encode_entry(e))
     }
 
     pub fn drop(&mut self, id: u64) -> io::Result<()> {
@@ -1272,7 +2460,7 @@ impl Index {
         let mut f = File::create(&tmp)?;
         f.write_all(format!("{MAGIC} {}\n", self.compat).as_bytes())?;
         for e in self.live.values() {
-            f.write_all(&frame(&encode_add(e)))?;
+            f.write_all(&frame(&encode_entry(e)))?;
         }
         for (&k, &(n, clock)) in &self.counts {
             f.write_all(&frame(&encode_count(k, n, clock)))?;
@@ -1282,5 +2470,289 @@ impl Index {
         self.file = OpenOptions::new().append(true).open(&self.path)?;
         self.records = (self.live.len() + self.counts.len()) as u64;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::STOCK_NAMESPACE;
+
+    #[test]
+    fn extend_journals_whole_index_entries_across_namespaces_and_skips_prefix_only() {
+        for whole in [false, true] {
+            for (case, namespace) in [STOCK_NAMESPACE, [1; crate::pool::NAMESPACE_BYTES]].into_iter().enumerate() {
+                let dir = std::env::temp_dir().join(format!("g6kv-extend-namespace-{}-{case}-{whole}", std::process::id()));
+                let mut stash = Stash::new(3, PAGE);
+                stash.add_tier(8, Keep::All, Some(Index::open(&dir, "extend-namespace").unwrap()));
+                if whole {
+                    stash.index_whole(0);
+                }
+                let first = Finished { history: (0..65).collect(), valid: 64, written_end: 64, pf_end: 64 };
+                stash.store_tail(Kind::Evicted, 0, first, &[0], &[0], 1, &[], 0, namespace, None);
+                let old = stash.entries(0)[0].clone();
+                assert_eq!(stash.commits, if whole { vec![(0, old.id)] } else { vec![] });
+                assert_eq!(stash.take_io().len(), 1);
+                stash.io_done().unwrap();
+                let loaded = Index::open(&dir, "extend-namespace").unwrap().1;
+                assert_eq!(loaded, if whole { vec![old.clone()] } else { vec![] });
+                assert!(loaded.iter().all(|e| e.namespace == namespace));
+
+                let next = Finished { history: (0..129).collect(), valid: 128, written_end: 128, pf_end: 128 };
+                assert!(stash.extend(old.id, 1, 0, &next, &[0, 1], 1, namespace));
+                let extended = stash.entries(0)[0].clone();
+                assert_ne!(extended.id, old.id);
+                assert_eq!(extended.namespace, namespace);
+                assert_eq!(extended.slots.len(), 2);
+                assert_eq!(extended.slots[0], old.slots[0]);
+                assert_eq!(stash.commits, if whole { vec![(0, extended.id)] } else { vec![] });
+                assert_eq!(stash.take_io(), vec![Io::Spill { tier: 0, page: 1, slot: extended.slots[1], part: Part::Full }]);
+                stash.io_done().unwrap();
+                drop(stash);
+                let (index, loaded) = Index::open(&dir, "extend-namespace").unwrap();
+                assert!(loaded.iter().all(|e| e.id != old.id && e.namespace == namespace && e.slots.len() == 2));
+                assert_eq!(loaded, if whole { vec![extended] } else { vec![] });
+                drop(index);
+                std::fs::remove_file(dir.join("index")).unwrap();
+                std::fs::remove_dir(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn old_index_version_starts_empty() {
+        let dir = std::env::temp_dir().join(format!("g6kv-old-index-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index"), b"g6kv-index 1 same-layout\n").unwrap();
+        let (ix, entries) = Index::open(&dir, "same-layout").unwrap();
+        assert!(entries.is_empty());
+        assert!(std::fs::read(dir.join("index")).unwrap().starts_with(b"g6kv-index 2 "));
+        drop(ix);
+        std::fs::remove_file(dir.join("index")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn boundary_state_exact_match_prompt_end_fallback_and_delta_extend() {
+        let dir = std::env::temp_dir().join(format!("g6kv-state-exact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Stash::new(2, 128);
+        s.set_state_mode(2, false);
+        s.set_rules(crate::reuse::Rules { strict: false, noend: true, grid: 0 });
+        s.add_tier(32, Keep::All, Some(Index::open(&dir, "ds41-v1").unwrap()));
+        s.index_whole(0);
+
+        // Sub-64 token prompt (37 tokens -> 0 full pages, 2 state blocks).
+        let h37: Vec<i32> = (1000..1037).collect();
+        let id37 = s
+            .capture_entry(
+                Finished { history: h37.clone(), valid: 37, written_end: 37, pf_end: 37 },
+                &[],
+                9,
+                1,
+                STOCK_NAMESPACE,
+                None,
+                false,
+                None,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let io = s.take_pending_io();
+        assert_eq!(io.len(), 2);
+        assert!(io.iter().enumerate().all(|(k, x)| matches!(x, Io::Spill { page: 9, part, .. } if *part == Part::State(k as u32))));
+        s.finish_io().unwrap();
+
+        // Partial prefix (20 < 37) must NOT match an exact-boundary entry.
+        let mut p20 = h37[..20].to_vec();
+        p20.extend(5000..5030);
+        assert_eq!(s.match_state(&p20, 50, STOCK_NAMESPACE).skip, 0);
+
+        // Exact continuation (lcp >= 37, limit >= 37) matches at 37.
+        let mut turn1: Vec<i32> = h37.clone();
+        turn1.extend(2000..2163); // 200 tokens total
+        let hit = s.match_state(&turn1, turn1.len() as i32 - 1, STOCK_NAMESPACE);
+        assert_eq!((hit.skip, hit.age, hit.stored), (37, id37, true));
+        let (valid, hits, full) = s.restore_entry(hit.tier as usize, hit.age, &[0, 1, 2], 4).unwrap();
+        assert_eq!((valid, hits, full), (37, 1, 0));
+        assert_eq!(s.take_pending_io().len(), 2);
+        s.finish_io().unwrap();
+
+        // Turn 1 PromptEnd at 200 tokens (3 full pages + 2 state blocks) extends id37.
+        let pf_id = s
+            .capture_entry(
+                Finished { history: turn1.clone(), valid: 200, written_end: 200, pf_end: 200 },
+                &[10, 11, 12],
+                4,
+                2,
+                STOCK_NAMESPACE,
+                Some((id37, 0)),
+                false,
+                None,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!s.has_entry(id37));
+        assert_eq!(s.take_pending_io().len(), 5);
+        s.finish_io().unwrap();
+
+        // Turn 1 RequestEnd at 250 tokens (still 3 full pages + 2 state blocks) with keep_from=true:
+        // shares the 3 full pages via zero-copy Prefix base and spills ONLY the 2 state blocks!
+        let mut turn1_end = turn1.clone();
+        turn1_end.extend(3000..3050);
+        let req_id = s
+            .capture_entry(
+                Finished { history: turn1_end.clone(), valid: 250, written_end: 250, pf_end: 200 },
+                &[10, 11, 12],
+                4,
+                2,
+                STOCK_NAMESPACE,
+                Some((pf_id, 3)),
+                true,
+                None,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let req_io = s.take_pending_io();
+        assert_eq!(req_io.len(), 2, "RequestEnd must write 0 duplicate full pages");
+        assert!(req_io.iter().all(|x| matches!(x, Io::Spill { part: Part::State(_), .. })));
+        s.finish_io().unwrap();
+        assert!(s.has_entry(pf_id) && s.has_entry(req_id));
+
+        // Restart from disk: tag-5 entries and their shared Prefix base reload intact.
+        let summary_before = s.summary();
+        drop(s);
+        let mut s2 = Stash::new(2, 128);
+        s2.set_state_mode(2, false);
+        s2.set_rules(crate::reuse::Rules { strict: false, noend: true, grid: 0 });
+        s2.add_tier(32, Keep::All, Some(Index::open(&dir, "ds41-v1").unwrap()));
+        s2.index_whole(0);
+        assert_eq!(s2.loaded(), 0);
+        assert_eq!(s2.summary(), summary_before);
+        s2.keep_agreed(&summary_before);
+        assert!(s2.has_entry(pf_id) && s2.has_entry(req_id));
+
+        // Reasoning-stripped Turn 2 (matches first 200 tokens, diverges at 200) falls back to PromptEnd (skip = 200)!
+        let mut stripped_t2 = turn1.clone();
+        stripped_t2.extend(9000..9080);
+        let hit_stripped = s2.match_state(&stripped_t2, stripped_t2.len() as i32 - 1, STOCK_NAMESPACE);
+        assert_eq!((hit_stripped.skip, hit_stripped.age), (200, pf_id));
+
+        // Unstripped Turn 2 (matches all 250 tokens) hits RequestEnd (skip = 250)!
+        let mut full_t2 = turn1_end.clone();
+        full_t2.extend(8000..8090); // 340 tokens -> 5 full pages
+        let hit_full = s2.match_state(&full_t2, full_t2.len() as i32 - 1, STOCK_NAMESPACE);
+        assert_eq!((hit_full.skip, hit_full.age), (250, req_id));
+        let (_, _, restored_pages) = s2.restore_entry(0, req_id, &[20, 21, 22], 7).unwrap();
+        assert_eq!(restored_pages, 3);
+        assert_eq!(s2.take_pending_io().len(), 5); // 3 base pages + 2 state blocks
+        s2.finish_io().unwrap();
+
+        // Drop superseded pf_id, then extend req_id to 340 tokens (5 full pages):
+        // absorbs sole Prefix base (3 pages untouched!) and writes ONLY 2 new full pages + 2 state blocks!
+        assert!(s2.drop_entry(pf_id).unwrap());
+        let pf2_id = s2
+            .capture_entry(
+                Finished { history: full_t2.clone(), valid: 340, written_end: 340, pf_end: 340 },
+                &[20, 21, 22, 23, 24],
+                7,
+                3,
+                STOCK_NAMESPACE,
+                Some((req_id, 3)),
+                false,
+                None,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let ext_io = s2.take_pending_io();
+        assert_eq!(
+            ext_io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Full, .. })).count(),
+            2,
+            "1.00x delta: only pages 3 and 4 written"
+        );
+        assert_eq!(ext_io.iter().filter(|x| matches!(x, Io::Spill { part: Part::State(_), .. })).count(), 2);
+        s2.finish_io().unwrap();
+        assert!(s2.has_entry(pf2_id) && !s2.has_entry(req_id));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boundary_state_keep_id_pinning_and_namespace_isolation() {
+        let mut s = Stash::new(2, 64);
+        s.set_state_mode(1, false);
+        s.set_rules(crate::reuse::Rules { strict: false, noend: true, grid: 0 });
+        // Tight tier: 4 blocks total (each 64-token entry takes 1 full page + 1 state block = 2 blocks).
+        s.add_tier(4, Keep::All, None);
+
+        let a_hist: Vec<i32> = (100..170).collect();
+        let b_hist: Vec<i32> = (200..270).collect();
+        let c_hist: Vec<i32> = (300..370).collect();
+        let ns_steered = [7u8; crate::pool::NAMESPACE_BYTES];
+
+        // Store A (oldest, 2 blocks) and steered B (newest, 2 blocks) -> tier full (4/4 blocks).
+        let id_a = s
+            .capture_entry(
+                Finished { history: a_hist.clone(), valid: 68, written_end: 68, pf_end: 68 },
+                &[0],
+                0,
+                1,
+                STOCK_NAMESPACE,
+                None,
+                false,
+                None,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let _ = s.take_pending_io();
+        s.finish_io().unwrap();
+
+        let id_b = s
+            .capture_entry(
+                Finished { history: b_hist.clone(), valid: 68, written_end: 68, pf_end: 68 },
+                &[1],
+                1,
+                1,
+                ns_steered,
+                None,
+                false,
+                None,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let _ = s.take_pending_io();
+        s.finish_io().unwrap();
+
+        // Namespace isolation: steered B never matches stock, stock A never matches steered.
+        let mut b_cont = b_hist.clone();
+        b_cont.push(999);
+        assert_eq!(s.match_state(&b_cont, 69, STOCK_NAMESPACE).skip, 0);
+        assert_eq!(s.match_state(&b_cont, 69, ns_steered).skip, 68);
+
+        // Evict parked C while pinning oldest A (`keep_id = Some(id_a)`): B is evicted, A survives for restore!
+        let id_c = s
+            .capture_entry(
+                Finished { history: c_hist, valid: 68, written_end: 68, pf_end: 68 },
+                &[2],
+                2,
+                1,
+                STOCK_NAMESPACE,
+                None,
+                false,
+                Some(id_a),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let _ = s.take_pending_io();
+        s.finish_io().unwrap();
+        assert!(s.has_entry(id_a), "keep_id must protect claimed hit from LRU eviction");
+        assert!(!s.has_entry(id_b));
+        assert!(s.has_entry(id_c));
     }
 }

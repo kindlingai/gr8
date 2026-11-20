@@ -1,10 +1,33 @@
 # S2 multi-session serving, context parallelism, the KV pool, its stores and prefix reuse. knobs/README.md describes the fields.
 prefix: "GR8_"
 knobs:
+  GR8_SESSIONS:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Enable logical conversation handles and fork routes in the HTTP front end. 0 leaves existing routes and responses unchanged.
+  GR8_KV4_FOLD:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0..1"
+    doc: >-
+      Fold the normalized latent Hadamard into release UK and UV weights. Requires int4 KV and BF16 kv_b.
+  GR8_CAP_TOTAL:
+    scope: agree
+    kind: int
+    unset: "--cap"
+    doc: >-
+      The S2 logical page pool in tokens, a multiple of 64 and at least --cap: several sessions of up to --cap tokens
+      share it, while --cap keeps sizing one session's table and the per-request buffers. It sizes the drafter's pages
+      and GR8_RT_STORE's records. Needs GR8_RT_STORE, GR8_RT_LOCAL and GR8_RT_PLACE. For N full sessions: GR8_RT_PLACE x
+      64 + N x (--cap - R).
   GR8_CP:
     scope: agree
     kind: flag
-    unset: "1 in a CP build"
+    unset: "1 in a CP build, 0 in the Flash build"
     doc: >-
       Context-parallel KV: the first GR8_CP_R tokens are replicated and later pages are spread across ranks on a CP
       fabric of their own. Read only in builds with -DG6_CP=1.
@@ -106,6 +129,27 @@ knobs:
     doc: >-
       For tests, rank R sleeps the given ms inside every Nth KV tier drain that copies anything, set as
       <rank>:<ms>[:<every>].
+  GR8_KV_REWIDTH:
+    scope: local
+    kind: text
+    unset: "a persisted store written at another width starts empty"
+    doc: >-
+      Set by `./gr8 <model> scale` for one boot, never by hand: before a persisted --kv-store ssd store (GLM-5.3) or
+      the aligned checkpoint store (GLM-5.3-Flash) opens, rewrite the one the old width left (index.prev, *.prev) for
+      this rank, reading the other boxes' blocks from their kvman-peer, as
+      <old_nr>,<old_rank|x>,<token_file>,<old_set>,<peer0>,...,<peer old_nr-1> (old_set: the model set id the old width
+      booted with, which names the width). A store whose model, R, grid, block layout or engine differ (on
+      GLM-5.3-Flash also CAP and the prefill rows and lanes), or a failed rewrite, starts empty as without it.
+  GR8_KV_SHARE_PAGES:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With --reuse-prefix under S2, sessions below R share the KV pages of a common prompt prefix: a live session's
+      prefilled prompt pages and a retained run's pages are counted per holder, and a hit that ends inside a page copies
+      only that page's rows below the hit. A shared hit keeps the retained run and skips no rows to the reuse grid.
+      0 is stock.
   GR8_KV_SHARE_WHEN:
     scope: local
     kind: text
@@ -134,14 +178,36 @@ knobs:
     values: "0|1"
     doc: >-
       Prints one stderr line per S2 pool claim with its first page, page count and the retained runs it evicted.
+  GR8_QUIT_FAST:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      At an orderly quit of a served GLM-5.3 engine, after the KV store keeps the pool's runs and the links close, the
+      ranks meet at the fabric barrier and the process ends at once: the CUDA graphs, buffers and the CUDA runtime are
+      not freed one by one, process exit releases them. The Flash and DS41 engines ignore it.
   GR8_REUSE_ALIGN:
     scope: agree
     kind: flag
     unset: "1 with --serve, 0 offline"
     values: "0|1"
     doc: >-
-      With --reuse-prefix, a hit keeps only whole cold-prefill grid cells (--prefill rows), so the result equals a cold
-      prefill bit for bit. 0 keeps the whole matched prefix. 1 needs --prefill.
+      With --reuse-prefix, a hit keeps only whole cold-prefill grid cells (--prefill rows), so the result should equal a
+      cold prefill. Open issue #412 reports a hit that differs from a cold prefill at temperature 0 (GLM-5.3, TP=4).
+      0 keeps the whole matched prefix. 1 needs --prefill.
+  GR8_REUSE_GRID:
+    scope: agree
+    kind: int
+    unset: "--prefill rows when GR8_REUSE_ALIGN=1, off when GR8_REUSE_ALIGN=0"
+    values: "64..65536"
+    doc: >-
+      With --reuse-prefix, overrides the prefix-reuse grid in rows: a positive multiple of 64, at most --prefill. A hit
+      keeps [0, floor(min(skip, pf_end) / grid) * grid), or all pf_end rows on an exact prefill replay, so only whole
+      prefilled KV pages are reused and decode-written rows are never reused. Below --prefill, the suffix prefill does
+      not start on a cold prefill grid boundary (not cold-shaped). Conflicts with GR8_REUSE_ALIGN=0. The launcher
+      (scripts/engine_args.sh, REUSE_GRID) sets 64 on GLM-5.3 at TP=4 with KV_FORMAT=int4; see docs/SETTINGS.md for
+      the --kv-store write volume and the persist=on index behaviour.
   GR8_REUSE_HDUMP:
     scope: local
     kind: path
@@ -295,7 +361,9 @@ knobs:
     default: "0"
     doc: >-
       S2: while any session decodes, a prefill quantum takes at most this many rows on one lane, so decode rounds come
-      round sooner. A multiple of 64, at most --prefill. 0 = the full quantum.
+      round sooner. A multiple of 64, at most --prefill (or the DS41 W-row prefill width). 0 = the full quantum, except
+      DS41 with two lanes (GR8_DS_PF_LANES=2), which still takes W rows on one lane while a session decodes.
+      The DS41 launcher uses the smaller of 4096 and W by default; set 0 to favor the new long prompt's first word.
   GR8_S2_DECODE_ROUNDS:
     scope: agree
     kind: int
@@ -303,7 +371,8 @@ knobs:
     values: "0..64"
     doc: >-
       S2: while a prefill waits and sessions decode, runs this many decode rounds per prefill quantum instead of one. 0
-      or 1 = off.
+      or 1 = off. The DS41 launcher sets 16 when its effective decode-prefill quantum is positive; an explicit
+      S2_DECODE_ROUNDS or EXTRA_ENV value wins. Disabling the quantum omits the implicit rounds setting.
   GR8_S2_NOTICE_MAX:
     scope: agree
     kind: int
@@ -360,6 +429,14 @@ knobs:
     doc: >-
       S2: logs one line when the head anchors a notice, one when each rank applies the commit, and one per prefill
       quantum. Logs only.
+  GR8_S2_FRESH_SPEC:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1: the adaptive verify-width estimates (--spec-adaptive) restart with every DFlash2 request, as the drafter choice
+      does, so a request's T=0 reply does not depend on the requests before it. For gates that compare T=0 replies across
+      boots; serving keeps 0.
   GR8_S2_GROW:
     scope: agree
     kind: flag
@@ -368,6 +445,14 @@ knobs:
     doc: >-
       S2: a session holds the KV pages it needs now and takes more as its output grows, while every live session can
       still reach its worst case. 0 = every run holds its worst case from admission.
+  GR8_S2_REPLAY_LOG:
+    scope: local
+    kind: path
+    unset: "no log"
+    doc: >-
+      S2: every rank writes its planner's round log to PATH.<pid>: its settings, each call the driver makes and each
+      step's tokens, enough for engine/runtime/s2/tests/round_replay to rerun the planner and check every step. Each
+      call also hashes every slot's tokens and writes on the compute thread, so take no timing from a logging boot.
   GR8_S2_ROUNDLOG:
     scope: local
     kind: flag

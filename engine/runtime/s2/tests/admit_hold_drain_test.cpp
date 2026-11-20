@@ -1,13 +1,14 @@
 // GR8_S2_ADMIT_HOLD=1 and a burst whose ADMIT files land while the head is inside its hold chain: a shim can write
-// all 8 cmd files within 1 ms. The head's control loop reads cmd.<k> only between events (service.h loop), so a held
+// all 8 cmd files within 1 ms. The head's control loop reads cmd.<k> only between events (control.rs), so a held
 // commit that looks only at the in-memory queue misses a file that lands during the chain and releases the boundary
 // after the 2nd grant (2 commits at one boundary, 6 at a boundary 4 later).
 // Here: cmd.0 and cmd.1 are written before the run; cmd.2 .. cmd.7 are written from the head rank's bind of the first grant,
 // i.e. while the head is still inside that event (it waits for every rank's ACK). Asserted: all 8 grants apply at one boundary on
 // both ranks (the same step count at every bind) and the hold chain ends with the 8th (live + 1 == limit). Without the drain
-// (Service::drain_admits) the 3rd .. 8th grants apply after the 2nd grant's release, at a later step count.
-// Real Service, Driver, scheduler and event gate on two ranks over socket pairs; the native layer is a stand-in with no GPU
-// (a prefill quantum and a step each sleep 20 ms so boundaries pass while a notice waits). Build and run: see scripts/host_tests.sh.
+// (the control thread's drain_admits) the 3rd .. 8th grants apply after the 2nd grant's release, at a later step count.
+// Real Service, Driver, scheduler, pool and event gate on two ranks over socket pairs; the rest of the native layer is a
+// stand-in with no GPU (a prefill quantum and a step each sleep 20 ms so boundaries pass while a notice waits). Build
+// and run: see scripts/host_tests.sh.
 #include "s2/service.h"
 #include <cstdio>
 #include <sys/socket.h>
@@ -31,13 +32,10 @@ struct Rank {
     std::atomic<long> step{0};               // prefill quanta + steps run: a bind at the same count = the same boundary
     std::vector<long> bind_at;               // the step count at each grant's bind, in grant order
     std::function<void()> on_first_bind;     // head: writes cmd.2 .. cmd.7 during the first event
+    RunPool pool{1024, 1024, 64 * 1024};     // Config::pool_rows in pages
     NativeHooks hooks() {
         NativeHooks h;
-        h.pool.free_pages = [] { return uint32_t(1024); };
-        h.pool.room = [] { return uint32_t(1024); };
-        h.pool.reserve = [](uint64_t, uint64_t worst, uint32_t) { return Run{0, uint32_t((worst + PAGE - 1) / PAGE), 1, 7}; };
-        h.pool.release = [](const Run&) {};
-        h.pool.fits = [](uint64_t, uint64_t, uint32_t) { return true; };
+        h.pool.pool = &pool;
         h.bind = [this](const Grant&) {
             std::function<void()> f;
             {

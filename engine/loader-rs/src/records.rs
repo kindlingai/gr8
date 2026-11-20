@@ -5,6 +5,7 @@
 //!   int4 g32: symmetric, scale = fp16(amax / 7) per 32 inputs, code = clamp(rint(x / scale), -8, 7) + 8.
 
 use crate::exlr8::{e4m3_round, pow2_f64};
+pub use crate::nvfp4::{nvfp4_decode_group, nvfp4_fc1, nvfp4_fc2, nvfp4_record};
 
 /// f32 -> f16 bits, round to nearest even (subnormals kept, overflow to inf).
 pub fn f16_bits(x: f32) -> u16 {
@@ -128,6 +129,51 @@ pub fn mxfp8_record(codes: &[u8], scales: &[u8], k: usize) -> Vec<u8> {
                 rec[512 + 2 * i + 1] = scales[(16 * t + i + 8) * ng + g];
             }
         }
+    }
+    out
+}
+
+/// One MXFP8 record from a strided source: rows r0 .. r0 + 16, codes c0 .. c0 + 32 and scale column sg of each row.
+/// `cs` / `ss` = code / scale bytes per source row.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn mxfp8_group(rec: &mut [u8], codes: &[u8], scales: &[u8], cs: usize, ss: usize, r0: usize, c0: usize, sg: usize) {
+    let ord = gv_order();
+    for h in 0..2 {
+        for (i, &(r, c)) in ord.iter().enumerate() {
+            rec[h * 256 + i] = codes[(r0 + r) * cs + c0 + 16 * h + c];
+        }
+    }
+    for i in 0..8 {
+        rec[512 + 2 * i] = scales[(r0 + i) * ss + sg];
+        rec[512 + 2 * i + 1] = scales[(r0 + i + 8) * ss + sg];
+    }
+}
+
+/// MXFP8 gate and up matrices [r][k] (codes) with [r][k / 32] E8M0 scales -> [r / 16][k / 32][gate 528 | up 528],
+/// each half the `mxfp8_record` of its matrix.
+pub fn mxfp8_fc1(gc: &[u8], gs: &[u8], uc: &[u8], us: &[u8], r: usize, k: usize) -> Vec<u8> {
+    assert!(r.is_multiple_of(16) && k > 0 && k.is_multiple_of(32));
+    assert!(gc.len() == r * k && uc.len() == r * k && gs.len() == r * k / 32 && us.len() == r * k / 32);
+    let ng = k / 32;
+    let mut out = vec![0u8; r / 16 * ng * 1056];
+    for (i, d) in out.as_chunks_mut::<1056>().0.iter_mut().enumerate() {
+        let (ch, g) = (i / ng, i % ng);
+        mxfp8_group(&mut d[..528], gc, gs, k, ng, ch * 16, g * 32, g);
+        mxfp8_group(&mut d[528..], uc, us, k, ng, ch * 16, g * 32, g);
+    }
+    out
+}
+
+/// Columns c0 .. c0 + kn (both multiples of 32) of an MXFP8 [rows][kfull] matrix -> [rows / 16][kn / 32][528].
+pub fn mxfp8_fc2(c: &[u8], s: &[u8], rows: usize, kfull: usize, c0: usize, kn: usize) -> Vec<u8> {
+    assert!(rows.is_multiple_of(16) && kfull.is_multiple_of(32) && c0.is_multiple_of(32) && kn.is_multiple_of(32));
+    assert!(c0 + kn <= kfull && c.len() == rows * kfull && s.len() == rows * kfull / 32);
+    let ng = kn / 32;
+    let mut out = vec![0u8; rows / 16 * ng * 528];
+    for (i, d) in out.as_chunks_mut::<528>().0.iter_mut().enumerate() {
+        let (ot, g) = (i / ng, i % ng);
+        mxfp8_group(d, c, s, kfull, kfull / 32, ot * 16, c0 + g * 32, c0 / 32 + g);
     }
     out
 }

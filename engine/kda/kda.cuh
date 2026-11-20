@@ -4,6 +4,7 @@
 //   kda::build_state / build_scratch      build: fp32 state S [N_KDA][slots][nhmax][128][128] + conv history
 //                                         [N_KDA][slots][3][3][nhmax*128]; scratch for `rows` rows
 //   kda::reset(state, slot, st)           zero one slot's state, every KDA layer (session start)
+//   kda::copy(state, dst, src, n, st)     slots [src, src + n) to [dst, dst + n), disjoint ranges, every KDA layer
 //   kda::launch(w, state, scratch, xb, row_slot, M, partial, st)
 //       xb: BF16 fragment table of the fp32 block input (K = HID); row_slot: device [M]; partial: BF16 [M][HID], this
 //       rank's heads through its o_proj shard. Rows of one slot must be consecutive and in position order.
@@ -11,6 +12,8 @@
 //       step (fp32 state recurrence) -> out (o_norm * sigmoid gate, BF16 fragments) -> o_proj.
 // Graph-capturable: no host sync, no allocation in reset/launch.
 #pragma once
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
@@ -22,18 +25,6 @@
 
 namespace kda
 {
-// rank r's heads of layer l at TP nr (loader-rs release.rs Shard::heads: chunk(widths(64, nr), l, r))
-inline void heads(int l, int rank, int nr, int& h0, int& nh)
-{
-    std::vector<int> w(nr);
-    for (int j = 0; j < nr; ++j) w[j] = HEADS / nr + (j < HEADS % nr);
-    const int j = (rank + nr - l % nr) % nr;
-    h0 = 0;
-    for (int i = 0; i < j; ++i) h0 += w[i];
-    nh = w[j];
-}
-inline int nhmax(int nr) { return (HEADS + nr - 1) / nr; }
-
 struct KdaLayer
 {
     int l = -1, li = -1, h0 = 0, nh = 0;
@@ -376,6 +367,16 @@ inline void reset(const KdaState& s, int slot, cudaStream_t st)
     k_kda_reset<<<dim3(32, N_KDA), 256, 0, st>>>(s.S, s.conv, s.s_layer(), s.c_layer(), s.s_layer() / s.slots, s.c_layer() / s.slots, slot);
 }
 
+inline cudaError_t copy(const KdaState& s, int dst, int src, int n, cudaStream_t st)
+{
+    const size_t ss = s.s_layer() / s.slots, cs = s.c_layer() / s.slots;
+    cudaError_t e = cudaMemcpy2DAsync(s.S + dst * ss, s.s_layer() * sizeof(float), s.S + src * ss, s.s_layer() * sizeof(float),
+                                      n * ss * sizeof(float), N_KDA, cudaMemcpyDeviceToDevice, st);
+    if (e != cudaSuccess) return e;
+    return cudaMemcpy2DAsync(s.conv + dst * cs, s.c_layer() * sizeof(float), s.conv + src * cs, s.c_layer() * sizeof(float),
+                             n * cs * sizeof(float), N_KDA, cudaMemcpyDeviceToDevice, st);
+}
+
 inline Args make_args(const KdaLayer& w, const KdaState& s, const KdaScratch& sc, const int* row_slot, int M)
 {
     Args a;
@@ -427,7 +428,11 @@ inline void launch_oproj(const KdaLayer& w, const uint16_t* OF, int M, void* par
     {
         dtr::Gemv g;
         const int dodt = odt == gv::O_BF16 ? dtr::O_BF16 : dtr::O_F32;
-        dtr::make_out(w.ot, M, reinterpret_cast<const __half*>(OH), w.nh * DK, nullptr, partial, HID, dodt, *dt, 192, 0, 1, g);
+        if (const char* e = dtr::make_out(w.ot, M, reinterpret_cast<const __half*>(OH), w.nh * DK, nullptr, partial, HID, dodt, *dt, 192, 0, 1, g))
+        {
+            fprintf(stderr, "kda o_proj trellis, %d rows: %s\n", M, e);
+            abort();
+        }
 #ifdef DEC_SLOT
         if (slot) g.a.slot = *slot;
 #endif
@@ -879,6 +884,12 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
             ta.part = dt->part; ta.cnt = dt->cnt; ta.ldy = pl.ld();
             ta.dtr_ctas = nblk * 3 * KS;
             ta.pa = pa;
+            // k_kda_proj_trellis stages its rotated x slice, tiles(M) x (HID / 16 / KS) x 64 words, in sm[4096]
+            if (!(xa && (mode == 1 || mode == 2)) && static_cast<long>(g6mx::tiles(M)) * (HID / 16 / KS) * 64 > 4096)
+            {
+                fprintf(stderr, "kda: GR8_GLM53F_KDA_PROJ_KS=%d at %d rows overflows the projection kernel's shared x table\n", KS, M);
+                abort();
+            }
             g6mx::nt_dispatch(g6mx::tiles(M), [&](auto N) {
                 constexpr int NTv = decltype(N)::value;
                 if (xa && mode == 1)
@@ -902,7 +913,11 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
         for (int s = 0; s < 3; ++s)
         {
             dtr::Gemv g;
-            dtr::make_out(*m3[s], M, x, HID, nullptr, P + pl.q() + s * dl, pl.ld(), dtr::O_F32, *dt, s * 64, 0, 1, g);
+            if (const char* e = dtr::make_out(*m3[s], M, x, HID, nullptr, P + pl.q() + s * dl, pl.ld(), dtr::O_F32, *dt, s * 64, 0, 1, g))
+            {
+                fprintf(stderr, "kda %c projection trellis, %d rows: %s\n", "qkv"[s], M, e);
+                abort();
+            }
             dtr::launch(g, st);
         }
     }

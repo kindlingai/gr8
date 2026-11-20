@@ -299,7 +299,7 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     if (knob::init()) return 2;        // every bad GR8_ value and unknown name at once (docs/ENV.md)
-    pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+    pf_env_check();                    // strict GR8_PF_* choices (pf_env_check, prefill.cuh): a bad value exits before any work
 #if G6_MODEL_FLASH
     {   // GR8_MOE_TOPK (model change, screen arm): unset = the model's top-k
         const int tk = (int)knob::moe_topk();
@@ -363,6 +363,8 @@ int main(int argc, char** argv)
     if (pfw && (pfw <= MX || pfw != ds41_prefill_rowcap(DS41_TEXT(knob::ds_prefill_w()), MX))) die("GR8_TEST_DS41_M4_PFW=W needs MX < W = GR8_DS_PREFILL_W");
     const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
     if (pfw && pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
+    ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1)
+    if (pfw && ds41::br::l20_tail()) fprintf(stderr, "# GR8_TEST_DS41_M4_PFW: GR8_DS_PF_L20_TAIL=1: layer 20 in the bounded replay\n");
     if (pfw && (graph || mtp || MP)) die("GR8_TEST_DS41_M4_PFW: eager only (no --graph, --mtp, --prefill)");
     if (pfw) fprintf(stderr, "# GR8_TEST_DS41_M4_PFW: W-row non-final prefill chunks of %d rows, bounded replay tail %d\n", pfw, pf_tail);
 #endif
@@ -390,6 +392,9 @@ int main(int argc, char** argv)
 #endif
     if (knob::dec_shared_scratch() && !pfv2) die("GR8_DEC_SHARED_SCRATCH=1 needs --pfv2");
     const std::vector<int> layers = parse_ints(layers_s);
+    // the layers share one set of selected ids: after a step it holds the last full-index layer's, not the first layer's
+    if (knob::dec_shared_scratch() && knob::test_idx_dump() && layers.size() > 1)
+        die("GR8_TEST_IDX_DUMP with GR8_DEC_SHARED_SCRATCH=1 needs a single --layers layer");
     if (prompts.empty()) prompts.push_back(g6rt::DEFAULT_PROMPT);
     plan.inv_temp = g6rt::inv_temp(temp);
     if (const std::string e = g6rt::common_check(co, MX, plan.chunk); !e.empty()) die(e);   // the scheduler caps k at 7 whatever MX is
@@ -468,13 +473,22 @@ int main(int argc, char** argv)
     bool cp_seg = false;                //       GR8_CP_STEP_SEG
     (void)cp_step; (void)cp_seg;
 #if defined(G6_CP) && G6_CP
-    // CP: GR8_CP=0|1 (default 1 in a CP build), GR8_CP_R (replicated prefix tokens, multiple of 64, default 0),
+    // CP: GR8_CP=0|1 (default 1 in a CP build, 0 in the Flash build), GR8_CP_R (replicated prefix tokens, multiple of 64, default 0),
     // GR8_CP_S3=0|1 (default 1), GR8_CP_MMAX (CP fabric rows, default = the most rows of any step)
-    const bool cp_on = knob::cp().value_or(true);
+    const bool cp_on = knob::cp().value_or(!G6_MODEL_FLASH);   // Flash: off unless asked for
     const int cp_R = (int)knob::cp_r();
     const int cp_s3 = knob::cp_s3();
+#if G6_MODEL_FLASH
+    if (cp_on && s2mode) die("Flash GR8_CP: not with --s2");
+    if (cp_on && MP)
+        for (const auto& p : plans)
+            if ((int)p.prompt.size() > cp_R) die("Flash --prefill with GR8_CP: a prompt longer than GR8_CP_R (the prefill runs below R only)");
+#endif
     int cp_mmax = mtp + 1;
     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
+#if G6_MODEL_FLASH
+    cp_mmax = MX;   // as g6m4: a CP step may carry any decode step's rows
+#endif
 #ifdef DEC_S2
     // --s2 + GR8_CP_STEP_ROWS=n: as g6m4, the rounds whose step runs past R take at most n rows (s2/cp_rows.h) and the CP
     // loopback is sized for n. (An --s2 run's sessions stay below GR8_S2_BELOW <= R, so here the cap never engages.)
@@ -498,9 +512,9 @@ int main(int argc, char** argv)
         die("GR8_CP_R2 must be a multiple of 64 below GR8_CP_R, with GR8_CP on and GR8_TEST_S2_XLIST (the runs it lays out)");
     g6::CpColls cp_colls;
     {
-        std::vector<bool> full;
-        for (int l : layers) full.push_back(cp_full_index(l));
-        cp_colls.make(full, NR, cp_mmax);
+        std::vector<bool> full, attn;   // attn: the layers with an attention block (Flash: not the KDA layers)
+        for (int l : layers) { full.push_back(cp_full_index(l)); attn.push_back(cp_attn_layer(l)); }
+        cp_colls.make(full, NR, cp_mmax, attn);
     }
     g6::VLayout cp_L;
     cp_L.make(NR, cp_colls.cap, cp_colls.dst_k);
@@ -528,7 +542,7 @@ int main(int argc, char** argv)
     }
 #endif
     G6RT_CK(bind::init());
-    pf_prof().on = knob::pf_prof();
+    pf_prof().on = knob::pf_prof() == 1;   // the event form (2) is g6m4's
 
     // ---- loopback fabric
 #if G6_MODEL_DS41
@@ -700,7 +714,7 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
         if (cp_on)
             for (int c = 0; c < cp_colls.ncoll(); ++c) R[r].cp.vs.push_back(cp_L.vslot(c, r, cp_send[r], cp_recv[r], cp_bell[r], err));
-        if (cp_on && MP) cp_pf_alloc(R[r], st);     // step 4: prefill staging pools
+        if (cp_on && MP && !G6_MODEL_FLASH) cp_pf_alloc(R[r], st);     // step 4: prefill staging pools (Flash: none, it prefills below R)
 #endif
         R[r].graph = graph; R[r].in = in; R[r].out = out + r;
         loop.send[r] = f.send;
@@ -1139,6 +1153,17 @@ int main(int argc, char** argv)
     // layer i's attention block on every rank: the CP block in its three phases with the loopback between them
     auto attn_all = [&](int i, int M, int context) {
         if (!cp_block(R[0], context)) { attn_qs(rptr, qsl, i, M, context); return; }
+#if G6_MODEL_FLASH
+        // Flash: a KDA layer has no CP block; a DSA layer runs launch_dsa_cp's phases (flash_dsa.cuh)
+        if (R[0].layers[i].kda) { attn_qs(rptr, qsl, i, M, context); return; }
+        for (Model& m : R) launch_dsa_block(m, i, M, context, st, 0);
+        vdeliver(cp_colls.q[i], M);
+        vdeliver(cp_colls.cand[i], M);
+        for (Model& m : R) launch_dsa_block(m, i, M, context, st, 1);
+        for (int k = 1; k < NR; ++k) vdeliver(cp_colls.part[(size_t)i * (NR - 1) + k - 1], M);
+        for (Model& m : R) launch_dsa_block(m, i, M, context, st, 2);
+        return;
+#endif
         {
             const std::vector<int> gs = R[0].qs.layer_gathers(i);     // phase 0 in gather phases
             for (size_t p = 0; p <= gs.size(); ++p)
@@ -1263,7 +1288,7 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
     // step 4 (prefill.cuh cp_pf_*): staged view around a prefill sub-batch; gather layer i before its first attention
     // block, copy the rows back after its last
-    const bool cp_pf = cp_on && MP;
+    const bool cp_pf = cp_on && MP && !G6_MODEL_FLASH;
     // negative control (gate4.sh): GR8_TEST_CP_PF_BREAK=gather|back skips that half of the staging (the gate must then FAIL)
     const std::string cp_break = knob::test_cp_pf_break().value_or("");
     auto cp_enter = [&]() { if (cp_pf) for (Model& m : R) cp_pf_enter(m); };
@@ -1382,9 +1407,15 @@ int main(int argc, char** argv)
     const int gsplit = (int)knob::dec_split();
     if (gsplit >= NL || (gsplit && !graph)) die("GR8_DEC_SPLIT must be 0..layers-1 and needs --graph");
     cudaGraphExec_t exec2[NBK][MX + 1] = {};
+#if G6_MODEL_DS41
+    std::map<const cudaGraphExec_t*, Ds41SpanSet> span_sets;   // GR8_DS_SPAN: the spans of each captured step graph (the ranks in turn)
+#endif
     auto launch_main = [&](int k, int M) {
         G6RT_CK(cudaGraphLaunch(exec[k][M], st));
         if (gsplit) G6RT_CK(cudaGraphLaunch(exec2[k][M], st));
+#if G6_MODEL_DS41
+        if (ds41_span_on()) ds41_span_replayed(span_sets[&exec[k][M]], "", M, st);
+#endif
     };
     // the context bucket of a step; set as the capturing bucket of every rank (and draft) model
     auto bucket = [&](int context, bool draft) {
@@ -2405,8 +2436,14 @@ int main(int argc, char** argv)
                     for (int pc = gsplit ? 0 : -1; pc < (gsplit ? 2 : 0); ++pc)       // DEC_GSPLIT: parts A, B
                     {
                         cudaGraph_t g;
+#if G6_MODEL_DS41
+                        if (ds41_span_on() && pc != 1) ds41_span_begin(span_sets[&exec[k][M]]);   // part B's units are not stamped
+#endif
                         G6RT_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
                         enqueue(M, si.context, pc, gsplit);
+#if G6_MODEL_DS41
+                        ds41_span_end(st);
+#endif
                         G6RT_CK(cudaStreamEndCapture(st, &g));
                         size_t nodes = 0;
                         G6RT_CK(cudaGraphGetNodes(g, nullptr, &nodes));

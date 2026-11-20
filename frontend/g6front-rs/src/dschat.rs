@@ -15,7 +15,11 @@
 //!   reasoning of assistant turns before the last user turn is dropped, unless the request has tools;
 //! - assistant turns end with the eos token.
 //!
-//! Out of scope (400): image parts, the `latest_reminder` role and `task`.
+//! - image blocks (`image`, `image_url`, `input_image`, in any message's content list and in a tool_result's) become the
+//!   text `<｜deepseek_image｜>`; `render_mm` also returns the image blocks in prompt order (the encoder's
+//!   `process_image_messages`, run after the tool results are sorted). The placeholder in message text is refused.
+//!
+//! Out of scope (400): the `latest_reminder` role and `task`.
 
 use std::collections::HashMap;
 
@@ -30,7 +34,9 @@ const USER: &str = "<｜User｜>";
 pub const ASSISTANT: &str = "<｜Assistant｜>";
 pub const THINK_OPEN: &str = "<think>";
 pub const THINK_CLOSE: &str = "</think>";
-const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
+pub const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
+/// While rendering, image n is `\0gr8img<n>\0` in the text; the finished prompt puts the placeholder in its place.
+const MARK: &str = "\u{0}gr8img";
 
 pub const CALLS_OPEN: &str = "<｜DSML｜ calls>";
 pub const CALLS_CLOSE: &str = "</｜DSML｜ calls>";
@@ -136,7 +142,9 @@ impl Msg {
 
 fn check_text(s: &str) -> Result<(), RenderError> {
     if s.contains(IMAGE_PLACEHOLDER) {
-        return err(format!("message text contains the image token {IMAGE_PLACEHOLDER}; this model takes no images"));
+        return err(format!(
+            "message text contains the image token {IMAGE_PLACEHOLDER}; images go in image content blocks"
+        ));
     }
     Ok(())
 }
@@ -145,8 +153,8 @@ fn part_text(v: &Value) -> String {
     v.as_str().unwrap_or("").to_string()
 }
 
-/// One element of a content list as a block. Images are refused.
-fn list_block(b: &Value) -> Result<Block, RenderError> {
+/// One element of a content list as a block. An image becomes its marker; its block is pushed to `images`.
+fn list_block(b: &Value, images: &mut Vec<Value>) -> Result<Block, RenderError> {
     if let Some(s) = b.as_str() {
         check_text(s)?;
         return Ok(Block::Text(s.to_string()));
@@ -158,17 +166,40 @@ fn list_block(b: &Value) -> Result<Block, RenderError> {
             check_text(&t)?;
             Ok(Block::Text(t))
         }
-        Some("image" | "image_url" | "input_image") => err("image content is not supported by this model"),
+        Some("image" | "image_url" | "input_image") => {
+            if !has_source(b) {
+                return err("image block does not contain a valid source");
+            }
+            images.push(b.clone());
+            Ok(Block::Text(format!("{MARK}{}\u{0}", images.len() - 1)))
+        }
         Some("tool_result") => {
             let id = part_text(b.get("tool_use_id").unwrap_or(&Value::Null));
-            Ok(Block::Result { id, content: tool_content(b.get("content"))? })
+            Ok(Block::Result { id, content: tool_content(b.get("content"), images)? })
         }
         other => Ok(Block::Other(other.unwrap_or("None").to_string())),
     }
 }
 
+/// The encoder's `_extract_image` check: an `image_url` block needs a url, an `image` one a source, url or data.
+fn has_source(b: &Value) -> bool {
+    let nonempty = |v: Option<&Value>| match v {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Number(n)) => n.as_f64() != Some(0.0),
+        Some(Value::Bool(true)) => true,
+    };
+    match b.get("image_url") {
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(u @ Value::Object(_)) => nonempty(u.get("url")),
+        _ => ["source", "url", "data"].iter().any(|k| nonempty(b.get(*k))),
+    }
+}
+
 /// A tool message's content (or a tool_result block's): a string, or a list whose text parts join with a blank line.
-fn tool_content(v: Option<&Value>) -> Result<String, RenderError> {
+fn tool_content(v: Option<&Value>, images: &mut Vec<Value>) -> Result<String, RenderError> {
     match v {
         None | Some(Value::Null) => Ok(String::new()),
         Some(Value::String(s)) => {
@@ -178,7 +209,7 @@ fn tool_content(v: Option<&Value>) -> Result<String, RenderError> {
         Some(Value::Array(a)) => {
             let mut parts = Vec::new();
             for b in a {
-                match list_block(b)? {
+                match list_block(b, images)? {
                     Block::Text(t) => parts.push(t),
                     Block::Other(t) => parts.push(format!("[Unsupported {t}]")),
                     Block::Result { .. } => parts.push("[Unsupported tool_result]".to_string()),
@@ -191,7 +222,7 @@ fn tool_content(v: Option<&Value>) -> Result<String, RenderError> {
 }
 
 /// System / assistant content: text, or the text parts of a list joined with a blank line.
-fn plain_content(v: Option<&Value>) -> Result<(String, bool), RenderError> {
+fn plain_content(v: Option<&Value>, images: &mut Vec<Value>) -> Result<(String, bool), RenderError> {
     match v {
         None | Some(Value::Null) => Ok((String::new(), true)),
         Some(Value::String(s)) => {
@@ -202,7 +233,7 @@ fn plain_content(v: Option<&Value>) -> Result<(String, bool), RenderError> {
             let mut texts = Vec::new();
             let mut has_text = false;
             for b in a {
-                if let Block::Text(t) = list_block(b)? {
+                if let Block::Text(t) = list_block(b, images)? {
                     has_text = true;
                     texts.push(t)
                 }
@@ -214,14 +245,14 @@ fn plain_content(v: Option<&Value>) -> Result<(String, bool), RenderError> {
     }
 }
 
-fn user_blocks(v: Option<&Value>) -> Result<Vec<Block>, RenderError> {
+fn user_blocks(v: Option<&Value>, images: &mut Vec<Value>) -> Result<Vec<Block>, RenderError> {
     match v {
         None | Some(Value::Null) => Ok(vec![Block::Text(String::new())]),
         Some(Value::String(s)) => {
             check_text(s)?;
             Ok(vec![Block::Text(s.clone())])
         }
-        Some(Value::Array(a)) => a.iter().map(list_block).collect(),
+        Some(Value::Array(a)) => a.iter().map(|b| list_block(b, images)).collect(),
         Some(_) => err("message content must be a string or a list of parts"),
     }
 }
@@ -315,7 +346,7 @@ fn parse_calls(m: &Value) -> Result<Vec<Call>, RenderError> {
     Ok(out)
 }
 
-fn normalise(messages: &[Value], tools: &[Value]) -> Result<Vec<Msg>, RenderError> {
+fn normalise(messages: &[Value], tools: &[Value], images: &mut Vec<Value>) -> Result<Vec<Msg>, RenderError> {
     let mut out: Vec<Msg> = Vec::new();
     let tool_lines: Vec<String> = tools.iter().map(tool_line).collect::<Result<_, _>>()?;
     let first_is_system = messages
@@ -332,14 +363,14 @@ fn normalise(messages: &[Value], tools: &[Value]) -> Result<Vec<Msg>, RenderErro
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
         match role {
             "system" | "developer" => {
-                let (content, counts) = plain_content(m.get("content"))?;
+                let (content, counts) = plain_content(m.get("content"), images)?;
                 let mut msg = Msg::new(Role::System);
                 msg.content = content;
                 msg.counts_as_user = counts;
                 out.push(msg);
             }
             "user" => {
-                let blocks = user_blocks(m.get("content"))?;
+                let blocks = user_blocks(m.get("content"), images)?;
                 match out.last_mut() {
                     Some(last) if last.role == Role::User => last.blocks.extend(blocks),
                     _ => {
@@ -351,7 +382,7 @@ fn normalise(messages: &[Value], tools: &[Value]) -> Result<Vec<Msg>, RenderErro
             }
             "tool" => {
                 let id = part_text(m.get("tool_call_id").unwrap_or(&Value::Null));
-                let block = Block::Result { id, content: tool_content(m.get("content"))? };
+                let block = Block::Result { id, content: tool_content(m.get("content"), images)? };
                 match out.last_mut() {
                     Some(last) if last.role == Role::User => last.blocks.push(block),
                     _ => {
@@ -363,7 +394,7 @@ fn normalise(messages: &[Value], tools: &[Value]) -> Result<Vec<Msg>, RenderErro
             }
             "assistant" => {
                 let mut msg = Msg::new(Role::Assistant);
-                msg.content = plain_content(m.get("content"))?.0;
+                msg.content = plain_content(m.get("content"), images)?.0;
                 msg.calls = parse_calls(m)?;
                 let rc = m.get("reasoning_content").filter(|v| !v.is_null()).or_else(|| m.get("reasoning"));
                 msg.reasoning = rc.and_then(Value::as_str).unwrap_or("").to_string();
@@ -482,14 +513,25 @@ fn effort_prefix(effort: u32) -> String {
 }
 
 /// The prompt for `messages` (OpenAI wire format; `tools` is the request's tool list, may be empty).
+/// The prompt text of a request with no images; an image block is refused.
 pub fn render(messages: &[Value], tools: &[Value], o: &Opts) -> Result<String, RenderError> {
+    let (p, images) = render_mm(messages, tools, o)?;
+    if !images.is_empty() {
+        return err("image content is not supported here");
+    }
+    Ok(p)
+}
+
+/// The prompt text (one `<｜deepseek_image｜>` per image) and the image blocks in the order their placeholders appear.
+pub fn render_mm(messages: &[Value], tools: &[Value], o: &Opts) -> Result<(String, Vec<Value>), RenderError> {
     if messages.is_empty() {
         return err("messages must not be empty");
     }
     if !(1..=100).contains(&o.effort) {
         return err(format!("reasoning effort must be 1..=100, got {}", o.effort));
     }
-    let msgs = normalise(messages, tools)?;
+    let mut found = Vec::new();
+    let msgs = normalise(messages, tools, &mut found)?;
     // With tools present the model's reasoning is never dropped from earlier turns.
     let drop_thinking = tools.is_empty();
     let last_user = last_user_index(&msgs).map(|i| i as isize).unwrap_or(-1);
@@ -550,7 +592,35 @@ pub fn render(messages: &[Value], tools: &[Value], o: &Opts) -> Result<String, R
             p.push_str(if open { THINK_OPEN } else { THINK_CLOSE });
         }
     }
-    Ok(p)
+    if found.is_empty() {
+        return Ok((p, found));
+    }
+    place_images(&p, found)
+}
+
+/// Swap each marker for the placeholder and order the image blocks as their markers appear.
+fn place_images(p: &str, found: Vec<Value>) -> Result<(String, Vec<Value>), RenderError> {
+    let mut out = String::with_capacity(p.len());
+    let mut order = Vec::with_capacity(found.len());
+    let mut slots: Vec<Option<Value>> = found.into_iter().map(Some).collect();
+    let mut rest = p;
+    while let Some(i) = rest.find(MARK) {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + MARK.len()..];
+        let end = tail.find('\u{0}').ok_or_else(|| RenderError("message text contains a NUL character".into()))?;
+        let n: usize = tail[..end].parse().map_err(|_| RenderError("message text contains a NUL character".into()))?;
+        let Some(b) = slots.get_mut(n).and_then(Option::take) else {
+            return err("message text contains a NUL character");
+        };
+        order.push(b);
+        out.push_str(IMAGE_PLACEHOLDER);
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    if order.len() != slots.len() {
+        return err("an image block was dropped from the prompt");
+    }
+    Ok((out, order))
 }
 
 #[cfg(test)]
@@ -694,6 +764,40 @@ mod tests {
             let tools: Vec<Value> = req["tools"].as_array().cloned().unwrap_or_default();
             let got = render(req["messages"].as_array().unwrap(), &tools, &o).unwrap();
             assert_eq!(got, c["prompt"].as_str().unwrap(), "case {}", c["name"]);
+        }
+    }
+
+    /// ds41_vision_golden.json was rendered by the release's encoder (tests/ds41_vision_golden.py): the prompt text and
+    /// the order of the image records.
+    #[test]
+    fn images_match_the_official_encoder() {
+        let g: Value = serde_json::from_str(include_str!("ds41_vision_golden.json")).unwrap();
+        let cases = g.as_array().unwrap();
+        assert!(cases.len() >= 8);
+        for c in cases {
+            let o = Opts { thinking: c["thinking"].as_bool().unwrap(), effort: c["effort"].as_u64().unwrap() as u32 };
+            let (got, images) = render_mm(c["messages"].as_array().unwrap(), &[], &o).unwrap();
+            assert_eq!(got, c["prompt"].as_str().unwrap(), "case {}", c["name"]);
+            let order: Vec<&str> = images.iter().map(|b| crate::vision::block_b64(b).unwrap()).collect();
+            let want: Vec<&str> = c["order"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            assert_eq!(order, want, "case {}", c["name"]);
+        }
+    }
+
+    #[test]
+    fn image_refusals() {
+        let ok = json!([{"role": "user", "content": [{"type": "image", "data": "QUJD"}]}]);
+        assert_eq!(render_mm(ok.as_array().unwrap(), &[], &CHAT).unwrap().1.len(), 1);
+        assert!(render(ok.as_array().unwrap(), &[], &CHAT).is_err());
+        for bad in [
+            json!([{"role": "user", "content": [{"type": "image"}]}]),
+            json!([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": ""}}]}]),
+            json!([{"role": "user", "content": [{"type": "text", "text": "<｜deepseek_image｜>"}, {"type": "image", "data": "x"}]}]),
+            json!([{"role": "assistant", "content": "a", "reasoning_content": "<｜deepseek_image｜>"}, {"role": "user", "content": "x"}]),
+            // a forged marker cannot take an image's place
+            json!([{"role": "user", "content": [{"type": "text", "text": "\u{0}gr8img0\u{0}"}, {"type": "image", "data": "x"}]}]),
+        ] {
+            assert!(render_mm(bad.as_array().unwrap(), &[], &CHAT).is_err(), "{bad}");
         }
     }
 }

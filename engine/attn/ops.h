@@ -65,6 +65,9 @@ struct G6AttnOps {
     int (*replay_run)(const G6AttnReplay*, void*);
     int (*bind_reset_pages)(G6AttnBinding*, int, void*);
     int (*bind_check_clear)(G6AttnBinding*, int, unsigned*, void*);
+    int (*bind_create_pages)(G6AttnBinding*, const G6AttnPack*, int, int, int, int, int, int, void*, void*, size_t);
+    int (*bind_prefill_cache)(const G6AttnPrefill*, void**, size_t*);
+    int (*qo_create_ext)(G6AttnQo**, const G6AttnBinding*, const G6AttnTensor*, const G6AttnTensor*, int, void*, G6AttnQo*, void*, size_t);
 };
 
 // The linked model's table (one per binary). The runtime reaches every op through it.
@@ -125,3 +128,6 @@ inline int g6_attn_qo_warm(G6AttnQo* a0, int a1, void* a2) { auto f = g6_attn_op
 inline int g6_attn_replay_run(const G6AttnReplay* a0, void* a1) { auto f = g6_attn_ops()->replay_run; if (!f) g6_attn_missing("replay_run"); return f(a0, a1); }
 inline int g6_attn_bind_reset_pages(G6AttnBinding* a0, int a1, void* a2) { auto f = g6_attn_ops()->bind_reset_pages; if (!f) g6_attn_missing("bind_reset_pages"); return f(a0, a1, a2); }
 inline int g6_attn_bind_check_clear(G6AttnBinding* a0, int a1, unsigned* a2, void* a3) { auto f = g6_attn_ops()->bind_check_clear; if (!f) g6_attn_missing("bind_check_clear"); return f(a0, a1, a2, a3); }
+inline int g6_attn_bind_create_pages(G6AttnBinding* a0, const G6AttnPack* a1, int a2, int a3, int a4, int a5, int a6, int a7, void* a8, void* a9, size_t a10) { auto f = g6_attn_ops()->bind_create_pages; if (!f) g6_attn_missing("bind_create_pages"); return f(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10); }
+inline int g6_attn_bind_prefill_cache(const G6AttnPrefill* a0, void** a1, size_t* a2) { auto f = g6_attn_ops()->bind_prefill_cache; return f ? f(a0, a1, a2) : G6_ATTN_NOTSUP; }
+inline int g6_attn_qo_create_ext(G6AttnQo** a0, const G6AttnBinding* a1, const G6AttnTensor* a2, const G6AttnTensor* a3, int a4, void* a5, G6AttnQo* a6, void* a7, size_t a8) { auto f = g6_attn_ops()->qo_create_ext; return f ? f(a0, a1, a2, a3, a4, a5, a6, a7, a8) : G6_ATTN_NOTSUP; }

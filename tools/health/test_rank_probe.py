@@ -92,7 +92,7 @@ class Parsers(unittest.TestCase):
         self.assertEqual(rp.parse_throttle(None), (None, []))
 
     def test_roce_gid(self):
-        self.assertEqual(rp.roce_gid('192.168.1.7'), '0000:0000:0000:0000:0000:ffff:c0a8:0107')
+        self.assertEqual(rp.roce_gid('192.0.2.7'), '0000:0000:0000:0000:0000:ffff:c000:0207')
         self.assertIsNone(rp.roce_gid('not an ip'))
 
     def test_ib_bw(self):

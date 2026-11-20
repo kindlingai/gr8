@@ -25,22 +25,221 @@ def flash(*argv, peers=PEERS):
     return o
 
 
+class FlashWaterfillOptionsTests(unittest.TestCase):
+    PEERS2 = '10.0.0.1,10.0.0.2'
+
+    def plan(self, *argv):
+        return opt.engine_plan(flash('--tp', '2', '--kv-format', 'int4', *argv, peers=self.PEERS2))
+
+    def word(self, plan, key, value):
+        self.assertEqual([w for w in plan['env'] if w.startswith(key + '=')],
+                         [] if value is None else [key + '=' + value])
+
+    def test_defaults_and_eight_streams(self):
+        for args, sessions in (((), '4'), (('--sess', '8'), '8')):
+            p = self.plan(*args)
+            self.assertEqual((p['knobs']['SESS'], p['knobs']['MTP']), (sessions, '3'))
+            self.word(p, 'GR8_S2_SHARED_WATERFILL', '1')
+            self.word(p, 'GR8_S2_SHARED_WF_MARGIN', '0.02')
+            for flag, value in (('--mtp', '3'), ('--s2-sessions', sessions)):
+                self.assertEqual(p['args'][p['args'].index(flag) + 1], value)
+
+    def test_rollbacks_and_overrides(self):
+        for args, mtp, wf, margin in (
+            (('--s2-shared-waterfill', '0'), '1', '0', None),
+            (('--extra-env', 'GR8_S2_SHARED_WATERFILL=0'), '1', '0', None),
+            (('--s2-shared-waterfill', '0', '--mtp', '3'), '3', '0', None),
+            (('--mtp', '1'), '1', '1', '0.02'),
+            (('--sess', '1'), '1', None, None),
+        ):
+            with self.subTest(args=args):
+                p = self.plan(*args)
+                self.assertEqual(p['knobs']['MTP'], mtp)
+                self.word(p, 'GR8_S2_SHARED_WATERFILL', wf)
+                self.word(p, 'GR8_S2_SHARED_WF_MARGIN', margin)
+                if args == ('--sess', '1'):
+                    self.assertEqual(p['knobs']['SESS'], '1')
+
+    def test_other_shapes_untouched(self):
+        cases = [flash('--tp', str(tp), *args, peers=','.join('10.0.0.' + str(i + 1) for i in range(tp)))
+                 for tp, args in ((1, ('--kv-format', 'int4', '--sess', '4')), (2, ()), (3, ()),
+                                  (4, ('--kv-format', 'int4')))]
+        cases += [opt.parse(['--no-config', '--peers', PEERS], GLM), ds41()]
+        for o in cases:
+            opt.validate(o)
+            p = opt.engine_plan(o)
+            self.word(p, 'GR8_S2_SHARED_WATERFILL', None)
+            self.word(p, 'GR8_S2_SHARED_WF_MARGIN', None)
+
+    def test_refusals(self):
+        for args in (('--s2-shared-waterfill', '2'), ('--s2-shared-wf-margin', '-1'),
+                     ('--s2-shared-wf-margin', 'nan'), ('--s2-shared-wf-margin', 'inf')):
+            with self.subTest(args=args), self.assertRaises(opt.OptionError):
+                self.plan(*args)
+        with self.assertRaises(opt.OptionError):
+            ds41('--s2-shared-waterfill', '1')
+
+
+class Kv4ExactOptionsTests(unittest.TestCase):
+    WORDS = ('GR8_KV4_SC=4', 'GR8_KV4_SC_TR=2', 'GR8_KV4_QT=1',
+             'GR8_KV4_CTX=2', 'GR8_KV4_FUSE_ROT=1')
+
+    @staticmethod
+    def plan(*argv, tp=4):
+        peers = ','.join('192.0.2.' + str(i + 1) for i in range(tp))
+        o = opt.parse(['--no-config', '--peers', peers, '--tp', str(tp), *argv], GLM)
+        opt.validate(o)
+        return opt.engine_plan(o)
+
+    def test_int4_defaults(self):
+        for args in ((), ('--kv-format', 'int4')):
+            env = self.plan(*args)['env']
+            for word in self.WORDS:
+                self.assertEqual([w for w in env if w.startswith(word.split('=')[0] + '=')], [word])
+
+    def test_other_shapes_unchanged(self):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (4, ('--kv-format', 'fp8'))):
+            env = self.plan(*args, tp=tp)['env']
+            self.assertFalse([w for w in env if w.startswith('GR8_KV4_')])
+
+    def test_extra_env_wins_once(self):
+        keys = ('GR8_KV4_SC', 'GR8_KV4_CTX', 'GR8_KV4_QT', 'GR8_KV4_FUSE_ROT')
+        env = self.plan('--kv-format', 'int4', '--extra-env', ' '.join(k + '=0' for k in keys))['env']
+        for key in keys:
+            self.assertEqual([w for w in env if w.startswith(key + '=')], [key + '=0'])
+
+
+class Kv4OptionsTests(unittest.TestCase):
+    WORDS = Kv4ExactOptionsTests.WORDS + ('GR8_KV4_FOLD=1', 'GR8_KV4_TC=1', 'GR8_CP_ONECHAIN=1')
+
+    @staticmethod
+    def plan(*argv, tp=4):
+        plan = Kv4ExactOptionsTests.plan('--share-limit', '32768', *argv, tp=tp)
+        if plan['knobs']['SHARE_LIMIT'] != '32768':
+            raise AssertionError('tests require the stock shared prefix')
+        return plan
+
+    def assert_words_once(self, env, words):
+        for word in words:
+            self.assertEqual([w for w in env if w.startswith(word.split('=')[0] + '=')], [word])
+
+    def test_default_stack(self):
+        for args in ((), ('--kv-format', 'int4')):
+            p = self.plan(*args)
+            self.assertEqual(p['knobs']['CAP'], '513536')
+            self.assertEqual(p['args'][-2:], ['--kv-format', 'int4'])
+            self.assert_words_once(p['env'], self.WORDS)
+
+    def test_exact_rollback(self):
+        env = self.plan('--kv-format', 'int4', '--kv4-tc', '0', '--kv4-fold', '0', '--cp-onechain', '0')['env']
+        self.assert_words_once(env, Kv4ExactOptionsTests.WORDS +
+                               ('GR8_KV4_TC=0', 'GR8_KV4_FOLD=0', 'GR8_CP_ONECHAIN=0'))
+
+    def test_fp8_weights_keep_exact_path(self):
+        for args in (('--kvb', 'fp8'), ('--extra-env', 'GR8_KVB=fp8')):
+            env = self.plan('--kv-format', 'int4', '--v2-dense', '/release', *args)['env']
+            self.assertNotIn('GR8_KV4_FOLD=1', env)
+            self.assertNotIn('GR8_KV4_TC=1', env)
+            self.assert_words_once(env, Kv4ExactOptionsTests.WORDS)
+
+    def test_fold_override_disables_implicit_tc(self):
+        env = self.plan('--kv-format', 'int4', '--extra-env', 'GR8_KV4_FOLD=0')['env']
+        self.assert_words_once(env, ('GR8_KV4_FOLD=0',))
+        self.assertNotIn('GR8_KV4_FOLD=1', env)
+        self.assertNotIn('GR8_KV4_TC=1', env)
+
+    def test_flip_disables_implicit_onechain(self):
+        env = self.plan('--kv-format', 'int4', '--extra-env', 'GR8_ATTN_FLIP=1')['env']
+        self.assertNotIn('GR8_CP_ONECHAIN=1', env)
+
+    def test_no_defaults_for_other_shapes(self):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (4, ('--kv-format', 'fp8'))):
+            env = self.plan(*args, tp=tp)['env']
+            self.assertFalse([w for w in env if w.startswith(('GR8_KV4_', 'GR8_CP_ONECHAIN='))])
+
+    def test_refusals(self):
+        for args in (('--kv4-fold', '2'), ('--kv4-tc', 'x'), ('--kv-format', 'fp8', '--kv4-fold', '1'),
+                     ('--kv-format', 'int4', '--kv4-fold', '1', '--kvb', 'fp8', '--v2-dense', '/release')):
+            with self.assertRaises(opt.OptionError):
+                self.plan(*args)
+        with self.assertRaises(opt.OptionError):
+            self.plan('--kv4-fold', '1', tp=6)
+        with self.assertRaises(opt.OptionError):
+            flash('--kv-format', 'int4', '--kv4-fold', '1')
+
+
+class ReuseGridOptionsTests(unittest.TestCase):
+    """REUSE_GRID: 64 at TP=4 with int4 KV (GR8_REUSE_GRID), unchanged elsewhere."""
+
+    @staticmethod
+    def grid(*argv, tp=4):
+        return [w for w in Kv4ExactOptionsTests.plan(*argv, tp=tp)['env'] if w.startswith('GR8_REUSE_GRID=')]
+
+    def test_default_and_rollback(self):
+        for args in ((), ('--kv-format', 'int4')):
+            self.assertEqual(self.grid(*args), ['GR8_REUSE_GRID=64'])
+            self.assertEqual(Kv4ExactOptionsTests.plan(*args)['knobs']['REUSE_GRID'], '64')
+        self.assertEqual(self.grid('--reuse-grid', '0'), [])
+        self.assertEqual(self.grid('--reuse-grid', '4096'), ['GR8_REUSE_GRID=4096'])
+        self.assertEqual(self.grid('--reuse', '0'), [])
+
+    def test_extra_env(self):
+        self.assertEqual(self.grid('--extra-env', 'GR8_REUSE_GRID=256'), ['GR8_REUSE_GRID=256'])
+        for align in ('GR8_REUSE_ALIGN=0', 'G6_REUSE_ALIGN=0'):
+            self.assertEqual(self.grid('--extra-env', align), [])
+
+    def test_kv_store_takes_the_default_grid(self):
+        store = ('--kv-store', 'ssd:/x,size=1G')
+        self.assertEqual(self.grid(*store), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(self.grid(*store, '--kv-keep', 'sessions'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(self.grid(*store, '--reuse-grid', '64'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(self.grid('--kv-store', 'off'), ['GR8_REUSE_GRID=64'])
+        for rollback in (('--reuse-grid', '0'), ('--extra-env', 'GR8_REUSE_ALIGN=0')):
+            self.assertEqual(self.grid(*store, *rollback), [])
+        self.assertEqual(self.grid(*store, '--reuse-grid', '4096'), ['GR8_REUSE_GRID=4096'])
+        self.assertEqual(self.grid(*store, '--extra-env', 'GR8_REUSE_GRID=4096'), ['GR8_REUSE_GRID=4096'])
+        with self.assertRaises(opt.OptionError):   # a store needs REUSE, so --reuse 0 is refused, not a rollback
+            self.grid(*store, '--reuse', '0')
+        for tp, args in ((6, ('--kv-format', 'int4')), (4, ('--kv-format', 'fp8'))):
+            self.assertEqual(self.grid(*args, *store, tp=tp), [])
+
+    def test_other_shapes_unchanged(self):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (5, ()), (4, ('--kv-format', 'fp8'))):
+            self.assertEqual(self.grid(*args, tp=tp), [])
+
+    def test_refusals(self):
+        for args in (('--reuse-grid', '32'), ('--reuse-grid', '100'), ('--reuse', '0', '--reuse-grid', '64'),
+                     ('--extra-env', 'GR8_REUSE_ALIGN=0', '--reuse-grid', '64')):
+            with self.assertRaises(opt.OptionError):
+                self.grid(*args)
+        with self.assertRaises(opt.OptionError):
+            flash('--reuse-grid', '64')
+
+
 class OptionTests(unittest.TestCase):
     def test_defaults(self):
         o = flash()
         self.assertEqual((models.of(o), o.get('GROUP'), S.engine_bin(o)), (models.GLM53F, 'gr8-glm53f', 'g6m4_flash'))
         self.assertEqual(flash('--group', 'mine').get('GROUP'), 'mine')
+        # --kv-format int4 runs g6m4_flash-int4 and passes the flag, which that build requires
+        o = flash('--kv-format', 'int4')
+        self.assertEqual(S.engine_bin(o), 'g6m4_flash-int4')
+        self.assertEqual(opt.engine_plan(o)['args'][-2:], ['--kv-format', 'int4'])
         glm = opt.parse(['--no-config', '--peers', PEERS], GLM)
         self.assertEqual((models.of(glm), glm.get('GROUP')), (models.GLM53, 'gr8-glm53'))
+        self.assertEqual((glm.get('KV_FORMAT'), S.engine_bin(glm)), ('int4', 'g6m4-int4'))
+        fp8 = opt.parse(['--no-config', '--peers', PEERS, '--kv-format', 'fp8'], GLM)
+        self.assertEqual(S.engine_bin(fp8), 'g6m4')
 
     def test_refusals(self):
-        for argv, want in ((['--tp', '6'], 'want 4, 3 or 2 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
-                           (['--dflash', '1'], 'no DFlash2 drafter'),
-                           (['--drafter', 'https://huggingface.co/a/b'], 'no DFlash2 drafter')):
+        for argv, want in ((['--tp', '6'], 'want 4, 3, 2 or 1 (glm53f)'),
+                           (['--tp', '3', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter', 'https://huggingface.co/a/b'],
+                            'runs at TP=4, TP=2 and TP=1 (split) and TP=6')):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))
         for argv, want in ((['--reuse', '1'], 'GLM-5.3-Flash has no REUSE'), (['--sess', '9'], 'serves 1 to 8 sessions'),
+                           (['--tp', '3', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--dflash', '1'], 'drafter at TP=4'),
                            (['--sess', '0'], 'serves 1 to 8 sessions'),
                            (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):
             with self.assertRaises(opt.OptionError) as e:
@@ -48,18 +247,51 @@ class OptionTests(unittest.TestCase):
             self.assertIn(want, str(e.exception))
 
     def test_engine_plan(self):
-        for tp, peers in (('4', PEERS), ('2', '10.0.0.1,10.0.0.2')):
+        for tp, peers in (('4', PEERS), ('3', '10.0.0.1,10.0.0.2,10.0.0.3'), ('2', '10.0.0.1,10.0.0.2')):
             plan = opt.engine_plan(flash(peers=peers))
-            self.assertEqual(plan['knobs']['SESS'], '1')
+            sess = {'4': '8', '3': '4', '2': '1'}[tp]
+            self.assertEqual(plan['knobs']['SESS'], sess)
             self.assertIn('GR8_CP=0', plan['env'])
             self.assertIn('GR8_PF_RS=0', plan['env'])
-            self.assertIn('GR8_GLM53F_PF_STAGE_ASYNC=1', plan['env'])
-            (self.assertNotIn if tp == '4' else self.assertIn)('GR8_GLM53F_KDA_SCAN=1', plan['env'])
-            for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
+            # TP=4: sequence-parallel mHC in place of the peer-partial staging
+            self.assertIn('GR8_GLM53F_PF_STAGE_ASYNC=' + ('0' if tp == '4' else '1'), plan['env'])
+            self.assertIn('GR8_GLM53F_PF_SP=' + ('1' if tp == '4' else '0'), plan['env'])
+            self.assertIn('GR8_GLM53F_KDA_SCAN=1', plan['env'])
+            self.assertIn('GR8_PF_ROUTER_SPLIT=' + ('0' if tp == '4' else '1'), plan['env'])
+            for a in ('--reuse-prefix', '--wide', '--pfv2', '--qo-manifest'):
                 self.assertNotIn(a, plan['args'])
-            self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '1')
+            (self.assertNotIn if tp == '3' else self.assertIn)('--dflash-manifest', plan['args'])
+            self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], sess)
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('GR8_GLM53F_PF_DSA_F16GEMM=1', plan['env'])
+
+    def test_one_box(self):
+        # TP=1: one box, K2 (the width whose experts fit), one session, the drafter on as at TP=4 (the supervisor turns
+        # it off when the boot names none)
+        o = flash('--tp', '1', peers='10.0.0.1')
+        plan = opt.engine_plan(o)
+        self.assertEqual((plan['knobs']['SESS'], plan['knobs']['DFLASH']), ('1', '1'))
+        self.assertIn('--dflash-manifest', plan['args'])
+        flash('--tp', '1', '--drafter', 'https://huggingface.co/a/b', peers='10.0.0.1')
+        self.assertIn('GR8_PF_ROUTER_SPLIT=0', plan['env'])
+        self.assertEqual(models.GLM53F.default_variant[1], ('k2',))
+        self.assertEqual((S.fabric_needed(o), S.fabric_needed(flash())), (False, True))
+        with self.assertRaises(opt.OptionError) as e:
+            flash('--tp', '1', '--ips', '10.1.0.1', '--ips2', '10.2.0.1', peers='10.0.0.1')
+        self.assertIn('--tp 1 takes no --ips', str(e.exception))
+
+    def test_max_model_len(self):
+        # #339: the longest request, apart from the pool; a cluster option, so the boxes compare it
+        o = flash('--cap', '1048640', '--max-model-len', '262144')
+        c, _, _ = opt.canonical(o, opt.engine_plan(o), opt.split_list(PEERS))
+        self.assertEqual(c['MAX_MODEL_LEN'], '262144')
+        self.assertNotIn('MAX_MODEL_LEN', opt.canonical(flash(), opt.engine_plan(flash()), opt.split_list(PEERS))[0])
+        for argv, want in ((['--max-model-len', '0'], 'want 1 to 1048576'), (['--max-model-len', '2000000'], 'want 1 to 1048576'),
+                           (['--cap', '131136', '--max-model-len', '262144'], 'more than CAP 131136'),
+                           (['--max-model-len', 'x'], 'want a whole number')):
+            with self.assertRaises(opt.OptionError) as e:
+                flash(*argv)
+            self.assertIn(want, str(e.exception))
 
     def test_flash_cache(self):
         plan = opt.engine_plan(flash())
@@ -71,9 +303,12 @@ class OptionTests(unittest.TestCase):
         self.assertNotIn('--kv-store', plan['args'])
         plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/fc,size=64G'))
         self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G')
+        # persist=on keeps aligned checkpoints and their index across boots
+        plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/fc,size=64G,persist=on'))
+        self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G,persist=on')
         plan = opt.engine_plan(flash('--flash-cache', 'terminal'))
         self.assertIn('GR8_GLM53F_CACHE=terminal', plan['env'])
-        # the checkpoint store on a group lease (D-331 M8 (c)): the store as given, KV_SHARE_WHEN reaches the engine
+        # the checkpoint store on a group lease: the store as given, KV_SHARE_WHEN reaches the engine
         g = 'remote:192.0.2.5:7350,size=1G,group=flash'
         plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', g, '--kv-share-when', 'always'))
         self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], g)
@@ -84,8 +319,8 @@ class OptionTests(unittest.TestCase):
                            (['--kv-store', 'ssd:/tmp/fc,size=64G'], 'needs --flash-cache aligned or terminal'),
                            (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G', '--kv-store',
                              'ssd:/tmp/b,size=1G'], 'give one --kv-store'),
-                           (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G,persist=on'],
-                            'do not persist')):
+                           (['--flash-cache', 'terminal', '--kv-store', 'ssd:/tmp/a,size=1G,persist=on'],
+                            'cold-exact (aligned) checkpoints only')):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))
@@ -107,6 +342,35 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['knobs']['SHARE_LIMIT'], '32768')
             plan = opt.engine_plan(flash('--cap', '131072', peers=peers))
             self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '131072')
+
+    def test_dflash(self):
+        # DFLASH=1 at TP=4 and TP=2 gives the drafter packs and the adaptive draft count, and DFLASH=0 at TP=3. The
+        # supervisor turns DFLASH off when there is no drafter.
+        self.assertEqual(opt.engine_plan(flash())['knobs']['DFLASH'], '1')
+        self.assertEqual(opt.engine_plan(flash(peers='10.0.0.1,10.0.0.2'))['knobs']['DFLASH'], '1')
+        self.assertEqual(opt.engine_plan(flash(peers='10.0.0.1,10.0.0.2,10.0.0.3'))['knobs']['DFLASH'], '0')
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d'))
+        a = ' '.join(plan['args'])
+        self.assertIn('--dflash-manifest @DFLASH_DIR/dflash.r@R.manifest.json --dflash-pack @DFLASH_DIR/dflash.r@R.pack', a)
+        self.assertIn('--spec-adaptive', a)
+
+    def test_flash_cache_with_the_drafter(self):
+        # FLASH_CACHE and DFLASH=1 together (#340): both reach the engine; DFL_REUSE and DFL_REUSE_MIN pass through
+        # when set, else the engine's default holds
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'aligned'))
+        self.assertIn('GR8_GLM53F_CACHE=aligned', plan['env'])
+        self.assertIn('--dflash-manifest', ' '.join(plan['args']))
+        self.assertFalse([e for e in plan['env'] if e.startswith('GR8_DFL_REUSE')])
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'aligned',
+                                     '--dfl-reuse', '0', '--dfl-reuse-min', '64'))
+        self.assertIn('GR8_DFL_REUSE=0', plan['env'])
+        self.assertIn('GR8_DFL_REUSE_MIN=64', plan['env'])
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d', '--dfl-reuse', '2'))
+        self.assertIn('GR8_DFL_REUSE=2', plan['env'])
+        # terminal checkpoints are not cold-exact: the drafter takes aligned only (the engine refuses it too)
+        with self.assertRaises(opt.OptionError) as e:
+            flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'terminal')
+        self.assertIn('aligned checkpoints only', str(e.exception))
 
     def test_sessions(self):
         # SESS 2..8 share decode steps (each session its own KDA slots); a round of every session fits 32 rows
@@ -140,6 +404,39 @@ class Ds41Tests(unittest.TestCase):
         self.assertEqual((models.of(o), o.get('GROUP'), S.engine_bin(o)), (models.DS41, 'gr8-ds41', 'g6m4_ds41'))
         self.assertEqual(models.DS41.architecture, 'DeepseekV41ForCausalLM')
 
+    def test_slot_parking_default_conditions_and_rollback(self):
+        for args, want in [
+            ((), '1'),
+            (('--reuse', '1', '--sess', '2'), '1'),
+            (('--reuse', '0'), None),
+            (('--sess', '1'), None),
+            (('--extra-env', 'GR8_DS_PARK=0'), '0'),
+            (('--extra-env', 'GR8_DS_PARK=1'), '1'),
+            (('--extra-env', 'G6_DS_PARK=0'), '0'),
+            (('--extra-env', 'GR8_DS_CACHE_MIB=0'), None),
+            (('--extra-env', 'G6_DS41_CACHE_MIB=0'), None),
+            (('--extra-env', 'GR8_DS_CACHE_MIB=1024'), '1'),
+        ]:
+            with self.subTest(args=args):
+                env = opt.engine_plan(ds41(*args))['env']
+                self.assertEqual([e for e in env if e.startswith('GR8_DS_PARK=')],
+                                 [] if want is None else ['GR8_DS_PARK=' + want])
+        # The shell normalizes the legacy cache alias to this spelling. Test default selection without claiming
+        # that the knob validator accepts that intermediate spelling (or a zero cache size).
+        o = opt.parse(['--no-config', '--tp', '4', '--peers', PEERS, '--extra-env', 'GR8_DS41_CACHE_MIB=0'], {'GR8_MODEL': 'ds41'})
+        self.assertNotIn('GR8_DS_PARK=1', opt.engine_plan(o)['env'])
+
+    def test_kv_stores(self):
+        for store in ('mem:,size=1G', 'ssd:/tmp/kv,size=8G,persist=on', 'remote:localhost:7349,size=2G'):
+            plan = opt.engine_plan(ds41('--reuse', '1', '--kv-store', store,
+                                       '--kv-keep', 'sessions', '--kv-system-after', '4', '--kv-write-limit', '1'))
+            args = plan['args']
+            parsed = opt.kv_parse(store)
+            self.assertEqual(opt.kv_store_text(opt.kv_yaml(*parsed)), opt.kv_line(*parsed))
+            for key, value in (('--kv-store', store), ('--kv-keep', 'sessions'),
+                               ('--kv-system-after', '4'), ('--kv-write-limit', '1')):
+                self.assertEqual(args[args.index(key) + 1], value)
+
     def test_refusals(self):
         for argv, want in ((['--tp', '3'], 'want 4 (ds41)'), (['--dflash', '1'], 'no DFlash2 drafter'),
                            (['--kv-format', 'int4'], 'fp8 KV build only')):
@@ -148,7 +445,7 @@ class Ds41Tests(unittest.TestCase):
             self.assertIn(want, str(e.exception))
         # DS41 prefix snapshots are now opt-in via REUSE=1; the other refusals remain.
         opt.engine_plan(ds41('--reuse', '1'))
-        for argv, want in ((['--sess', '9'], 'serves several sessions only with GR8_DS_PREFILL_MIN>=2'),
+        for argv, want in ((['--sess', '2', '--extra-env', 'GR8_DS_PREFILL_MIN=0'], 'serves several sessions only with GR8_DS_PREFILL_MIN>=2'),
                            (['--mtp', '6'], 'drafts 0 to 5'), (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):
             with self.assertRaises(opt.OptionError) as e:
                 opt.engine_plan(ds41(*argv))
@@ -172,7 +469,14 @@ class Ds41Tests(unittest.TestCase):
             with self.assertRaises(opt.OptionError) as err:
                 ds41('--default-reasoning-effort', e)
             self.assertIn('want a whole number 1 to 100', str(err.exception))
-        # GLM keeps its list: no number, no none
+        # GLM and GLM-5.3-Flash take a name, none too (thinking off at the template's lowest effort), but no number
+        glm = opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', 'none'], GLM)
+        opt.validate(glm)
+        self.assertEqual(glm.get('DEFAULT_REASONING_EFFORT'), 'none')
+        self.assertEqual(flash('--default-reasoning-effort', 'none').get('DEFAULT_REASONING_EFFORT'), 'none')
+        with self.assertRaises(opt.OptionError) as err:
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', '50'], GLM))
+        self.assertIn('want none, minimal, low, medium, high, xhigh or max', str(err.exception))
         for e in ('50', 'none'):
             with self.assertRaises(opt.OptionError):
                 opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', e], {}))
@@ -183,18 +487,121 @@ class Ds41Tests(unittest.TestCase):
             opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--extra-env', 'GR8_DS_ENGRAM=0'], GLM))
         self.assertIn('DeepSeek-V4.1 engine variables', str(e.exception))
 
+    # the release stack's prefill words (docs/DEEPSEEK.md): the plain default; the fast decode words stay out
+    V2 = ('GR8_DS_PF_V2_L20_TAIL=1', 'GR8_DS_PF_V2_SEND_FFN_OPT=3', 'GR8_DS_PF_V2_BF16_TC=0', 'GR8_DS_PF_V2_W16K=1', 'GR8_DS_PF_V2=1', 'GR8_DS_PF_LANES=1', 'GR8_DS_PF_TAIL=128', 'GR8_DS_SH_TC=1', 'GR8_DS_PREFILL_W=12288', 'GR8_DS_ATTN_PW=12288',
+          'GR8_DS41_IDX_PW=12288', 'GR8_DS_PF_V2_GATE_RO=1', 'GR8_DS_PF_V2_STRIPE_MIN=1048576', 'GR8_DS_PF_V2_ATTN_PIPE=1',
+          'GR8_DS_ENGRAM_IO_THREADS=64', 'GR8_DS_ATTN_TC_TILE=2', 'GR8_S2_ADMIT_HOLD=1', 'GR8_S2_TAIL_FIRST=1', 'GR8_S2_DECODE_PF=4096', 'GR8_S2_DECODE_ROUNDS=16')
+    FAST = ('GR8_DS_RELAXED_ACCEPT', 'GR8_DS_MOE_TOPK_DECODE', 'GR8_DS41_HEAD_MX', 'GR8_DS_ATTN_TC_MF')
+
+    def test_the_default_prefill_is_the_release_stack(self):
+        env = opt.engine_plan(ds41())['env']
+        for e in self.V2:
+            self.assertEqual([w for w in env if w.startswith(e.split('=')[0] + '=')], [e])
+        self.assertFalse([w for w in env if w.startswith(self.FAST)])
+        self.assertFalse([w for w in env if w.startswith(('GR8_DS_MHC_ROW_SHARD=', 'GR8_DS_MHC_Y_MXFP8='))])   # engine defaults: 0
+
+    def test_v2_width_overrides(self):
+        for override in ('GR8_DS_PF_V2_W16K=0', 'GR8_DS_PREFILL_W=8192'):
+            env = opt.engine_plan(ds41('--extra-env', override))['env']
+            for key in ('GR8_DS_PREFILL_W', 'GR8_DS_ATTN_PW', 'GR8_DS41_IDX_PW'):
+                self.assertEqual([w for w in env if w.startswith(key + '=')], [key + '=8192'])
+            self.assertNotIn('GR8_DS_PF_V2_W16K=1', env)
+            if override.endswith('W16K=0'):
+                self.assertEqual(env.count(override), 1)
+
+    def test_v2_bf16_tc_opt_in(self):
+        env = opt.engine_plan(ds41('--extra-env', 'GR8_DS_PF_V2_BF16_TC=7'))['env']
+        self.assertEqual([w for w in env if w.startswith('GR8_DS_PF_V2_BF16_TC=')], ['GR8_DS_PF_V2_BF16_TC=7'])
+        self.assertIn('GR8_DS_PF_V2=1', env)
+        self.assertIn('GR8_DS_PREFILL_W=12288', env)
+        for argv in (('--exact', '1'), ('--extra-env', 'GR8_DS_PF_V2=0'), ('--extra-env', 'GR8_DS_MHC_ROW_SHARD=1')):
+            old_env = opt.engine_plan(ds41(*argv))['env']
+            self.assertFalse([w for w in old_env if w.startswith('GR8_DS_PF_V2_BF16_TC')], argv)
+
+    def test_exact_output_is_the_old_prefill(self):
+        # EXACT=1, EXTRA_ENV GR8_DS_PF_V2=0 and the 1M-context row split: today's stack, two lanes, W 4096, no v2 word
+        for argv in (('--exact', '1'), ('--extra-env', 'GR8_DS_PF_V2=0'), ('--extra-env', 'GR8_DS_MHC_ROW_SHARD=1')):
+            env = opt.engine_plan(ds41(*argv))['env']
+            for e in ('GR8_DS_PF_LANES=2', 'GR8_DS_PREFILL_W=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS41_IDX_PW=4096', 'GR8_S2_DECODE_PF=4096', 'GR8_S2_DECODE_ROUNDS=16'):
+                self.assertIn(e, env)
+            for w in ('GR8_DS_PF_V2=1', 'GR8_DS_SH_TC', 'GR8_DS_PF_TAIL', 'GR8_DS_PF_V2_', 'GR8_S2_TAIL_FIRST', 'GR8_S2_ADMIT_HOLD',
+                      'GR8_DS_ATTN_TC_TILE', 'GR8_DS_ENGRAM_IO_THREADS'):
+                self.assertFalse([e for e in env if e.startswith(w)], (argv, w))
+        # the exact list is the default list less the release words, with two lanes and W 4096
+        exact = [e for e in opt.engine_plan(ds41('--exact', '1'))['env']]
+        default = [e for e in opt.engine_plan(ds41())['env'] if not e.startswith(tuple(v.split('=')[0] + '=' for v in self.V2))]
+        self.assertEqual([e for e in exact if not e.startswith(('GR8_DS_PF_LANES=', 'GR8_DS_PREFILL_W=', 'GR8_DS_ATTN_PW=',
+                                                                'GR8_DS41_IDX_PW=', 'GR8_S2_DECODE_PF=', 'GR8_S2_DECODE_ROUNDS='))], default)
+        # an EXTRA_ENV word keeps its value; W follows it on either stack
+        env = opt.engine_plan(ds41('--extra-env', 'GR8_DS_PREFILL_W=4096'))['env']
+        self.assertIn('GR8_DS_PF_V2=1', env)
+        self.assertEqual(sorted(e for e in env if e.startswith(('GR8_DS_PREFILL_W=', 'GR8_DS_ATTN_PW='))),
+                         ['GR8_DS_ATTN_PW=4096', 'GR8_DS_PREFILL_W=4096'])
+        env = opt.engine_plan(ds41('--extra-env', 'GR8_DS_SH_TC=0'))['env']
+        self.assertEqual([e for e in env if e.startswith('GR8_DS_SH_TC=')], ['GR8_DS_SH_TC=0'])   # the engine falls back, one line
+        self.assertIn('GR8_S2_ADMIT_HOLD=0', opt.engine_plan(ds41('--s2-admit-hold', '0'))['env'])
+
+    def test_exact_is_ds41_only_and_0_or_1(self):
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--exact', '1'], GLM))
+        self.assertIn('ds41 only', str(e.exception))
+        with self.assertRaises(opt.OptionError) as e:
+            ds41('--exact', '2')
+        self.assertIn('want 0', str(e.exception))
+
     def test_engine_plan(self):
         plan = opt.engine_plan(ds41())
-        self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '1', '1048576'))
-        self.assertIn('GR8_CP=0', plan['env'])
-        self.assertIn('GR8_DEC_BK=16384', plan['env'])
+        self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '5', '262144'))
+        for e in ('GR8_CP=0', 'GR8_DEC_BK=262144', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=12288', 'GR8_DS_ATTN_PW=12288', 'GR8_DS_PF_LANES=1', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1',
+                  'GR8_DS_PF_POOL=4', 'GR8_DS_SRC_FAST=3', 'GR8_DS_MOE_PDL=1', 'GR8_DS41_ADMIT_KEEP_SCRATCH=1', 'GR8_DS41_PUB16=1',
+                  'GR8_DS41_GV_QUAD=1', 'GR8_S2_DECODE_PF=4096', 'GR8_S2_DECODE_ROUNDS=16', 'GR8_DS_COMP_FP4=1'):
+            self.assertIn(e, plan['env'])
         self.assertFalse([e for e in plan['env'] if 'PF_STAGE_ASYNC' in e])   # none of the GLM or Flash prefill stack
-        self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '1')
+        self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '5')
+        # one decode graph bucket: DEC_BK follows CAP unless set
+        self.assertIn('GR8_DEC_BK=1048576', opt.engine_plan(ds41('--cap', '1048576'))['env'])
+        self.assertIn('GR8_DEC_BK=16384', opt.engine_plan(ds41('--dec-bk', '16384'))['env'])   # an explicit value still wins
+        # packed FP4 compressed rows by default; EXTRA_ENV GR8_DS_COMP_FP4=0 opts out (one copy, its value)
+        off = opt.engine_plan(ds41('--extra-env', 'GR8_DS_COMP_FP4=0'))['env']
+        self.assertEqual([e for e in off if e.startswith('GR8_DS_COMP_FP4=')], ['GR8_DS_COMP_FP4=0'])
         self.assertEqual(plan['args'][plan['args'].index('--mtp') + 1], '0')
-        for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
+        self.assertIn('--reuse-prefix', plan['args'])
+        for a in ('--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
             self.assertNotIn(a, plan['args'])
-        plan = opt.engine_plan(ds41('--extra-env', 'GR8_DS_ENGRAM=0 GR8_DEC_SPLIT=0'))
+        # a variable EXTRA_ENV names replaces the tuned one, and the attention and indexer widths follow the prefill width
+        plan = opt.engine_plan(ds41('--extra-env', 'GR8_DS_ENGRAM=0 GR8_DEC_SPLIT=0 GR8_DS_MTP=0 GR8_DS_PREFILL_W=1024'))
+        self.assertEqual(sorted(e for e in plan['env'] if e.startswith(('GR8_DS_MTP=', 'GR8_DS_ATTN_PW=', 'GR8_DS41_IDX_PW='))),
+                         ['GR8_DS41_IDX_PW=1024', 'GR8_DS_ATTN_PW=1024', 'GR8_DS_MTP=0'])
         self.assertIn('GR8_DS_ENGRAM=0', plan['env'])
+        self.assertEqual([e for e in plan['env'] if e.startswith('GR8_S2_DECODE_PF=')], ['GR8_S2_DECODE_PF=1024'])
+        plan = opt.engine_plan(ds41('--extra-env', 'GR8_DS_PREFILL_W=512'))
+        self.assertIn('GR8_S2_DECODE_PF=512', plan['env'])
+        plan = opt.engine_plan(ds41('--extra-env', 'GR8_S2_DECODE_PF=0'))
+        self.assertEqual([e for e in plan['env'] if e.startswith('GR8_S2_DECODE_PF=')], ['GR8_S2_DECODE_PF=0'])
+        plan = opt.engine_plan(ds41('--s2-decode-pf', '512'))
+        self.assertIn('GR8_S2_DECODE_PF=512', plan['env'])
+        plan = opt.engine_plan(ds41('--sess', '1', '--extra-env', 'GR8_DS_PREFILL_MIN=0'))
+        self.assertIn('GR8_S2_DECODE_PF=0', plan['env'])
+
+    def test_ds41_decode_rounds_overrides_and_disabled_quantum(self):
+        for argv in (('--s2-decode-rounds', '8'), ('--extra-env', 'GR8_S2_DECODE_ROUNDS=8')):
+            env = opt.engine_plan(ds41(*argv))['env']
+            self.assertEqual([w for w in env if w.startswith('GR8_S2_DECODE_ROUNDS=')], ['GR8_S2_DECODE_ROUNDS=8'])
+        env = opt.engine_plan(ds41('--s2-decode-rounds', '8', '--extra-env', 'GR8_S2_DECODE_ROUNDS=0'))['env']
+        self.assertEqual([w for w in env if w.startswith('GR8_S2_DECODE_ROUNDS=')], ['GR8_S2_DECODE_ROUNDS=0'])
+        for argv in (('--s2-decode-pf', '0'), ('--extra-env', 'GR8_S2_DECODE_PF=0'),
+                     ('--s2-decode-pf', '4096', '--extra-env', 'GR8_S2_DECODE_PF=0'),
+                     ('--sess', '1', '--extra-env', 'GR8_DS_PREFILL_MIN=0')):
+            env = opt.engine_plan(ds41(*argv))['env']
+            self.assertEqual([w for w in env if w.startswith('GR8_S2_DECODE_PF=')], ['GR8_S2_DECODE_PF=0'])
+            self.assertFalse([w for w in env if w.startswith('GR8_S2_DECODE_ROUNDS=')], argv)
+        for argv in (('--s2-decode-pf', '0', '--s2-decode-rounds', '8'),
+                     ('--extra-env', 'GR8_S2_DECODE_PF=0 GR8_S2_DECODE_ROUNDS=8')):
+            env = opt.engine_plan(ds41(*argv))['env']
+            self.assertEqual([w for w in env if w.startswith('GR8_S2_DECODE_ROUNDS=')], ['GR8_S2_DECODE_ROUNDS=8'])
+        env = opt.engine_plan(ds41('--s2-decode-pf', '0', '--extra-env', 'GR8_S2_DECODE_PF=512'))['env']
+        self.assertIn('GR8_S2_DECODE_PF=512', env)
+        self.assertIn('GR8_S2_DECODE_ROUNDS=16', env)
 
 
 class Ds41ReleaseTests(unittest.TestCase):
@@ -275,7 +682,7 @@ class RequiredTests(unittest.TestCase):
             o = opt.parse(['--no-config', '--peers', PEERS], env)            # down, status and logs need none
             with self.assertRaises(opt.OptionError) as e:
                 opt.validate(o)                                              # up, check, prepare, show-config
-            self.assertIn('no model: set GR8_MODEL to glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)', str(e.exception))
+            self.assertIn('no model: set GR8_MODEL to glm53 (GLM-5.3), glm53f (GLM-5.3-Flash), ds41 (DeepSeek-V4.1-Flash) or ink2 (Inkling-2-Small)', str(e.exception))
             self.assertNotIn('pseudo', str(e.exception))
 
     def test_an_unknown_name(self):
@@ -283,14 +690,14 @@ class RequiredTests(unittest.TestCase):
                                ([], {'GR8_MODEL': 'glm53x'}, 'environment')):
             with self.assertRaises(opt.OptionError) as e:
                 opt.parse(['--no-config', *argv], env)
-            self.assertIn(f'from the {src}: not a model gr8 serves. Want glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)',
+            self.assertIn(f'from the {src}: not a model gr8 serves. Want glm53 (GLM-5.3), glm53f (GLM-5.3-Flash), ds41 (DeepSeek-V4.1-Flash) or ink2 (Inkling-2-Small)',
                           str(e.exception))
             self.assertNotIn('pseudo', str(e.exception))
         self.assertIs(models.of(opt.parse(['--no-config'], {'GR8_MODEL': 'pseudo'})), models.PSEUDO)   # asked for
 
     def test_a_release_of_the_other_model_is_named_before_the_variant(self):
         t = tempfile.mkdtemp()
-        # TP=3 GLM-5.3 wants bit225 or down1, and Flash k4: neither release has the other's, so the variant step would
+        # TP=3 GLM-5.3 wants bit260 or bit225, and Flash k4: neither release has the other's, so the variant step would
         # fail first, on a missing manifest, if the architecture were not checked before it
         for name, arch, peers, want in (
                 ('glm53', 'Glm5NextForConditionalGeneration', '10.0.0.1,10.0.0.2,10.0.0.3', './gr8 glm53f serves it'),
@@ -309,11 +716,17 @@ class RequiredTests(unittest.TestCase):
     def test_the_listing(self):
         glm, flash = models.describe(models.GLM53), models.describe(models.GLM53F)
         self.assertIn('--tp       4, 6, 3 or 5', glm)
-        self.assertIn('TP=3 bit225 else down1', glm)
+        self.assertIn('TP=3 bit260 else bit225', glm)
         self.assertIn(models.GLM53.release, glm)
-        self.assertIn('--tp       4, 3 or 2', flash)
-        self.assertNotIn('--drafter', flash)
-        self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F))
+        self.assertIn('--tp       4, 3, 2 or 1', flash)
+        self.assertIn('TP=1 k2', flash)
+        self.assertIn('--drafter URL (DFlash2), --kv-format int4', flash)
+        self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F, models.DS41, models.INK2))
+        ds = models.describe(models.DS41)
+        self.assertIn('a local copy of an exlr8 release of DeepseekV41ForCausalLM', ds)
+        self.assertIn('--variant  none: the release is read in place', ds)
+        self.assertNotIn('by default', ds)
+        self.assertIn('ds41 (DeepSeek-V4.1-Flash)', models.CHOICES)
 
 
 class PseudoTests(unittest.TestCase):

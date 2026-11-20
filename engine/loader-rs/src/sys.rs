@@ -21,9 +21,24 @@ extern "C" {
     fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     fn posix_fadvise(fd: i32, off: i64, len: i64, advice: i32) -> i32;
     fn sysconf(name: i32) -> i64;
+    fn getrlimit(res: i32, rl: *mut [u64; 2]) -> i32;
+    fn setrlimit(res: i32, rl: *const [u64; 2]) -> i32;
 }
 
 const SC_PAGESIZE: i32 = 30;
+const RLIMIT_NOFILE: i32 = 7;
+
+/// Raises the soft open-file limit to the hard one and returns the new soft limit (0 if it cannot be read). A loader
+/// with compacted copies holds two descriptors for each source and each copy, which passes the usual soft 1024.
+pub fn raise_nofile() -> u64 {
+    let mut rl = [0u64; 2];
+    if unsafe { getrlimit(RLIMIT_NOFILE, &mut rl) } != 0 { return 0; }
+    if rl[0] < rl[1] {
+        let want = [rl[1], rl[1]];
+        if unsafe { setrlimit(RLIMIT_NOFILE, &want) } == 0 { rl[0] = rl[1]; }
+    }
+    rl[0]
+}
 
 pub fn fadvise_dontneed(f: &File, off: u64, len: u64) {
     unsafe { posix_fadvise(f.as_raw_fd(), off as i64, len as i64, POSIX_FADV_DONTNEED) };
@@ -89,9 +104,18 @@ pub struct AlignedBuf {
 }
 
 impl AlignedBuf {
+    /// Aborts through handle_alloc_error when the allocation fails.
     pub fn new(n: usize) -> AlignedBuf {
         let layout = std::alloc::Layout::from_size_align(n.div_ceil(4096) * 4096, 4096).unwrap();
-        AlignedBuf { p: unsafe { std::alloc::alloc(layout) }, layout }
+        AlignedBuf::try_new(n).unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
+    }
+
+    /// None when the size has no layout or the allocation fails.
+    pub fn try_new(n: usize) -> Option<AlignedBuf> {
+        let layout = std::alloc::Layout::from_size_align(n.checked_next_multiple_of(4096)?.max(4096), 4096).ok()?;
+        let p = unsafe { std::alloc::alloc(layout) };
+        // not then_some: that builds the AlignedBuf first, and dropping it would free the null pointer
+        if p.is_null() { None } else { Some(AlignedBuf { p, layout }) }
     }
 
     pub fn slice(&mut self, n: usize) -> &mut [u8] {

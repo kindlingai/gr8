@@ -372,15 +372,18 @@ class Release:
         """What steering_hf asks of a source's repo: the file list, a fetch into place, and a hash check."""
         return StoreRepo(self)
 
+    # GLM-5.3-Flash image input (GR8_GLM53F_VISION=1, supervisor.resolve_model): the rank also fetches the vision tower
+    vision = False
+
     def whole_files(self, tp, rank):
-        """The rank's index slices (every rank's under a layout), and the dense and vocab files without the vision
-        tower, as hfsource.Release.whole_files."""
+        """The rank's index slices (every rank's under a layout), and the dense and vocab files, the vision tower only
+        with image input on, as hfsource.Release.whole_files."""
         r = r'\d+' if self.layout else str(rank)
         slices = sorted(p for p in self.files if re.fullmatch(rf'index-slices/tp{tp}/k\d/rank{r}\.safetensors', p))
         if not slices:
             raise modelset.ModelError(f'{self} has no index slices for TP={tp}')
         dense = sorted(p for p in self.files if p.startswith('dense/') and p.endswith('.safetensors')
-                       and not p.startswith('dense/vision-'))
+                       and (self.vision or not p.startswith('dense/vision-')))
         return slices + dense
 
     def key(self, tp, rank, variant):

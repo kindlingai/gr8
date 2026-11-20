@@ -1,0 +1,32 @@
+{
+ "image": "photo_scene_250x180.png",
+ "ppm": "photo_scene_250x180.ppm",
+ "w": 250,
+ "h": 180,
+ "vit_h": 14,
+ "vit_w": 18,
+ "tokens": 63,
+ "dim": 4096,
+ "nproj": 64,
+ "rows": [
+  0,
+  1,
+  8,
+  9,
+  31,
+  54,
+  61,
+  62
+ ],
+ "rgb_sha256": "5c52a4cbe0dd1e8a0adb4088e7d0aea2eadb751e1bd972988e3d992975038dae",
+ "patches_bf16_sha256": "a6ab567cf8ae07512d56cfd8bcb6568db02a291f54d341b0e7df1dee3a90451c",
+ "torchvision_patches_match_formula": true,
+ "pil_backend_patch_maxdiff": 2.384185791015625e-07,
+ "bf16_vs_f32": {
+  "rel_fro": 0.10863771289587021,
+  "row_rel_max": 0.8168481588363647,
+  "row_rel_mean": 0.10880433768033981,
+  "row_rel_median": 0.039214663207530975
+ },
+ "rms": 0.025113169310627945
+}

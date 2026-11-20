@@ -2,13 +2,16 @@
 Nothing picks one for the runner. `./gr8 models` (this file run) lists each model and the values its options take."""
 import json
 import os
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
+import shlex
 
 
 # The files the front end and the boxes' set id read from the tokenizer directory. GLM's release also carries the chat template
 # and generation config; DeepSeek's does not (its prompt comes from encoding.py, ported in frontend/g6front-rs/src/dschat.rs).
 TOKENIZER_GLM = ('chat_template.jinja', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json')
 TOKENIZER_DS = ('tokenizer.json', 'tokenizer_config.json')
+TOKENIZER_INK2 = ('chat_template.jinja', 'tokenizer.json', 'tokenizer_config.json')
 
 
 class ModelMismatch(Exception):
@@ -31,50 +34,108 @@ class Model:
     int4_kv: bool               # KV_FORMAT=int4 (bin/<engine>-int4)
     thinking_off: bool          # the chat template can turn thinking off (reasoning_effort none)
     fabric: bool = True         # the ranks talk over RDMA: rails and /dev/infiniband
-    dialect: str = 'glm'        # the front end's --dialect: glm (GLM chat template and <tool_call>) or ds41 (DeepSeek DSML)
-    served: str = ''            # the front end's --served-model-name (empty: the dialect's own default)
+    dialect: str = 'glm'        # the front end's --dialect: glm, ds41, or hf (generic chat_template.jinja + JSON tool calls)
+    served: tuple = ()          # the front end's --served-model-name: /v1/models lists the first first, a request may
+                                # name any (empty: the dialect's own, glm-5.3 and glm53 for GLM)
     defaults: tuple = ()        # (KEY, value) option defaults for this model, over the table's: origin '<name> default'
-    vocab: int = 0              # the shim's --vocab-size: the ids the engine's embedding table takes (0: the shim's own, GLM-5.3's)
-    eos_ids: tuple = ()         # the shim's --eos-ids (empty: the shim's own, GLM-5.3's)
+    vocab: int = 0              # the shim's --vocab-size (0: discover from config.json vocab_size)
+    eos_ids: tuple = ()         # the shim's --eos-ids (empty: generation_config.json / config.json eos_token_id)
+    max_positions: int = 1048576   # config.json max_position_embeddings (0: read config.json): longest MAX_MODEL_LEN
+    native_release: bool = False   # True: exlr8 native release read in place (no index slices, no variants)
+    second_rail: str = 'all'    # the engine's second fabric rail: 'all' (--ips2) or 'prefill' (--pf-ips2)
+    per_slot_pool: bool = False # True: pool_rows = SESS * per-session CAP (--capacity-slots SESS on the shim)
+    stage_relay: bool = False   # True: relay loading stage lines from g6m4.r<r>.err to the supervisor log
+
+    tp_defaults: dict = field(default_factory=dict)  # TP -> {KEY: value}; explicit options always win
+    engine_profile: str = 'glm' # existing shell defaults/env/args implementation to reuse
+    smoke_script: str = 'smoketest/run.sh'
+    simulator: str = 'm4sim'
+    shim_legacy: bool = False # original GLM hello identity and token bounds
+    grammar: bool = False
+    checkpoint_cache: bool = False
+    kv4_fold: bool = False
+    uniform_rows: bool = False
+    serve_options: tuple = ()   # optional engine knobs MTP, CHUNK, EAGER, EXACT
+    engine_prefixes: tuple = () # model-specific EXTRA_ENV prefixes this engine implements
+    vision_knob: str = ''
+    drafter_url: str = ''
+    min_free_gib: int = 0
+    legacy_identity: bool = False # omit model from the original GLM handshake digest
+    build_widths: tuple = ('1', '2', '3', '4', '5', '6', '8')
+    build_define: str = ''
+    build_fc2gl: int = 6
+    build_flags_script: str = ''
+    build_what_env: str = ''
+    int4_row: str = 'int4g32h'
+    build_markers: tuple = ()
+    scalable: bool = False      # `./gr8 <name> scale` changes a running cluster's width (an orderly restart that holds requests)
 
     @property
     def tp_sizes(self):
         return ', '.join(self.tp[:-1]) + ' or ' + self.tp[-1] if len(self.tp) > 1 else self.tp[0]
 
 
-# GLM-5.3 variants: home, down1 and up1 follow the TR3 checkpoint's per-expert widths. The bitNNN profiles spend their
-# bits by tensor type, then by layer, in the order that lowered full-vocabulary KL against bf16 the most per byte.
-# The TP=3 default: bit225 is down1's size with 5-10% lower KL against bf16, at par on code and ~2% slower on prose. A
-# release from before it boots down1. home's experts take 99.8 GB of a rank at TP=3, which leaves no room for the KV
-# pool on a 128 GB box. At TP=4 home stays: bit325 lowers KL by 1.5-7% at home's size but decoded ~2.5% slower in
-# three boots each.
+# GLM-5.3 variants: the release's width profiles (v0.6, mul1). Each bitNNN spends its bits by tensor type, then by
+# layer, in the order that lowered full-vocabulary KL against bf16 the most per byte; bit200, bit300 and bit400 are
+# all K2, all K3 and all K4. v0.6 removed home, down1, up1 (now bit400), bit243 and bit338.
+# TP=4, TP=5 and TP=6 take bit325, the old home's size (74.8 GB of experts on the busiest rank at TP=4). bit400 puts
+# 91.9 GB on a rank at TP=4, which does not fit next to the default decode graphs and KV pool: it boots only by name,
+# with lower memory settings. The TP=3 default: bit260 (80.2 GB of experts on the busiest rank; on v0.5 it booted at
+# TP=3 with the default KV pool, smoke and an 87K needle passed; not booted on v0.6). bit325 puts 99.8 GB on a rank at
+# TP=3, which leaves no room for the KV pool on a 128 GB box. A release without bit260 boots bit225.
 GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4', 'g6m4', 'glm',
               ('4', '6', '3', '5'),
-              {'home': 3.25, 'down1': 2.25, 'up1': 4.0,
-               'bit225': 2.25, 'bit243': 2.43, 'bit260': 2.60, 'bit325': 3.25, 'bit338': 3.38},
-              {3: ('bit225', 'down1')}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, False)
-# GLM-5.3-Flash: uniform-width releases, K4 by default.
+              {'bit200': 2.0, 'bit225': 2.25, 'bit239': 2.39, 'bit260': 2.60, 'bit273': 2.73,
+               'bit300': 3.0, 'bit325': 3.25, 'bit332': 3.32, 'bit390': 3.92, 'bit400': 4.0},
+              {3: ('bit260', 'bit225'), 4: ('bit325',), 5: ('bit325',), 6: ('bit325',)}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, True,
+              vocab=154880, eos_ids=(154820, 154827, 154829), shim_legacy=True, drafter_url='https://huggingface.co/incoai/GLM-5.3-DFlash2', grammar=True, kv4_fold=True, legacy_identity=True,
+              tp_defaults={'4': {'KV_FORMAT': 'int4'}}, scalable=True)
+# GLM-5.3-Flash: uniform-width releases, K4 by default. K2 is the width whose experts fit one box (TP=1).
 GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4',
-               'g6m4_flash', 'flash', ('4', '3', '2'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
-               {2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', False, False, True)
+               'g6m4_flash', 'flash', ('4', '3', '2', '1'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
+               {1: ('k2',), 2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', True, True, True,
+               served=('glm-5.3-flash', 'glm53f'),   # its own names: a router that lists models by name keeps it apart from GLM-5.3
+               second_rail='prefill', engine_profile='flash', simulator='m4sim_flash',
+               vocab=154880, eos_ids=(154820, 154827, 154829), shim_legacy=True, drafter_url='https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2', grammar=True, checkpoint_cache=True,
+               vision_knob='GR8_GLM53F_VISION',
+               build_widths=('1', '2', '3', '4'), build_define='G6_MODEL_FLASH', build_fc2gl=4,
+               int4_row='int4nope', build_markers=('flash kv: borrow-idle, %u of', 'flash ckpt share: now'), scalable=True)
 # DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): the official weights in the exlr8 native layout (FP8 trunk, MXFP4 routed
 # experts), no width variants, TP=4. Its drafter is DSpark, the checkpoint's MTP layers (GR8_DS_MTP), not DFlash2. The front
 # end speaks the ds41 dialect (DSML tool calls, numeric reasoning effort). A request that names no reasoning effort gets
 # low (50), which kept the release's answers at about a quarter of high's thinking tokens.
 DS41 = Model('ds41', 'DeepSeek-V4.1-Flash', 'https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native',
              'g6m4_ds41', 'ds41', ('4',), {}, {}, 'gr8-ds41', 'DeepseekV41ForCausalLM', False, False, True,
-             dialect='ds41', served='deepseek-v4.1-flash', vocab=129280, eos_ids=(1,),   # engine/model_geom_ds41.h VOCAB, TOK_EOS
-             defaults=(('DEFAULT_MAX_TOKENS', '32768'), ('DEFAULT_REASONING_EFFORT', 'low')))
+             dialect='ds41', served=('deepseek-v4.1-flash',), vocab=129280, eos_ids=(1,),   # engine/model_geom_ds41.h VOCAB, TOK_EOS
+             defaults=(('DEFAULT_MAX_TOKENS', '32768'), ('DEFAULT_REASONING_EFFORT', 'low')),
+             native_release=True, per_slot_pool=True, stage_relay=True,
+             engine_profile='ds41', simulator='m4sim_ds41', smoke_script='smoketest/ds41.sh',
+             serve_options=('CHUNK', 'EAGER', 'EXACT'), engine_prefixes=('GR8_DS_', 'GR8_DS41_'),
+             uniform_rows=True, min_free_gib=8, build_widths=('4',), build_define='G6_MODEL_DS41',
+             build_fc2gl=4, build_flags_script='scripts/ds41_build_flags.sh', build_what_env='DS41_WHAT')
+# Inkling-2-Small: the published safetensors checkpoint, read in place (config.json and its shards; every rank plans its
+# image from them, engine/loader-rs/src/ink2.rs). NVFP4 and MXFP8 routed experts, no width variants, TP=6 or 4. The engine
+# serves the 48 text layers at MTP 0 (the default) to 7, the drafts of the checkpoint's drafter layers; the front end
+# speaks the inkling dialect. Image input (GR8_INK2_VISION=1) runs the vision tower of the same checkpoint: no extra file.
+INK2 = Model('ink2', 'Inkling-2-Small', 'https://huggingface.co/thinkingmachines/Inkling-2-Small',
+             'g6m4_ink2', 'ink2', ('6', '4'), {}, {}, 'gr8-ink2', 'Inkling2ForConditionalGeneration', False, False, True,
+             dialect='inkling', served=('inkling-2-small', 'ink2'), vocab=201024, eos_ids=(200006, 199999),   # engine/model_geom_ink2.h
+             max_positions=1048576, per_slot_pool=True, stage_relay=True,
+             engine_profile='ink2', simulator='m4sim_ink2', smoke_script='smoketest/ink2.sh',
+             serve_options=('MTP', 'CHUNK', 'EAGER'), engine_prefixes=('GR8_INK2_',), vision_knob='GR8_INK2_VISION',
+             min_free_gib=8,
+             build_widths=('1', '4', '6'), build_define='G6_MODEL_INK2', build_fc2gl=4, build_what_env='INK2_WHAT')
 # The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on
 # a CPU. Its release is a directory with responses.toml and the tokenizer files.
 PSEUDO = Model('pseudo', 'the pseudo engine', '', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo',
-               'GlmMoeDsaForCausalLM', False, False, False, fabric=False)
-MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, PSEUDO)}
+               'GlmMoeDsaForCausalLM', False, False, False, fabric=False, shim_legacy=True, engine_profile='pseudo', simulator='', second_rail='prefill',
+               vocab=154880, eos_ids=(154820, 154827, 154829), scalable=True)
+MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, INK2, PSEUDO)}
 
 
 # The models a runner names. pseudo, the test engine, is served when named but left out of the lists.
-SERVED = (GLM53, GLM53F)
-CHOICES = ' or '.join(f'{m.name} ({m.title})' for m in SERVED)
+SERVED = tuple(m for m in MODELS.values() if m.fabric)
+CHOICES = ', '.join(f'{m.name} ({m.title})' for m in SERVED[:-1]) + f' or {SERVED[-1].name} ({SERVED[-1].title})'
 
 
 def of(o):
@@ -96,21 +157,135 @@ def check_config(model, directory):
         raise ModelMismatch(f'{path} is {arch}, and ./gr8 {model.name} serves {model.architecture}{hint}')
 
 
+def _read_json_dict(directory, name):
+    path = os.path.join(directory or '', name)
+    if not directory or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _pos_int(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+def _eos_ids(v):
+    if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+        return (v,)
+    if isinstance(v, (list, tuple)):
+        return tuple(x for x in v if isinstance(x, int) and not isinstance(x, bool) and x >= 0)
+    return ()
+
+
+def release_metadata(model: Model, directory: str) -> dict:
+    """Resolves {'vocab': int, 'eos_ids': tuple, 'max_positions': int} for a model and its tokenizer/release directory.
+    Explicit values on Model win first; missing fields fall back to config.json and generation_config.json (including
+    nested text_config on VLMs)."""
+    vocab = model.vocab if model.vocab > 0 else 0
+    eos_ids = tuple(model.eos_ids) if model.eos_ids else ()
+    max_positions = model.max_positions if model.max_positions > 0 else 0
+    if (vocab and eos_ids and max_positions) or not directory:
+        return {'vocab': vocab, 'eos_ids': eos_ids, 'max_positions': max_positions}
+    cfg = _read_json_dict(directory, 'config.json')
+    text_cfg = cfg.get('text_config') if isinstance(cfg.get('text_config'), dict) else {}
+    if not vocab:
+        vocab = _pos_int(cfg.get('vocab_size')) or _pos_int(text_cfg.get('vocab_size'))
+    if not eos_ids:
+        gen_cfg = _read_json_dict(directory, 'generation_config.json')
+        gen_text = gen_cfg.get('text_config') if isinstance(gen_cfg.get('text_config'), dict) else {}
+        for raw in (gen_cfg.get('eos_token_id'), gen_text.get('eos_token_id'),
+                    cfg.get('eos_token_id'), text_cfg.get('eos_token_id')):
+            ids = _eos_ids(raw)
+            if ids:
+                eos_ids = tuple(dict.fromkeys(ids))
+                break
+    if not max_positions:
+        max_positions = (_pos_int(cfg.get('max_position_embeddings')) or
+                         _pos_int(text_cfg.get('max_position_embeddings')))
+    return {'vocab': vocab, 'eos_ids': eos_ids, 'max_positions': max_positions}
+
+
 def describe(m):
     """What `./gr8 models` prints for m: the name to give and the values the model's options take."""
     defaults = ', '.join(f'TP={tp} ' + ' else '.join(m.default_variant.get(int(tp), ('home',))) for tp in m.tp)
     extra = [o for o, on in (('--drafter URL (DFlash2)', m.drafter), ('--kv-format int4', m.int4_kv),
                              ('--default-reasoning-effort none', m.thinking_off)) if on]
+    # A model without variants (ds41) reads its release in place, from a local copy fetched beforehand.
+    copy = '' if m.variants else 'a local copy of '
+    variant = ([f'        --variant  {", ".join(m.variants)}', f'                   by default {defaults}'] if m.variants
+               else ['        --variant  none: the release is read in place (docs/DEEPSEEK-BOOT.md)'])
     return '\n'.join([f'{m.name:7} {m.title}: ./gr8 {m.name} <command>, or GR8_MODEL={m.name}',
-                      f'        --model    an exlr8 release of {m.architecture} (config.json `architectures`), such as',
+                      f'        --model    {copy}an exlr8 release of {m.architecture} (config.json `architectures`), such as',
                       f'                   {m.release}',
                       f'        --tp       {m.tp_sizes}',
-                      f'        --variant  {", ".join(m.variants)}',
-                      f'                   by default {defaults}',
+                      *variant,
                       *([f'        also       {", ".join(extra)}'] if extra else [])])
 
 
+def image_binaries():
+    binaries = []
+    for m in SERVED:
+        binaries += [m.engine, *([m.engine + '-int4'] if m.int4_kv else []), m.simulator]
+    return tuple(dict.fromkeys(b for b in binaries + ['gpuprobe', 'g6front-rs', 'g6load', 'kvman-remote', 'kvman-peer'] if b))
+
+
+def query(argv):
+    """Small registry-only CLI, also exposed as launch.py model-get (no network or option validation)."""
+    if argv == ['names']:
+        return ' '.join(MODELS)
+    if argv == ['served-names']:
+        return ' '.join(m.name for m in SERVED)
+    if argv == ['image-binaries']:
+        return ' '.join('bin/' + b for b in image_binaries())
+    if len(argv) < 2:
+        raise ValueError('want MODEL FIELD [TP], names, served-names or image-binaries')
+    name, key, *rest = argv
+    if key == 'build-shell':
+        m = next((m for m in MODELS.values() if m.build == name), None)
+        if m is None:
+            raise ValueError('unknown build target: ' + name)
+        fields = {'BUILD_ENGINE': m.engine, 'BUILD_SIM': m.simulator, 'BUILD_WIDTHS': ' '.join(m.build_widths),
+                  'BUILD_DEFINE': m.build_define, 'BUILD_FC2GL': str(m.build_fc2gl),
+                  'BUILD_FLAGS_SCRIPT': m.build_flags_script, 'BUILD_WHAT_ENV': m.build_what_env,
+                  'BUILD_INT4': str(int(m.int4_kv)), 'BUILD_INT4_ROW': m.int4_row,
+                  'BUILD_MARKERS': '\n'.join(m.build_markers)}
+        return '\n'.join(k + '=' + shlex.quote(v) for k, v in fields.items())
+    if name not in MODELS:
+        raise ValueError('unknown model: ' + name + '; see ./gr8 models')
+    m = MODELS[name]
+    if key == 'tp-defaults':
+        return '\n'.join(k + '=' + str(v) for k, v in m.tp_defaults.get(rest[0] if rest else m.tp[0], {}).items())
+    if key == 'default-kv-format':
+        return m.tp_defaults.get(rest[0] if rest else m.tp[0], {}).get('KV_FORMAT', 'fp8')
+    if key == 'served-name':
+        return m.served[0] if m.served else ''
+    if not hasattr(m, key) or key.startswith('_'):
+        raise ValueError('unknown model field: ' + key)
+    v = getattr(m, key)
+    if isinstance(v, bool):
+        return str(int(v))
+    if isinstance(v, (tuple, list)):
+        return '\n'.join(map(str, v))
+    if isinstance(v, dict):
+        return json.dumps(v)
+    return str(v)
+
+
 if __name__ == '__main__':
+    if sys.argv[1:2] == ['get']:
+        try:
+            print(query(sys.argv[2:]))
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(2)
+        sys.exit()
+    if sys.argv[1:2] == ['served']:   # ./gr8 <name> smoke: the name its requests send
+        print(MODELS[sys.argv[2]].served[0] if MODELS[sys.argv[2]].served else '')
+        sys.exit()
     print('\n\n'.join(describe(m) for m in SERVED))
     print('\n./gr8 knobs lists every option. The pseudo engine (./gr8 pseudo, no GPU) is for tests: '
           'frontend/pseudo-engine.')

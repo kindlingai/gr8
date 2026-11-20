@@ -60,6 +60,12 @@ int main() {
     different=on; different.scale_bits=st::canonical_scale_bits(2.0);
     h=pool.match(next,200,int(next.size())-1,st::cache_namespace(different)); CHECK(h.skip==0 && std::string(h.why)=="namespace");
     h=pool.match(next,200,int(next.size())-1,st::cache_namespace(on)); CHECK(h.skip>0 && std::string(h.why)=="hit");
+    // the Rust control thread's namespace (control.rs cache_namespace) is steering.h's, byte for byte
+    auto rs_ns=[](const st::Identity& x) {
+        g6rt::CacheNamespace n; g6svc_cache_namespace(reinterpret_cast<const g6sch_identity*>(&x), n.data()); return n;
+    };
+    st::Identity img=off; img.images=true; for (int i=0;i<32;++i) img.image_digest[size_t(i)]=uint8_t(3*i+1);
+    for (const auto& x : {off, on, different, img}) CHECK(rs_ns(x)==st::cache_namespace(x));
 
     // A retired slot is cleared before its generation is reused; the next admission owns its complete identity.
     Scheduler reused(cfg);

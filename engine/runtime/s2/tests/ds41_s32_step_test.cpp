@@ -32,6 +32,7 @@ static Launch step(int ns, int rps, int base = 0, int stride = 1) {
     }
     l.samples.assign(size_t(ns * rps), Sampling{});
     l.steering_scales.assign(size_t(ns * rps), 0.f);
+    l.steering_slots.assign(size_t(ns * rps), 0);
     return l;
 }
 

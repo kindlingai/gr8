@@ -109,6 +109,8 @@ struct Tensors
     int fc1_wide = 0;                 // set if bind::widen_fc1 ran on this tr3.fc1 (K3 experts in the wide order, tr3_wide.cuh)
     int fc2_wide = 0;                 // set if bind::widen_fc2 ran on this tr3.fc2
     const uint8_t* const* ptab = nullptr;   // EL3 (#151): the layer's piece table (bind::LayerTensors::ptab); nullptr = the pack layout
+    int fc1_wide4 = 0;                // set if bind::widen_k4_fc1 ran on this tr3.fc1 (K4 experts in wide-K4 order)
+    int fc2_wide4 = 0;                // set if bind::widen_k4_fc2 ran on this tr3.fc2
     int k2 = 1;                       // 2-bit units in the layer (bind::LayerTensors::k2 after bind::scan_widths)
     int k3 = 1;                       // 3-bit units in the layer (bind::LayerTensors::k3 after bind::scan_widths)
     int sh_trellis = 0;               // shared expert as trellis row 256 (bind::LayerTensors::sh_trellis)
@@ -416,6 +418,7 @@ struct Gemm
     long long tsB = 0, tsG = 0;
     int rgrp = 0;                     // k_gemm_mx8f full-M launches: > 1 = grouped raster of rgrp row blocks (PF_GEMMRF;
                                       // launch sets it from GR8_PF_GEMMG when 0). Launch order only: the same bits.
+    uint8_t const_s = 0, const_s2 = 0; // 1 = weights come from dtr::make_fp8 (all scales == 127; GR8_PF_DENSE_OPT)
 #if G6_MODEL_FLASH
     int h16 = 0;                      // 1: k_gemm_tr_h16 (fp16 m16n8k16 on shx_store_h16 A-fragments + Tr3Lane<4, true> B)
 #endif
@@ -1672,6 +1675,7 @@ inline Gemm with_rgrp(const Gemm& g)
     if (!r.rgrp) r.rgrp = static_cast<int>(knob::pf_gemmg());
     return r;
 }
+#include "pf_dense_opt.cuh"
 inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = RsOut())
 {
     if (!g.on) return;
@@ -1705,6 +1709,7 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
     static int nsm = 0;
     if (!nsm) { int d = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, d); }
     const bool big = mode == 2 || (mode != 3 && NB * ((RB + 7) / 8) >= 2 * nsm);
+    if (mode == 0 && knob::pf_dense_opt() && pf_dense_opt::try_launch(g, rs, big, nsm, st)) return;
     if (g.tw)                         // dense trellis tiles (k_gemm_tr): never paired, fp16 / BF16 out
     {
 #if G6_MODEL_FLASH
@@ -1769,7 +1774,7 @@ inline void launch_pair(const Gemm& a, const Gemm& b, cudaStream_t st, int mode)
         return;
     }
     Gemm p = a;
-    p.w2 = b.w; p.ws2 = b.ws; p.N2 = b.N; p.y2 = b.y; p.ldy2 = b.ldy; p.bf162 = b.bf16; p.osvh2 = b.osvh;
+    p.w2 = b.w; p.ws2 = b.ws; p.N2 = b.N; p.y2 = b.y; p.ldy2 = b.ldy; p.bf162 = b.bf16; p.osvh2 = b.osvh; p.const_s2 = b.const_s;
     p.x8_2 = b.x8 != a.x8 ? b.x8 : nullptr;
     launch(b.pre, st);
     launch(p, st, mode);
@@ -2044,14 +2049,32 @@ struct Expert
 #endif
     int cb = TR3_MCG;                 // the experts' codebook (tr3.cuh TR3_*): launch_fc1 / launch_fc2 pick the CB kernels.
                                       // Host-side only, last, so the kernels' offsets of the members above stay unchanged
+    // GR8_PF_WT (bind_prefill_wt.cuh): fc1 / fc2 over tiles of up to WM_R routes of one expert, the fc1 input quantized
+    // once per token. The segment kernels above read none of these.
+    int wtk = 0;                      // 1: launch_fc1 / launch_fc2 run k_pf_fc1t / k_pf_fc2t (make_layer: block-scale layers, knob on)
+    int hq8_ready = 0;                // 1: hq8 / hs8 already hold this x (a pass of the same layer wrote them): launch_fc1t skips k_pf_hq8
+    int* wtiles = nullptr;            // [max_wtiles_t][3] expert, first route, rows (<= WT_R): k_pf_fill writes it when set
+    int* n_wtiles = nullptr;          // [1]
+    int* rr_wp = nullptr;             // [8M] tile * WT_R + position in the tile (as rr_sp for the segments): k_pf_mid's x2 slot
+    uint8_t* hq8 = nullptr;           // [M][HID] E4M3 of f16(H128(x * sg)) per token row, TR3 k order (k_pf_hq8)
+    uint8_t* hs8 = nullptr;           // [M][HID / 32] its E8M0 scale bytes
+    int wtc = 0;                      // 1: k_pf_fc2t sums each token's routes itself (the fused combine) and launch_fin does nothing
+    int wt_gmajor = 0;                // 1: k_pf_fc2t's CTAs run group-major (GR8_PF_WT_GMAJOR)
+    int* cnt_tg = nullptr;            // [M][HID / 128] the combine's route counters (zeroed by launch_fc2t)
+    int t_wide4 = 0;                  // K4 experts of t_fc1 are in wide-K4 order (GR8_TR3_WIDE4)
+    int t_wide42 = 0;                 // K4 experts of t_fc2 are in wide-K4 order (GR8_TR3_WIDE4)
+    int k3 = 0;                       // 3-bit units in the layer (for strict per-M wide-K4 dispatch)
 };
 
 inline int max_segments(int M) { return (M * TOPK + RS - 1) / RS + NEXP; }
-#if G6_MODEL_FLASH
 constexpr int WM_R = 256;             // rows (routes of one expert) of a k_pf_fc1w tile
 inline int max_wtiles(int M) { return (M * TOPK + WM_R - 1) / WM_R + NEXP; }
-inline int pass_wtiles(const Expert& A) { return max_wtiles(A.M) + (A.shr ? (A.M + WM_R - 1) / WM_R : 0); }
+#ifndef PF_WT_R
+#define PF_WT_R 128
 #endif
+constexpr int WT_R = PF_WT_R;         // routes of a k_pf_fc1t / k_pf_fc2t tile (bind_prefill_wt.cuh; 128 or 256)
+inline int max_wtiles_t(int M) { return (M * TOPK + WT_R - 1) / WT_R + NEXP; }
+inline int pass_wtiles(const Expert& A) { return max_wtiles(A.M) + (A.shr ? (A.M + WM_R - 1) / WM_R : 0); }
 
 // grid ceil(M/8), block 256: warp = one token. Rule of glue::k_router_plan: key = sigmoid(logit) + bias, ties ->
 // lowest expert id; weights = sigmoid of the selected / their sum * route_scale.
@@ -2137,10 +2160,7 @@ __global__ void __launch_bounds__(256) k_pf_count(Expert A)
 // grid NEXP (expert), block 256: the expert's routes in token order, its segments, the inverse map.
 template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Expert A)
 {
-    __shared__ int c[256], base, segb;
-#if G6_MODEL_FLASH
-    __shared__ int wtb;
-#endif
+    __shared__ int c[256], base, segb, wtb, wttb;
     const int e = blockIdx.x, t = threadIdx.x;
     if (e == NEXP)                    // Expert::shr: the shared expert, one route per row in row order, after every routed route
     {
@@ -2150,15 +2170,13 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
             for (int i = 0; i < NEXP; ++i) { off += A.cnt[i]; sb += (A.cnt[i] + RS - 1) / RS; }
             base = off; segb = sb;
             *A.n_seg = sb + (A.M + RS - 1) / RS;
+            int wb = 0, tb = 0;
+            for (int i = 0; i < NEXP; ++i) { wb += (A.cnt[i] + WM_R - 1) / WM_R; tb += (A.cnt[i] + WT_R - 1) / WT_R; }
+            wtb = wb; wttb = tb;
 #if G6_MODEL_FLASH
-            if (A.wt)
-            {
-                int wb = 0;
-                for (int i = 0; i < NEXP; ++i) wb += (A.cnt[i] + WM_R - 1) / WM_R;
-                wtb = wb;
-                *A.n_wt = wb + (A.M + WM_R - 1) / WM_R;
-            }
+            if (A.wt) *A.n_wt = wb + (A.M + WM_R - 1) / WM_R;
 #endif
+            if (A.wtiles) *A.n_wtiles = tb + (A.M + WT_R - 1) / WT_R;
         }
         __syncthreads();
         for (int i = t; i < A.M; i += 256)
@@ -2166,6 +2184,7 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
             const int idx = base + i;
             A.rr_row[idx] = i; A.rr_e[idx] = NEXP; A.rr_w[idx] = 1.f;
             A.rr_sp[idx] = (segb + i / RS) * RS + i % RS;
+            if (A.wtiles) A.rr_wp[idx] = (wttb + i / WT_R) * WT_R + i % WT_R;
         }
         for (int i = t; i < (A.M + RS - 1) / RS; i += 256)
         {
@@ -2180,6 +2199,12 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
                 w[0] = NEXP; w[1] = base + i * WM_R; w[2] = min(WM_R, A.M - i * WM_R);
             }
 #endif
+        if (A.wtiles)
+            for (int i = t; i < (A.M + WT_R - 1) / WT_R; i += 256)
+            {
+                int* w = A.wtiles + static_cast<size_t>(wttb + i) * 3;
+                w[0] = NEXP; w[1] = base + i * WT_R; w[2] = min(WT_R, A.M - i * WT_R);
+            }
         return;
     }
     const int C = (A.M + 255) / 256, m0 = min(A.M, t * C), m1 = min(A.M, m0 + C);
@@ -2188,19 +2213,14 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
     c[t] = n;
     if (t == 0)
     {
-        int off = 0, sb = 0;
-        for (int i = 0; i < e; ++i) { off += A.cnt[i]; sb += (A.cnt[i] + RS - 1) / RS; }
-        base = off; segb = sb;
+        int off = 0, sb = 0, wb = 0, tb = 0;
+        for (int i = 0; i < e; ++i) { off += A.cnt[i]; sb += (A.cnt[i] + RS - 1) / RS; wb += (A.cnt[i] + WM_R - 1) / WM_R; tb += (A.cnt[i] + WT_R - 1) / WT_R; }
+        base = off; segb = sb; wtb = wb; wttb = tb;
         if (e == NEXP - 1 && !A.shr) *A.n_seg = sb + (A.cnt[e] + RS - 1) / RS;
 #if G6_MODEL_FLASH
-        if (A.wt)
-        {
-            int wb = 0;
-            for (int i = 0; i < e; ++i) wb += (A.cnt[i] + WM_R - 1) / WM_R;
-            wtb = wb;
-            if (e == NEXP - 1 && !A.shr) *A.n_wt = wb + (A.cnt[e] + WM_R - 1) / WM_R;
-        }
+        if (A.wt && e == NEXP - 1 && !A.shr) *A.n_wt = wb + (A.cnt[e] + WM_R - 1) / WM_R;
 #endif
+        if (A.wtiles && e == NEXP - 1 && !A.shr) *A.n_wtiles = tb + (A.cnt[e] + WT_R - 1) / WT_R;
     }
     __syncthreads();
     int p = 0;
@@ -2211,6 +2231,7 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
             const int idx = base + p;
             A.rr_row[idx] = i / TOPK; A.rr_e[idx] = e; A.rr_w[idx] = A.tok_w[i];
             A.rr_sp[idx] = (segb + p / RS) * RS + p % RS;
+            if (A.wtiles) A.rr_wp[idx] = (wttb + p / WT_R) * WT_R + p % WT_R;
             A.pos[i] = idx;
             ++p;
         }
@@ -2231,6 +2252,12 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
             w[0] = e; w[1] = base + i * WM_R; w[2] = min(WM_R, ne - i * WM_R);
         }
 #endif
+    if (A.wtiles)
+        for (int i = t; i < (ne + WT_R - 1) / WT_R; i += 256)
+        {
+            int* w = A.wtiles + static_cast<size_t>(wttb + i) * 3;
+            w[0] = e; w[1] = base + i * WT_R; w[2] = min(WT_R, ne - i * WT_R);
+        }
 }
 
 // One row of a 128 block, 4 consecutive values per lane (k = lane*4 + e): MXFP8-quantize (scale per 32 k = 8 lanes)
@@ -4132,6 +4159,13 @@ __global__ void __launch_bounds__(256) k_pf_mid(Expert A)
         return;
     }
 #endif
+    if (A.wtk)                // the tile layout of k_pf_fc2t: row block (tile, position / 16), the same records
+    {
+        const int wp = A.rr_wp[route], tp = wp % WT_R;
+        uint8_t* rec = A.x2 + ((static_cast<size_t>(wp / WT_R) * (WT_R / 16) + (tp >> 4)) * EB + b) * 4 * REC;
+        store_mx8_tr3(v, lane, tp & 15, [&](int s) { return rec + s * REC; });
+        return;
+    }
     uint8_t* rec = A.x2 + ((static_cast<size_t>(sp / RS) * MB + (p >> 4)) * EB + b) * 4 * REC;
     store_mx8_tr3(v, lane, p & 15, [&](int s) { return rec + s * REC; });
 }
@@ -5298,6 +5332,8 @@ template <bool RS = false, bool SHX = false, bool CUT = false> __global__ void _
     }
 }
 
+#include "bind_prefill_wt.cuh"
+
 inline void launch_route_rows(const Expert& A, cudaStream_t st)     // logits -> tok_e, tok_w of the A.M rows of A
 {
     switch (A.topk)                 // GR8_MOE_TOPK cut: one instance per K; K = TOPK is the pre-cut kernel
@@ -5348,6 +5384,7 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
 template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_t st)
 {
     if (!A.on) return;
+    if (A.wtk) { launch_fc1t<EB>(A, st); return; }
     tr3_cb_dispatch(A.cb, [&](auto C) {
         constexpr int CB = decltype(C)::value, NBS = CB == TR3_MCG;     // NBS: the codebook has non-block-scale kernels
         const dim3 g(2 * EB, A.maxseg);
@@ -5408,7 +5445,7 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
 template <int EB = g6nr::EB> inline void launch_mid(const Expert& A, cudaStream_t st)
 {
 #if G6_MODEL_FLASH
-    if (A.on && A.h16) { k_pf_mid<EB, true><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A); return; }
+    if (A.on && A.h16 && !A.wtk) { k_pf_mid<EB, true><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A); return; }
 #endif
     if (A.on) k_pf_mid<EB><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A);
 }
@@ -5416,6 +5453,7 @@ template <int EB = g6nr::EB> inline void launch_mid(const Expert& A, cudaStream_
 template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_t st)
 {
     if (!A.on) return;
+    if (A.wtk) { launch_fc2t<EB>(A, st); return; }
     tr3_cb_dispatch(A.cb, [&](auto C) {
         constexpr int CB = decltype(C)::value, NBS = CB == TR3_MCG;     // as launch_fc1
         const dim3 g(HID / 128 / FC2GL, A.maxseg);
@@ -5438,6 +5476,7 @@ template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_
 template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_t st)
 {
     if (!A.on) return;
+    if (A.wtk) { launch_fc2t<EB>(A, st); return; }
     tr3_cb_dispatch(A.cb, [&](auto C) {
         constexpr int CB = decltype(C)::value, NBS = CB == TR3_MCG;     // as launch_fc1
         const dim3 g(HID / 128, A.maxseg);
@@ -5448,7 +5487,7 @@ template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_
 #endif
 inline void launch_fin(const Expert& A, cudaStream_t st)
 {
-    if (!A.on) return;
+    if (!A.on || (A.wtk && wt_fused(A))) return;        // the fused combine wrote out in k_pf_fc2t
     if (A.topk < TOPK)              // GR8_MOE_TOPK cut: the fin skips pos -1 (dropped routes)
     {
         if (A.sh_svh)
@@ -5644,6 +5683,9 @@ struct Scratch
     uint8_t *hq, *hs;                 // [M][HID], [M][HID / 32] Expert::hq, hs
     int *wt, *n_wt;                   // Expert::wt, n_wt
 #endif
+    int *wtiles, *n_wtiles, *rr_wp;   // Expert::wtiles, n_wtiles, rr_wp (GR8_PF_WT)
+    uint8_t *hq8, *hs8;               // Expert::hq8, hs8
+    int* cnt_tg;                      // Expert::cnt_tg
 };
 
 inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)     // eb = blocks per expert (EB of the launches)
@@ -5694,10 +5736,12 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)  
     t.sh_segs = reinterpret_cast<int*>(take((m + RS - 1) / RS * 3 * 4));
     t.sh_n_seg = reinterpret_cast<int*>(take(4));
     t.z1 = reinterpret_cast<__half*>(take(R * 2 * eb * 128 * 2));
+    // x2 row blocks: the larger of the segment layout (ms segments x MB) and the tile layout (max_wtiles_t tiles x WT_R / 16)
+    const size_t x2rb_t = static_cast<size_t>(max_wtiles_t(M)) * (WT_R / 16), x2rb = ms * MB > x2rb_t ? ms * MB : x2rb_t;
 #if G6_MODEL_FLASH
-    t.x2 = reinterpret_cast<uint8_t*>(take(ms * MB * eb * 4096));       // >= 4 * REC: also the fp16 A fragments (Expert::h16)
+    t.x2 = reinterpret_cast<uint8_t*>(take(x2rb * eb * 4096));       // >= 4 * REC: also the fp16 A fragments (Expert::h16)
 #else
-    t.x2 = reinterpret_cast<uint8_t*>(take(ms * MB * eb * 4 * REC));
+    t.x2 = reinterpret_cast<uint8_t*>(take(x2rb * eb * 4 * REC));
 #endif
     t.yw = reinterpret_cast<__half*>(take(R * HID * 2));
 #if G6_MODEL_FLASH
@@ -5712,6 +5756,12 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)  
 #ifdef PF_AOP
     t.aop = reinterpret_cast<uint8_t*>(take(ms * AOP_NS * 2 * AOPS));
 #endif
+    t.wtiles = reinterpret_cast<int*>(take(static_cast<size_t>(max_wtiles_t(M)) * 3 * 4));
+    t.n_wtiles = reinterpret_cast<int*>(take(4));
+    t.rr_wp = reinterpret_cast<int*>(take(R * 4));
+    t.hq8 = reinterpret_cast<uint8_t*>(take(m * HID));
+    t.hs8 = reinterpret_cast<uint8_t*>(take(m * (HID / 32)));
+    t.cnt_tg = reinterpret_cast<int*>(take(m * (HID / 128) * 4));
     if (s) *s = t;
     return o;
 }
@@ -5814,6 +5864,7 @@ inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, con
 #endif
         L.q_b.x8 = sc.x8_up;
         L.q_b.osvh = T.tsvh[0];
+        if (!L.q_b.tw) L.q_b.const_s = 1;
     }
     if (T.tsuh[1] && L.o_proj.on)
     {
@@ -5823,15 +5874,16 @@ inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, con
         L.xq_attn.h16 = L.o_proj.h16;
 #endif
         L.o_proj.osvh = T.tsvh[1];
+        if (!L.o_proj.tw) L.o_proj.const_s = 1;
     }
 #if G6_MODEL_FLASH
     if (T.kda_suh[0] || T.kda_suh[1] || T.kda_suh[2])
     {
         for (int i = 0; i < 3; ++i)
             if (!T.kda_suh[i] || !T.kda_svh[i]) return "Flash KDA trellis matrix without its suh / svh";
-        if (L.kda_q.on) { L.xq_x.suh = T.kda_suh[0]; L.xq_x.h16 = L.kda_q.h16; L.kda_q.osvh = T.kda_svh[0]; }
-        if (L.kda_k.on) { L.kda_k.osvh = T.kda_svh[1]; }
-        if (L.kda_v.on) { L.kda_v.osvh = T.kda_svh[2]; }
+        if (L.kda_q.on) { L.xq_x.suh = T.kda_suh[0]; L.xq_x.h16 = L.kda_q.h16; L.kda_q.osvh = T.kda_svh[0]; if (!L.kda_q.tw) L.kda_q.const_s = 1; }
+        if (L.kda_k.on) { L.kda_k.osvh = T.kda_svh[1]; if (!L.kda_k.tw) L.kda_k.const_s = 1; }
+        if (L.kda_v.on) { L.kda_v.osvh = T.kda_svh[2]; if (!L.kda_v.tw) L.kda_v.const_s = 1; }
     }
 #endif
     if (T.tsuh[2] || T.tsuh[3] || T.tsuh[4])
@@ -5870,6 +5922,9 @@ inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, con
 #endif
         L.xq_act.on = 0;
         L.down.osvh = T.tsvh[4];
+        if (!L.gate.tw) L.gate.const_s = 1;
+        if (!L.up.tw) L.up.const_s = 1;
+        if (!L.down.tw) L.down.const_s = 1;
     }
     return nullptr;
 }
@@ -6061,6 +6116,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         A.cb = T.cb;
         A.t_fc1 = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p); A.t_wide = T.fc1_wide; A.t_fc2 = static_cast<const uint8_t*>(T.t[T_TR3_FC2].p); A.t_wide2 = T.fc2_wide;
         A.t_ptab = T.ptab;
+        A.t_wide4 = T.fc1_wide4; A.t_wide42 = T.fc2_wide4; A.k3 = T.k3;
         A.t_v1 = static_cast<const __half*>(v1.p); A.t_v2 = static_cast<const __half*>(v2.p); A.t_v3 = static_cast<const __half*>(v3.p);
         A.bs = bsf;
         A.t_sg = static_cast<const __half*>(sgn.p); A.t_v1b = static_cast<const __half*>(v1b.p); A.t_v3b = static_cast<const __half*>(v3b.p);
@@ -6075,9 +6131,9 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             // (default 6144; slower than k_pf_fc1 below ~5000). Byte-equal to k_pf_fc1.
             // the WM kernels read K4 order only: the widened order (fc1_wide / fc2_wide) differs only for K2 and K3 units
             const bool k4 = !T.k2 && !T.k3;
-            A.wm = A.hx && knob::pf_wm() && M >= knob::pf_wm_min() && (!T.fc1_wide || k4);
+            A.wm = A.hx && knob::pf_wm() && M >= knob::pf_wm_min() && (!T.fc1_wide || k4) && !T.fc1_wide4;
             // GR8_PF_WM2, k_pf_fc2w: byte-equal, ~4% slower than k_pf_fc2v at M 8192 (bench): off
-            A.wm2 = A.wm && A.fc2v2 && knob::pf_wm2() && (!T.fc2_wide || k4);
+            A.wm2 = A.wm && A.fc2v2 && knob::pf_wm2() && (!T.fc2_wide || k4) && !T.fc2_wide4;
         }
         if (A.wm) { A.wt = sc.wt; A.n_wt = sc.n_wt; }
 #endif
@@ -6088,6 +6144,18 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
 #ifdef PF_F12
         A.f12 = knob::pf_f12().value_or(true) ? 1 : 0;   // compiled in: on unless GR8_PF_F12=0
 #endif
+        // GR8_PF_WT: the expert-tile kernels take block-scale layers whose K2 / K3 units are in the wide order (or K4-only
+        // layers). Flash: not with GR8_PF_ROUTER_SPLIT, whose route tables never fill the tile list
+        if (bsf && knob::pf_wt() && ((!T.k2 && !T.k3) || (T.fc1_wide && T.fc2_wide)) && !(G6_MODEL_FLASH && knob::pf_router_split()))
+        {
+            A.wtk = 1;
+            A.wtiles = sc.wtiles; A.n_wtiles = sc.n_wtiles; A.rr_wp = sc.rr_wp; A.hq8 = sc.hq8; A.hs8 = sc.hs8;
+            A.wtc = knob::pf_wt_fuse() ? 1 : 0; A.wt_gmajor = knob::pf_wt_gmajor() ? 1 : 0; A.cnt_tg = sc.cnt_tg;
+        }
+        if ((T.fc1_wide4 || T.fc2_wide4) && !A.wtk)
+            return "wide-K4 tr3.fc1/fc2 requires expert-tile prefill (GR8_PF_WT=1, block-scale)";
+        if ((T.fc1_wide4 || T.fc2_wide4) && T.sh_trellis && !T.sh_fp8)
+            return "wide-K4 tr3.fc1/fc2 requires FP8 shared expert in prefill (not GR8_V2_SHARED=trellis)";
         if (T.sh_trellis && T.sh_fp8)
         {
             if (tab.shape[0] != NEXP + 1) return "trellis shared expert without tr3.table row NEXP";
@@ -6132,6 +6200,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             S.nroutes = M; S.maxseg = (M + RS - 1) / RS;
             S.rr_row = sc.sh_rr_row; S.rr_e = sc.sh_rr_e; S.rr_sp = sc.sh_rr_sp; S.rr_w = sc.sh_rr_w;
             S.segs = sc.sh_segs; S.n_seg = sc.sh_n_seg; S.pos = nullptr;
+            S.wtk = 0; S.wtc = 0; S.wtiles = nullptr; S.n_wtiles = nullptr; S.rr_wp = nullptr;   // the trellis shared pass keeps the segment kernels
 #if G6_MODEL_FLASH
             S.wm = 0; S.wm2 = 0; S.wt = nullptr; S.n_wt = nullptr;
 #endif

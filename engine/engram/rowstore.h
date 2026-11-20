@@ -2,6 +2,7 @@
 // O_DIRECT behind a set-associative row cache. Contract: docs/DEEPSEEK-ENGRAM.md section 3 step 2 and section 4.
 //
 //   file      PREFIX.engram.L###.w8, u8 [part][256], rank r serves global rows [first, first+valid), file row = id - first.
+//   columns   opt-in: ids stay global, files carry disjoint column runs; foreign check uses the same ColShard as device dequant.
 //   request   O_DIRECT needs an aligned offset, length and buffer. The store asks statx for the file's dio_offset_align / dio_mem_align,
 //             reads the aligned block (default 4096 B = 16 rows) that holds the row and copies the 256 B out of it. A row never
 //             straddles a block. Rows of one fetch that share a block share one read; the same row asked twice is read once.
@@ -10,7 +11,12 @@
 //             chunk thousands, and the pool is sized for the latter.
 //   fetch     one call per (table, step or chunk): ids[n] -> dst[n][256]. Rows this rank does not own are skipped (dst untouched, the
 //             caller zeroes or ignores them). dst may be null: the call then only warms the cache (prefetch).
-// A fetch is serialized by a mutex; the reads of one fetch run in parallel on the pool.
+// A fetch is serialized by a mutex; reads run on the pool, or one raw io_uring driven by the fetch thread.
+// The serialized lane owns the ring, shared by exact fetch and cache warm; no extra I/O threads.
+//   keepalive opt-in (StoreOpts::keepalive_ms > 0, O_DIRECT table 0 only): while fetches are active (one in the last 250 ms), a thread
+//             reads 4 blocks of table 0 when no fetch has read the drive for keepalive_ms, so the drive does not idle-sleep between
+//             decode steps. It reads into its own buffer (the cache and results do not change), never takes the fetch mutex, sleeps
+//             with no I/O when fetches stop, and on a failed read logs once and stops itself (fetches are not affected).
 #pragma once
 #include <algorithm>
 #include <atomic>
@@ -33,6 +39,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "hash.h"
+#include "col_shard.h"
+#include "uring_reader.h"
 
 namespace ds41 { namespace engram {
 
@@ -49,7 +57,8 @@ struct TableFile
     std::string path;       // a file of rows [first, first + valid) from byte 0, when `runs` is empty
     int64_t first = 0;      // first global row this rank serves
     int64_t valid = 0;      // rows it serves (the file may hold more: pad rows up to `part`)
-    std::vector<TableRun> runs;   // the rows in several files (ascending, consecutive from `first`)
+    std::vector<TableRun> runs;   // ascending, consecutive within each owned range
+    ColShard columns{};            // disabled: contiguous; enabled: only these column ranges
 };
 
 struct StoreOpts
@@ -57,8 +66,10 @@ struct StoreOpts
     size_t cache_bytes = 4ull << 30;   // GR8_DS_ENGRAM_CACHE_MIB
     int ways = 16;                     // GR8_DS_ENGRAM_WAYS, 1..16
     int io_threads = 32;               // GR8_DS_ENGRAM_IO_THREADS (64 is fastest for prefill)
+    int io_uring = 128;                  // GR8_DS_ENGRAM_IO_URING: 0 = pread pool; positive = queue depth
     size_t block = 4096;               // smallest read; raised to the file's dio_offset_align if that is larger
     bool direct = true;                // false: buffered pread (tmpfs, or a filesystem that refuses O_DIRECT)
+    int keepalive_ms = 0;              // GR8_DS_ENGRAM_KEEPALIVE_MS (boot default 15); 0 = no keepalive thread
 };
 
 struct FetchStats
@@ -216,12 +227,15 @@ class RowStore
 public:
     ~RowStore()
     {
+        stop_keepalive();   // before the readers and the descriptors go
+        uring_.reset();
         pool_.reset();   // join the workers before the descriptors go
         for (auto& t : tab_) for (auto& r : t.runs) if (r.fd >= 0) close(r.fd);
     }
 
     bool open(const std::vector<TableFile>& files, const StoreOpts& o, std::string* err)
     {
+        stop_keepalive();
         opts_ = o;
         size_t align = 4096;
         block_ = o.block;
@@ -230,13 +244,14 @@ public:
             Tab t;
             t.first = f.first;
             t.valid = f.valid;
-            if (f.first < 0 || f.valid < 0 || f.first + f.valid >= (1ll << 30) - 1) { *err = f.path + ": row range outside the 30-bit tag space"; return false; }
+            t.columns = f.columns;
+            if (f.first < 0 || f.valid < 0 || (f.columns.enabled ? f.columns.rows != f.valid : f.first + f.valid >= (1ll << 30) - 1)) { *err = f.path + ": row range outside the 30-bit tag space"; return false; }
             std::vector<TableRun> runs = f.runs;
-            if (runs.empty()) runs.push_back({f.path, f.first, f.valid, 0});
-            int64_t next = f.first;
+            if (runs.empty() && !f.columns.enabled) runs.push_back({f.path, f.first, f.valid, 0});
+            int64_t next = f.columns.enabled ? 0 : f.first;
             for (const TableRun& tr : runs)
             {
-                if (tr.row0 != next || tr.rows < 0) { *err = tr.path + ": runs are not consecutive from the first row"; return false; }
+                if (f.columns.enabled ? !f.columns.run(tr.row0, tr.rows, next) : (tr.row0 != next || tr.rows < 0)) { *err = tr.path + ": runs are not consecutive from the first row"; return false; }
                 next += tr.rows;
                 Run r;
                 r.row0 = tr.row0; r.rows = tr.rows; r.off = tr.off;
@@ -265,7 +280,7 @@ public:
                 }
                 t.runs.push_back(r);
             }
-            if (next != f.first + f.valid) { *err = f.path + ": runs do not cover the valid rows"; return false; }
+            if (next != (f.columns.enabled ? f.valid : f.first + f.valid)) { *err = f.path + ": runs do not cover the valid rows"; return false; }
             tab_.push_back(t);
         }
         size_t b = 256;
@@ -273,20 +288,57 @@ public:
         block_ = b;
         align = std::max(align, block_);
         if (!cache_.init(o.cache_bytes, o.ways, err)) return false;
-        pool_.reset(new IoPool());
-        pool_->start(std::max(1, o.io_threads), block_, align);
+        if (o.io_uring > 0)
+        {
+            uring_.reset(new UringReader());
+            const int e = uring_->start((unsigned)o.io_uring, block_, align);
+            if (e)
+            {
+                uring_.reset();
+                static std::once_flag unavailable;
+                std::call_once(unavailable, [e] {
+                    fprintf(stderr, "# ds41 engram io_uring unavailable errno=%d, using pread pool\n", e);
+                });
+            }
+        }
+        if (!uring_)
+        {
+            pool_.reset(new IoPool());
+            pool_->start(std::max(1, o.io_threads), block_, align);
+        }
+        static std::once_flag reader;
+        std::call_once(reader, [&] {
+            if (uring_) fprintf(stderr, "# ds41 engram reader=uring qd=%d\n", o.io_uring);
+            else fprintf(stderr, "# ds41 engram reader=pread threads=%d\n", std::max(1, o.io_threads));
+        });
+        start_keepalive(o.keepalive_ms, align);
         return true;
     }
 
+    bool using_uring() const { return bool(uring_); }
     size_t block() const { return block_; }
     bool direct(int table) const { return tab_[table].direct; }
     const RowCache& cache() const { return cache_; }
     const FetchStats& totals() const { return total_; }
     uint64_t fetches() const { return nfetch_; }
 
+    struct KeepaliveStats { uint64_t ticks = 0, reads = 0, errors = 0, max_us = 0; };
+    KeepaliveStats keepalive_stats() const
+    {
+        KeepaliveStats k;
+        k.ticks = ka_ticks_.load(std::memory_order_relaxed);
+        k.reads = ka_reads_.load(std::memory_order_relaxed);
+        k.errors = ka_errors_.load(std::memory_order_relaxed);
+        k.max_us = ka_max_us_.load(std::memory_order_relaxed);
+        return k;
+    }
+    bool keepalive_running() const { return ka_th_.joinable(); }
+    uint64_t keepalive_blocks() const { return ka_total_blocks_; }
+
     // ids[n] -> dst[n][256] (null: warm the cache only). Returns 0, or the errno of a failed read (stats->err).
     int fetch(int table, const uint32_t* ids, size_t n, uint8_t* dst, FetchStats* stats = nullptr)
     {
+        ka_note_fetch();
         std::lock_guard<std::mutex> lk(mu_);
         FetchStats st;
         const auto t0 = Clock::now();
@@ -298,7 +350,7 @@ public:
         for (size_t i = 0; i < n; ++i)
         {
             const int64_t id = ids[i];
-            if (id < T.first || id >= T.first + T.valid) { ++st.foreign; continue; }
+            if (T.columns.enabled ? T.columns.at((uint32_t)id) < 0 : (id < T.first || id >= T.first + T.valid)) { ++st.foreign; continue; }
             const uint8_t* row = cache_.find(row_tag(table, (uint32_t)id));
             if (row)
             {
@@ -328,7 +380,7 @@ public:
             int ri = 0;
             for (size_t u = 0; u < nu; ++u)
             {
-                while (uid[u] >= T.runs[ri].row0 + T.runs[ri].rows) ++ri;   // ids ascend; every id is in [first, first + valid)
+                while (uid[u] >= T.runs[ri].row0 + T.runs[ri].rows) ++ri;   // ids ascend; foreign check admitted only rows in the validated runs
                 const Run& R = T.runs[ri];
                 uoff[u] = R.off + (uint64_t)(uid[u] - R.row0) * kRowBytes;
                 const uint64_t blk = uoff[u] & ~(uint64_t)(block_ - 1);
@@ -339,7 +391,25 @@ public:
             std::atomic<int> err{0};
             std::atomic<uint64_t> bytes{0};
             const size_t blk_sz = block_;
-            pool_->run((int)tasks.size(), [&](int ti, uint8_t* buf)
+            if (uring_)
+            {
+                const int rc = uring_->run(tasks.size(), [&](size_t ti, io_uring_sqe& e) {
+                    e.fd = T.runs[tasks[ti].run].fd;
+                    e.off = tasks[ti].off;
+                }, [&](size_t ti, const uint8_t* buf, int r) {
+                    const Task& k = tasks[ti];
+                    if (r < 0) { int z = 0; err.compare_exchange_strong(z, -r); return; }
+                    bytes += (uint64_t)r;
+                    for (uint32_t u = k.u0; u < k.u1; ++u)
+                    {
+                        const uint64_t in = uoff[u] - k.off;
+                        if ((uint64_t)r < in + kRowBytes) { int z = 0; err.compare_exchange_strong(z, EIO); return; }
+                        memcpy(&urow[(size_t)u * kRowBytes], buf + in, kRowBytes);
+                    }
+                });
+                if (rc) { int z = 0; err.compare_exchange_strong(z, rc); }
+            }
+            else pool_->run((int)tasks.size(), [&](int ti, uint8_t* buf)
             {
                 const Task& k = tasks[ti];
                 ssize_t r;
@@ -369,6 +439,11 @@ public:
         st.total_us = us(t0, t2);
         total_.add(st);
         ++nfetch_;
+        {
+            const int64_t t2n = ns_of(t2);
+            if (st.blocks > 0) ka_last_io_ns_.store(t2n, std::memory_order_release);
+            ka_mark_fetch(t2n);   // fetch end: wakes a thread that parked during a fetch longer than the active window
+        }
         if (stats) *stats = st;
         return st.err;
     }
@@ -384,6 +459,134 @@ public:
 private:
     using Clock = std::chrono::steady_clock;
     static double us(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::micro>(b - a).count(); }
+    static int64_t ns_of(Clock::time_point t) { return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count(); }
+    static int64_t now_ns() { return ns_of(Clock::now()); }
+
+    // ---- keepalive
+    static constexpr int64_t kActiveWindowNs = 250000000;   // fetches in the last 250 ms = active
+    static constexpr int kKeepaliveReads = 4;               // blocks per tick
+    static constexpr uint64_t kKeepaliveStride = 131071;    // block stride between reads (prime): spread, no sequential read-ahead
+    struct KaRun { int fd; uint64_t base_off, nblocks; };
+
+    // Called at fetch start AND at fetch end: mark activity at t and wake the keepalive thread when it may be parked (the previous
+    // mark is older than the active window). The end call matters: a fetch longer than the window lets the thread park while it
+    // runs, and the next fetches (short gaps) would then never see an idle edge. The thread checks its park condition under ka_mu_
+    // and this notify takes ka_mu_ after the store, so the wake cannot be lost.
+    void ka_mark_fetch(int64_t t)
+    {
+        const int64_t prev = ka_last_fetch_ns_.exchange(t, std::memory_order_acq_rel);
+        if (ka_th_.joinable() && t - prev > kActiveWindowNs)
+        {
+            std::lock_guard<std::mutex> g(ka_mu_);   // the idle -> active edge only; never held across I/O
+            ka_cv_.notify_one();
+        }
+    }
+    void ka_note_fetch()
+    {
+        if (!ka_th_.joinable()) return;
+        ka_mark_fetch(now_ns());
+    }
+    void start_keepalive(int ms, size_t align)
+    {
+        ka_runs_.clear();
+        ka_total_blocks_ = 0;
+        if (ms <= 0 || tab_.empty() || !tab_[0].direct) return;
+        for (const Run& r : tab_[0].runs)
+        {
+            const uint64_t end = r.off + (uint64_t)r.rows * kRowBytes;
+            if (r.fd < 0 || (uint64_t)r.rows * kRowBytes < block_) continue;
+            const uint64_t base = (r.off + block_ - 1) & ~(uint64_t)(block_ - 1);
+            if (base >= end) continue;
+            const uint64_t nb = (end - base) / block_;   // whole aligned blocks inside [off, end): never past the run or EOF
+            if (nb < 1) continue;
+            ka_runs_.push_back({r.fd, base, nb});
+            ka_total_blocks_ += nb;
+        }
+        if (!ka_total_blocks_) return;
+        void* raw = nullptr;
+        if (posix_memalign(&raw, std::max(align, block_), block_) != 0) { ka_runs_.clear(); ka_total_blocks_ = 0; return; }
+        ka_buf_ = (uint8_t*)raw;
+        ka_stop_ = false;
+        ka_last_fetch_ns_.store(now_ns() - 2 * kActiveWindowNs, std::memory_order_release);   // idle until the first fetch
+        ka_last_io_ns_.store(0, std::memory_order_release);
+        ka_th_ = std::thread([this, ms] { ka_loop((int64_t)ms * 1000000); });
+    }
+    void stop_keepalive()
+    {
+        if (ka_th_.joinable())
+        {
+            {
+                std::lock_guard<std::mutex> g(ka_mu_);
+                ka_stop_ = true;
+            }
+            ka_cv_.notify_all();
+            ka_th_.join();
+        }
+        free(ka_buf_);
+        ka_buf_ = nullptr;
+        ka_runs_.clear();
+        ka_total_blocks_ = 0;
+    }
+    // block index i of the eligible runs -> (fd, byte offset)
+    void ka_block(uint64_t i, int* fd, uint64_t* off) const
+    {
+        for (const KaRun& r : ka_runs_)
+        {
+            if (i < r.nblocks) { *fd = r.fd; *off = r.base_off + i * block_; return; }
+            i -= r.nblocks;
+        }
+        *fd = ka_runs_.back().fd;
+        *off = ka_runs_.back().base_off;
+    }
+    void ka_loop(int64_t interval_ns)
+    {
+        uint64_t cursor = 0;
+        std::unique_lock<std::mutex> g(ka_mu_);
+        for (;;)
+        {
+            if (ka_stop_) return;
+            const int64_t t = now_ns();
+            const int64_t since_fetch = t - ka_last_fetch_ns_.load(std::memory_order_acquire);
+            if (since_fetch > kActiveWindowNs)
+            {   // idle: park until a fetch starts (ka_note_fetch) or stop; no CPU, no I/O
+                ka_cv_.wait(g, [&] { return ka_stop_ || now_ns() - ka_last_fetch_ns_.load(std::memory_order_acquire) <= kActiveWindowNs; });
+                continue;
+            }
+            const int64_t since_io = t - ka_last_io_ns_.load(std::memory_order_acquire);
+            if (since_io < interval_ns)
+            {
+                const int64_t wait = std::min(interval_ns - since_io, kActiveWindowNs - since_fetch + 1);
+                ka_cv_.wait_for(g, std::chrono::nanoseconds(std::max<int64_t>(wait, 100000)));
+                continue;
+            }
+            g.unlock();   // the reads run without any lock
+            int64_t max_ns = 0;
+            for (int k = 0; k < kKeepaliveReads; ++k)
+            {
+                cursor = (cursor + kKeepaliveStride) % ka_total_blocks_;
+                int fd;
+                uint64_t off;
+                ka_block(cursor, &fd, &off);
+                const int64_t a = now_ns();
+                ssize_t r;
+                do r = pread(fd, ka_buf_, block_, (off_t)off); while (r < 0 && errno == EINTR);
+                const int e = r < 0 ? errno : 0;
+                max_ns = std::max(max_ns, now_ns() - a);
+                if (r < (ssize_t)block_)
+                {   // fail-safe: stop the keepalive only; fetch() and its error state are untouched
+                    ka_errors_.fetch_add(1, std::memory_order_relaxed);
+                    fprintf(stderr, "# ds41 engram keepalive stopped after pread rc=%lld errno=%d\n", (long long)r, e);
+                    return;
+                }
+                ka_reads_.fetch_add(1, std::memory_order_relaxed);
+            }
+            ka_last_io_ns_.store(now_ns(), std::memory_order_release);
+            ka_ticks_.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t mu = (uint64_t)(max_ns / 1000);
+            if (mu > ka_max_us_.load(std::memory_order_relaxed)) ka_max_us_.store(mu, std::memory_order_relaxed);   // the only writer
+            g.lock();
+        }
+    }
     struct Run
     {
         int fd = -1;
@@ -394,6 +597,7 @@ private:
     {
         std::vector<Run> runs;
         int64_t first = 0, valid = 0;
+        ColShard columns{};
         bool direct = true;
     };
     StoreOpts opts_;
@@ -401,9 +605,20 @@ private:
     std::vector<Tab> tab_;
     RowCache cache_;
     std::unique_ptr<IoPool> pool_;
+    std::unique_ptr<UringReader> uring_;
     std::mutex mu_;
     FetchStats total_;
     uint64_t nfetch_ = 0;
+    // keepalive (its own mutex, for the cv only; RowStore::mu_ is never taken by the keepalive thread)
+    std::vector<KaRun> ka_runs_;
+    uint64_t ka_total_blocks_ = 0;
+    uint8_t* ka_buf_ = nullptr;
+    std::thread ka_th_;
+    std::mutex ka_mu_;
+    std::condition_variable ka_cv_;
+    bool ka_stop_ = false;
+    std::atomic<int64_t> ka_last_fetch_ns_{0}, ka_last_io_ns_{0};
+    std::atomic<uint64_t> ka_ticks_{0}, ka_reads_{0}, ka_errors_{0}, ka_max_us_{0};
 };
 
 }}  // namespace ds41::engram

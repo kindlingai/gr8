@@ -11,8 +11,19 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
                                        Version 5 has several profiles: <scope> <n>, then n x <profile> <digest> <layers>.
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
   shim -> DIR/req.<id>                 written as req.<id>.tmp, then renamed. Two lines:
-        n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
+        n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float>
+        [pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end or -1>]
+        [boost <start> <per1k> <max>] [seqt <mult>:<base>:<min>:<cap>] [seqa <mult>:<base>:<min>:<cap>]
+        [seqg <mult>:<base>:<min>:<cap>:<id,id,...>] [lp <k>] [plp <k>]
+                                                            (pen: the generate frame's penalties, each in [-2, 2], and the
+                                                             think block's close, when one is nonzero, a boost is on,
+                                                             or a seq scope is on and the close is known;
+                                                             boost: the frame's think_end_boost; seqt / seqa / seqg: the
+                                                             frame's sequence_penalty scopes; all only when the head wrote
+                                                             DIR/penalty.s2, boost and seq when that file names them)
         [sys <system_tokens>] [ins <after>:<unless or -1>:<id,id,...>]      (version 3: the generate frame's insert rule, never with lp)
+        [img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>] ...    (one per image, last; only when the head wrote DIR/vision.s2,
+                                                             which names the model's image geometry: glm5v, ink2, else DS41's)
         <prompt id,id,...>
       <id> is the request ordinal: unique, strictly increasing in submit order (gaps are fine).
   shim -> rank 0 DIR/cmd.<k>           k = 0, 1, 2, ... with no gap, written the same way, one line:
@@ -26,9 +37,13 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
                                                              first t line; the shim sends one prompt_logprobs frame then
         l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line, before it
         t <id> <id> ...                                      newly committed tokens -> tokens frame (+ logprobs)
-        m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters, just before end
-        end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame (with the request's
+        m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters so far: about once a second
+                                                             while it decodes, and once just before end
+        end <stop|length|error|abort|busy> <stop_id or -1> <completion_tokens>   -> finish frame (with the request's
                                                              `spec` and `timing`: what it added to the metrics frame)
+                                                             busy (the GR8_BUSY_* guard, docs/ENV.md) carries a 4th
+                                                             number, the Retry-After seconds: `end busy -1 0 60`
+                                                             -> an error finish with status 429 + retry_after
       A request cancelled while still queued gets only "end abort -1 0".
 A request the engine cannot parse or fit ends the whole epoch (the engine writes DIR/abort.s2 and exits), so the shim
 checks every field before it writes a file. SIGTERM/SIGINT writes DIR/quit (quit an idle engine).
@@ -67,6 +82,15 @@ READY_FIELDS = {'1': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows')
                 '3': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')}
 INSERT_MAX = 64   # tokens one insert rule may hold (engine/runtime/insert_rule.h)
 PAGE = 64         # KV rows per page (engine/runtime/s2/scheduler.h); status.s2 counts pages
+# images (engine/runtime/image_input.h, PROTOCOL.md `images`). DS41: engine/runtime/ds41_vision_plan.h
+IMAGE_TOKEN = 129264
+IMAGE_PATCH, IMAGE_DOWN, IMAGE_MAX_SPAN = 14, 3, 1024
+# GLM-5.3-Flash (vision.s2 says glm5v): engine/runtime/flash_vision_plan.h
+GLM5V_IMAGE_TOKEN, GLM5V_MERGE, GLM5V_MIN_TOKENS, GLM5V_MAX_TOKENS = 154854, 2, 16, 8000
+# Inkling-2-Small (vision.s2 says ink2): engine/runtime/ink2_vision_plan.h
+INK2_IMAGE_TOKEN, INK2_PATCH, INK2_MERGE, INK2_MIN_TOKENS, INK2_MAX_TOKENS = 200054, 20, 2, 1, 6400
+IMAGES_MAX = 16
+IMAGES_B64_MAX = 48 << 20
 
 
 def payload_hash(data: bytes) -> int:
@@ -226,7 +250,89 @@ def _steering_header(f: dict, capability: dict | None):
     return f' steer {profile} {bits:08x}', None
 
 
-def build_request(f: dict, ordinal: int, steering: dict | None = None):
+def glm5v_span(vit_h: int, vit_w: int) -> int | None:
+    """The span of a GLM-5.3-Flash patch grid, None when its processor cannot produce it (glm5v::span_of)."""
+    m = GLM5V_MERGE
+    if vit_h < m or vit_w < m or vit_h % m or vit_w % m:
+        return None
+    n = (vit_h // m) * (vit_w // m)
+    return n if GLM5V_MIN_TOKENS <= n <= GLM5V_MAX_TOKENS else None
+
+
+def ink2_span(vit_h: int, vit_w: int) -> int | None:
+    """The span of an Inkling-2-Small patch grid, None when its processor cannot produce it (ink2v::span_of)."""
+    m = INK2_MERGE
+    if vit_h < m or vit_w < m or vit_h % m or vit_w % m:
+        return None
+    n = (vit_h // m) * (vit_w // m)
+    return n if INK2_MIN_TOKENS <= n <= INK2_MAX_TOKENS else None
+
+
+def image_span(vit_h: int, vit_w: int, model: str = 'ds41') -> int | None:
+    """The span of a patch grid, None when the model's processor cannot produce it (ds41v::grid_of, glm5v::span_of,
+    ink2v::span_of)."""
+    if model == 'glm5v':
+        return glm5v_span(vit_h, vit_w)
+    if model == 'ink2':
+        return ink2_span(vit_h, vit_w)
+    lim = IMAGE_DOWN * IMAGE_MAX_SPAN
+    if not (1 <= vit_h <= lim and 1 <= vit_w <= lim):
+        return None
+    lh, lw = -(-vit_h // IMAGE_DOWN), -(-vit_w // IMAGE_DOWN)
+    n = lh * (lw + 1) + 2
+    return n if n <= IMAGE_MAX_SPAN else None
+
+
+def vision_model(path: str) -> str:
+    """The image geometry vision.s2 names: glm5v (GLM-5.3-Flash), ink2 (Inkling-2-Small), else ds41 (its file holds 1)."""
+    try:
+        with open(path) as fh:
+            words = fh.read().split()
+        return words[0] if words in (['glm5v'], ['ink2']) else 'ds41'
+    except OSError:
+        return 'ds41'
+
+
+def images_field(images, prompt, model: str = 'ds41') -> tuple[str, str | None]:
+    """The generate frame's `images` -> (the request line's img fields or '', error or None). Checks what
+    g6s2::parse_request checks (a request it refuses ends the epoch): the grid, the span inside the prompt and made of the
+    image token, ascending spans, the pixel bytes' size. model: the engine's image geometry (vision.s2)."""
+    token = {'glm5v': GLM5V_IMAGE_TOKEN, 'ink2': INK2_IMAGE_TOKEN}.get(model, IMAGE_TOKEN)
+    patch = INK2_PATCH if model == 'ink2' else IMAGE_PATCH
+    if images is None or images == []:
+        return '', None
+    if not isinstance(images, list) or len(images) > IMAGES_MAX:
+        return '', f'images must be a list of at most {IMAGES_MAX}'
+    out, end, total = [], 0, 0
+    for im in images:
+        if not isinstance(im, dict):
+            return '', 'bad image'
+        pos, vh, vw, key, rgb = (im.get(k) for k in ('pos', 'vit_h', 'vit_w', 'key', 'rgb'))
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (pos, vh, vw)):
+            return '', 'image pos/vit_h/vit_w must be integers'
+        span = image_span(vh, vw, model)
+        if span is None:
+            return '', f'bad image grid {vh}x{vw}'
+        if pos < end or pos + span > len(prompt):
+            return '', 'image spans must ascend, not overlap and lie inside the prompt'
+        if any(t != token for t in prompt[pos:pos + span]):
+            return '', f'an image span must be {span} image tokens ({token})'
+        if not isinstance(key, str) or not re.fullmatch(r'[0-9a-f]{16}', key):
+            return '', 'image key must be 16 lowercase hex digits'
+        if not isinstance(rgb, str) or len(rgb) % 4 or not re.fullmatch(r'[A-Za-z0-9+/]*={0,2}', rgb):
+            return '', 'image rgb must be padded base64'
+        n = len(rgb) // 4 * 3 - (len(rgb) - len(rgb.rstrip('=')))
+        if n != vh * vw * patch * patch * 3:
+            return '', f'image rgb must be {vh * patch}x{vw * patch} RGB bytes'
+        total += len(rgb)
+        if total > IMAGES_B64_MAX:
+            return '', f'images over {IMAGES_B64_MAX} bytes of base64'
+        out.append(f' img {pos}:{vh}:{vw}:{key}:{rgb}')
+        end = pos + span
+    return ''.join(out), None
+
+
+def build_request(f: dict, ordinal: int, steering: dict | None = None, image_model: str = 'ds41'):
     """-> (req.<id> bytes, error message or None). Validates what g6s2::parse_request / reserve_rows would reject."""
     prompt = f.get('prompt') or []
     mt = f.get('max_tokens')
@@ -253,6 +359,54 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
         return None, 'bad temperature'
     if not (math.isfinite(top_p) and 0 < top_p <= 1):
         return None, 'top_p must be in (0, 1]'
+    pen = ''
+    try:
+        pens = [float(f.get(k) or 0.0) for k in ('presence_penalty', 'frequency_penalty',
+                                                 'thinking_presence_penalty', 'thinking_frequency_penalty')]
+    except (TypeError, ValueError, OverflowError):
+        return None, 'bad presence_penalty/frequency_penalty'
+    if not all(math.isfinite(x) and -2 <= x <= 2 for x in pens):
+        return None, 'presence_penalty and frequency_penalty must be in [-2, 2]'
+    think_end = f.get('think_end')
+    if think_end is not None and (not isinstance(think_end, int) or isinstance(think_end, bool) or not 0 <= think_end < VOCAB):
+        return None, f'bad think_end (must be 0..{VOCAB - 1})'
+    boost = ''
+    tb = f.get('think_end_boost')
+    if tb is not None:
+        try:
+            start, per1k, mx = int(tb['start']), float(tb['per1k']), float(tb['max'])
+        except (TypeError, ValueError, KeyError, OverflowError):
+            return None, 'bad think_end_boost'
+        if isinstance(tb['start'], bool) or not 0 <= start <= INT32_MAX or not (math.isfinite(per1k) and per1k >= 0) \
+                or not (math.isfinite(mx) and 0 <= mx <= 20):
+            return None, 'think_end_boost: start must be 0 or more, per1k 0 or more and max 0..20'
+        if per1k > 0 and mx > 0:
+            boost = f' boost {start} {per1k!r} {mx!r}'
+    seq = ''
+    sp = f.get('sequence_penalty')
+    if sp is not None:
+        if not isinstance(sp, dict):
+            return None, 'bad sequence_penalty'
+        for scope, word in (('thinking', 'seqt'), ('answer', 'seqa'), ('guard', 'seqg')):
+            v = sp.get(scope)
+            if v is None:
+                continue
+            try:
+                mult, base, smin, cap = float(v['mult']), float(v['base']), int(v['min']), float(v['cap'])
+                avoid = list(v['avoid']) if scope == 'guard' else []
+            except (TypeError, ValueError, KeyError, OverflowError):
+                return None, f'bad sequence_penalty.{scope}'
+            if isinstance(v['min'], bool) or not (math.isfinite(mult) and mult >= 0 and math.isfinite(base) and base >= 1
+                                                 and smin >= 1 and math.isfinite(cap) and 0 <= cap <= 20):
+                return None, f'sequence_penalty.{scope}: want mult >= 0, base >= 1, min >= 1 and cap 0..20'
+            if scope == 'guard' and (not 1 <= len(avoid) <= 4096 or any(
+                    not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < VOCAB for i in avoid)):
+                return None, 'sequence_penalty.guard.avoid: 1 to 4096 token ids'
+            if mult > 0 and cap > 0:
+                seq += f' {word} {mult!r}:{base!r}:{smin}:{cap!r}' + (':' + ','.join(map(str, avoid)) if avoid else '')
+    # pen carries think_end, which the engine needs to tell thinking from the answer for boost and seqt/seqa
+    if any(pens) or boost or (seq and think_end is not None):
+        pen = ' pen ' + ' '.join(repr(x) for x in pens) + f" {-1 if think_end is None else think_end}"
     lps = {}
     for key, word in (('logprobs', 'lp'), ('prompt_logprobs', 'plp')):
         v = f.get(key)
@@ -277,9 +431,14 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
     steer, err = _steering_header(f, steering)
     if err:
         return None, err
+    img, err = images_field(f.get('images'), prompt, image_model)
+    if err:
+        return None, err
+    if img and ('plp' in lps or steer):
+        return None, 'images cannot be combined with prompt_logprobs or steering'
 
     body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}"
-            + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + gram + steer + '\n' + ','.join(map(str, prompt))
+            + pen + boost + seq + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + gram + steer + img + '\n' + ','.join(map(str, prompt))
             + '\n').encode()
     return body, None
 
@@ -351,7 +510,7 @@ class Shim:
         except Exception as e:  # a dead front end must not kill the engine loop
             log.warning('write to front end failed: %r', e)
 
-    def finish(self, r: Req, reason, ct=0, stop_id=None, message=None):
+    def finish(self, r: Req, reason, ct=0, stop_id=None, message=None, status=None, retry_after=None):
         if r.done:
             return
         r.done = True
@@ -360,9 +519,9 @@ class Shim:
         if r.fh:
             r.fh.close()
             r.fh = None
-        self.answer(r, reason, ct, stop_id, message)
+        self.answer(r, reason, ct, stop_id, message, status=status, retry_after=retry_after)
 
-    def answer(self, r: Req, reason, ct=0, stop_id=None, message=None):
+    def answer(self, r: Req, reason, ct=0, stop_id=None, message=None, status=None, retry_after=None):
         """The finish frame, once per request."""
         if r.answered:
             return
@@ -374,6 +533,10 @@ class Shim:
              'prompt_tokens': len(r.f.get('prompt') or []), 'cached_tokens': r.reused or 0, 'completion_tokens': ct}
         if message:
             f['message'] = message
+        if status is not None:
+            f['status'] = status
+        if retry_after is not None:
+            f['retry_after'] = retry_after
         # this request's share of the metrics frame's counters, the same numbers, when it added any
         if r.spec is not None:
             f['spec'] = r.spec
@@ -460,6 +623,14 @@ class Shim:
             hello['insert'] = True
         if self.cfg.get('grammar'):
             hello['grammar'] = True
+        if self.cfg.get('vision'):
+            hello['vision'] = True
+        if self.cfg.get('penalty'):
+            hello['penalties'] = True
+        if self.cfg.get('boost'):
+            hello['think_end_boost'] = True
+        if self.cfg.get('seq'):
+            hello['sequence_penalty'] = True
         if self.cfg['steering']:
             hello['steering'] = self.cfg['steering']
         wire.write_frame(writer, hello)
@@ -490,7 +661,9 @@ class Shim:
     def max_model_len(self):
         # DS41 reserves one fixed CAP slab per session; ready.s2 reports their
         # aggregate pool. Other models share one pool, so capacity_slots=1.
-        room = self.cfg['pool_rows'] // self.a.capacity_slots - self.cfg['guard']
+        # GR8_CAP_TOTAL: the shared pool holds several sessions, one request still at most cap_rows
+        pool = self.cfg['pool_rows'] // self.a.capacity_slots
+        room = (min(pool, self.a.cap_rows) if self.a.cap_rows else pool) - self.cfg['guard']
         return min(self.a.max_model_len, room) if self.a.max_model_len else room
 
     def submit(self, f, writer, mine):
@@ -514,6 +687,15 @@ class Shim:
             return self.finish(r, 'error', message='not supported by this engine: insert')
         if f.get('grammar') is not None and not self.cfg.get('grammar'):   # the engine would refuse the gram field
             return self.finish(r, 'error', message='not supported by this engine: grammar')
+        if f.get('images') not in (None, []) and not self.cfg.get('vision'):   # the engine would refuse the img field
+            return self.finish(r, 'error', message='not supported by this engine: images')
+        if any(f.get(k) for k in ('presence_penalty', 'frequency_penalty', 'thinking_presence_penalty',
+                                  'thinking_frequency_penalty')) and not self.cfg.get('penalty'):   # the pen field
+            return self.finish(r, 'error', message='not supported by this engine: penalties')
+        if f.get('think_end_boost') is not None and not self.cfg.get('boost'):   # the boost field
+            return self.finish(r, 'error', message='not supported by this engine: think_end_boost')
+        if f.get('sequence_penalty') is not None and not self.cfg.get('seq'):   # the seqt / seqg fields
+            return self.finish(r, 'error', message='not supported by this engine: sequence_penalty')
         if f.get('prompt_logprobs') is not None and len(prompt) > self.a.max_plp_prompt:
             return self.finish(r, 'error', message=f'prompt too long for prompt_logprobs (max {self.a.max_plp_prompt})')
         if not isinstance(mt, int) or not prompt or mt < 1 or len(prompt) + mt > self.max_model_len():
@@ -569,7 +751,7 @@ class Shim:
                     return
                 ordinal = self.next_id
                 self.next_id += 1
-                body, err = build_request(r.f, ordinal, self.cfg['steering'])
+                body, err = build_request(r.f, ordinal, self.cfg['steering'], self.cfg.get('vision_model') or 'ds41')
                 if err:
                     return self.finish(r, 'error', message=err)
                 errs = await self.write_all(f'req.{ordinal}', body)
@@ -653,21 +835,32 @@ class Shim:
                         return self.finish(r, 'error', ct=r.emitted, message='engine returned mismatched logprobs')
                     fr['logprobs'] = lps
                 self.send(r, fr)
-        elif w[0] == 'm':
-            r.m = [int(x) for x in w[1:]]
+        elif w[0] == 'm':   # cumulative: the metrics counters take the change since the request's last m line
+            v = [int(x) for x in w[1:]]
+            old = r.m or []
+            d = [v[i] - (old[i] if i < len(old) else 0) for i in range(len(v))]
+            self.c['rounds'] += d[0]
+            self.c['draft_tokens'] += d[1]
+            self.c['accepted'] += d[2]
+            cur, pp = self.c['per_pos'], d[3:]
+            self.c['per_pos'] = [(cur[i] if i < len(cur) else 0) + (pp[i] if i < len(pp) else 0)
+                                 for i in range(max(len(cur), len(pp)))]
+            r.m = v
         elif w[0] == 'end':
             reason, sid, ct = w[1], int(w[2]), int(w[3])
             if ct != r.emitted:
                 log.warning('req.%s: end says %d tokens, saw %d', r.ordinal, ct, r.emitted)
-            if r.m:   # per-request counters, added once
+            if r.m:   # the request's last m line: what it added to the metrics counters
                 v = r.m
-                self.c['rounds'] += v[0]
-                self.c['draft_tokens'] += v[1]
-                self.c['accepted'] += v[2]
-                cur, pp = self.c['per_pos'], v[3:]
-                self.c['per_pos'] = [(cur[i] if i < len(cur) else 0) + (pp[i] if i < len(pp) else 0)
-                                     for i in range(max(len(cur), len(pp)))]
-                r.spec = {'drafts': v[0], 'draft_tokens': v[1], 'accepted': v[2], 'accepted_per_pos': pp}
+                r.spec = {'drafts': v[0], 'draft_tokens': v[1], 'accepted': v[2], 'accepted_per_pos': v[3:]}
+            if reason == 'busy':
+                # the busy guard's refusal (GR8_BUSY_*): `end busy -1 0 <retry_after>` -> an error finish carrying
+                # the HTTP status and Retry-After, which the front end answers as 429 + Retry-After
+                retry = int(w[4]) if len(w) > 4 else 60
+                self.finish(r, 'error', ct=ct, message=f'busy: the server is at capacity; retry after {retry} s',
+                            status=429, retry_after=retry)
+                log.info('req.%s end busy (retry after %d s)', r.ordinal, retry)
+                return
             if reason not in ('stop', 'length', 'error', 'abort'):
                 reason = 'error'
             self.finish(r, reason, ct=ct, stop_id=sid if sid >= 0 else None,
@@ -738,6 +931,16 @@ class Shim:
                             raise ValueError('ready.s2 pool rows not divisible by --capacity-slots')
                         # g6m4 --grammar-dir: the head writes grammar.s2 before ready.s2
                         self.cfg['grammar'] = os.path.exists(f'{self.a.dir}/grammar.s2')
+                        # an engine with its vision tower loaded: the head writes vision.s2 before ready.s2, with the
+                        # model's image geometry (glm5v, ink2; DS41 writes 1)
+                        self.cfg['vision'] = os.path.exists(f'{self.a.dir}/vision.s2')
+                        self.cfg['vision_model'] = vision_model(f'{self.a.dir}/vision.s2') if self.cfg['vision'] else None
+                        # presence / frequency penalties (engine/runtime/penalty.h): the head writes penalty.s2 before
+                        # ready.s2; one that names boost takes the think-end boost too
+                        self.cfg['penalty'] = os.path.exists(f'{self.a.dir}/penalty.s2')
+                        marker = open(f'{self.a.dir}/penalty.s2').read().split() if self.cfg['penalty'] else []
+                        self.cfg['boost'] = 'boost' in marker
+                        self.cfg['seq'] = 'seq' in marker
                         break
                 except ValueError as e:
                     log.error('%s', e)
@@ -791,12 +994,34 @@ def id_list(text):
         raise argparse.ArgumentTypeError(f'want comma-separated token ids: {text!r}')
 
 
+def model_metadata(name, vocab, eos_ids, directory):
+    """CLI overrides release metadata. Only the original no-metadata invocation defaults to GLM."""
+    if directory:
+        from types import SimpleNamespace
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from tools.launch.models import release_metadata
+        meta = release_metadata(SimpleNamespace(vocab=vocab or 0, eos_ids=eos_ids or (), max_positions=0), directory)
+        if vocab is None:
+            vocab = meta['vocab']
+        if eos_ids is None:
+            eos_ids = list(meta['eos_ids'])
+    elif name == 'glm-5.3-g6' and vocab in (None, 154880):
+        vocab = 154880 if vocab is None else vocab
+        eos_ids = [154820, 154827, 154829] if eos_ids is None else eos_ids
+    if not vocab or eos_ids is None or not eos_ids:
+        raise ValueError('model metadata missing: provide --vocab-size and --eos-ids or --model-dir with config.json')
+    return vocab, eos_ids
+
+
 async def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--dir', required=True, help="the head rank's engine --serve DIR (local)")
     ap.add_argument('--sock', default='/run/g6/engine.sock')
     ap.add_argument('--max-model-len', type=int, default=0,
                     help='cap on prompt + max_tokens (0 = pool_rows / capacity_slots - guard, from ready.s2)')
+    ap.add_argument('--cap-rows', type=int, default=0,
+                    help='rows one request may reserve, guard included (the engine\'s --cap); 0 = the pool. Below the '
+                         'pool when GR8_CAP_TOTAL shares it among sessions: the engine fails its epoch on a longer one')
     ap.add_argument('--capacity-slots', type=int, default=1,
                     help='number of fixed per-session capacity slabs in ready.s2 pool_rows (DS41 only; default 1 shared pool)')
     ap.add_argument('--sessions', type=int, default=8,
@@ -811,12 +1036,17 @@ async def main(argv=None):
     ap.add_argument('--cancel-timeout', type=float, default=60.0, help='answer abort if the engine sends no end line this long after CANCEL')
     ap.add_argument('--stall-timeout', type=float, default=900.0, help='error an admitted request after this long with no resp')
     ap.add_argument('--model-name', default=MODEL_NAME, help="the hello's model (default GLM-5.3's)")
-    ap.add_argument('--vocab-size', type=int, default=VOCAB,
+    ap.add_argument('--model-dir', help='release metadata directory (config.json and generation_config.json)')
+    ap.add_argument('--vocab-size', type=int,
                     help='token ids the engine takes (0..N-1): the hello vocab_size and the bound on prompt, insert and grammar ids')
-    ap.add_argument('--eos-ids', type=id_list, default=EOS_IDS, help="the hello's eos_ids, comma-separated")
+    ap.add_argument('--eos-ids', type=id_list, help="the hello's eos_ids, comma-separated")
     a = ap.parse_args(argv)
     if a.capacity_slots < 1:
         ap.error('--capacity-slots must be positive')
+    try:
+        a.vocab_size, a.eos_ids = model_metadata(a.model_name, a.vocab_size, a.eos_ids, a.model_dir)
+    except ValueError as e:
+        ap.error(str(e))
     err = set_model(a.model_name, a.vocab_size, a.eos_ids)
     if err:
         ap.error(err)

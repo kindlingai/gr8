@@ -5,15 +5,15 @@
 //! another's write. Dropping a `Stream` before its `finish` frame sends `cancel`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::wire::{self, FrameReader, GenParams};
 
@@ -46,15 +46,102 @@ pub struct Engine {
     conn: Mutex<Conn>,
     ready: AtomicBool,
     seq: AtomicU64,
+    /// `/internal/hold`: until this instant a request waits for the engine instead of failing (a scale's cutover)
+    hold_until: Mutex<Option<Instant>>,
+    /// wakes the waiters when the hold or `ready` changes
+    changed: Notify,
+    /// requests blocked in `wait_ready`
+    waiting: AtomicUsize,
+    /// requests let through (`admit`) whose route is not registered yet: tokenizing, rendering
+    admitted: AtomicUsize,
+}
+
+/// A request `Engine::admit` let through, counted as running until its route is registered or it ends.
+pub struct Admit(Arc<Engine>);
+
+impl Drop for Admit {
+    fn drop(&mut self) {
+        self.0.admitted.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Engine {
     pub fn new(path: String) -> Arc<Engine> {
-        Arc::new(Engine { path, conn: Mutex::default(), ready: AtomicBool::new(false), seq: AtomicU64::new(1) })
+        Arc::new(Engine {
+            path,
+            conn: Mutex::default(),
+            ready: AtomicBool::new(false),
+            seq: AtomicU64::new(1),
+            hold_until: Mutex::new(None),
+            changed: Notify::new(),
+            waiting: AtomicUsize::new(0),
+            admitted: AtomicUsize::new(0),
+        })
     }
 
     pub fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+    }
+
+    /// The hold's deadline while one is set and not yet passed.
+    fn held(&self) -> Option<Instant> {
+        self.hold_until.lock().unwrap().filter(|t| Instant::now() < *t)
+    }
+
+    /// Hold new requests for up to `seconds` (0 clears the hold and releases the waiters).
+    pub fn hold(&self, seconds: u64) {
+        *self.hold_until.lock().unwrap() =
+            (seconds > 0).then(|| Instant::now() + Duration::from_secs(seconds.min(86_400)));
+        self.changed.notify_waiters();
+    }
+
+    /// (hold set, requests running on the engine or let through to it, requests waiting for it)
+    pub fn counts(&self) -> (bool, usize, usize) {
+        let running = self.conn.lock().unwrap().routes.len() + self.admitted.load(Ordering::Acquire);
+        (self.held().is_some(), running, self.waiting.load(Ordering::Acquire))
+    }
+
+    /// `wait_ready` for a request, which is counted as running (`counts`) from before it reads the hold until its route
+    /// is registered or the returned guard drops: a drain that sets the hold and then reads no running request cannot
+    /// miss one that is still tokenizing. None: the engine is not connected.
+    pub async fn admit(self: &Arc<Self>) -> Option<Admit> {
+        loop {
+            self.admitted.fetch_add(1, Ordering::AcqRel);
+            let a = Admit(self.clone());
+            if self.held().is_none() {
+                return self.ready().then_some(a);
+            }
+            drop(a);
+            if !self.wait_ready().await {
+                return None;
+            }
+        }
+    }
+
+    /// Whether a new request may go to the engine. With a hold set it first waits until the hold is cleared or its
+    /// deadline passes; with none it answers at once.
+    pub async fn wait_ready(&self) -> bool {
+        if self.held().is_none() {
+            return self.ready();
+        }
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        struct Waiting<'a>(&'a AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _w = Waiting(&self.waiting);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable(); // registered before the check, so no change is missed
+            let Some(deadline) = self.held() else { return self.ready() };
+            tokio::select! {
+                _ = changed => {}
+                _ = tokio::time::sleep_until(deadline.into()) => {}
+            }
+        }
     }
 
     pub fn hello(&self) -> Option<Arc<Value>> {
@@ -65,9 +152,25 @@ impl Engine {
     pub fn grammars(&self) -> bool {
         self.hello().is_some_and(|h| h.get("grammar") == Some(&Value::Bool(true)))
     }
+    /// The engine takes `generate`'s images (its hello says `"vision": true`).
+    pub fn vision(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("vision") == Some(&Value::Bool(true)))
+    }
     /// The engine applies `generate`'s insert rule (its hello says `"insert": true`).
     pub fn inserts(&self) -> bool {
         self.hello().is_some_and(|h| h.get("insert") == Some(&Value::Bool(true)))
+    }
+    /// The engine applies `generate`'s presence / frequency penalties (its hello says `"penalties": true`).
+    pub fn penalties(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("penalties") == Some(&Value::Bool(true)))
+    }
+    /// The engine applies `generate`'s think-end boost (its hello says `"think_end_boost": true`).
+    pub fn think_end_boost(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("think_end_boost") == Some(&Value::Bool(true)))
+    }
+    /// The engine applies `generate`'s sequence penalty (its hello says `"sequence_penalty": true`).
+    pub fn sequence_penalty(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("sequence_penalty") == Some(&Value::Bool(true)))
     }
 
     pub fn start(self: &Arc<Self>) {
@@ -90,7 +193,9 @@ impl Engine {
                 log::warn!("engine closed the connection");
             }
             self.fail_all("engine connection lost");
-            tokio::time::sleep(Duration::from_secs_f64(backoff)).await;
+            // a scale's cutover (hold set) brings the new engine up soon: retry often
+            let wait = if self.held().is_some() { 0.25 } else { backoff };
+            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
             // until the first connection the shim is starting (the launchers start the front end early): retry often
             backoff = if ever { (backoff * 2.0).min(5.0) } else { 0.25 };
         }
@@ -255,5 +360,37 @@ impl Drop for Stream {
             self.engine.conn.lock().unwrap().routes.remove(self.id.as_str());
             let _ = self.engine.send(wire::cancel(&self.id));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_admitted_request_counts_as_running_until_its_route_or_its_end() {
+        let e = Engine::new(String::new());
+        e.ready.store(true, Ordering::Release);
+        let a = e.admit().await.expect("ready");
+        assert_eq!(e.counts(), (false, 1, 0), "admitted, still tokenizing: a drain must wait for it");
+        e.hold(60); // the drain's hold: the admitted request still counts, so running is not 0
+        assert_eq!(e.counts(), (true, 1, 0));
+        drop(a);
+        assert_eq!(e.counts(), (true, 0, 0));
+        // a request during the hold waits, uncounted as running, and is admitted when the hold ends
+        let w = tokio::spawn({
+            let e = e.clone();
+            async move { e.admit().await.is_some() }
+        });
+        while e.counts().2 == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(e.counts(), (true, 0, 1));
+        e.hold(0);
+        assert!(w.await.unwrap());
+        assert_eq!(e.counts(), (false, 0, 0));
+        e.ready.store(false, Ordering::Release);
+        assert!(e.admit().await.is_none());
+        assert_eq!(e.counts(), (false, 0, 0));
     }
 }

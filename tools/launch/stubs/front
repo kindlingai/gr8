@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Stub front end for the supervisor tests: /health is 200 once the engine socket accepts a connection, else 503.
-Its arguments go to out/front.json next to the engine socket's run/ directory."""
+Its arguments go to out/front.json next to the engine socket's run/ directory. /internal/hold holds new requests as the
+real front end does (frontend/g6front-rs, ./gr8 <model> scale), each call logged to out/hold.log, and POST
+/v1/completions with {"prompt": [ids], "max_tokens": n} runs one request on the engine socket (PROTOCOL.md):
+200 {"ids": [...]} when it finishes, 503 with no engine, 500 when the engine goes under it."""
 import argparse
 import http.server
 import json
 import os
 import socket
+import struct
+import threading
+import time
+import urllib.parse
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--model-dir')
@@ -14,17 +21,81 @@ ap.add_argument('--port', type=int)
 ap.add_argument('--default-max-tokens', type=int)
 ap.add_argument('--share-tokens', type=int)
 ap.add_argument('--default-reasoning-effort')
-ap.add_argument('--default-thinking-budget', type=int)
+ap.add_argument('--default-thinking-budget')
 ap.add_argument('--allow-thinking-off', action='store_true')
+ap.add_argument('--clamp-max-tokens', action='store_true')
 ap.add_argument('--undeclared-tool-calls', choices=('text', 'emit'))
 ap.add_argument('--supervisor')
+ap.add_argument('--enable-prompt-tokens-details', action='store_true')
 a = ap.parse_args()
-with open(os.path.join(os.path.dirname(os.path.dirname(a.engine_sock)), 'out', 'front.json'), 'w') as f:
+OUT = os.path.join(os.path.dirname(os.path.dirname(a.engine_sock)), 'out')
+with open(os.path.join(OUT, 'front.json'), 'w') as f:
     json.dump(vars(a), f)
+
+lock = threading.Lock()
+hold_until, running, waiting, seq = 0.0, 0, 0, [0]
+
+
+def held():
+    return time.monotonic() < hold_until
+
+
+def frame(s, obj):
+    b = json.dumps(obj).encode()
+    s.sendall(struct.pack('>I', len(b)) + b)
+
+
+def read(f):
+    h = f.read(4)
+    if len(h) < 4:
+        return None
+    return json.loads(f.read(struct.unpack('>I', h)[0]))
+
+
+def generate(prompt, max_tokens):
+    """(status, body) of one request on the engine socket."""
+    with lock:
+        seq[0] += 1
+        rid = f'stub-{os.getpid()}-{seq[0]}'
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(a.engine_sock)
+    except OSError:
+        return 503, {'error': 'engine not connected'}
+    with s, s.makefile('rb') as f:
+        try:
+            read(f)   # hello
+            frame(s, {'type': 'generate', 'id': rid, 'prompt': prompt, 'max_tokens': max_tokens, 'min_tokens': 0,
+                      'temperature': 0.0, 'top_p': 1.0, 'top_k': 0, 'min_p': 0.0, 'seed': None, 'stop_ids': [],
+                      'logprobs': None, 'prompt_logprobs': None})
+            ids = []
+            while (m := read(f)) is not None:
+                if m.get('id') != rid:
+                    continue
+                ids += m.get('ids', [])
+                if m['type'] == 'finish':
+                    return 200, {'ids': ids, 'reason': m.get('reason')}
+        except OSError:
+            pass
+    return 500, {'error': 'engine connection lost'}
 
 
 class H(http.server.BaseHTTPRequestHandler):
+    def reply(self, code, obj=None):
+        body = json.dumps(obj).encode() if obj is not None else b''
+        self.send_response(code)
+        if code == 503:
+            self.send_header('Retry-After', '5')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def hold_state(self):
+        return {'hold': held(), 'running': running, 'waiting': waiting}
+
     def do_GET(self):
+        if self.path == '/internal/hold':
+            return self.reply(200, self.hold_state())
         ok = False
         try:
             with socket.socket(socket.AF_UNIX) as s:
@@ -32,11 +103,35 @@ class H(http.server.BaseHTTPRequestHandler):
                 ok = True
         except OSError:
             pass
-        self.send_response(200 if ok and self.path == '/health' else 503)
-        self.end_headers()
+        self.reply(200 if ok and self.path == '/health' else 503)
+
+    def do_POST(self):
+        global hold_until, running, waiting
+        u = urllib.parse.urlparse(self.path)
+        if u.path == '/internal/hold':
+            n = int(urllib.parse.parse_qs(u.query)['seconds'][0])
+            hold_until = time.monotonic() + n if n else 0.0
+            with open(os.path.join(OUT, 'hold.log'), 'a') as f:
+                f.write(f'{n}\n')
+            return self.reply(200, self.hold_state())
+        if u.path != '/v1/completions':
+            return self.reply(404)
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        with lock:
+            waiting += 1
+        while held():
+            time.sleep(0.05)
+        with lock:
+            waiting -= 1
+            running += 1
+        try:
+            self.reply(*generate(body['prompt'], body.get('max_tokens', 8)))
+        finally:
+            with lock:
+                running -= 1
 
     def log_message(self, *_):
         pass
 
 
-http.server.HTTPServer(('127.0.0.1', a.port), H).serve_forever()
+http.server.ThreadingHTTPServer(('127.0.0.1', a.port), H).serve_forever()

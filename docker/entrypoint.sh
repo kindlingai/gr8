@@ -1,6 +1,6 @@
 #!/bin/bash
 # The image's entrypoint: ./gr8 $GR8_MODEL COMMAND [OPTIONS], with no command meaning `up`. GR8_MODEL is required
-# (glm53 or glm53f): nothing picks the model for the runner. It first sets up this box's working directory (GR8_WORK_DIR):
+# (glm53, glm53f or ds41): nothing picks the model for the runner. It first sets up this box's working directory (GR8_WORK_DIR):
 # out/ exists, and bin/ links to the image's engine, which runs every TP width.
 #
 # It sets its own limits, so a runtime without compose's `ulimits:` (Kubernetes has no such field) needs no wrapper: no
@@ -18,11 +18,12 @@ cmd=$1; shift
 
 # ./gr8 refuses an unknown name, listing the models; this names the line to add.
 if [ -z "${GR8_MODEL:-}" ]; then
-  echo "gr8: GR8_MODEL is not set: name the model, GR8_MODEL=glm53 (GLM-5.3) or GR8_MODEL=glm53f (GLM-5.3-Flash)," \
-       "in docker/.env, with docker run -e, or in the container's env on Kubernetes" >&2
+  echo "gr8: GR8_MODEL is not set: name the model in docker/.env or the container environment:" >&2
+  for name in $(python3 /opt/gr8/tools/launch/models.py get served-names); do echo "GR8_MODEL=$name" >&2; done
   exit 2
 fi
 model=$GR8_MODEL
+python3 /opt/gr8/tools/launch/models.py get "$model" build > /dev/null || exit 2
 
 # A crash must not dump core: a rank maps ~90 GB, and the dumping thread holds the NVIDIA driver's lock the whole time
 # it writes, which can leave the box unreachable until a power cycle.

@@ -49,13 +49,14 @@ struct Ds41IdxModel
     bool pipe_b = false;                             // GR8_DS41_IDX_PIPE_B=1: the pipelined dense logits on index-source layers 2/8/14/20 only
     bool q_trig = false;                             // GR8_DS41_IDX_Q_TRIG=1: once-per-row query rope sincos
     bool pipe_qr = false;                            // GR8_DS41_IDX_PIPE_QR=1: Q-stationary cp.async dense logits
+    bool keep_scratch = false;                       // GR8_DS41_ADMIT_KEEP_SCRATCH=1: a slot clear (slot >= 0) leaves scratch / sscr as they are
     bool wqb_tc_warned = false;
     bool reuse = false;                             // GR8_DS41_IDX_REUSE=1 / ds41_idx_set_reuse: layers 24..36 keep the layer-20 top-512 list (no wq_b, logits, top-k there; layer 20 skips cand_blocks)
     // SESS > 1 (Model::ds_slots S2 slots): ca / ica / shadow hold one slab ("page") of rows_kv rows per slot; a call's page table is Model::sess
     // + row0 (the slot of the session's first row), so pages[0] = the slot. A step of ns > 1 sessions runs each index op once per session
-    // (rows j*rps .. of Model::ds_ns sessions), session j on its own scratch sscr[j] (MX rows) so layer 20's candidate blocks stay until 24..36.
+    // (rows j*rps .. of Model::ds_ns sessions), session j on its own scratch sscr[j] (sess_cap rows) so layer 20's candidate blocks stay until 24..36.
     int slots = 1;
-    int sess_cap = MX;                             // Model::ds41_pack_enabled: 64 rows per segment; else MX, the decode allocation
+    int sess_cap = MX;                             // Model::ds41_pack_enabled: 64 rows per segment; else Model::ds41_sess_rows (1, or k + 1 with DSpark)
     void* sscr[32] = {};
 };
 
@@ -134,6 +135,10 @@ inline bool sessions(const Model& m, const Ds41IdxModel& S, int rows, Sess& q)
     q.ns = S.slots > 1 ? m.ds_ns : 1;
     if (q.ns < 1 || q.ns > S.slots || rows % q.ns) return false;
     const int rps = rows / q.ns;
+    if (q.ns > 1 && rps > S.sess_cap) {   // sscr[j] holds sess_cap rows (Model::ds41_sess_rows)
+        fprintf(stderr, "DS41 indexer: %d sessions of %d rows each, above the per-session index scratch of %d rows\n", q.ns, rps, S.sess_cap);
+        return false;
+    }
     for (int j = 0; j < q.ns; ++j) {
         q.row0[j] = j * rps; q.len[j] = rps; q.cnorm0[j] = j * ((rps + 1) / 2);
     }
@@ -150,6 +155,7 @@ inline Ds41IdxStage stage(Model& m, Ds41IdxModel& S, int kix, const Sess& q, int
     t.klen = S.klen + row0; t.max_klen = max_klen(S, kix); t.R = q.len[j];
     t.ica = S.ica[kix]; t.pages = pages_of(m, S, row0); t.rpp = S.rows_kv[kix];
     t.scratch = q.ns > 1 ? S.sscr[j] : S.scratch; t.Rcap = q.ns > 1 ? S.sess_cap : S.rcap; t.max_rows = carve_rows(S); t.use_cand = 0;
+    t.flat = q.ns > 1;   // sscr[j] is carved one pass only
     t.pipe_b = 0;  // set by index_topk only for source layers; candidate layers keep the plain logits even when GR8_DS41_IDX_DENSE_MAXK makes them dense
     t.q_trig = S.q_trig;
     t.pipe_qr = 0;
@@ -185,6 +191,7 @@ inline int ds41_idx_bind(void* model, int i, int capacity, void* stream)
         S.dense_maxk = (int)knob::ds41_idx_dense_maxk();
         S.wqb_tc = (int)knob::ds41_idx_wqb_tc();
         S.pipe_b = m.ds41_idx_pipe_b;
+        S.keep_scratch = m.ds41_admit_keep_scratch;
         S.q_trig = knob::ds41_idx_q_trig();
         S.pipe_qr = knob::ds41_idx_pipe_qr();
         if (S.pipe_qr) {
@@ -193,10 +200,10 @@ inline int ds41_idx_bind(void* model, int i, int capacity, void* stream)
         }
         S.lay.resize(m.nl);
         S.slots = m.ds_slots;
-        S.sess_cap = m.ds41_pack_enabled ? ds41::pack::MAX_SEGMENT_ROWS : MX;
+        S.sess_cap = m.ds41_pack_enabled ? ds41::pack::MAX_SEGMENT_ROWS : std::min(std::max(m.ds41_sess_rows, 1), MX);
         if (S.slots < 1 || S.slots > 32) die("DS41 indexer bind: ds_slots " + std::to_string(S.slots) + " outside 1..32");
         S.scratch = zalloc(ds41_idx_scratch_bytes(S.rcap, S.lim1));
-        if (S.slots > 1) for (int j = 0; j < S.slots; ++j) S.sscr[j] = zalloc(ds41_idx_scratch_bytes(S.sess_cap, S.lim1));
+        if (S.slots > 1) for (int j = 0; j < S.slots; ++j) S.sscr[j] = zalloc(ds41_idx_scratch_bytes_flat(S.sess_cap, S.lim1));   // decode graphs: one pass
         S.klen = (int*)zalloc((size_t)S.rcap * sizeof(int));
         S.zero = (int*)zalloc(sizeof(int));
         S.q_b = (__nv_bfloat16*)zalloc((size_t)S.rcap * geom::IDX_WQB_OUT * 2);
@@ -243,10 +250,16 @@ inline int ds41_idx_bind(void* model, int i, int capacity, void* stream)
         w.wqb_codes = q.w; w.wqb_scales = q.s; w.wqb_gv = q.gv;
         w.wproj = bf16_mat(m, l, "idx.weights_proj", geom::IDX_HEADS, HID);
     }
-    if (l >= 20 && !S.shadow) S.shadow = (__nv_bfloat16*)zalloc((size_t)S.slots * (capacity + S.rcap) * 512 * 2);
+    const bool fp4 = knob::ds_comp_fp4();   // GR8_DS_COMP_FP4: layers 20..39 read the layer-20 ca rows themselves (no bf16 shadow)
+    if (l >= 20 && !fp4 && !S.shadow) S.shadow = (__nv_bfloat16*)zalloc((size_t)S.slots * (capacity + S.rcap) * 512 * 2);
     a->topk = S.topk;
     a->ldtk = geom::IDX_TOPK;
-    if (l >= 20) { a->comp_src = S.shadow; a->C.src_ss = (size_t)(capacity + S.rcap) * 512; }   // the shadow's slot stride = the layer-20 ca slab (rows_kv)
+    if (l >= 20 && fp4)
+    {
+        if (!S.ca[3]) die("DS41 indexer bind: GR8_DS_COMP_FP4=1 needs layer 20 bound before layer " + std::to_string(l));
+        a->comp_src = (const __nv_bfloat16*)S.ca[3]; a->C.src_ss = (size_t)S.rows_kv[3] * DS41_CA_ROW; a->C.src_q = 1;   // row = position, slab = slot (as the shadow)
+    }
+    else if (l >= 20) { a->comp_src = S.shadow; a->C.src_ss = (size_t)(capacity + S.rcap) * 512; }   // the shadow's slot stride = the layer-20 ca slab (rows_kv)
     w.bound = true;
     (void)stream;
     return 0;
@@ -377,6 +390,7 @@ inline int ds41_idx_op_index_topk(void* model, int i, int rows, void* stream)
         t.use_cand = use_cand;
         t.pipe_b = S->pipe_b && !cand;  // exactly the four native dense index sources (2/8/14/20)
         t.pipe_qr = S->pipe_qr && !cand && S->chunk_end > 0 && q.len[j] >= 16;
+        t.cand_src = l == geom::CAND_SOURCE && !cand_skipped(*S, kix);   // ds41_idx_op_cand_blocks follows in plan order
         ds41_idx_topk(&t, stream);
     }
     return 0;
@@ -395,7 +409,8 @@ inline int ds41_idx_op_cand_blocks(void* model, int i, int rows, void* stream)
     if (!sessions(m, *S, rows, q)) return 1;
     for (int j = 0; j < q.ns; ++j)
     {
-        const Ds41IdxStage t = stage(m, *S, kix, q, j);
+        Ds41IdxStage t = stage(m, *S, kix, q, j);
+        t.cand_src = 1;   // layer 20's index_topk ran first with cand_src = 1 (tiled: it made the blocks)
         ds41_idx_cand_blocks(&t, stream);
     }
     S->cand_ready = true;
@@ -422,7 +437,28 @@ inline int ds41_idx_pf_compact(void* model, Shift&& shift)
 // A model that never ran ds41_idx_bind has nothing to clear (returns 0). The attention block's own caches (window ring, compressed rows, compressor state)
 // are cleared by its own function. Called by rank.cuh reset() for DS41 (forward declare it there like ds41_attn_ops.cuh does for ds41_idx_bind).
 // slot (SESS > 1): clear only that S2 slot's ca / ica / shadow slab (the other sessions keep theirs); -1 = every slot. The step buffers below
-// (scratch, klen, q_b, ..., the shared list) are rewritten by every step before they are read, so they are cleared whole either way.
+// (scratch, klen, q_b, ..., the shared list) are rewritten by every step before they are read, so they are cleared whole either way;
+// GR8_DS41_ADMIT_KEEP_SCRATCH=1 leaves the scratch and the per-session sscr out of a slot clear (they are most of its bytes).
+// the shared step buffers a clear also clears (all: a full reset; else unless GR8_DS41_ADMIT_KEEP_SCRATCH=1 keeps the scratch)
+inline int ds41_idx_clear_shared_(Ds41IdxModel* S, cudaStream_t st, bool all)
+{
+    using namespace ds41_idx_detail;
+    auto clr = [&](void* p, size_t bytes) { if (p && bytes) G6RT_CK(cudaMemsetAsync(p, 0, bytes, st)); };
+    if (all || !S->keep_scratch)   // a full reset (slot -1) always clears them
+    {
+        clr(S->scratch, ds41_idx_scratch_bytes(S->rcap, S->lim1));
+        for (int j = 0; j < S->slots; ++j) clr(S->sscr[j], ds41_idx_scratch_bytes_flat(S->sess_cap, S->lim1));
+    }
+    clr(S->klen, (size_t)S->rcap * sizeof(int));
+    clr(S->q_b, (size_t)S->rcap * geom::IDX_WQB_OUT * 2);
+    clr(S->wproj, (size_t)S->rcap * geom::IDX_HEADS * 2);
+    clr(S->y512, (size_t)S->rcap * 512 * 2);
+    clr(S->pre, (size_t)S->rcap * 512 * 2);
+    if (S->topk) G6RT_CK(cudaMemsetAsync(S->topk, 0xFF, (size_t)S->rcap * geom::IDX_TOPK * sizeof(int32_t), st));   // 0xFFFFFFFF = int32 -1
+    S->chunk_end = 0;
+    S->cand_ready = false;
+    return 0;
+}
 inline int ds41_idx_clear(void* model, void* stream, int slot)   // slot default -1: rank.cuh's declaration
 {
     using namespace ds41_idx_detail;
@@ -439,17 +475,16 @@ inline int ds41_idx_clear(void* model, void* stream, int slot)   // slot default
         if (S->ca[k]) clr(S->ca[k] + k0 * S->rows_kv[k] * DS41_CA_ROW, nk * S->rows_kv[k] * DS41_CA_ROW);
     }
     if (S->shadow) clr(S->shadow + k0 * (S->cap + S->rcap) * 512, nk * (S->cap + S->rcap) * 512 * 2);
-    clr(S->scratch, ds41_idx_scratch_bytes(S->rcap, S->lim1));
-    for (int j = 0; j < S->slots; ++j) clr(S->sscr[j], ds41_idx_scratch_bytes(S->sess_cap, S->lim1));
-    clr(S->klen, (size_t)S->rcap * sizeof(int));
-    clr(S->q_b, (size_t)S->rcap * geom::IDX_WQB_OUT * 2);
-    clr(S->wproj, (size_t)S->rcap * geom::IDX_HEADS * 2);
-    clr(S->y512, (size_t)S->rcap * 512 * 2);
-    clr(S->pre, (size_t)S->rcap * 512 * 2);
-    if (S->topk) G6RT_CK(cudaMemsetAsync(S->topk, 0xFF, (size_t)S->rcap * geom::IDX_TOPK * sizeof(int32_t), st));   // 0xFFFFFFFF = int32 -1
-    S->chunk_end = 0;
-    S->cand_ready = false;
-    return 0;
+    return ds41_idx_clear_shared_(S, st, slot < 0);
+}
+// the shared step buffers ds41_idx_clear(slot) also clears, without the slot's slabs: GR8_DS_PARK's resume of a parked slot
+// (ds41_native.cuh bind), so the next step sees what it sees after a clear and a restore
+inline int ds41_idx_clear_shared(void* model, void* stream)
+{
+    using namespace ds41_idx_detail;
+    Ds41IdxModel* S = find(*(Model*)model, false);
+    if (!S || S->lay.empty()) return 0;
+    return ds41_idx_clear_shared_(S, (cudaStream_t)stream, false);
 }
 // ST_INDEX_BORROW: a reuse layer whose index source is outside the layer subset. GR8_DS41_BORROW_TOPK=<raw int32 [rows][512]> (the CPU reference's dump of
 // that source's list) is copied into the shared list; without it the list stays what the last index source left (a one-time warning).

@@ -9,12 +9,14 @@ inline const char* slots_error(int slots)
 }
 // DSpark: nsess = min(main_slots, maxs) (<= maxs, the markov step's sessions; above maxs S2 dynamically turns MTP off); k = MTP depth 1..block;
 // a round of up to nsess sessions must fit one step: nsess x (k + 1) verify rows and nsess x block draft rows <= mx
-inline const char* dsp_nsess_error(int nsess, int main_slots, int draft_slots, int k, int mx, int maxs, int block)
+// verify_all = false (GR8_DS_SESS_DRAFTS): maxs is the draft launch's session cap and the verify rows are the Batch's by active count
+// (s2/ds41_sess_drafts.h), so only the draft rows are checked here
+inline const char* dsp_nsess_error(int nsess, int main_slots, int draft_slots, int k, int mx, int maxs, int block, bool verify_all = true)
 {
     const int want_nsess = main_slots < maxs ? main_slots : maxs;
     if (nsess < 1 || nsess > maxs || nsess != want_nsess || draft_slots != main_slots) return "DSpark: nsess must be the S2 slots of both Models";
     if (k < 1 || k > block) return "DSpark: k must be 1..5";
-    if (nsess * (k + 1) > mx || nsess * block > mx) return "DSpark: the sessions need more rows a step than MX";
+    if ((verify_all && nsess * (k + 1) > mx) || nsess * block > mx) return "DSpark: the sessions need more rows a step than MX";
     return nullptr;
 }
 }  // namespace ds41slots

@@ -2,8 +2,13 @@
 """The DS41 main fabric's second rail must reach g6m4 as --ips2, not --pf-ips2."""
 
 import ast
+from dataclasses import replace
 from pathlib import Path
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import models  # noqa: E402
 
 
 SRC = Path(__file__).with_name('supervisor.py')
@@ -24,14 +29,13 @@ def boot_rail_assignment(source: str) -> ast.AST:
     return assigns[0].value
 
 
-def routed_flag(source: str, model_name: str) -> str:
+def routed_flag(source: str, model) -> str:
     expr = boot_rail_assignment(source)
-    class Model:
-        name = model_name
+    m = models.MODELS[model] if isinstance(model, str) else model
     class Models:
         @staticmethod
         def of(_):
-            return Model()
+            return m
     return eval(compile(ast.Expression(expr), str(SRC), 'eval'), {'models': Models, 'o': object()})
 
 
@@ -40,12 +44,14 @@ class TestDs41Ips2Routing(unittest.TestCase):
         src = SRC.read_text()
         self.assertEqual(routed_flag(src, 'ds41'), '--ips2')
         self.assertEqual(routed_flag(src, 'glm53'), '--ips2')
+        self.assertEqual(routed_flag(src, 'pseudo'), '--pf-ips2')
         self.assertEqual(routed_flag(src, 'glm53f'), '--pf-ips2')
+        self.assertEqual(routed_flag(src, replace(models.DS41, second_rail='prefill')), '--pf-ips2')
 
     def test_old_ds41_pf_only_route_fails(self):
         src = SRC.read_text()
         old = "models.of(o).name == 'glm53'"
-        new = "models.of(o).name in ('glm53', 'ds41')"
+        new = "models.of(o).second_rail == 'all'"
         self.assertEqual(src.count(new), 1)
         self.assertEqual(routed_flag(src.replace(new, old, 1), 'ds41'), '--pf-ips2')
 

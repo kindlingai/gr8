@@ -53,7 +53,7 @@ fn run() -> Result<(), String> {
         }
     }
     let t0 = std::time::Instant::now();
-    let opts = g6load::release::Opts { qo, trellis: !rounded, kvb_fp8 };
+    let opts = g6load::release::Opts { qo, trellis: !rounded, kvb_fp8, kvb_rot: gr8knobs::KV4_FOLD.get() };
     let (img, table) = g6load::release::plan(&a[1], &a[2], &a[3], &a[4], nr, rank, layout.as_ref(), opts)?;
     eprint!("{table}");
     if sizes {

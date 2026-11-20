@@ -9,7 +9,9 @@
 //   rows    positions Model::pos[0] .. pos[0]+rows-1, read on the device (graph-safe); decode form only (window ring + top-k list)
 //   state   Layer::ds41_attn -> Ds41AttnLayer, made by ds41_attn_bind (Table::bind_attn, once, rows = capacity)
 // All 40 layers bind. Compressed rows: layers 2..19 read the C.comp of their source (2, 8, 14: bf16, fp4-valued, written by comp_row);
-// layers 20..39 (ratio 1) read LayerState::comp_src, which the indexer sets to its bf16 shadow of the packed fp4 rows (there is no paged 288 B reader yet).
+// layers 20..39 (ratio 1) read LayerState::comp_src, which the indexer sets to its bf16 shadow of the packed fp4 rows.
+// GR8_DS_COMP_FP4=1: the sources keep packed 288 B rows (C.compq, no C.comp) and layers 20..39 read the indexer's layer-20 ca rows (no shadow);
+// the attention gather dequantizes them to the same bf16 values (C.src_q).
 //
 // For the indexer (ds41_idx_ops.cuh, ST_CA_ROW): Ds41AttnLayer::S.qr = q_a-normed bf16 [rows][1280] (written by ST_ATTN_PROJ); S.cnorm = post-norm
 // pre-rope compressed rows completed by the last comp_row, bf16 [(rows+1)/2][512]; W.inv = the layer's rope table. The indexer sets
@@ -40,13 +42,18 @@ void ds41_attn_set_gv(int on, int tpc, int ks, ds41a::XfragFn fn_xfrag, ds41a::G
 void ds41_attn_set_src_fast(int bits);
 void ds41_attn_set_tc(int on);
 void ds41_attn_set_tc_mfast(int on);
+void ds41_attn_set_tc_tile(int mode);
 void ds41_attn_set_comp_fp8(int on);
 void ds41_attn_comp_prepack(const ds41a::bf16* src, uint8_t* codes, uint8_t* scales, void* st);
 void ds41_attn_set_cpasync(int on);
+void ds41_attn_set_pipe(int on);
 void ds41_attn_set_split(int on);
 void ds41_attn_set_win_floor(int pos);
+void ds41_attn_set_gv_rows_max(int max_rows);
 int ds41_attn_gv_ready(const ds41a::Weights*, int rows);
 int ds41_attn_project(const ds41a::Fp8Mat*, const void* x, int rows, void* y, int ldy, uint8_t* codes, uint8_t* scales, uint32_t* xf, void* st);
+int ds41_attn_project_nt(const ds41a::Fp8Mat*, const void* x, int rows, void* y, int ldy, uint8_t* codes, uint8_t* scales, uint32_t* xf, void* st);
+void ds41_attn_set_gv_nt(ds41a::XfragNtFn fn_xfrag_nt, ds41a::GemvFn fn_gemv_nt);
 }
 
 // GR8_DS_SRC_FAST (default 0 = the generic launches): bit 1 = the ratio-2 compressor GEMV (bit-identical to k_f32gemm2), bit 2 = the indexer wq_b through the MXFP8 GEMV
@@ -144,7 +151,8 @@ inline const __nv_bfloat16* ds41_vec(Model& m, int l, const char* nm, long long 
 }
 
 // Engram, ST_ENGRAM's project hook: kv[rows][25600] = fp8gemm(act_quant(emb[rows][6144]), wkv), wkv = L001 / L014 .engram.wkv [25600][6144]
-// (full on every rank). The dense MXFP8 GEMV of the attention projections: one pass over the weight for up to 8 rows, 8-row passes above.
+// (full on every rank). The dense MXFP8 GEMV of the attention projections, multi-tile: one pass over the weight for up to 32 rows, 32-row
+// passes above (ds41_attn_project_nt; bit-identical to the 8-row passes of ds41_attn_project).
 // Bound with the layer (ds41_attn_bind at l = 1, 14) when the pack has the tensor; the scratch is carved there, so the hook allocates nothing.
 struct Ds41EngramProj { ds41a::Fp8Mat W{}; uint8_t *codes = nullptr, *scales = nullptr; uint32_t* xf = nullptr; };
 inline Ds41EngramProj g_ds41_eng[2];
@@ -158,9 +166,15 @@ inline void ds41_engram_bind(Model& m, int l)
     Ds41EngramProj& q = g_ds41_eng[e];
     q.W = ds41_fp8(m, l, "engram.wkv", N, K);
     if (!q.W.gv) die("DS41 Engram bind: " + p + ".mx.gv missing (the project hook needs the GEMV records)");
-    q.codes = dmalloc<uint8_t>((size_t)8 * K);
-    q.scales = dmalloc<uint8_t>((size_t)8 * K / 32);
-    q.xf = dmalloc<uint32_t>((size_t)K * 4);
+    q.codes = dmalloc<uint8_t>((size_t)32 * K);      // 32 rows (project_rows_nt)
+    q.scales = dmalloc<uint8_t>((size_t)32 * K / 32);
+    q.xf = dmalloc<uint32_t>((size_t)4 * K * 4);      // 4 row tiles
+    static bool nt_set = false;
+    if (!nt_set)
+    {
+        nt_set = true;
+        ds41_attn_set_gv_nt(ds41a::gv_xfrag_nt_launch, ds41a::gv_gemv_nt_launch);
+    }
 }
 // EngramHooks::project (engine/engram/engram_dev.cuh): e = 0 (layer 1) or 1 (layer 14); 0 = ok.
 inline int ds41_engram_project(void* model, int e, int rows, void* stream, const __nv_bfloat16* emb, __nv_bfloat16* kv)
@@ -169,7 +183,7 @@ inline int ds41_engram_project(void* model, int e, int rows, void* stream, const
     if (e < 0 || e > 1 || rows < 1) return 1;
     const Ds41EngramProj& q = g_ds41_eng[e];
     if (!q.W.gv) return ds41::NOTSUP;
-    return ds41_attn_project(&q.W, emb, rows, kv, q.W.N, q.codes, q.scales, q.xf, stream);
+    return ds41_attn_project_nt(&q.W, emb, rows, kv, q.W.N, q.codes, q.scales, q.xf, stream);
 }
 
 // The indexer's per-layer bind/prepare (engine/attn/ds41_idx_ops.cuh, included after this header in ds41_step.cuh): this file owns the table slots
@@ -262,11 +276,13 @@ inline int ds41_attn_bind(void* model, int i, int capacity, void* stream)
         if (!gv_set)
         {
             gv_set = true;
-            ds41_attn_set_gv(knob::ds_attn_gv(), (int)knob::ds_attn_gv_tpc(), (int)knob::ds_attn_gv_ks(), ds41a::gv_xfrag_launch, ds41a::gv_gemv_launch);
+            ds41_attn_set_gv(knob::ds_attn_gv(), (int)knob::ds_attn_gv_tpc(), (int)knob::ds_attn_gv_ks(), ds41a::gv_xfrag_launch,
+                             knob::ds41_gv_quad() ? ds41a::gv_gemv_launch_q : ds41a::gv_gemv_launch);   // GR8_DS41_GV_QUAD=1: q_b / o_a / o_b in quad records (default off)
             const bool tc = knob::ds_attn_tc();   // 1 = the five projections at M >= 9 run on the block-scaled tensor-core GEMM (default 0)
             ds41_attn_set_tc(tc);
             if (tc) fprintf(stderr, "DS41 attention tensor-core GEMM: GR8_DS_ATTN_TC=1 (M >= 9)\n");
             ds41_attn_set_tc_mfast((int)knob::ds_attn_tc_mf());   // that GEMM's launch order: 0 = N tile fastest (default), 1 = M tile fastest, 2 = auto (M tile fastest only for a weight >= 100 MB)
+            ds41_attn_set_tc_tile((int)knob::ds_attn_tc_tile());   // that GEMM's 128 x 128 tile: 0 = 2-deep ring (default), 1 = 3-deep swizzled ring, 2 = its persistent form; the same bits
             ds41_attn_set_comp_fp8(knob::ds_comp_fp8());   // default off; BF16 compressor weight prepack, lossy
             if (!g_ds41_attn_pw) ds41_attn_set_prefill_rows((int)knob::ds_attn_pw());
             g_ds41_src_fast = (int)knob::ds_src_fast();
@@ -292,6 +308,19 @@ inline int ds41_attn_bind(void* model, int i, int capacity, void* stream)
     }
     a->heads = plan.heads;
     W = plan.W;
+    if (knob::ds41_gv_quad())   // GR8_DS41_GV_QUAD=1: repack this layer's q_b / o_a / o_b GEMV records to quads, in place, before any capture
+    {
+        const int G = a->heads / ds41a::HPG, tpc = (int)knob::ds_attn_gv_tpc(), ks = (int)knob::ds_attn_gv_ks();
+        const int n = ds41a::gv_quad_bind(W.wq_b, 1, tpc, ks, (cudaStream_t)stream) + ds41a::gv_quad_bind(W.wo_a, G, tpc, ks, (cudaStream_t)stream) +
+                      ds41a::gv_quad_bind(W.wo_b, 1, tpc, ks, (cudaStream_t)stream);
+        G6RT_CK(cudaStreamSynchronize((cudaStream_t)stream));
+        static bool told = false;
+        if (!told)
+        {
+            told = true;
+            fprintf(stderr, "DS41 attention GEMV: GR8_DS41_GV_QUAD=1 (layer %d: %d of 3 weights, q_b / o_a / o_b, repacked to quad records, k_gv_mx_q)\n", l, n);
+        }
+    }
     if (geom::has_compressor_gate(l))
     {
         if (knob::ds_comp_fp8())
@@ -342,8 +371,16 @@ inline int ds41_attn_bind(void* model, int i, int capacity, void* stream)
     if (geom::has_compressor_gate(l))
     {
         a->comp_rows = (size_t)(capacity / 2 + 2);
-        a->C.comp_ss = a->comp_rows * ds41a::HD;
-        a->C.comp = dmalloc<__nv_bfloat16>(ns * a->C.comp_ss);             // bf16, fp4-valued; the packed 288 B form is a follow-up
+        if (knob::ds_comp_fp4())   // GR8_DS_COMP_FP4: packed 288 B rows (comp_ss in bytes), the same values
+        {
+            a->C.comp_ss = a->comp_rows * ds41a::CQ_ROW;
+            a->C.compq = dmalloc<uint8_t>(ns * a->C.comp_ss);
+        }
+        else
+        {
+            a->C.comp_ss = a->comp_rows * ds41a::HD;
+            a->C.comp = dmalloc<__nv_bfloat16>(ns * a->C.comp_ss);         // bf16, fp4-valued
+        }
         a->C.kvs = dmalloc<float>(ns * 2 * ds41a::HD);
         a->C.scs = dmalloc<float>(ns * 2 * ds41a::HD);
     }
@@ -435,9 +472,10 @@ inline int ds41_attn_op_core(void* model, int i, int rows, void* stream)
                 if (a->src_pos < 0) return ds41::NOTSUP;  // the subset has no layer that owns these compressed rows
             }
             const Ds41AttnLayer* s = ds41_attn_state(m, a->src_pos);
-            if (!s || !s->C.comp) return ds41::NOTSUP;
-            comp = s->C.comp;
+            if (!s || !(s->C.comp || s->C.compq)) return ds41::NOTSUP;
+            comp = s->C.compq ? (const __nv_bfloat16*)s->C.compq : s->C.comp;
             a->C.src_ss = s->C.comp_ss;                   // SESS > 1: the source's slot stride (the indexer sets src_ss with comp_src)
+            a->C.src_q = s->C.compq != nullptr;           // packed rows: src_ss in bytes
         }
         TK = geom::IDX_TOPK;                              // the list is -1 padded past the visible rows
     }
@@ -447,7 +485,10 @@ inline int ds41_attn_op_core(void* model, int i, int rows, void* stream)
     {
         ds41a::Cache C_pf = a->C; C_pf.ring = a->ring_pf; C_pf.ring_rows = a->ring_pf_rows;
         ds41a::Scratch S_pf = a->S; S_pf.sess = nullptr; S_pf.ns = 1;
-        const __nv_bfloat16* comp_pf = (comp && a->S.sess) ? comp + (size_t)m.ds_pf_slot * a->C.src_ss : comp;
+        const __nv_bfloat16* comp_pf = comp;
+        if (comp && a->S.sess)
+            comp_pf = a->C.src_q ? (const __nv_bfloat16*)((const uint8_t*)comp + (size_t)m.ds_pf_slot * a->C.src_ss)
+                                 : comp + (size_t)m.ds_pf_slot * a->C.src_ss;
         ds41_attn_core(&a->W, &C_pf, comp_pf, &S_pf, rows, 0, a->heads, a->topk, a->ldtk, TK, stream, m.pos);
         return 0;
     }
@@ -481,9 +522,10 @@ inline int ds41_attn_clear_layer(Model& m, int i, void* stream, int slot = -1)
     const size_t k0 = slot < 0 ? 0 : (size_t)slot, nk = slot < 0 ? (size_t)m.ds_slots : 1;
     const size_t ring = (size_t)a->C.ring_rows * ds41a::HD;
     G6RT_CK(cudaMemsetAsync(a->C.ring + k0 * ring, 0, nk * ring * sizeof(__nv_bfloat16), st));
-    if (a->C.comp)
+    if (a->C.comp || a->C.compq)
     {
-        G6RT_CK(cudaMemsetAsync(a->C.comp + k0 * a->C.comp_ss, 0, nk * a->C.comp_ss * sizeof(__nv_bfloat16), st));
+        if (a->C.comp) G6RT_CK(cudaMemsetAsync(a->C.comp + k0 * a->C.comp_ss, 0, nk * a->C.comp_ss * sizeof(__nv_bfloat16), st));
+        else G6RT_CK(cudaMemsetAsync(a->C.compq + k0 * a->C.comp_ss, 0, nk * a->C.comp_ss, st));
         G6RT_CK(cudaMemsetAsync(a->C.kvs + k0 * 2 * ds41a::HD, 0, nk * 2 * ds41a::HD * sizeof(float), st));
         G6RT_CK(cudaMemsetAsync(a->C.scs + k0 * 2 * ds41a::HD, 0, nk * 2 * ds41a::HD * sizeof(float), st));
     }

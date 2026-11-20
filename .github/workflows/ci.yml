@@ -62,13 +62,15 @@ jobs:
               - '.github/ci/**'
               - 'frontend/**'
               - 'tools/launch/**'
+              - 'tools/switch/**'
+              - 'config/switch.env.example'
               - 'tools/steering/**'
               - 'smoketest/**'
               - 'gr8'
               - 'engine/**'
               - 'knobs/**'
               - 'scripts/engine_args.sh'
-            # the host tests, the tools' and the bench gate's tests, the compose file, the Helm chart and the engine's
+            # the host tests, the tools' and the bench's tests, the compose file, the Helm chart and the engine's
             # Rust crates; bash -n of the recipes' scripts
             engine:
               - '!**/*.md'
@@ -86,7 +88,6 @@ jobs:
               - 'bench/**'
               - 'docker/**'
               - 'deploy/**'
-              - 'recipes/**/*.sh'
       - name: The builds
         id: build
         if: github.event_name == 'pull_request'
@@ -94,15 +95,19 @@ jobs:
         with:
           predicate-quantifier: some-with-excludes
           filters: |
-            # the Dockerfile's rust-dist: the loader, the page allocator and the front end
+            # the Dockerfile's rust-dist: the loader, the page allocator, the scheduling logic and the front end
             rust:
               - '!**/*.md'
               - '.github/workflows/ci.yml'
               - 'Dockerfile'
               - '.dockerignore'
+              - 'engine/Cargo.toml'
+              - 'engine/Cargo.lock'
+              - 'engine/hostcore-rs/**'
               - 'engine/loader-rs/**'
               - 'engine/kvman-rs/**'
               - 'engine/knobs-rs/**'
+              - 'engine/scheduler-rs/**'
               - 'knobs/**'
               - 'frontend/g6front-rs/**'
             # the engine builds and the image: what the Dockerfile's engine stages copy (the front end's Cargo files
@@ -115,6 +120,7 @@ jobs:
               - 'engine/**'
               - 'knobs/**'
               - 'scripts/build.sh'
+              - 'scripts/ds41_build_flags.sh'
               - 'tools/health/gpuprobe.cu'
               - 'frontend/g6front-rs/Cargo.toml'
               - 'frontend/g6front-rs/Cargo.lock'
@@ -144,8 +150,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.rustup/toolchains
+            engine/target
             engine/loader-rs/target
-            engine/kvman-rs/target
             engine/knobs-rs/target
             frontend/g6front-rs/target
             frontend/pseudo-engine/target
@@ -220,9 +226,9 @@ jobs:
           if-no-files-found: error
 
   engine:
-    # The four parts (GLM with the fp8 KV, GLM with the int4 KV, Flash, and the
-    # test binaries) are the whole cost of a build and share no compilation, so
-    # they get a runner each. Two on one runner spend most of their time
+    # The five parts (GLM with the fp8 KV, GLM with the int4 KV, Flash,
+    # DeepSeek-V4.1-Flash, and the test binaries) are the whole cost of a build
+    # and share no compilation, so they get a runner each. Two on one runner spend most of their time
     # competing for its four cores: the fp8 leg, with Flash and the tests, took
     # 27-42 min while int4 alone took 6-11.
     name: Engine build (${{ matrix.label }}, arm64, CUDA 13, sm_121a)
@@ -230,6 +236,9 @@ jobs:
     if: needs.changes.outputs.engine == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
+    env:
+      # the compile cache is saved by main only, as the layer cache is
+      NVCC_SAVE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     strategy:
       fail-fast: false
       matrix:
@@ -259,6 +268,27 @@ jobs:
               type=gha,scope=gr8
               type=gha,scope=gr8-flash
             cache_to: type=gha,scope=gr8-flash,mode=max
+          - leg: flash-int4
+            label: Flash int4 KV
+            target: dist-flash-int4
+            cache_from: |
+              type=gha,scope=gr8
+              type=gha,scope=gr8-flash-int4
+            cache_to: type=gha,scope=gr8-flash-int4,mode=max
+          - leg: ds41
+            label: DeepSeek-V4.1-Flash
+            target: dist-ds41
+            cache_from: |
+              type=gha,scope=gr8
+              type=gha,scope=gr8-ds41
+            cache_to: type=gha,scope=gr8-ds41,mode=max
+          - leg: ink2
+            label: Inkling-2-Small
+            target: dist-ink2
+            cache_from: |
+              type=gha,scope=gr8
+              type=gha,scope=gr8-ink2
+            cache_to: type=gha,scope=gr8-ink2,mode=max
           - leg: tests
             label: tests
             target: dist-tests
@@ -274,6 +304,36 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h /
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      # The compile cache (docs/BUILD-CACHE.md): the leg's cache mount (gr8-nvcc-<leg>, Dockerfile), kept in the Actions
+      # cache between runs. A run whose engine layer has to run again, because the layer cache misses or an edit
+      # reaches the engine, compiles only the objects that changed. Every run restores main's newest copy for the leg; main
+      # saves one per set of compile inputs (the key below), so a merge that leaves the engine alone saves nothing.
+      # The steps after the build run in reverse: the cache dance copies the mount out, then actions/cache saves it.
+      - name: The compile cache's key
+        id: nvcc
+        run: echo "key=gr8-nvcc-${{ matrix.leg }}-${{ hashFiles('Dockerfile', 'engine/**', 'knobs/**', 'scripts/build.sh', 'scripts/ds41_build_flags.sh', 'tools/health/gpuprobe.cu', 'frontend/g6front-rs/Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+      - name: Restore the compile cache, and save it after the build
+        id: nvcc-save
+        if: env.NVCC_SAVE == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ runner.temp }}/nvcc-cache
+          key: ${{ steps.nvcc.outputs.key }}
+          restore-keys: gr8-nvcc-${{ matrix.leg }}-
+      - name: Restore the compile cache
+        if: env.NVCC_SAVE != 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ runner.temp }}/nvcc-cache
+          key: ${{ steps.nvcc.outputs.key }}
+          restore-keys: gr8-nvcc-${{ matrix.leg }}-
+      - name: Put the compile cache in the builder's cache mount
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723  # v3.4.0
+        with:
+          cache-map: '{"${{ runner.temp }}/nvcc-cache": {"target": "/var/cache/gr8-nvcc", "id": "gr8-nvcc-${{ matrix.leg }}"}}'
+          scratch-dir: ${{ runner.temp }}/nvcc-dance
+          # copy it back out only to save it: on main, when no copy has this key yet
+          skip-extraction: ${{ env.NVCC_SAVE != 'true' || steps.nvcc-save.outputs.cache-hit == 'true' }}
       - name: Widths
         # A pull request compiles the three widths whose code differs: 1, the
         # PF_F12 fat-CTA width 4, and the largest. main and tags compile all
@@ -284,7 +344,10 @@ jobs:
           [ "${{ github.event_name }}" = pull_request ] && widths='1 4 8'
           echo "widths=$widths" >> "$GITHUB_OUTPUT"
           case "${{ matrix.leg }}" in
-            flash) echo "Flash, TP widths 2 3 4" ;;
+            flash) echo "Flash, TP widths 1 2 3 4" ;;
+            flash-int4) echo "Flash int4 KV, TP widths 1 2 3 4" ;;
+            ds41) echo "DeepSeek-V4.1-Flash, TP width 4" ;;
+            ink2) echo "Inkling-2-Small, TP widths 1 4 6" ;;
             tests) echo "test binaries, dtr_test at TP4" ;;
             *) echo "${{ matrix.label }}, TP widths ${widths:-1 2 3 4 5 6 8}" ;;
           esac >> "$GITHUB_STEP_SUMMARY"
@@ -436,7 +499,10 @@ jobs:
           docker image ls "$img"
           docker run --rm --entrypoint bash "$img" -c '
             set -eu
-            for b in bin/g6m4 bin/g6m4-int4 bin/m4sim bin/gpuprobe bin/g6front-rs bin/g6load; do
+            binaries=$(python3 tools/launch/models.py get image-binaries)
+            test -n "$binaries"
+            for b in $binaries; do
+              [ -x "$b" ] || { echo "$b: not in the image"; exit 1; }
               if ldd "$b" | grep "not found"; then echo "$b: missing libraries"; exit 1; fi
             done
             python3 -c "import g6s2shim"
@@ -446,11 +512,14 @@ jobs:
             python3 tools/steering/trace_audit.py --help > /dev/null
             bin/g6front-rs --help > /dev/null
             echo smoke OK'
-          docker run --rm -e GR8_MODEL=glm53 "$img" show-config --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4 \
-            --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --no-check > /dev/null
-          # TP=5: the entrypoint no longer picks a bin/ by width, so every width the launcher accepts gets through it
-          docker run --rm -e GR8_MODEL=glm53 "$img" show-config \
-            --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4,192.0.2.5 --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --no-check > /dev/null
+          # Every registered GPU model and supported TP must pass the entrypoint's config smoke.
+          configs=$(docker run --rm --entrypoint python3 "$img" -c 'from tools.launch.models import SERVED; [print(m.name, tp, m.release) for m in SERVED for tp in m.tp]')
+          test -n "$configs"
+          while read -r model tp release; do
+            peers=$(python3 -c 'import sys; print(",".join("192.0.2." + str(i+1) for i in range(int(sys.argv[1]))))' "$tp")
+            docker run --rm -e GR8_MODEL="$model" "$img" show-config --tp "$tp" --peers "$peers" \
+              --model "$release" --no-check > /dev/null
+          done <<< "$configs"
           # no model stops in the entrypoint, with exit 2 and the line to add: nothing picks one
           rc=0; err=$(docker run --rm "$img" 2>&1 >/dev/null) || rc=$?
           echo "$err"

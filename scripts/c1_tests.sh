@@ -9,8 +9,10 @@
 # that never resized; #153) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same weights,
 # byte for byte; --bench times absorb / value_project; #50) and s2_steer_test (S2 batched decode steers each row as solo
 # decode does: the S2 and solo layer bindings, the shared-expert finalize and the attention consume per row against each
-# session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP). headgroup_test and kda_g9_det
-# build in one fixed configuration each, whatever GR8_NR and EXTRA say (docs/TESTING.md).
+# session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP) and test_flash_cp (Flash
+# context-parallel decode against the replicated path). headgroup_test, kda_g9_det and test_flash_cp build in one fixed
+# configuration each, whatever GR8_NR and EXTRA say (docs/TESTING.md). TEST=ds41_v2 runs the DS41 v2 prefill tests (each
+# in the one configuration its header names).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
 #   GR8_NR=4 scripts/c1_tests.sh bin4               the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
@@ -37,6 +39,9 @@ FLAGS="-gencode=arch=compute_$A,code=sm_$A $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR
 # every test links the knob table (engine/knobs-rs): the engine headers read their settings through it
 KNOBLIB="$REPO/engine/knobs-rs/target/release/libgr8knobs.a"
 [ -f "$KNOBLIB" ] || cargo build --quiet --release --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
+# and the host Rust (engine/Cargo.toml): the S2 scheduling logic and the S2 page allocator
+HOSTLIB="$REPO/engine/target/release/libg6host.a"
+[ -f "$HOSTLIB" ] || cargo build --quiet --release --manifest-path "$REPO/engine/Cargo.toml"
 build_run() {   # build_run <test> <extra sources...>  (test args in ARGS); a test outside runtime/tests is a path under engine/
   local src=$1; shift
   case "$src" in */*) ;; *) src=runtime/tests/$src ;; esac
@@ -46,12 +51,12 @@ build_run() {   # build_run <test> <extra sources...>  (test args in ARGS); a te
   [ -x "$BIN" ] || stale=1
   [ "$(cat "$BIN.flags" 2>/dev/null)" = "$FLAGS" ] || stale=1
   if [ "$stale" = 0 ] && [ -n "$(find "$REPO/engine" -type f \( -name '*.cu' -o -name '*.cuh' -o -name '*.h' \) -newer "$BIN" -print -quit)" ]; then stale=1; fi
-  local a; for a in "$@" "$KNOBLIB"; do [ -f "$a" ] && [ "$a" -nt "$BIN" ] && stale=1; done   # e.g. a rebuilt libg6kvman.a
+  local a; for a in "$@" "$KNOBLIB" "$HOSTLIB"; do [ -f "$a" ] && [ "$a" -nt "$BIN" ] && stale=1; done   # e.g. a rebuilt libg6host.a
   if [ "$stale" = 1 ]; then
     echo "building $BIN ($FLAGS)"
     rm -f "$BIN" "$BIN.flags"
     # shellcheck disable=SC2086
-    nvcc -O2 -std=c++17 $FLAGS -o "$BIN" "$SRC" "$@" "$KNOBLIB" -lpthread -ldl -lm
+    nvcc -O2 -std=c++17 $FLAGS -o "$BIN" "$SRC" "$@" "$KNOBLIB" "$HOSTLIB" -lpthread -ldl -lm
     echo "$FLAGS" > "$BIN.flags"
   else
     echo "up to date: $BIN"
@@ -70,22 +75,27 @@ with_flags() {
   return $r
 }
 FLASH_FLAGS="-DG6_MODEL_FLASH=1 -DG6_NR=2"
-# kvlib_ready: target/release/libg6kvman.a for the tests that link it, built first when cargo is on PATH; 1 (with
-# the reason) when it is missing or older than the crate's sources
+# kvlib_ready: a current libg6host.a for the tests that use the page allocator, built first when cargo is on PATH; 1
+# (with the reason) when it is missing or older than the crates' sources
 kvlib_ready() {
-  local crate="$REPO/engine/kvman-rs" lib="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
+  local e="$REPO/engine"
   if command -v cargo > /dev/null; then
-    cargo build --release -q --manifest-path "$crate/Cargo.toml" || { echo "cargo build --release failed"; return 1; }
+    cargo build --release -q --manifest-path "$e/Cargo.toml" || { echo "cargo build --release failed"; return 1; }
   fi
-  [ -f "$lib" ] || { echo "no $lib (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"; return 1; }
-  if [ -n "$(find "$crate/src" "$crate/Cargo.toml" -newer "$lib" -print -quit)" ]; then
-    echo "$lib is older than engine/kvman-rs/src (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
+  [ -f "$HOSTLIB" ] || { echo "no $HOSTLIB (cargo build --release --manifest-path engine/Cargo.toml)"; return 1; }
+  if [ -n "$(find "$e/Cargo.toml" "$e/hostcore-rs" "$e/kvman-rs/src" "$e/kvman-rs/Cargo.toml" "$e/scheduler-rs/src" \
+      "$e/scheduler-rs/Cargo.toml" -newer "$HOSTLIB" -print -quit)" ]; then
+    echo "$HOSTLIB is older than its sources (cargo build --release --manifest-path engine/Cargo.toml)"
     return 1
   fi
 }
 TEST=${TEST:-all}
 ARGS=("$@")
 rc=0
+if [ "$TEST" = all ] || [ "$TEST" = dispram_gpu_test ]; then
+  [ "$TEST" = all ] && ARGS=()
+  build_run dispram_gpu_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
 if [ "$TEST" = all ] || [ "$TEST" = row_budget_test ]; then
   build_run row_budget_test || rc=$?
 fi
@@ -109,11 +119,10 @@ if [ "$TEST" = all ] || [ "$TEST" = kvb8_test ]; then
   esac
 fi
 if [ "$TEST" = all ] || [ "$TEST" = canon_test ]; then
-  # a session's KV across page lists and layouts (#152): links the S2 page allocator's library (engine/kvman-rs)
+  # a session's KV across page lists and layouts (#152): needs the S2 page allocator (engine/kvman-rs)
   [ "$TEST" = all ] && ARGS=()
-  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
-    build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$KVLIB" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
     echo "SKIP canon_test: $why"
   fi
@@ -121,9 +130,8 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = kv_resize_test ]; then
   # the KV pool's chunks shrunk and grown under live sessions (#153): the allocator's library and the driver API
   [ "$TEST" = all ] && ARGS=()
-  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
-    build_run kv_resize_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcublas -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    build_run kv_resize_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" -lcublas -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
     echo "SKIP kv_resize_test: $why"
   fi
@@ -131,10 +139,9 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
   # the Flash KV caches in chunks (GR8_GLM53F_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
   [ "$TEST" = all ] && ARGS=()
-  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
     GLM_FLAGS="$FLAGS"; FLAGS="$FLAGS -DG6_MODEL_FLASH=1"
-    GR8_TEST_KVMAN_LEDGER="$REPO/engine/kvman-rs/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/ops_flash.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    GR8_TEST_KVMAN_LEDGER="$REPO/engine/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/ops_flash.cu" "$REPO/engine/attn/kvchunks.cu" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
     FLAGS="$GLM_FLAGS"
   else
     echo "SKIP flash_kv_chunks_test: $why"
@@ -169,6 +176,24 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = kda_g9_det ]; then
   [ "$TEST" = all ] && ARGS=()
   with_flags "$FLASH_FLAGS -DG9_CONV_DBG=1" build_run kda/tests/kda_g9_det || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = test_flash_cp ]; then
+  # Flash context-parallel decode against the replicated path, every rank of TP=2 on this GPU, 4096-token key tiles
+  [ "$TEST" = all ] && ARGS=()
+  with_flags "$FLASH_FLAGS -DG6_KV4=1 -DG6_CP=1 -DDEC_S2 -DKP_TILE_POOLS=1024" build_run tests/test_flash_cp || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = ds41_v2 ]; then
+  # the DS41 v2 prefill (GR8_DS_PF_V2) kernels against the stock ones, synthetic data (docs/TESTING.md), each in the one
+  # configuration its header names, whatever GR8_NR and EXTRA say; ds41_v2_fc2_profile is a profile, built by scripts/build.sh
+  ARGS=()
+  with_flags "-DG6_MODEL_DS41=1" build_run attn/tests/ds41_v2_l20_tail_test "$REPO/engine/attn/ds41_bind.cu" "$REPO/engine/attn/ds41_attn.cu" || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  for t in attn/tests/ds41_v2_attn_test attn/tests/ds41_v2_index_test kernels/tests/ds41_v2_moe_test runtime/tests/ds41_v2_mhc_test \
+      runtime/tests/ds41_v2_timing_test tests/test_ds41_v2_width tests/test_ds41_v2_wire; do
+    with_flags "" build_run "$t" || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  done
+  for t in runtime/tests/ds41_v2_w16k_test runtime/tests/ds41_v2_engram_test runtime/tests/ds41_v2_ffn_test tests/test_ds41_v2_send_ffn_opt_gpu tests/test_ds41_v2_s8_combo_gpu; do
+    with_flags "-DG6_MODEL_DS41=1" build_run "$t" "$REPO/engine/attn/ds41_attn.cu" || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  done
 fi
 if [ "$rc" = 0 ]; then echo "c1_tests: PASS"; else echo "c1_tests: FAIL (exit $rc)"; fi
 exit "$rc"

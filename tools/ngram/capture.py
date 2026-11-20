@@ -19,8 +19,8 @@ import sys
 import time
 import urllib.request
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'bench', 'gate'))
-from client import Client  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'bench'))
+from gr8bench.client import Client  # noqa: E402
 
 
 def post(c, path, body):

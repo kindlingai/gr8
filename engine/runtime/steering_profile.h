@@ -94,9 +94,14 @@ inline std::array<uint8_t, 32> schedule_hash(Scope scope, const std::vector<uint
     return digest;
 }
 
-inline Profile load_profile(const std::string& directory, const ExpectedModel& expected) {
+// Validate manifest bytes + directions payload into a Profile. The single
+// validation path for every input container: profile directories
+// (load_profile) and GLP GGUF vectors (steering_glp.h) both end here, so
+// identity, digest and norm semantics cannot drift between formats.
+inline Profile profile_from_parts(const std::string& manifest_json, const std::string& payload,
+                                  const ExpectedModel& expected) {
     Profile p;
-    p.manifest_json = read_file(directory + "/manifest.json", MANIFEST_MAX_BYTES);
+    p.manifest_json = manifest_json;
     p.manifest_digest = sha256(p.manifest_json.data(), p.manifest_json.size());
     const auto root = g6v::Json::parse(p.manifest_json);
     object_known(root, "root", {"schema_version", "profile_name", "model", "scope", "layers", "alphas",
@@ -176,7 +181,7 @@ inline Profile load_profile(const std::string& directory, const ExpectedModel& e
         }
     }
 
-    const std::string raw = read_file(directory + "/directions.f32", size_t(want));
+    const std::string& raw = payload;
     if (raw.size() != want) throw std::runtime_error("steering profile: short/trailing directions payload");
     if (sha256(raw.data(), raw.size()) != p.tensor_digest)
         throw std::runtime_error("steering profile: directions digest mismatch");
@@ -198,6 +203,13 @@ inline Profile load_profile(const std::string& directory, const ExpectedModel& e
     }
     p.schedule_digest = schedule_hash(p.scope, p.layers, p.alphas);
     return p;
+}
+
+inline Profile load_profile(const std::string& directory, const ExpectedModel& expected) {
+    const std::string manifest = read_file(directory + "/manifest.json", MANIFEST_MAX_BYTES);
+    // Bounded at the schema cap; profile_from_parts enforces the exact byte_count.
+    const std::string raw = read_file(directory + "/directions.f32", DIRECTIONS_MAX_BYTES);
+    return profile_from_parts(manifest, raw, expected);
 }
 
 } // namespace g6rt::steering

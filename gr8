@@ -11,10 +11,12 @@
 #        --model URL|DIR              the exlr8 release, https://huggingface.co/<org>/<repo>[@rev] or a local copy of
 #                                     it. The engine plans every rank's weights from its files
 #        --model-cache DIR            this box's local directory for its shard (alone: boot from it)
-#        --drafter URL                TP=4 or 6: the DFlash2 drafter's repo, fetched and converted on each box
+#        --drafter URL                TP=4 or 6 (Flash: also 2 and 1): the DFlash2 drafter's repo, fetched and converted on each box
 #        --cap 262144, --sess 4, ...  every knob ./gr8 knobs lists, as --<knob> VALUE
 #   ./gr8 glm53 down                  stop every box of the last boot
 #   ./gr8 glm53 restart [OPTIONS]     down, then up
+#   ./gr8 glm53 scale --tp N --peers LIST [--drain-timeout S]   change the serving cluster's width by an orderly restart
+#                                     that holds requests and carries the KV store's sessions (docs/SWITCHING.md)
 #   ./gr8 glm53 status                every box's state, engine and MemAvailable, and the head's shim, front end, /health
 #   ./gr8 glm53 health                exit 0 when this box serves (on the head, its /health answers too), else 1: a
 #                                     readiness check for compose and Kubernetes probes, on every rank
@@ -25,9 +27,13 @@
 #   ./gr8 glm53 knobs [WORD..] [OPTIONS]   every option, and the value each TP runs with these options; WORDs keep
 #                                     the options whose name holds one
 #   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API (./gr8 ds41 smoke: smoketest/ds41.sh)
-#   ./gr8 glm53 bench [ARGS]          bench/pbench.py against this head's API
-#   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh; with
-#                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
+#   ./gr8 glm53 bench [ARGS]          bench/bench.py against this head's API, cooling and sampling the PEERS boxes
+#                                     between stages; --quick, --full, --json FILE (bench/README.md)
+#   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh;
+#                                     also bin/g6m4-int4 for TP=4 or an unconfigured clone; KV_FORMAT=fp8 skips it
+#
+#   ./gr8 switch <glm53|glm53f|ds41> [@FILE]  switch the configured Compose cluster from one controller
+#                                     config/switch.env.example; defaults to ./switch.env; --timeout SECONDS
 #
 #   ./gr8 knobs [WORD..]              every option of ./gr8 <model> and ./gr8 kv: flag, scope, default and meaning
 #   ./gr8 models                      the models, and for each the name to give, its release and the values --tp and
@@ -40,6 +46,9 @@
 #   ./gr8 query [OPTIONS] PROMPT      one chat prompt streamed to the terminal, thinking dim (tools/query/query.py):
 #                                     --api URL, --steer PROFILE[:SCALE], --effort, --record/--replay FILE, --window 40x10
 #
+#   ./gr8 perftest --peers A,B,C,D    the fabric's collective health: NCCL all-reduce, Ring then Tree, run on every box at
+#                                     once (tools/perftest/perftest.py; tools/perftest/build.sh builds bin/nccl_probe)
+#
 #   ./gr8 test [frontend|engine|all]  the CPU tests CI runs (.github/ci/cpu-tests.sh), all by default; docs/TESTING.md
 #   ./gr8 test pseudo TOKENIZER_DIR   the smoke test and the front end's API tests against the pseudo engine, no GPU
 #   ./gr8 test gpu [BIN_DIR]          the one-GPU unit tests (scripts/c1_tests.sh)
@@ -47,6 +56,8 @@
 # Options come from the command line, then one config file (@FILE, else ./cluster.env, else config/cluster.env, which
 # ./gr8 parses and does not source), then the environment, then the defaults. An old config file works: HOSTS is read as PEERS. ./gr8 knobs
 # lists every option.
+# The model is the name given here: a GR8_MODEL in the config file or the environment that names another stops up,
+# check, prepare and show-config.
 # --no-check (or CHECK=0) boots without the checks.
 set -eu
 REPO=$(cd "$(dirname "$0")" && pwd)
@@ -70,14 +81,12 @@ options "$@"; set -- ${rest[@]+"${rest[@]}"}
 [ $# -gt 0 ] || { usage; exit 0; }
 model=$1
 case $model in
-  glm53) build_model=glm ;;
-  glm53f) build_model=flash ;;
-  ds41) build_model=ds41 ;;
-  pseudo) build_model=pseudo ;;
+  switch) shift; exec python3 "$REPO/tools/switch/switch.py" "$@" ;;
   models) exec python3 "$REPO/tools/launch/models.py" ;;
   knobs) shift; GR8_MODEL='' exec python3 "$REPO/tools/launch/launch.py" knobs "$@" ;;
   kv) shift; exec python3 "$REPO/tools/launch/kvnode.py" "$@" ;;
   query) shift; exec python3 "$REPO/tools/query/query.py" "$@" ;;
+  perftest) shift; exec python3 "$REPO/tools/perftest/perftest.py" "$@" ;;
   test)
     shift
     case ${1:-all} in
@@ -86,11 +95,14 @@ case $model in
       gpu) shift; exec bash "$SCRIPTS/c1_tests.sh" "$@" ;;
       *) echo "gr8: ./gr8 test [frontend|engine|all], ./gr8 test pseudo TOKENIZER_DIR or ./gr8 test gpu [BIN_DIR]" >&2; exit 2 ;;
     esac ;;
-  *) echo "gr8: the first argument names the model, glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash): ./gr8 glm53 <command>" \
-          "(./gr8 models lists them; or ./gr8 knobs, ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
+  *) build_model=$(python3 "$REPO/tools/launch/launch.py" model-get "$model" build) || exit 2 ;;
+
 esac
 shift
-export GR8_MODEL=$model   # tools/launch/options.py
+# The name is the model. The launcher takes it as --named-model and refuses a GR8_MODEL in the config file or the
+# environment that names another (#244), so the environment's own value reaches it untouched; what this script runs
+# itself (smoke, bench, build) gets the name as GR8_MODEL.
+named=(--named-model "$model")
 options "$@"; set -- ${rest[@]+"${rest[@]}"}
 [ $# -gt 0 ] || { usage; exit 0; }
 cmd=$1; shift
@@ -104,17 +116,23 @@ done
 set -- ${args[@]+"${args[@]}"}
 api() { echo "http://127.0.0.1:$PORT"; }
 case $cmd in
-  up|down|restart|status|health|logs|check|show-config|prepare|knobs)
+  up|down|restart|scale|status|health|logs|check|show-config|prepare|knobs)
     [ $check = 0 ] && set -- "$@" --no-check
-    exec python3 "$REPO/tools/launch/launch.py" "$cmd" "$@" ;;
+    exec python3 "$REPO/tools/launch/launch.py" "$cmd" "${named[@]}" "$@" ;;
+esac
+export GR8_MODEL=$model   # smoke/run.sh, scripts/build.sh
+case $cmd in
   smoke)
-    PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT) || exit 2   # the port as up reads it, from the same file
+    PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT "${named[@]}") || exit 2   # the port as up reads it, from the same file
     url=${1:-$(api)}; [ $# -gt 0 ] && shift
-    [ "$model" = ds41 ] && exec bash "$REPO/smoketest/ds41.sh" "$url" "$@"   # DeepSeek's cases: its dialect, its served name
-    exec bash "$REPO/smoketest/run.sh" "$url" "$@" ;;
+    smoke=$(python3 "$REPO/tools/launch/launch.py" model-get "$model" smoke_script) || exit 2
+    # the model's own served name (models.py), else smoketest/lib.sh's from model.yaml: GLM-5.3's
+    [ $# = 0 ] && name=$(python3 "$REPO/tools/launch/models.py" served "$model") && [ -n "$name" ] && set -- "$name"
+    exec bash "$REPO/$smoke" "$url" "$@" ;;
   bench)
-    PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT) || exit 2
-    exec python3 "$REPO/bench/pbench.py" --url "$(api)" "$@" ;;
+    PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT "${named[@]}") || exit 2
+    peers=$(python3 "$REPO/tools/launch/launch.py" get PEERS "${named[@]}" 2> /dev/null) || peers=""
+    exec python3 "$REPO/bench/bench.py" --url "$(api)" ${peers:+--hosts "$peers"} "$@" ;;
   build)
     out=${1:-$REPO/bin}
     if [ "$build_model" = pseudo ]; then
@@ -122,10 +140,17 @@ case $cmd in
       mkdir -p "$out" && cp "$REPO/frontend/pseudo-engine/target/release/g6pseudo" "$out/"
       exec "$SCRIPTS/build_front.sh" "$out"
     fi
-    [ -n "${KV_FORMAT:-}" ] || KV_FORMAT=$(python3 "$REPO/tools/launch/launch.py" get KV_FORMAT 2> /dev/null) || KV_FORMAT=""
+    if [ -z "${KV_FORMAT:-}" ]; then
+      KV_FORMAT=$(python3 "$REPO/tools/launch/launch.py" get KV_FORMAT "${named[@]}" 2> /dev/null) || KV_FORMAT=""
+      tp_cfg=$(python3 "$REPO/tools/launch/launch.py" get TP "${named[@]}" 2> /dev/null) || tp_cfg=""
+      if [ -z "$KV_FORMAT" ]; then
+        KV_FORMAT=$(python3 "$REPO/tools/launch/launch.py" model-get "$model" default-kv-format ${tp_cfg:+"$tp_cfg"}) || exit 2
+      fi
+    fi
     # MODEL here is scripts/build.sh's (glm or flash), not the launcher's release
     MODEL=$build_model KV_FORMAT=fp8 "$SCRIPTS/build.sh" "$out"
-    # the int4 KV engine (--kv-format int4) only when asked: it is a second full g6m4 build
+    # GLM TP=4 (also before a fresh clone is configured) needs int4; Flash still needs KV_FORMAT=int4.
+    # Keep the fp8 engine too for rollback: int4 is a second full g6m4 build.
     if [ "$KV_FORMAT" = int4 ]; then MODEL=$build_model KV_FORMAT=int4 "$SCRIPTS/build.sh" "$out"; fi
     exec "$SCRIPTS/build_front.sh" "$out" ;;
   *)

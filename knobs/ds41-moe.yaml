@@ -13,11 +13,11 @@ knobs:
   GR8_DS_MOE_ELOG:
     scope: local
     kind: flag
-    default: "1"
+    default: "0"
     legacy: ["DS41_MOE_ELOG"]
     doc: >-
       1: every prefill router call (more than 32 rows) writes the distinct experts of each layer to a device ring that
-      the host reads after the chunk. 0: no record is written.
+      the host reads after the chunk. Default 0: no record, host readback or diagnostic stream fence.
   GR8_DS_MOE_FC1BSTG:
     scope: agree
     kind: flag
@@ -42,6 +42,24 @@ knobs:
       An L2 evict_last hint on the routed expert weight loads of the read-once expert loop. 0: off. 1: k_fc1_ro only. 2:
       k_fc1_ro and k_fc2_ro. No activation load or store carries a hint, and decode and the shared expert are not
       touched. Every value is the same.
+  GR8_DS_MOE_TC:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1: the routed experts of a prefill chunk (more than 256 rows) run on the block-scaled tensor cores: the MXFP4 expert
+      records as stored are the e2m1 operand, the activations are rounded to MXFP8 (E4M3 per 32 with an E8M0 scale, as
+      GR8_DS_ATTN_TC rounds the attention inputs), fp32 accumulate. Not bit-equal to 0, which keeps the fp16 kernels.
+      Decode and the shared expert are not touched. DS41's launcher defaults set 1.
+  GR8_DS_MOE_TC_OS2:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|8|10|20|40"
+    doc: >-
+      With GR8_DS_MOE_TC=1: the number of slices the fc2 kernel splits an expert's output columns into, one slice at a
+      time. 0 = the build's value (16). More slices keep fewer partial sums in L2 before the fused combine reads them,
+      and read the activations more times. Every value gives the same output bits.
   GR8_DS_MOE_PDL:
     scope: agree
     kind: flag
@@ -99,4 +117,5 @@ knobs:
       1: the shared expert of the read-once prefill path runs on the tensor-core MXFP8 GEMM (x and act quantized to E4M3
       per 32 with E8M0 scales), and the combine reads its bf16 output. Not bit-identical to 0. Decode and the chunked
       path keep the GEMV. Costs a plain copy of the shared weights per MoE layer (9,461,760 bytes) plus scratch, and
-      needs the attention object's ds41_gemm_mx_tc and ds41_sh_* entries linked.
+      needs the attention object's ds41_gemm_mx_tc and ds41_sh_* entries linked. The v2 prefill (GR8_DS_PF_V2) needs 1.
+      The launcher sets 1 for DS41; EXACT=1 leaves it unset (exact output).

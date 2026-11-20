@@ -10,7 +10,9 @@
 // coll_seq(step, c, ncoll). A chunk takes one id from Dispatch's main sequence (Dispatch::prefill, prefill_seq); the next MAIN step has
 // sequence + 1. Every rank runs the same Driver, so the ids agree.
 #pragma once
+#include "prompt_rule.h"
 #include "scheduler.h"
+#include "../image_input.h"
 #include "../ds41_coll_order.h"
 #include "../ds41_pack_layout.h"
 #include <algorithm>
@@ -26,11 +28,6 @@ inline void ds41_prefill_single_lane(Config& sc, uint32_t rows) {
     sc.prefill_rows = rows;
     sc.two_lanes = false;
 }
-// does this prompt run as MAIN decode steps (true) or prefill (false)? Prompt logprobs (plp) score each prompt row against the next prompt
-// token, which only a decode step produces; steering scales target MAIN rows. Both stay on the decode path.
-inline bool ds41_decode_prompt(uint32_t prefill_min, size_t prompt_tokens, int plp, bool steering) {
-    return prefill_min == 0 || prompt_tokens < prefill_min || plp >= 0 || steering;
-}
 // One W-row chunk of one session, as Dispatch hands it to the callee. The callee ENQUEUES and LAUNCHES (no sync); the caller fences.
 struct Ds41PrefillChunk {
     const int* tok = nullptr;      // host: prompt[first .. first + rows - 1]; valid for the call
@@ -41,6 +38,7 @@ struct Ds41PrefillChunk {
     unsigned slot = 0;             // Slot::key.slot (0 with one session)
     uint32_t first_page = 0, pages = 0;   // Slot::run
     uint32_t prompt_rows = 0;      // the prompt size N (GR8_DS_PF_LATE_FINAL: rows after this chunk = N - 1 - context)
+    const std::vector<g6rt::ImageIn>* images = nullptr;   // the session's image spans (Payload::images), valid for the call; null = none
 };
 using Ds41PrefillFn = std::function<void(const Ds41PrefillChunk&)>;
 // One indivisible ragged W launch. Host token spans remain separately owned by the
@@ -135,4 +133,19 @@ inline Ds41ChunkColl ds41_chunk_collectives(const std::vector<int>& ids, int eco
     }
     return o;
 }
+// Under v2 the main transport carries only the late replay interval.
+inline Ds41ChunkColl ds41_main_chunk_collectives(const Ds41ChunkColl& coll, bool pf_v2, bool skip_late, int i_late, int nl) {
+    if (!pf_v2) return coll;
+    require(i_late > 0 && i_late < nl, "DS41 v2 main collectives: invalid late split");
+    if (skip_late) return {};
+    require(coll.sizes.size() >= size_t(2 * nl), "DS41 v2 main collectives: missing layer slots");
+    Ds41ChunkColl result;
+    result.sizes = coll.sizes;
+    for (size_t c = 0; c < result.sizes.size(); ++c) {
+        if (c >= size_t(2 * i_late) && c < size_t(2 * nl)) result.order.push_back(int(c));
+        else result.sizes[c] = 0;
+    }
+    return result;
+}
+
 }

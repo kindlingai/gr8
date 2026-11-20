@@ -1,0 +1,56 @@
+# Inkling-2-Small runtime settings. knobs/README.md describes the fields.
+prefix: "GR8_INK2_"
+knobs:
+  GR8_INK2_VISION:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = with --serve, an Inkling-2-Small checkpoint with model.visual.* tensors activates the vision tower at boot,
+      allocating its workspace and prefill staging pool before serving starts, so the engine accepts requests with
+      images (hello `vision`). Without those tensors the engine serves text only. 0 (the default) leaves the vision
+      tower off and allocates no vision workspace.
+  GR8_INK2_FAST_ALLREDUCE:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = on a cluster the per-rank partial sums of a step cross the fabric from the device: one fabric
+      step per forward and per draft block, a pooled slot per collective, the kernels write the send slot, ring the
+      doorbell, wait for the peers and sum in rank order, with no host copy between the layers. 0 = one host-staged
+      exchange per collective. The sums are the same bytes either way. Every rank must agree.
+  GR8_INK2_GPU_HEAD_PACK:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = a row of head logits is reduced on the device to its largest candidates, its maximum and its sum of exp, and
+      only those cross to the host (up to 512 candidates a row; more fall back to the host). 0 (the default) = the
+      whole row of logits is copied to the host and reduced there. The candidates and the tokens are the same.
+  GR8_INK2_CUBLAS_PREFILL:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = the BF16 projections of a prompt step of 32 or more consecutive rows of one session run on the cuBLAS
+      tensor-core GEMM. 0 (the default) = the engine kernel at every size. The sums differ in order, so the rows can
+      differ in the last bit; decode and verify steps never take this path. Every rank must agree.
+  GR8_INK2_TC_PREFILL_ATTN:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = the attention of a prompt step of 16 or more consecutive rows of one session scores tiles of 64 keys on the
+      tensor cores, each key tile read once for all rows. 0 (the default) = the per-row kernels at every size. The
+      scores are sums in another order and the probabilities are rounded for the product with V, so the rows agree
+      within rounding, not bit for bit; decode and verify steps never take this path. Every rank must agree.

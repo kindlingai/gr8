@@ -14,10 +14,11 @@ import urllib.parse
 import urllib.request
 
 URL = os.environ.get('URL', 'http://127.0.0.1:8100')
-# the front end runs with --allow-thinking-off: the thinking-off tests run, and the refusals of thinking off skip
+# the front end runs with --allow-thinking-off --default-reasoning-effort none: a request that names no effort has
+# thinking off, and the test of that default runs
 THINKING_OFF = os.environ.get('ALLOW_THINKING_OFF') == '1'
-# the front end runs with --undeclared-tool-calls emit
-EMIT_UNDECLARED = os.environ.get('UNDECLARED_TOOL_CALLS') == 'emit'
+# the front end runs with --undeclared-tool-calls text (emit is its default)
+EMIT_UNDECLARED = os.environ.get('UNDECLARED_TOOL_CALLS') != 'text'
 
 
 def post(path, body, raw=False):
@@ -79,6 +80,9 @@ class Chat(unittest.TestCase):
         s, r = post('/v1/chat/completions', body)
         self.assertEqual(s, 200)
         self.assertTrue(r['choices'][0]['message']['content'].endswith('#### 42'))
+        # thinking: False turns thinking off, so none of the reasoning reaches the reply
+        self.assertIsNone(r['choices'][0]['message'].get('reasoning'))
+        self.assertNotIn('Let me think', r['choices'][0]['message']['content'])
         self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
         self.assertEqual(r['choices'][0]['stop_reason'], 154827)
 
@@ -108,8 +112,8 @@ class Chat(unittest.TestCase):
         self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
 
     def test_undeclared_tool_call(self):
-        # the reply calls web_search, which the request does not declare: text by default, a call with
-        # --undeclared-tool-calls emit (its arguments are strings: there is no schema to coerce them by)
+        # the reply calls web_search, which the request does not declare: a call by default (its arguments are strings:
+        # there is no schema to coerce them by), text with --undeclared-tool-calls text
         body = {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'call-an-undeclared-tool'}],
                 'tools': TOOLS, 'max_tokens': 200}
         s, r = post('/v1/chat/completions', body)
@@ -225,7 +229,7 @@ def bad(path, body):
 
 
 class Thinking(unittest.TestCase):
-    """reasoning_effort, thinking_budget and the refusals (GLM 5.3's template cannot turn thinking off)."""
+    """reasoning_effort, thinking_budget, thinking off and the refusals."""
 
     def test_reasoning_tokens_count_through_think_end(self):
         s, r = post('/v1/chat/completions', CHAT)
@@ -283,12 +287,6 @@ class Thinking(unittest.TestCase):
 
     def test_refusals(self):
         for path in ('/v1/chat/completions', '/tokenize'):
-            if not THINKING_OFF:
-                m = bad(path, dict(CHAT, chat_template_kwargs={'enable_thinking': False}))
-                self.assertIn('thinking cannot be disabled', m)
-                self.assertIn('reasoning_effort "low"', m)
-                self.assertIn('--allow-thinking-off', m)
-                self.assertIn('"none"', bad(path, dict(CHAT, reasoning_effort='none')))
             for e in ('auto', 'LOW', 3):
                 self.assertEqual(bad(path, dict(CHAT, reasoning_effort=e)),
                                  'reasoning_effort must be none, minimal, low, medium, high, xhigh or max')
@@ -297,29 +295,50 @@ class Thinking(unittest.TestCase):
                              'thinking_budget must be an integer or null')
         self.assertIn('logprobs', bad('/v1/chat/completions', dict(CHAT, thinking_budget=5, logprobs=True)))
 
-    @unittest.skipUnless(THINKING_OFF, 'needs the front end with --allow-thinking-off (ALLOW_THINKING_OFF=1)')
     def test_thinking_off(self):
-        """enable_thinking false and reasoning_effort "none" render one prompt: no Reasoning Effort turn, and the
-        generation prompt ends on a closed think block. The reply is content only, whole or streamed."""
+        """enable_thinking false, thinking false and reasoning_effort "none" render the template's lowest effort with
+        the think block open (GLM's template has no thinking-off branch). The reply withholds the reasoning, whole or
+        streamed, and none of it reaches the content."""
         def ids(**kw):
             return post('/tokenize', dict({'model': 'glm-5.3', 'messages': CHAT['messages']}, **kw))[1]['tokens']
-        off = ids(chat_template_kwargs={'enable_thinking': False})
-        self.assertEqual(ids(reasoning_effort='none'), off)
-        text = post('/detokenize', {'tokens': off})[1]['prompt']
-        self.assertNotIn('Reasoning Effort:', text)
-        self.assertTrue(text.endswith('<think></think>'), text[-80:])
-        # an explicit enable_thinking true wins over "none" (TensorFold): the prompt is the default one
-        self.assertEqual(ids(reasoning_effort='none', chat_template_kwargs={'enable_thinking': True}), ids())
-        body = dict(CHAT, chat_template_kwargs={'enable_thinking': False})
-        s, r = post('/v1/chat/completions', body)
+        low = ids(reasoning_effort='low')
+        for kw in ({'chat_template_kwargs': {'enable_thinking': False}}, {'chat_template_kwargs': {'thinking': False}},
+                   {'reasoning_effort': 'none'}, {'chat_template_kwargs': {'reasoning_effort': 'none'}}):
+            self.assertEqual(ids(**kw), low, kw)
+        text = post('/detokenize', {'tokens': low})[1]['prompt']
+        self.assertIn('Reasoning Effort: Low', text)
+        self.assertNotIn('Reasoning Effort: Max', text)
+        self.assertTrue(text.endswith('<|assistant|><think>'), text[-80:])
+        # an explicit switch on wins over "none" (TensorFold): the prompt is the thinking-on one
+        on = ids(chat_template_kwargs={'enable_thinking': True}) if THINKING_OFF else ids()
+        self.assertEqual(ids(reasoning_effort='none', chat_template_kwargs={'enable_thinking': True}), on)
+        self.assertEqual(ids(reasoning_effort='none', chat_template_kwargs={'thinking': True}), on)
+        for kw in ({'chat_template_kwargs': {'enable_thinking': False}}, {'chat_template_kwargs': {'thinking': False}},
+                   {'reasoning_effort': 'none'}):
+            body = dict(CHAT, **kw)
+            s, r = post('/v1/chat/completions', body)
+            self.assertEqual(s, 200, r)
+            msg = r['choices'][0]['message']
+            self.assertIsNone(msg.get('reasoning'), kw)
+            self.assertIsNone(msg.get('reasoning_content'), kw)
+            self.assertTrue(msg['content'], kw)
+            self.assertNotIn('Let me think', msg['content'])
+            deltas = [c['choices'][0]['delta'] for c in sse('/v1/chat/completions', body) if c['choices']]
+            self.assertTrue(all(d.get('reasoning') is None and d.get('reasoning_content') is None for d in deltas))
+            self.assertEqual(''.join(d.get('content') or '' for d in deltas), msg['content'])
+
+    @unittest.skipUnless(THINKING_OFF, 'needs --default-reasoning-effort none (ALLOW_THINKING_OFF=1)')
+    def test_default_effort_none(self):
+        """--default-reasoning-effort none: a request that names nothing has thinking off; an explicit effort wins."""
+        s, r = post('/v1/chat/completions', CHAT)
         self.assertEqual(s, 200, r)
         msg = r['choices'][0]['message']
         self.assertIsNone(msg.get('reasoning'))
         self.assertTrue(msg['content'])
-        self.assertEqual(r['usage']['completion_tokens_details']['reasoning_tokens'], 0)
-        deltas = [c['choices'][0]['delta'] for c in sse('/v1/chat/completions', body) if c['choices']]
-        self.assertFalse(any(d.get('reasoning') for d in deltas))
-        self.assertEqual(''.join(d.get('content') or '' for d in deltas), msg['content'])
+        self.assertNotIn('Let me think', msg['content'])
+        s, r = post('/v1/chat/completions', dict(CHAT, reasoning_effort='high'))
+        self.assertEqual(s, 200, r)
+        self.assertTrue(r['choices'][0]['message']['reasoning'])
 
     def test_response_format_json_object_extracts(self):
         body = dict(CHAT, messages=[{'role': 'user', 'content': 'Give me JSON.'}],

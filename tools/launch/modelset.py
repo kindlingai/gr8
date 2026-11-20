@@ -92,6 +92,49 @@ def ds_set(d, tp, model_dir=None):
     return ModelSet(describe_release(d, tp, tok, models.TOKENIZER_DS), f'{d} (exlr8 native release)', tok, d)
 
 
+def is_ink2(d):
+    """A Hugging Face safetensors checkpoint directory: config.json with the shard index or the one weights file."""
+    return bool(d) and os.path.isfile(os.path.join(d, 'config.json')) and (
+        os.path.isfile(os.path.join(d, 'model.safetensors.index.json')) or
+        os.path.isfile(os.path.join(d, 'model.safetensors')))
+
+
+def safetensors_header_sha256(path):
+    """sha256 of a safetensors file's header (the 8-byte length and the JSON that follows): the tensor names, shapes and
+    offsets, without reading the weights."""
+    with open(path, 'rb') as f:
+        head = f.read(8)
+        n = int.from_bytes(head, 'little')
+        if len(head) != 8 or n <= 0 or n > (1 << 30):
+            raise ModelError(f'{path}: not a safetensors file')
+        body = f.read(n)
+        if len(body) != n:
+            raise ModelError(f'{path}: truncated safetensors header')
+    return hashlib.sha256(head + body).hexdigest()
+
+
+def ink2_set(d, tp, model_dir=None):
+    """The model set of an Inkling-2-Small safetensors checkpoint, used in place. The weights are named by the sha256 of
+    config.json, of model.safetensors.index.json (or, without it, of the header of model.safetensors) and, when the
+    checkpoint has one, of hf_quant_config.json."""
+    tok = tokenizer_dir(d, model_dir, models.TOKENIZER_INK2)
+    index = os.path.join(d, 'model.safetensors.index.json')
+    parts = {'config.json': sha256_file(os.path.join(d, 'config.json'))}
+    if os.path.isfile(index):
+        parts['model.safetensors.index.json'] = sha256_file(index)
+    else:
+        parts['model.safetensors'] = safetensors_header_sha256(os.path.join(d, 'model.safetensors'))
+    quant = os.path.join(d, 'hf_quant_config.json')
+    if os.path.isfile(quant):
+        parts['hf_quant_config.json'] = sha256_file(quant)
+    weights = hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    s = {'format': FORMAT, 'tp': tp, 'ranks': [], 'dflash': [], 'qo': None,
+         'tokenizer': {f: sha256_file(os.path.join(tok, f)) for f in models.TOKENIZER_INK2},
+         'source': {'kind': 'hf-safetensors', 'weights': weights}}
+    s['set_id'] = compute_id(s)
+    return ModelSet(s, f'{d} (safetensors checkpoint)', tok, d)
+
+
 def release_set(d, tp, model_dir=None, label=None):
     """The model set of an exlr8 release directory, used in place."""
     tok = tokenizer_dir(d, model_dir)
@@ -170,13 +213,30 @@ def model_id(ms, variant):
     return hashlib.sha256(f'{ms.id} {variant.name} {variant.sha256}{src}'.encode()).hexdigest()
 
 
+def release_hidden(manifest_path):
+    """hidden_size from the config.json of the release a manifest belongs to (manifests/ sits in the release root, and
+    config.json in it or in tokenizer/; a multimodal config keeps it in text_config), or None. Flash's manifests do not
+    carry it."""
+    root = os.path.dirname(os.path.dirname(manifest_path))
+    for path in (os.path.join(root, 'config.json'), os.path.join(root, 'tokenizer', 'config.json')):
+        try:
+            with open(path) as f:
+                c = json.load(f)
+        except (OSError, ValueError):
+            continue
+        h = c.get('hidden_size') or (c.get('text_config') or {}).get('hidden_size')
+        if h:
+            return h
+    return None
+
+
 def expert_gb(path, tp):
     """GB of routed and shared expert weights on the busiest rank at this TP, under the manifest's widths (half h of
     expert e in layer l belongs to rank (16e + h + l) mod tp)."""
     with open(path) as f:
         manifest = json.load(f)
         layers = manifest['layers']
-    hidden = int(manifest.get('hidden_size', 6144))
+    hidden = int(manifest.get('hidden_size') or release_hidden(path) or 6144)
     half_bytes = {k: hidden * 16 * k for k in (2, 3, 4)}
     per = [0] * tp
     for key, e in layers.items():

@@ -9,6 +9,16 @@ knobs:
     doc: >-
       The DFlash2 drafter's body GEMVs read INT4 g32 copies of their MXFP8 records, made at boot. Drafts only, +382 MB
       per rank. Needs --dflash-manifest.
+  GR8_DFL_DEDUP:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      In a DFlash2 query step, fuse each layer's context and block kv_proj into one 16-row GEMV, fuse xfrag writes into
+      k_conv and k_silu, and merge selector walk candidates in shared memory without local spills. Bit-identical drafts.
+      Needs --dflash-manifest.
   GR8_DFL_DUMP:
     scope: local
     kind: path
@@ -30,15 +40,14 @@ knobs:
     default: "1"
     doc: >-
       With --dflash, 0 gives the drafter no prompt context from the prefill, so it starts from the last prompt token.
-      Flash --prefill with --dflash needs 0.
   GR8_DFL_REUSE:
     scope: agree
     kind: int
-    unset: "2 when serving DFlash2 with MTP, else 0"
+    unset: "2 when serving DFlash2 with MTP, else 0; GLM-5.3-Flash without MTP: 1 with GR8_GLM53F_CACHE, else 0"
     values: "0..2"
     doc: >-
-      With DFlash2 under S2, 1 lets a request whose prefix-reuse hit landed in the drafter's window keep the drafter,
-      and 2 also gives the drafter to a request alone on MTP.
+      With DFlash2 under S2, 1 lets a request whose prefix-reuse hit (on GLM-5.3-Flash, a session checkpoint hit)
+      landed in the drafter's window keep the drafter, and 2 also gives the drafter to a request alone on MTP.
   GR8_DFL_REUSE_MIN:
     scope: agree
     kind: int
@@ -222,11 +231,12 @@ knobs:
     unset: "unset"
     doc: >-
       A solo DFlash2 session also drafts from this n-gram table file and verifies its chain when it promises more tokens
-      per verify ms. Needs --serve.
+      per verify ms. With GR8_S2_SHARED_WATERFILL, the table also supplies shared MTP prefixes and tails (Flash: shared
+      only). Needs --serve and either DFlash2 or shared waterfill.
   GR8_NGRAM_KMAX:
     scope: agree
     kind: int
-    unset: "--dflash-k"
+    unset: "--dflash-k with DFlash2; 7 for shared-waterfill MTP-only n-grams"
     values: "1.."
     doc: >-
       Sets the longest GR8_NGRAM chain a round verifies.
@@ -264,3 +274,21 @@ knobs:
     doc: >-
       S2 with DFlash2: overrides the verify costs for 1..8 rows with eight comma-separated positive times in ms, for the
       DFlash2 draft count and the drafter choice.
+  GR8_S2_SHARED_WATERFILL:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      Allocate shared S2 verify rows by cumulative marginal acceptance per shared round cost. GLM and Flash only;
+      captures all reachable main and draft graph widths within existing admission caps. Supersedes KStopB thresholds
+      and explore rounds. Solo rounds and the disabled path are unchanged. Additional graph captures can increase boot
+      time and memory (wider multi-session graph-capture cost not yet measured).
+  GR8_S2_SHARED_WF_MARGIN:
+    scope: agree
+    kind: float
+    default: "0.0"
+    legacy: []
+    doc: >-
+      Finite nonnegative relative utility improvement required to widen a shared waterfill round.

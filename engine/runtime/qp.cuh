@@ -151,7 +151,8 @@ inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share)
         for (int s = 0; s < R.S; ++s)
         {
             if (!qp_check(R.slot[s])) die("GR8_PF_QP_ROLL: slot " + std::to_string(s) + " shapes");
-            if (int e = g6_attn_qo_create(&R.qa[s], &m.layers[i0].ab, &R.slot[s].uk, &R.slot[s].uv, P.qp_rows, st, s ? R.qa[0] : nullptr))
+            const auto t = s ? std::pair<void*, size_t>{} : pf_qo_table(P);
+            if (int e = g6_attn_qo_create_ext(&R.qa[s], &m.layers[i0].ab, &R.slot[s].uk, &R.slot[s].uv, P.qp_rows, st, s ? R.qa[0] : nullptr, t.first, t.second))
                 die("rank " + std::to_string(m.rank) + ": g6_attn_qo_create (pair, roll slot " + std::to_string(s) + ") failed (" + std::to_string(e) + ")");
             b += g6_attn_qo_bytes(R.qa[s]);
         }
@@ -176,7 +177,8 @@ inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share)
         if (!P.qpl[i]) continue;
         QpW& w = (*P.qpw)[i];
         if (!qp_check(w)) die("GR8_PF_OWN=4: layer " + std::to_string(m.layers[i].l) + " has no pair weights");
-        if (int e = g6_attn_qo_create(&P.qa[i], &m.layers[i].ab, &w.uk, &w.uv, P.qp_rows, st, owner))
+        const auto t = owner ? std::pair<void*, size_t>{} : pf_qo_table(P);
+        if (int e = g6_attn_qo_create_ext(&P.qa[i], &m.layers[i].ab, &w.uk, &w.uv, P.qp_rows, st, owner, t.first, t.second))
             die("rank " + std::to_string(m.rank) + " layer " + std::to_string(m.layers[i].l) + ": g6_attn_qo_create (pair) failed (" + std::to_string(e) + ")");
         if (!owner) owner = P.qa[i];
         G6RT_CK(cudaStreamSynchronize(st));      // the FP16 copies are made: the BF16 pair UK / UV can go
@@ -299,6 +301,7 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
         bindp::Gemm g;
         if (const char* er = bindp::make_gemm(w.qb_c, w.qb_s, e - a0, xq.dst, y0, 0, g)) die(std::string("pair q_b: ") + er);
         g.osvh = trq ? w.qb_svh : nullptr;
+        g.const_s = trq ? 1 : 0;
         bindp::launch(g, st);
     };
     if (no > 0) qb(a0r, r1, P.qp_qb + (size_t)(S - (r0 - a0r)) * 8192);

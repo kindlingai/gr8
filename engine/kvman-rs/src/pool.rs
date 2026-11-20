@@ -32,6 +32,21 @@ pub struct Hit {
     pub tier: u32,
 }
 
+/// GR8_KV_SHARE_PAGES: rows [0, rows) of page `from` copied into page `to`, in every latent and index cache (main and
+/// draft model), before anything writes `to` (copy-on-write of a shared partial page). The engine takes the queue
+/// (take_copies) at each bind and growth, after the tier copies (io) and before any prefill.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageCopy {
+    pub from: u32,
+    pub to: u32,
+    pub rows: u32,
+}
+
+/// Hit::age of a hit on a LIVE run (GR8_KV_SHARE_PAGES): this bit, plus the run's table version. Retained ages and
+/// stored entry ids never reach it.
+pub const LIVE_HIT: u64 = 1 << 63;
+
 /// Every error leaves the pool as it was. The engine treats each one as fatal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -97,6 +112,11 @@ struct Held {
     exclusive: bool,
     worst: u32, // the most pages the run may grow to
     rp: u32,    // its prefix pages, R / 64 for the R it was granted at (the pool's for a run below R)
+    from: Option<(u64, usize)>, // Kept::from
+    // GR8_KV_SHARE_PAGES: (namespace, prompt) from count(), and the rows prefill has written (prefilled()): a run with
+    // pf > 0 shares its first pf rows with a new prompt that continues them
+    sp: Option<(Namespace, Vec<i32>)>,
+    pf: u32,
 }
 
 /// Totals for status.s2: live runs, the pages they hold and could grow to, granted and refused growth.
@@ -108,6 +128,14 @@ pub struct Stats {
     pub worst_pages: u32,
     pub grows: u64,
     pub stalls: u64,
+}
+
+/// busy_view's answer: the retained runs (their ages, oldest first) a reserve on the same state would evict, and how
+/// many of them the caller's clock still counts as live (their last response ended under the guard's idle bound ago).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BusyView {
+    pub victims: Vec<u64>,
+    pub live_victims: u32,
 }
 
 /// A retired run: its pages count as free until a reservation evicts it or a hit adopts its start.
@@ -123,9 +151,15 @@ pub struct Kept {
     pub namespace: Namespace,
     /// its prefix pages, as Held::rp
     pub rp: u32,
+    /// (stored entry id, n): the run's pages [0, n) are byte copies of that entry's pages [0, n) (it was restored from
+    /// it, or adopted a run that was), so storing the run writes only its pages past n (stash.rs extend)
+    pub from: Option<(u64, usize)>,
+    /// when this process's clock saw the retire, nanoseconds since the pool was built. Advice to the head's busy
+    /// guard only (busy_view, called with the caller's clock): never in the digest, and no pool decision reads it.
+    pub retired_ns: i64,
 }
 
-/// Opaque cache identity. Only the all-zero namespace participates in stored tiers.
+/// Opaque cache identity. STOCK_NAMESPACE (all zero) selects unsteered stock behavior.
 pub const NAMESPACE_BYTES: usize = 70;
 pub type Namespace = [u8; NAMESPACE_BYTES];
 pub const STOCK_NAMESPACE: Namespace = [0; NAMESPACE_BYTES];
@@ -176,10 +210,21 @@ pub struct Pool {
     // with window: the most window runs live at once (the engine's slot pool covers that many sessions' rows of one
     // step), 0 = no limit
     runs: u32,
+    // the most pages one run's worst case may take (one session's page table, --cap / 64), 0 = no limit. A pool larger
+    // than one table (GR8_CAP_TOTAL) needs it: a longer run would get a table that maps only its first pages
+    run_limit: u32,
     version: u32,
     live: u32,
     live_hi: u32, // of live: the pages at or above place (the drafter's tail copies of split runs)
-    used: Vec<bool>,
+    used: Vec<bool>, // used[p] == (live_ref[p] > 0): a live run holds p (retained runs count as free)
+    // GR8_KV_SHARE_PAGES (share): live_ref[p] = the live runs whose list holds p. Off, it is 0 or 1 (= used). The
+    // retained holders (kept_ref) are counted from `kept` when needed (kept_ref()), so no eviction path can miss them
+    live_ref: Vec<u32>,
+    share: bool,
+    copies: Vec<PageCopy>,
+    next_share: Option<(Namespace, Vec<i32>)>,
+    // pages a grant is adopting while it fills (spill: still held, they do not leave HBM)
+    adopting: Vec<u32>,
     held: BTreeMap<u32, Held>,
     exclusive: bool,
     keep: bool,
@@ -194,6 +239,8 @@ pub struct Pool {
     next_span: Option<u64>,
     next_continues: bool,    // count() found the next grant continues a conversation
     next_len: Option<usize>, // the next grant's prompt length (any namespace), for the write limit's credit
+    next_prompt: Option<(Namespace, Vec<i32>)>, // the next grant's (namespace, prompt), for next_continues_run
+    next_from: Option<(u64, usize)>, // the next grant's provenance (Kept::from), set by a hit just before its grant
     // resize (#153): pages [0, place) come in chunks of `chunk` pages (0 = off). An offline chunk's pages hold no live
     // or retained run and are not counted anywhere, so the engine may release their memory.
     chunk: u32,
@@ -203,6 +250,8 @@ pub struct Pool {
     // (a group head): a pool that never reports does no work for it and holds nothing
     seen: HashMap<u64, Instant>,
     ages_on: bool,
+    // the pool's build time: the base of the Kept::retired_ns stamps (advisory; see Kept)
+    start: Instant,
 }
 
 impl Pool {
@@ -225,10 +274,16 @@ impl Pool {
             window: 0,
             ids: 0,
             runs: 0,
+            run_limit: 0,
             version: 0,
             live: 0,
             live_hi: 0,
             used: vec![false; pool_pages as usize],
+            live_ref: vec![0; pool_pages as usize],
+            share: cfg!(feature = "share_default"),
+            copies: Vec::new(),
+            next_share: None,
+            adopting: Vec::new(),
             held: BTreeMap::new(),
             exclusive: false,
             keep: false,
@@ -243,11 +298,74 @@ impl Pool {
             next_span: None,
             next_continues: false,
             next_len: None,
+            next_prompt: None,
+            next_from: None,
             chunk: 0,
             offline: Vec::new(),
             seen: HashMap::new(),
             ages_on: false,
+            start: Instant::now(),
         })
+    }
+
+    /// This process's clock, nanoseconds since the pool was built (the retire stamps and busy_view's caller base).
+    pub fn now_ns(&self) -> i64 {
+        self.start.elapsed().as_nanos() as i64
+    }
+
+    /// GR8_KV_SHARE_PAGES: runs below R share physical pages. A hit (on a retained run, or on a live run whose prefill
+    /// passed the hit) takes the source's full pages below the hit by reference count instead of moving them, and a
+    /// copy (PageCopy) of the source's partial page when the hit ends inside one. The retained source stays, its
+    /// retirement order refreshed. Off (the default), every call behaves as before and the digest is unchanged.
+    /// Only before any reservation. Err(BadArgument) otherwise.
+    pub fn share_pages(&mut self, on: bool) -> Result<(), Error> {
+        if self.live != 0 || !self.kept.is_empty() {
+            return Err(Error::BadArgument);
+        }
+        self.share = on;
+        Ok(())
+    }
+
+    pub fn sharing(&self) -> bool {
+        self.share
+    }
+
+    /// The live runs that hold page p.
+    pub fn live_ref(&self, p: u32) -> u32 {
+        self.live_ref.get(p as usize).copied().unwrap_or(0)
+    }
+
+    /// The retained runs that hold each page (kept_ref), counted from the retained lists.
+    pub fn kept_ref(&self) -> Vec<u32> {
+        let mut v = vec![0u32; self.pages as usize];
+        for k in &self.kept {
+            for &p in &k.list {
+                v[p as usize] += 1;
+            }
+        }
+        v
+    }
+
+    /// The copies queued since the last take_copies(), in order. The engine runs them before anything writes their
+    /// `to` pages (s2.cuh s2_copy_rows), on every rank.
+    pub fn take_copies(&mut self) -> Vec<PageCopy> {
+        std::mem::take(&mut self.copies)
+    }
+
+    pub fn copies_pending(&self) -> usize {
+        self.copies.len()
+    }
+
+    /// GR8_KV_SHARE_PAGES: live run r's prefill has written rows [0, rows) (the driver, every rank, between rounds).
+    /// From then on a prompt that continues those rows can share them. No-op with sharing off.
+    pub fn prefilled(&mut self, r: &Run, rows: u32) -> Result<(), Error> {
+        if !self.share {
+            return Ok(());
+        }
+        self.held(r)?;
+        let h = self.held.get_mut(&r.table_version).expect("held() found it");
+        h.pf = h.pf.max(rows);
+        Ok(())
     }
 
     /// Resize (#153): pages [0, place) in chunks of `pages_per_chunk` (the last one may be shorter). Only while every
@@ -427,6 +545,13 @@ impl Pool {
         Ok(())
     }
 
+    /// After the last add_tier(): drops the index runs whose base came back in no tier, and the session runs of a
+    /// whole index reopened with keep=system, plus the records add_tier dropped for slots past the tier or taken twice
+    /// (stash.rs Stash::loaded). Returns how many.
+    pub fn tiers_loaded(&mut self) -> usize {
+        self.stash.as_mut().map_or(0, |s| s.loaded())
+    }
+
     pub fn stash(&self) -> Option<&Stash> {
         self.stash.as_ref()
     }
@@ -482,6 +607,25 @@ impl Pool {
         self.ids = ids;
         self.runs = runs;
         Ok(())
+    }
+
+    /// The most pages one run's worst case may take (0 = no limit): one session's page table when the pool is larger.
+    /// Before any reservation.
+    pub fn run_limit(&mut self, pages: u32) -> Result<(), Error> {
+        if self.live != 0 || !self.kept.is_empty() {
+            return Err(Error::BadArgument);
+        }
+        self.run_limit = pages;
+        Ok(())
+    }
+
+    /// The run limit (0 = none).
+    pub fn run_limit_pages(&self) -> u32 {
+        self.run_limit
+    }
+
+    fn over_run_limit(&self, worst: u64) -> bool {
+        self.run_limit > 0 && pages_for(worst) > self.run_limit as u64
     }
 
     /// With window: the window runs live now.
@@ -643,8 +787,11 @@ impl Pool {
     /// `span`: the tokens of the prompt's system span (system message and tool definitions as templated), when the
     /// front end sent it.
     pub fn count(&mut self, prompt: &[i32], span: Option<u32>) -> u32 {
+        self.next_prompt = None;
+        self.next_share = self.share.then(|| (STOCK_NAMESPACE, prompt.to_vec()));
         let Some(s) = &self.stash else { return 0 };
         self.next_tokens = Some(prompt.to_vec());
+        self.next_prompt = Some((STOCK_NAMESPACE, prompt.to_vec()));
         self.next_len = Some(prompt.len());
         self.next_span = span.map(|x| s.span_rows(x, prompt.len()));
         if !s.counting() {
@@ -720,7 +867,9 @@ impl Pool {
         if namespace == STOCK_NAMESPACE {
             return self.count(prompt, span);
         }
+        self.next_share = self.share.then(|| (namespace, prompt.to_vec()));
         self.next_tokens = None;
+        self.next_prompt = self.stash.is_some().then(|| (namespace, prompt.to_vec()));
         self.next_len = Some(prompt.len());
         self.next_span = None;
         // a non-stock prompt that continues a run of its own namespace (retained or stored) counts as continued, so a
@@ -781,6 +930,54 @@ impl Pool {
             gone
         };
         let below = (self.below_rows as u64 / PAGE) as usize;
+        // GR8_KV_SHARE_PAGES: a retained run whose storable pages another holder keeps in HBM (a live run, a retained run
+        // that stays, or the grant adopting them), or that another leaving run covers, adds nothing to a tier: it is
+        // let go, not written.
+        // Its prefix stays hit-able through those holders. A run that frees any page spills as before (the tier stores
+        // a shared prefix once). Only pages with no holder left are ever freed (fill_range's claims).
+        let shared_out: Vec<Kept>;
+        let gone = if self.share && self.stash.is_some() && !gone.is_empty() {
+            let mut held = vec![false; self.pages as usize];
+            for k in &self.kept {
+                for &p in &k.list {
+                    held[p as usize] = true;
+                }
+            }
+            for &p in &self.adopting {
+                held[p as usize] = true;
+            }
+            // what a tier would store of a run: its full pages of valid rows (a tier's grid is a multiple of a page)
+            let storable = |k: &Kept| ((k.st.valid.max(0) as u64 / PAGE) as usize).min(k.list.len());
+            // a run another leaving run of its namespace covers (same physical pages over all its storable rows, more
+            // valid rows, or as many and later in `gone`) is that run's prefix: the tier stores it once, with that run
+            let covered = |i: usize, k: &Kept| {
+                let s = storable(k);
+                gone.iter().enumerate().any(|(j, k2)| {
+                    j != i
+                        && k2.namespace == k.namespace
+                        && k2.list.len() >= s
+                        && k2.list[..s] == k.list[..s]
+                        && (k2.st.valid > k.st.valid || (k2.st.valid == k.st.valid && j > i))
+                })
+            };
+            let mut stay = Vec::new();
+            let mut leave = Vec::new();
+            for (i, k) in gone.iter().enumerate() {
+                let s = storable(k);
+                if k.list[..s].iter().all(|&p| held[p as usize] || self.live_ref[p as usize] > 0) || covered(i, k) {
+                    stay.push(k.clone());
+                } else {
+                    leave.push(k.clone());
+                }
+            }
+            shared_out = leave;
+            for k in &stay {
+                self.let_go(k);
+            }
+            &shared_out[..]
+        } else {
+            gone
+        };
         let Some(s) = &mut self.stash else { return };
         if gone.is_empty() {
             return;
@@ -796,12 +993,18 @@ impl Pool {
         s.put_evicted(gone, below, &resident);
     }
 
-    // hits of a run granted from `src` (its finished state and hits): one more when the prompt continues it
-    fn hits_from(&self, st: &Finished, hits: u32) -> u32 {
-        match &self.next_tokens {
-            Some(p) if continues(p, &st.history, st.pf_end.max(0) as usize) => hits.saturating_add(1),
-            _ => 0,
+    // hits of a run granted from `src` (its finished state, hits and namespace): one more when the prompt continues it
+    fn hits_from(&self, st: &Finished, hits: u32, namespace: Namespace) -> u32 {
+        if self.next_continues_run(st, namespace) {
+            hits.saturating_add(1)
+        } else {
+            0
         }
+    }
+
+    // whether the next grant's prompt continues the run or stored entry `st` in its own namespace
+    fn next_continues_run(&self, st: &Finished, namespace: Namespace) -> bool {
+        matches!(&self.next_prompt, Some((ns, p)) if *ns == namespace && continues(p, &st.history, st.pf_end.max(0) as usize))
     }
 
     pub fn exclusive(&self, rows: u64) -> bool {
@@ -911,7 +1114,7 @@ impl Pool {
 
     fn fits_at(&self, rows: u64, worst: u64, rp: u64) -> bool {
         let (n, w) = (pages_for(rows), pages_for(worst));
-        if rows == 0 || n > w || !self.admissible_at(worst, rp) {
+        if rows == 0 || n > w || !self.admissible_at(worst, rp) || self.over_run_limit(worst) {
             return false;
         }
         if past(worst, rp) {
@@ -925,6 +1128,79 @@ impl Pool {
             return self.split_room(main, draft);
         }
         n <= self.lo_free() as u64 && w <= self.place_online() as u64 && self.safe(Some((n, w)), None)
+    }
+
+    /// The busy guard's view of a reserve_r(rows, worst, r) on this state: the retained runs it would evict, oldest
+    /// first, and how many of them retired at most `idle_ns` before `now_ns` (`idle_ns` 0: none). It is a dry run of
+    /// fill_range and evict_for_ids and must pick the same runs (tests/busy.rs). The pool itself never reads a clock,
+    /// so every rank's pool stays identical. Where fits_at fails (the head's intake check), the view walks every
+    /// retained run and still lacks room.
+    pub fn busy_view(&self, rows: u64, worst: u64, r: u32, now_ns: i64, idle_ns: i64) -> BusyView {
+        let mut victims = Vec::new();
+        if let Some(rp) = self.rp_of(r).filter(|&rp| rows != 0 && self.admissible_at(worst, rp)) {
+            if !past(worst, rp) {
+                victims = self.evict_view(pages_for(rows) as usize, 0, self.place, 0);
+            } else if self.nr == 0 {
+                victims = self.kept.iter().map(|k| k.age).collect();
+            } else {
+                let (main, draft) = self.exclusive_pages(worst, rp);
+                victims = self.evict_view(main as usize, 0, self.place, 0);
+                // the drafter's fill walks the runs the main fill left
+                let more = self.evict_view(draft as usize, self.place, self.pages, victims.len());
+                victims.extend(more);
+                if self.window > 0 {
+                    let more = self.evict_ids_view(draft.div_ceil(self.nr as u64), &victims);
+                    victims.extend(more);
+                }
+            }
+        }
+        let live = |k: &&Kept| idle_ns != 0 && now_ns - k.retired_ns <= idle_ns && victims.contains(&k.age);
+        let live_victims = self.kept.iter().filter(live).count() as u32;
+        BusyView { victims, live_victims }
+    }
+
+    // fill_range(need, lo, hi) as a dry run, with kept[..gone] already evicted: the ages of the runs it evicts
+    fn evict_view(&self, need: usize, lo: u32, hi: u32, gone: usize) -> Vec<u64> {
+        let (lo, hi) = (lo as usize, hi as usize);
+        let left = &self.kept[gone..];
+        let mut claims: Vec<u32> = (lo..hi).map(|p| (self.used[p] || !self.online(p as u32)) as u32).collect();
+        for k in left {
+            for &p in k.list.iter().filter(|&&p| (p as usize) >= lo && (p as usize) < hi) {
+                claims[p as usize - lo] += 1;
+            }
+        }
+        let mut spare = claims.iter().filter(|&&c| c == 0).count();
+        let mut victims = Vec::new();
+        for k in left {
+            if spare >= need {
+                break;
+            }
+            for &p in k.list.iter().filter(|&&p| (p as usize) >= lo && (p as usize) < hi) {
+                claims[p as usize - lo] -= 1;
+                if claims[p as usize - lo] == 0 {
+                    spare += 1;
+                }
+            }
+            victims.push(k.age);
+        }
+        victims
+    }
+
+    // evict_for_ids(need) as a dry run, with the runs in `gone` already evicted
+    fn evict_ids_view(&self, need: u64, gone: &[u64]) -> Vec<u64> {
+        let held: u64 = self.held.values().map(|h| self.ids_of(h)).sum();
+        let mut gone = gone.to_vec();
+        let mut victims = Vec::new();
+        loop {
+            let kept: u64 = self.kept.iter().filter(|k| !gone.contains(&k.age)).map(|k| self.kept_ids(k)).sum();
+            if self.ids == 0 || (self.ids as u64).saturating_sub(held + kept) >= need {
+                break;
+            }
+            let Some(k) = self.kept.iter().find(|k| !gone.contains(&k.age) && self.kept_ids(k) > 0) else { break };
+            victims.push(k.age);
+            gone.push(k.age);
+        }
+        victims
     }
 
     /// A run of pages for `rows` now that may grow (grow()) to `worst` rows. An exclusive run holds its worst case.
@@ -984,13 +1260,31 @@ impl Pool {
             return Err(Error::PastWorst);
         }
         let add = n - have;
-        if add > self.lo_free() as u64 || !self.safe(None, Some((r.table_version, add))) {
+        // GR8_KV_SHARE_PAGES copy-on-write guard: a run whose last page another run holds, not known to be full (its
+        // prefilled rows end before it), gets that page as a fresh copy first, one page more. A hit never shares a
+        // partial page, so this does not happen; the guard keeps a shared page from ever being written
+        let cow = self.share && self.cow_last(h);
+        let need = add + cow as u64;
+        if need > self.lo_free() as u64 || !self.safe(None, Some((r.table_version, need))) {
             self.stalls += 1;
             return Ok(None);
         }
         let mut h = self.held.remove(&r.table_version).expect("held() found it");
         if let Some(s) = &mut self.stash {
             s.earn(add);
+        }
+        let mut have = have;
+        if cow {
+            let from = h.list.pop().expect("a run holds a page");
+            let rows = if (h.pf as u64) > (have - 1) * PAGE { (h.pf as u64 - (have - 1) * PAGE) as u32 } else { PAGE as u32 };
+            self.mark(&[from], false);
+            have -= 1;
+            let mut one = h.list.clone();
+            let gone = self.fill(&mut one, h.list.len() + 1);
+            self.spill(&gone);
+            let to = *one.last().expect("filled");
+            self.copies.push(PageCopy { from, to, rows });
+            h.list.push(to);
         }
         let gone = self.fill(&mut h.list, n as usize);
         self.spill(&gone);
@@ -1060,6 +1354,91 @@ impl Pool {
         self.remove(r).map(|_| ())
     }
 
+    // whether a grant adopting retained run k's first ceil(skip / 64) pages may write into the last of them: always
+    // without sharing; with it, when the hit ends on a page boundary or no other run (live or retained) holds that page
+    fn partial_own(&self, k: &Kept, skip: i32) -> bool {
+        if !self.share || skip <= 0 || (skip as u64).is_multiple_of(PAGE) {
+            return true;
+        }
+        let Some(&p) = k.list.get(pages_for(skip as u64) as usize - 1) else { return true };
+        self.live_ref[p as usize] == 0 && self.kept.iter().filter(|x| x.list.contains(&p)).count() <= 1
+    }
+
+    // whether live run h's last page has another holder and may still be written (not known full)
+    fn cow_last(&self, h: &Held) -> bool {
+        let Some(&p) = h.list.last() else { return false };
+        let full = (h.pf as u64) >= h.list.len() as u64 * PAGE;
+        !full && (self.live_ref[p as usize] > 1 || self.kept.iter().any(|k| k.list.contains(&p)))
+    }
+
+    // GR8_KV_SHARE_PAGES: whether a grant of n pages (worst w) that shares `shared` (its first pages, held by another
+    // run) fits: its fresh pages plus the shared ones no live run holds yet come out of the free pages below place,
+    // and every live run can still reach its worst case (safe_share)
+    fn share_room(&self, shared: &[u32], n: u64, w: u64) -> bool {
+        let cost = (n - shared.len() as u64) + shared.iter().filter(|&&p| self.live_ref[p as usize] == 0).count() as u64;
+        n <= w && cost <= self.lo_free() as u64 && self.safe_share(self.place_online(), Some((shared, n, w)), None, None)
+    }
+
+    // Banker's safety with shared pages (safe_with when sharing): the live runs in order of remaining need, smallest
+    // first; when one finishes, each of its pages comes back only when no other live run in the simulation still holds
+    // it (sim refs reach 0), so a shared page is charged once and credited once. `new` = (its shared first pages,
+    // pages now, worst). Retained runs count as free, as in safe_with.
+    fn safe_share(
+        &self,
+        online: u32,
+        new: Option<(&[u32], u64, u64)>,
+        grow: Option<(u32, u64)>,
+        split: Option<u64>,
+    ) -> bool {
+        if self.exclusive {
+            return new.is_none() && grow.is_none() && split.is_none();
+        }
+        let place = self.place as usize;
+        let mut refs: Vec<u32> = self.live_ref[..place].to_vec();
+        let mut free = online as i64 - (self.live - self.live_hi) as i64;
+        // (remaining need, its pages below place in refs, pages it adds that no one else holds)
+        let mut runs: Vec<(u64, u32, Vec<u32>, u64)> = Vec::with_capacity(self.held.len() + 2);
+        for (v, h) in &self.held {
+            let add = grow.filter(|g| g.0 == *v).map_or(0, |g| g.1);
+            let low: Vec<u32> = h.list.iter().copied().filter(|&p| (p as usize) < place).collect();
+            runs.push(((h.worst as u64).saturating_sub(h.list.len() as u64 + add), *v, low, add));
+        }
+        free -= grow.map_or(0, |g| g.1 as i64);
+        if let Some((shared, n, w)) = new {
+            for &p in shared {
+                if refs[p as usize] == 0 {
+                    free -= 1;
+                }
+                refs[p as usize] += 1;
+            }
+            let fresh = n - shared.len() as u64;
+            free -= fresh as i64;
+            runs.push((w.saturating_sub(n), u32::MAX, shared.to_vec(), fresh));
+        }
+        if let Some(m) = split {
+            free -= m as i64;
+            runs.push((0, u32::MAX - 1, Vec::new(), m));
+        }
+        if free < 0 {
+            return false;
+        }
+        runs.sort_unstable_by_key(|r| (r.0, r.1));
+        for (need, _, low, fresh) in runs {
+            if need as i64 > free {
+                return false;
+            }
+            free += fresh as i64;
+            for p in low {
+                let r = &mut refs[p as usize];
+                *r -= 1;
+                if *r == 0 {
+                    free += 1;
+                }
+            }
+        }
+        true
+    }
+
     /// A live run's pages, in table order.
     pub fn list(&self, r: &Run) -> Result<&[u32], Error> {
         Ok(&self.held(r)?.list)
@@ -1086,7 +1465,7 @@ impl Pool {
     }
 
     pub fn retain_namespaced(&mut self, r: &Run, st: Finished, namespace: Namespace) -> Result<(), Error> {
-        let (exclusive, hits, span, rp) = self.held(r).map(|h| (h.exclusive, h.hits, h.span, h.rp))?;
+        let (exclusive, hits, span, rp, from) = self.held(r).map(|h| (h.exclusive, h.hits, h.span, h.rp, h.from))?;
         let list = self.remove(r)?;
         if !self.keep || st.valid <= 0 {
             return Ok(());
@@ -1101,7 +1480,8 @@ impl Pool {
         // a window run is retained with its list (prefix, window, drafter tail): the engine keeps its rows store records
         // for it, and a hit adopts them with the pages (take_hit), or they go when the pool evicts it
         self.age += 1;
-        self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace, rp });
+        let retired_ns = self.now_ns();
+        self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace, rp, from, retired_ns });
         Ok(())
     }
 
@@ -1147,7 +1527,12 @@ impl Pool {
                 }
                 continue;
             }
-            let t = reuse::begin(&self.rules, &k.st, prompt, limit, true);
+            let shared_hit = self.share && !k.exclusive && !past(worst, rp);
+            let t = if shared_hit {
+                reuse::begin_pool(&self.rules, &k.st, prompt, limit, true)
+            } else {
+                reuse::begin(&self.rules, &k.st, prompt, limit, true)
+            };
             if t.skip <= 0 {
                 if best.skip == 0 && t.lcp >= best.lcp {
                     best.lcp = t.lcp;
@@ -1171,10 +1556,16 @@ impl Pool {
                     // its own pages: the adopted ones and fresh ones of both classes must fit
                     room = room && self.hit_room(adopted, a, n, worst, rp);
                 }
+            } else if shared_hit {
+                let full = (t.skip as u64 / PAGE) as usize;
+                room = room && adopted.iter().all(|&p| p < self.place) && self.share_room(&k.list[..full], n, w);
             } else {
                 room = room && n <= self.lo_free() as u64 && n <= w;
                 room = room && adopted.iter().all(|&p| p < self.place) && self.safe(Some((n, w)), None);
             }
+            // GR8_KV_SHARE_PAGES: a grant that adopts (moves) a run's pages writes past the hit into its last adopted
+            // page: only when no other run holds that page
+            room = room && (shared_hit || self.partial_own(k, t.skip));
             if !room {
                 if best.skip == 0 {
                     best.why = Why::Room;
@@ -1183,6 +1574,38 @@ impl Pool {
             }
             if t.skip > best.skip || (t.skip == best.skip && k.age > best.age) {
                 best = Hit { skip: t.skip, lcp: t.lcp, why: Why::Hit, age: k.age, stored: false, tier: 0 };
+            }
+        }
+        // GR8_KV_SHARE_PAGES: a live run below R whose prefill passed the hit (prefilled()) shares its pages too. It
+        // wins only with more rows than every retained run (a retained hit refreshes its run; a live one has no
+        // lease to refresh). Its age is LIVE_HIT | its table version
+        if self.share && !past(worst, rp) {
+            for (v, h) in &self.held {
+                let Some((ns, toks)) = h.sp.as_ref().filter(|_| h.pf > 0 && !h.exclusive) else { continue };
+                if *ns != namespace {
+                    continue;
+                }
+                let pf = (h.pf as usize).min(toks.len()) as i32;
+                let t = reuse::begin_on(&self.rules, toks, pf, pf, pf, prompt, limit, true, false);
+                if t.skip <= best.skip {
+                    if best.skip == 0 && t.skip <= 0 && t.lcp >= best.lcp {
+                        best.lcp = t.lcp;
+                        best.why = t.why;
+                    }
+                    continue;
+                }
+                let (a, full) = (pages_for(t.skip as u64), (t.skip as u64 / PAGE) as usize);
+                let room = a <= h.list.len() as u64
+                    && a <= n
+                    && h.list[..a as usize].iter().all(|&p| p < self.place)
+                    && self.share_room(&h.list[..full], n, w);
+                if !room {
+                    if best.skip == 0 {
+                        best.why = Why::Room;
+                    }
+                    continue;
+                }
+                best = Hit { skip: t.skip, lcp: t.lcp, why: Why::Hit, age: LIVE_HIT | *v as u64, stored: false, tier: 0 };
             }
         }
         // the tiers in order. A stored hit must reuse more rows than the pool's best, since a pool hit is free of copies.
@@ -1259,7 +1682,8 @@ impl Pool {
         }
         self.check_version()?;
         let e = self.stash.as_mut().expect("found in it").begin_restore(tier, id);
-        let hits = self.hits_from(&e.st, e.hits);
+        let hits = self.hits_from(&e.st, e.hits, e.namespace);
+        let cont = self.next_continues_run(&e.st, e.namespace);
         self.earn(n, a);
         let (list, gone, exclusive, pool_base) = if past(worst, rp) {
             if self.nr == 0 {
@@ -1286,8 +1710,11 @@ impl Pool {
             if let Some(i) = from_pool {
                 let k = self.kept.remove(i);
                 let b = e.base.expect("a pool base is a base").1;
-                if k.st.valid > (b as u64 * PAGE) as i32 {
+                // what of k a tier would store (stash.rs storable) past the pages the grant adopts
+                if self.stored_rows(&k) > b as u64 * PAGE {
                     self.spill(std::slice::from_ref(&k));
+                } else {
+                    self.let_go(&k);
                 }
                 list.extend_from_slice(&k.list[..b]);
             }
@@ -1298,6 +1725,11 @@ impl Pool {
         // a past-R grant restores its tail into pages past the hit's, so it passes its whole list
         let into = if exclusive { &list[..] } else { &list[..a as usize] };
         self.stash.as_mut().expect("found in it").restore(tier, &e, into, pool_base, exclusive);
+        // the grant's pages below the hit's full pages are byte copies of e's (D2: its store extends e in place).
+        // Only for a run that continues e: it then holds all e holds, and replaces it
+        if !exclusive && cont {
+            self.next_from = Some((e.id, ((skip as u64 / PAGE) as usize).min(e.below())));
+        }
         let (rows, how) = (if exclusive { worst } else { rows }, if pool_base { "stored+pool" } else { "stored" });
         Ok(self.grant(list, exclusive, w as u32, rows, how, &gone, hits, rp))
     }
@@ -1318,6 +1750,25 @@ impl Pool {
                 && k.list.len() >= b
                 && k.list[..b].iter().all(|&p| p < self.place)
         })
+    }
+
+    // a retained run leaves the pool unspilled (a hit holds all a tier would store of it): its conversation's head is
+    // remembered, as put_evicted does for a spilled one, so the conversation's next prompt still counts as continuing
+    fn let_go(&mut self, k: &Kept) {
+        if let Some(s) = &mut self.stash {
+            if k.namespace == STOCK_NAMESPACE {
+                s.forget(&k.st);
+            }
+        }
+    }
+
+    // the rows of retained run k a tier would store when the pool evicts it (stash.rs storable; a run past R keeps
+    // its valid rows, its tail is not cut)
+    fn stored_rows(&self, k: &Kept) -> u64 {
+        match &self.stash {
+            Some(s) if !k.exclusive => s.storable(&k.st),
+            _ => k.st.valid.max(0) as u64,
+        }
     }
 
     /// Claims a match_prefix() hit (skip, age) as a new grant: the retained run's first ceil(skip / 64) pages, then
@@ -1347,6 +1798,9 @@ impl Pool {
         if skip <= 0 || !self.admissible_at(worst, rp) {
             return Err(Error::NoHit);
         }
+        if self.over_run_limit(worst) {
+            return Err(Error::NoRoom);
+        }
         if let Some(t) = from {
             let r = self.take_stored(skip, age, t as usize, rows, worst, rp);
             if r.is_ok() && self.ages_on {
@@ -1354,7 +1808,13 @@ impl Pool {
             }
             return r;
         }
+        if self.share && age & LIVE_HIT != 0 {
+            return self.take_live(skip, (age & !LIVE_HIT) as u32, rows, worst, rp);
+        }
         let i = self.kept.iter().position(|k| k.age == age).ok_or(Error::NotRetained)?;
+        if self.share && !self.kept[i].exclusive && !past(worst, rp) {
+            return self.take_kept_shared(i, skip, rows, worst, rp);
+        }
         let w = pages_for(worst);
         let (a, n) = (pages_for(skip as u64), if past(worst, rp) { w + self.window as u64 } else { pages_for(rows) });
         // checks the C++ pool left to match(): a hit from match() on this state always passes them
@@ -1362,7 +1822,7 @@ impl Pool {
         if a > k.list.len() as u64 || a > n {
             return Err(Error::NoHit);
         }
-        if !self.same_layout(k, a, worst, rp) {
+        if !self.same_layout(k, a, worst, rp) || !self.partial_own(k, skip) {
             return Err(Error::NoRoom);
         }
         let adopted = &k.list[..a as usize];
@@ -1391,12 +1851,21 @@ impl Pool {
         }
         self.check_version()?;
         let k = self.kept.remove(i);
-        let hits = self.hits_from(&k.st, k.hits);
+        let hits = self.hits_from(&k.st, k.hits, k.namespace);
+        let full = (skip as u64 / PAGE) as usize;
+        // the grant's full pages below the hit are k's: k's provenance carries over to them (Kept::from)
+        let from = k.from.filter(|_| self.next_continues_run(&k.st, k.namespace)).map(|(id, n)| (id, n.min(full)));
         self.earn(n, a);
         // the grant keeps the run's first a pages and writes past its skip: what the run held beyond that goes to a
-        // tier, read before the grant writes
-        if k.st.valid > skip {
+        // tier, read before the grant writes. Below R, only what a tier would store of it (stash.rs storable) counts;
+        // a hit on the run's own conversation has no rows past skip and spills nothing.
+        // With no reuse grid, `skip` may end inside a page. The grant will rewrite that page,
+        // but the retained run has nothing *past* the hit when its valid rows end at `skip`.
+        let spills_past_hit = if k.exclusive { k.st.valid > skip } else { self.stored_rows(&k) > skip as u64 };
+        if spills_past_hit {
             self.spill(std::slice::from_ref(&k));
+        } else {
+            self.let_go(&k);
         }
         if past(worst, rp) && k.exclusive && self.window > 0 {
             // a retained window run: its prefix, window and drafter pages below the hit, then the drafter's fresh ones
@@ -1425,7 +1894,86 @@ impl Pool {
         }
         let gone = self.fill(&mut list, n as usize);
         self.spill(&gone);
+        self.next_from = from;
         Ok(self.grant(list, false, w as u32, rows, "hit", &gone, hits, rp))
+    }
+
+    // GR8_KV_SHARE_PAGES hit on retained run i (below R): the run stays retained, its retirement refreshed (it is
+    // retired again now, so the oldest-first eviction reaches it last); the grant shares its full pages below the hit
+    // and copies its partial page (PageCopy) into a fresh one
+    fn take_kept_shared(&mut self, i: usize, skip: i32, rows: u64, worst: u64, rp: u64) -> Result<Run, Error> {
+        let w = pages_for(worst);
+        let (a, n, full) = (pages_for(skip as u64), pages_for(rows), (skip as u64 / PAGE) as usize);
+        let k = &self.kept[i];
+        if a > k.list.len() as u64 || a > n {
+            return Err(Error::NoHit);
+        }
+        if k.list[..a as usize].iter().any(|&p| p >= self.place) || !self.share_room(&k.list[..full], n, w) {
+            return Err(Error::NoRoom);
+        }
+        self.check_version()?;
+        let mut k = self.kept.remove(i);
+        let hits = self.hits_from(&k.st, k.hits, k.namespace);
+        let from = k.from.filter(|_| self.next_continues_run(&k.st, k.namespace)).map(|(id, m)| (id, m.min(full)));
+        self.earn(n, a);
+        let src = (a as usize > full).then(|| k.list[a as usize - 1]);
+        let list = k.list[..full].to_vec();
+        self.age += 1;
+        k.age = self.age;
+        k.retired_ns = self.now_ns();
+        self.kept.push(k);
+        Ok(self.grant_shared(list, src, skip, n, w, rows, hits, from, rp, "share"))
+    }
+
+    // GR8_KV_SHARE_PAGES hit on live run v (below R, prefilled past the hit): the grant shares its full pages below the
+    // hit and copies its partial page, which the live run goes on writing
+    fn take_live(&mut self, skip: i32, v: u32, rows: u64, worst: u64, rp: u64) -> Result<Run, Error> {
+        let w = pages_for(worst);
+        let (a, n, full) = (pages_for(skip as u64), pages_for(rows), (skip as u64 / PAGE) as usize);
+        let h = self.held.get(&v).ok_or(Error::NotRetained)?;
+        if h.exclusive || past(worst, rp) || skip as u64 > h.pf as u64 || a > h.list.len() as u64 || a > n {
+            return Err(Error::NoHit);
+        }
+        if h.list[..a as usize].iter().any(|&p| p >= self.place) || !self.share_room(&h.list[..full], n, w) {
+            return Err(Error::NoRoom);
+        }
+        self.check_version()?;
+        let src = (a as usize > full).then(|| h.list[a as usize - 1]);
+        let list = h.list[..full].to_vec();
+        self.earn(n, a);
+        Ok(self.grant_shared(list, src, skip, n, w, rows, 0, None, rp, "share-live"))
+    }
+
+    // the shared grant: `list` = the shared full pages, then fresh pages to n (the first of them the copy of `src`,
+    // the source's partial page, when the hit ends inside it)
+    #[allow(clippy::too_many_arguments)]
+    fn grant_shared(
+        &mut self,
+        mut list: Vec<u32>,
+        src: Option<u32>,
+        skip: i32,
+        n: u64,
+        w: u64,
+        rows: u64,
+        hits: u32,
+        from: Option<(u64, usize)>,
+        rp: u64,
+        how: &str,
+    ) -> Run {
+        let full = list.len();
+        self.adopting = list.clone();
+        let gone = self.fill(&mut list, n as usize);
+        self.spill(&gone);
+        self.adopting.clear();
+        if let Some(from) = src {
+            let to = list[full];
+            // the source left in this fill (its run evicted): its page may come back as the copy itself
+            if to != from {
+                self.copies.push(PageCopy { from, to, rows: (skip as u64 % PAGE) as u32 });
+            }
+        }
+        self.next_from = from;
+        self.grant(list, false, w as u32, rows, how, &gone, hits, rp)
     }
 
     /// Every rank's pool must agree: folded into Scheduler::digest at each event boundary.
@@ -1435,6 +1983,9 @@ impl Pool {
             h = mix(h, 0x7274_0000_0000_0000 | self.window as u64);   // a pool without the window hashes as before
             h = mix(h, self.ids as u64);
             h = mix(h, self.runs as u64);
+        }
+        if self.run_limit > 0 {
+            h = mix(h, 0x726c_0000_0000_0000 | self.run_limit as u64);   // a pool without the limit hashes as before
         }
         for (p, _) in self.used.iter().enumerate().filter(|(_, &u)| u) {
             h = mix(h, p as u64);
@@ -1468,6 +2019,28 @@ impl Pool {
                 }
             }
         }
+        // GR8_KV_SHARE_PAGES: every page's live and retained holders, each live run's prefilled rows and shared
+        // prompt, and the queued copies (without sharing the digest is what it was before)
+        if self.share {
+            h = mix(h, 0x7368_0000_0000_0000);
+            let kr = self.kept_ref();
+            for p in 0..self.pages as usize {
+                if self.live_ref[p] != 0 || kr[p] != 0 {
+                    h = mix(h, (p as u64) << 32 | (self.live_ref[p] as u64) << 16 | kr[p] as u64);
+                }
+            }
+            for (v, x) in &self.held {
+                h = mix(mix(h, *v as u64), x.pf as u64);
+                if let Some((ns, t)) = &x.sp {
+                    h = mix(h, t.len() as u64);
+                    h = t.iter().fold(h, |h, &x| mix(h, x as u32 as u64));
+                    h = ns.iter().fold(h, |h, &b| mix(h, b as u64));
+                }
+            }
+            for c in &self.copies {
+                h = mix(mix(mix(h, c.from as u64), c.to as u64), c.rows as u64);
+            }
+        }
         // offline chunks (resize): with every chunk online the digest is what it was before resize existed
         if self.offline.iter().any(|&o| o) {
             h = mix(h, self.chunk as u64);
@@ -1480,9 +2053,15 @@ impl Pool {
             Some(s) => {
                 for x in self.held.values() {
                     h = mix(h, x.hits as u64);
+                    if let Some((id, n)) = x.from {
+                        h = mix(mix(h, id), n as u64);
+                    }
                 }
                 for k in &self.kept {
                     h = mix(h, k.hits as u64);
+                    if let Some((id, n)) = k.from {
+                        h = mix(mix(h, id), n as u64);
+                    }
                 }
                 s.fold(h, mix)
             }
@@ -1526,6 +2105,9 @@ impl Pool {
     // below place of a new split run (its prefix and shard: held at once, need 0). `online` = the online pages below
     // place.
     fn safe_with(&self, online: u32, new: Option<(u64, u64)>, grow: Option<(u32, u64)>, split: Option<u64>) -> bool {
+        if self.share {
+            return self.safe_share(online, new.map(|(n, w)| (&[][..], n, w)), grow, split);
+        }
         if self.exclusive {
             return new.is_none() && grow.is_none() && split.is_none();
         }
@@ -1620,15 +2202,27 @@ impl Pool {
     }
 
     // Callers have checked every page: free, below pages, and no page twice.
+    // With sharing a page may be in several live lists: live_ref counts them, and live / live_hi count each page once
+    // (while live_ref > 0). Without, live_ref is 0 or 1 and this is the single-owner mark it was.
     fn mark(&mut self, list: &[u32], on: bool) {
         for &p in list {
-            debug_assert!(self.used[p as usize] != on);
-            self.used[p as usize] = on;
+            let i = p as usize;
+            debug_assert!(self.share || self.used[i] != on);
+            debug_assert!(on || self.live_ref[i] > 0);
+            let edge = if on {
+                self.live_ref[i] += 1;
+                self.live_ref[i] == 1
+            } else {
+                self.live_ref[i] -= 1;
+                self.live_ref[i] == 0
+            };
+            if edge {
+                self.used[i] = on;
+                let hi = (p >= self.place) as u32;
+                self.live = if on { self.live + 1 } else { self.live - 1 };
+                self.live_hi = if on { self.live_hi + hi } else { self.live_hi - hi };
+            }
         }
-        let n = list.len() as u32;
-        let hi = list.iter().filter(|&&p| p >= self.place).count() as u32;
-        self.live = if on { self.live + n } else { self.live - n };
-        self.live_hi = if on { self.live_hi + hi } else { self.live_hi - hi };
     }
 
     // `list` (adopted pages, if any) grows by `need` pages out of [lo, hi): the lowest pages no run holds or retains,
@@ -1738,11 +2332,14 @@ impl Pool {
         self.log_claim(how, &r, rows, gone);
         let tokens = self.next_tokens.take().unwrap_or_default();
         self.next_len = None;
+        self.next_prompt = None;
         let span = self.next_span.take();
         // a run that continues its conversation counts as continued once, even when it found nothing to reuse
         let hits = hits.max(std::mem::take(&mut self.next_continues) as u32);
+        let from = self.next_from.take();
         let rp = if exclusive { rp } else { self.rp0() } as u32;
-        self.held.insert(r.table_version, Held { tokens, hits, span, list, exclusive, worst, rp });
+        let sp = self.next_share.take();
+        self.held.insert(r.table_version, Held { tokens, hits, span, list, exclusive, worst, rp, from, sp, pf: 0 });
         // with the page classes on (nr > 0) a split run holds only its own pages; without, the whole pool
         self.exclusive = self.exclusive || (exclusive && self.nr == 0);
         r

@@ -218,10 +218,12 @@ inline void fill(ds41::Table& t)
 // Tensors (docs/DEEPSEEK-WEIGHTS.md): L040.main_proj / main_norm, L04j.kv / kv_norm (the attention's bound ones), L042.markov_head.{embed,head},
 // L042.confidence_head.proj, L042.norm (the draft head's final norm). markov_head.head is stored full [VOCAB][256]: the rank's shard starts at row vlo.
 // tap_rows: capacity of the tap buffer in rows (0 = MX, the decode step; a prefill chunk of W rows needs W: 31.5 MB at W = 1024).
-inline Dsp build(Model& main, Model& draft, int nsess, int k, bool host_accept = false, int tap_rows = 0)
+// maxs / verify_all (GR8_DS_SESS_DRAFTS): the draft launch's session cap (default MARKOV_MAXS) and dsp_nsess_error's verify check
+inline Dsp build(Model& main, Model& draft, int nsess, int k, bool host_accept = false, int tap_rows = 0, int maxs = ::ds41dsp::MARKOV_MAXS,
+                 bool verify_all = true)
 {
     // nsess = the S2 slots (Model::ds_slots of both Models): the arrays below hold that many sessions; a step runs 1..nsess of them (Model::ds_ns)
-    if (const char* e = ds41slots::dsp_nsess_error(nsess, main.ds_slots, draft.ds_slots, k, MX, ::ds41dsp::MARKOV_MAXS, BLOCK))
+    if (const char* e = ds41slots::dsp_nsess_error(nsess, main.ds_slots, draft.ds_slots, k, MX, std::min(maxs, ::ds41dsp::MARKOV_MAXS), BLOCK, verify_all))
         die(std::string(e) + ": nsess " + std::to_string(nsess) + ", slots main " + std::to_string(main.ds_slots) + " draft " + std::to_string(draft.ds_slots) +
             ", k " + std::to_string(k) + ", MX " + std::to_string(MX) + " (" + std::to_string(std::max(nsess * (k + 1), nsess * BLOCK)) + " rows a step)");
     // the head merge waits for head_bytes_tk(1, HEAD_NC, false) (op_markov passes no tk); the proxy sends coll_bytes: the same number or no boot

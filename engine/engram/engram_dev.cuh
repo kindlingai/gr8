@@ -33,6 +33,8 @@ extern "C" int ds41_gemm_mx_tc(const uint8_t* A, int lda, const uint8_t* SA, int
 namespace ds41 { namespace engram {
 
 constexpr int kWideMaxRows = 4096;    // W-row prefill: GR8_DS_PREFILL_W is MX..4096
+constexpr int kV2MaxRows = 8192;
+constexpr int kV2W16KMaxRows = 16384;
 constexpr int kDecodeRows = 32;   // MX: up to this many rows begin_step hashes with the decode launch <<<1, rows>>>
 constexpr int kNotSup = 801;   // ds41::NOTSUP (cudaErrorNotSupported): the hook is not wired
 
@@ -105,6 +107,23 @@ __global__ void k_dequant(const uint32_t* ids, const uint8_t* stage, const uint8
     *(uint4*)(emb + (size_t)r * kEmbDim + (size_t)g * kRowBytes + c * 8) = make_uint4(o[0], o[1], o[2], o[3]);
 }
 
+// Opt-in column kernel; keep the original contiguous kernel above unchanged.
+__global__ void k_dequant_col(const uint32_t* ids, const uint8_t* stage, const uint8_t* s8, ColShard columns, int rows, __nv_bfloat16* emb)
+{
+    const int r = blockIdx.x, g = blockIdx.y * 8 + (threadIdx.x >> 5), c = threadIdx.x & 31;
+    const int64_t loc = columns.at(g, ids[(size_t)r * kIds + g]);
+    uint32_t o[4] = {0, 0, 0, 0};
+    if (loc >= 0)
+    {
+        const uint2 w = *(const uint2*)(stage + ((size_t)r * kIds + g) * kRowBytes + c * 8);
+        const uint8_t s = s8[(size_t)loc * kScaleBytes + (c >> 2)];
+        const uint8_t* wb = (const uint8_t*)&w;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) o[k] = (uint32_t)dequant1(wb[2 * k], s) | (uint32_t)dequant1(wb[2 * k + 1], s) << 16;
+    }
+    *(uint4*)(emb + (size_t)r * kEmbDim + (size_t)g * kRowBytes + c * 8) = make_uint4(o[0], o[1], o[2], o[3]);
+}
+
 // The W-row wkv's activation quantizer (act_quant.h): emb bf16 [rows][6144] -> codes u8 [rows][6144], E8M0 bytes [rows][192]. One warp per
 // block of 32 (a lane per element), 8 warps per CTA: grid ceil(rows * 192 / 8).
 __global__ void __launch_bounds__(256) k_act_quant_rows(const __nv_bfloat16* __restrict__ x, int rows, uint8_t* __restrict__ codes, uint8_t* __restrict__ sc)
@@ -141,12 +160,15 @@ __device__ __forceinline__ float eg_ld(const float* p) { return *p; }
 __device__ __forceinline__ float eg_ld(const __nv_bfloat16* p) { return __bfloat162float(*p); }
 __device__ __forceinline__ void eg_st(float* p, float v) { *p = v; }
 __device__ __forceinline__ void eg_st(__nv_bfloat16* p, float v) { *p = __ushort_as_bfloat16(f32_to_bf16(v)); }
+// dead (DS41 image input; null on every text-only launch): a row with dead[r] set keeps its trunk (official Engram: the gate is 0
+// on image tokens).
 template <class TT>
-__device__ __forceinline__ void gate_body(TT* T, const __nv_bfloat16* kv, const float* wgt, int rows)
+__device__ __forceinline__ void gate_body(TT* T, const __nv_bfloat16* kv, const float* wgt, int rows, const unsigned char* dead = nullptr)
 {
     __shared__ float red[kGateThreads / 32][3];
     __shared__ float gate_s;
     const int r = blockIdx.x, j = blockIdx.y, tid = threadIdx.x;
+    if (dead && dead[r]) return;
     TT* t = T + ((size_t)r * kStreams + j) * kHid;
     const __nv_bfloat16* key = kv + (size_t)r * kKvDim + (size_t)j * kHid;
     const __nv_bfloat16* val = kv + (size_t)r * kKvDim + (size_t)kStreams * kHid;
@@ -189,6 +211,9 @@ __device__ __forceinline__ void gate_body(TT* T, const __nv_bfloat16* kv, const 
 }
 __global__ void __launch_bounds__(kGateThreads) k_gate(float* T, const __nv_bfloat16* kv, const float* wgt, int rows) { gate_body<float>(T, kv, wgt, rows); }
 __global__ void __launch_bounds__(kGateThreads) k_gate(__nv_bfloat16* T, const __nv_bfloat16* kv, const float* wgt, int rows) { gate_body<__nv_bfloat16>(T, kv, wgt, rows); }
+// the same with image rows (a launch with set_dead): separate symbols, so the text-only kernels above are unchanged
+__global__ void __launch_bounds__(kGateThreads) k_gate_dead(float* T, const __nv_bfloat16* kv, const float* wgt, int rows, const unsigned char* dead) { gate_body<float>(T, kv, wgt, rows, dead); }
+__global__ void __launch_bounds__(kGateThreads) k_gate_dead(__nv_bfloat16* T, const __nv_bfloat16* kv, const float* wgt, int rows, const unsigned char* dead) { gate_body<__nv_bfloat16>(T, kv, wgt, rows, dead); }
 
 #define EG_CK(call, err) do { const cudaError_t e_ = (call); if (e_ != cudaSuccess) { *(err) = std::string("engram: " #call ": ") + cudaGetErrorString(e_); return false; } } while (0)
 
@@ -207,6 +232,8 @@ struct Config
 {
     std::string prefix;              // weights PREFIX (PREFIX.engram.json, .cmap, .L###.w8/.s8)
     int rank = 0, nr = 1;
+    bool prefill_v2_w16k = false;
+    bool prefill_v2 = false;         // stock admission remains <= 4096
     int max_rows = 8;                // MX; a prefill build (GR8_DS_PREFILL_W) sets its W, up to 4096
     Knobs knobs;                     // read_knobs()
     const __nv_bfloat16* q_w[kNE] = {};   // device [4][5120] bf16: layer e's engram.q_weight / engram.k_weight (the image)
@@ -227,8 +254,9 @@ public:
     bool init(const Config& c, std::string* err)
     {
         cfg_ = c;
-        if (c.max_rows < 1 || c.max_rows > kWideMaxRows) { *err = "engram: max_rows outside 1.." + std::to_string(kWideMaxRows); return false; }
-        if (!load_sidecar(c.prefix, c.rank, c.nr, &sc_, err)) return false;
+        const int max_allowed = c.prefill_v2 ? (c.prefill_v2_w16k ? kV2W16KMaxRows : kV2MaxRows) : kWideMaxRows;
+        if (c.max_rows < 1 || c.max_rows > max_allowed) { *err = "engram: max_rows outside 1.." + std::to_string(max_allowed); return false; }
+        if (!load_sidecar(c.prefix, c.rank, c.nr, &sc_, err, c.knobs.col_shard)) return false;
         for (int e = 0; e < kNE; ++e)
             if (!c.q_w[e] || !c.k_w[e]) { *err = "engram: q_weight / k_weight pointers of layer " + std::to_string(kLayerIds[e]) + " missing"; return false; }
 
@@ -262,8 +290,8 @@ public:
             EG_CK(cudaHostAlloc(&stage_h_[e], mr * kIds * kRowBytes, cudaHostAllocMapped), err);
             EG_CK(cudaHostGetDevicePointer(&stage_d_[e], stage_h_[e], 0), err);
             const TableInfo& t = sc_.t[e];
-            EG_CK(cudaMalloc(&s8_d_[e], (size_t)t.part * kScaleBytes), err);
-            if (t.sruns.empty() ? !load_file_to_device(t.s8, (uint64_t)t.part * kScaleBytes, s8_d_[e], err)
+            EG_CK(cudaMalloc(&s8_d_[e], (size_t)(t.columns.enabled ? std::max<int64_t>(1, t.part) : t.part) * kScaleBytes), err);
+            if (!t.columns.enabled && t.sruns.empty() ? !load_file_to_device(t.s8, (uint64_t)t.part * kScaleBytes, s8_d_[e], err)
                                 : !load_runs_to_device(t, s8_d_[e], err)) return false;
             k_wprod<<<(kStreams * kHid + 255) / 256, 256>>>(c.q_w[e], c.k_w[e], wgt_d_[e], kStreams * kHid);
         }
@@ -271,15 +299,22 @@ public:
         EG_CK(cudaDeviceSynchronize(), err);
 
         std::vector<TableFile> files;
-        for (int e = 0; e < kNE; ++e) files.push_back({sc_.t[e].w8, sc_.t[e].first, sc_.t[e].valid, sc_.t[e].runs});
+        for (int e = 0; e < kNE; ++e) files.push_back({sc_.t[e].w8, sc_.t[e].first, sc_.t[e].valid, sc_.t[e].runs, sc_.t[e].columns});
         if (!store_.open(files, c.knobs.store, err)) return false;
         for (int e = 0; e < kNE; ++e)
             fprintf(stderr, "# rank %d: engram rowstore layer %03d file %s %s block %zu\n",
                     c.rank, kLayerIds[e], sc_.t[e].runs.empty() ? sc_.t[e].w8.c_str() : (std::to_string(sc_.t[e].runs.size()) + " release runs").c_str(),
                     store_.direct(e) ? "direct=1" : "fallback=buffered", store_.block());
+        if (c.knobs.col_shard)
+        {
+            fprintf(stderr, "# rank %d: engram col_shard=1 columns", c.rank);
+            for (int j = c.rank; j < kIds; j += c.nr) fprintf(stderr, " %d", j);
+            fprintf(stderr, "\n");
+        }
         hooks_ = c.hooks;
         for (int e = 0; e < kNE; ++e) { wkv_codes_[e] = c.wkv_codes[e]; wkv_scales_[e] = c.wkv_scales[e]; }
         verbose_ = c.knobs.verbose;
+        ka_ms_ = store_.keepalive_running() ? c.knobs.store.keepalive_ms : 0;
         if (c.knobs.lookahead)
         {
             warm_win_in_.assign(mr * kNGram, -1);
@@ -362,6 +397,9 @@ public:
 
     // The ST_ENGRAM op of layer slot e (0 = layer 1, 1 = layer 14). T = the trunk [rows][4][5120], BF16-valued, edited in place: FP32, or BF16 under
     // DS_MHC_TRUNK_BF16 (the overload below; same body).
+    // DS41 image input: device [rows] row flags of the next op launches (1 = an image row: gate 0), or null (every text-only launch).
+    // Host state read at launch; the caller sets it per launch (ds41_op_engram).
+    void set_dead(const unsigned char* dead) { dead_ = dead; }
     int op(void* model, int e, int rows, float* T, cudaStream_t main) { return op_t(model, e, rows, T, main); }
     int op(void* model, int e, int rows, __nv_bfloat16* T, cudaStream_t main) { return op_t(model, e, rows, T, main); }
     template <class TT>
@@ -371,12 +409,38 @@ public:
         if (!ready_ || e < 0 || e >= kNE || rows < 1 || rows > cfg_.max_rows) return cudaErrorInvalidValue;
         cudaError_t r;
         if ((r = cudaStreamWaitEvent(main, done_[e], 0)) != cudaSuccess) return r;
-        k_dequant<<<dim3(rows, kIds / 8), 256, 0, main>>>(ids_d_ + (size_t)e * rows * kIds, stage_d_[e], s8_d_[e], sc_.t[e].first, sc_.t[e].valid, rows, emb_d_[e]);
+        if (cfg_.knobs.col_shard)
+            k_dequant_col<<<dim3(rows, kIds / 8), 256, 0, main>>>(ids_d_ + (size_t)e * rows * kIds, stage_d_[e], s8_d_[e], sc_.t[e].columns, rows, emb_d_[e]);
+        else k_dequant<<<dim3(rows, kIds / 8), 256, 0, main>>>(ids_d_ + (size_t)e * rows * kIds, stage_d_[e], s8_d_[e], sc_.t[e].first, sc_.t[e].valid, rows, emb_d_[e]);
         if ((r = cudaGetLastError()) != cudaSuccess) return r;
         if (int x = hooks_.reduce(model, e, rows, main, emb_d_[e])) return x;
         if (!(tc_ && rows > kDecodeRows && project_wide(e, rows, main)))   // chunks of <= kDecodeRows rows: the hook, as in the decode build
             if (int x = hooks_.project(model, e, rows, main, emb_d_[e], kv_d_)) return x;
-        k_gate<<<dim3(rows, kStreams), kGateThreads, 0, main>>>(T, kv_d_, wgt_d_[e], rows);
+        if (dead_) k_gate_dead<<<dim3(rows, kStreams), kGateThreads, 0, main>>>(T, kv_d_, wgt_d_[e], rows, dead_);
+        else k_gate<<<dim3(rows, kStreams), kGateThreads, 0, main>>>(T, kv_d_, wgt_d_[e], rows);
+        return cudaGetLastError();
+    }
+
+    // v2: preserve begin_step's early fetch and wait only on its device event.
+    // exchange(ids,stage,scales,first,valid,columns,emb) assembles only the row owner's
+    // cells into emb[owned][6144]. No host count readback or fence here.
+    template <class TT, class Exchange>
+    int op_owned(void* model,int e,int rows,int row0,int owned,TT* T,cudaStream_t main,Exchange&& exchange) {
+        if (!hooks_.project) return kNotSup;
+        if (!ready_ || e<0 || e>=kNE || rows<1 || rows>cfg_.max_rows || row0<0 || owned<0 ||
+            (owned && row0+owned>rows)) return cudaErrorInvalidValue;
+        if (sc_.t[e].columns.enabled != cfg_.knobs.col_shard) return cudaErrorInvalidValue;
+        cudaError_t rc=cudaStreamWaitEvent(main,done_[e],0);
+        if(rc!=cudaSuccess)return rc;
+        if(int x=exchange(ids_d_+size_t(e)*rows*kIds,stage_d_[e],s8_d_[e],sc_.t[e].first,sc_.t[e].valid,sc_.t[e].columns,emb_d_[e]))return x;
+        if(!owned)return 0;
+        // Match the STOCK chunk's projection family, not the owner's smaller
+        // row count. A full-row TC chunk must not turn into scalar GEMV merely
+        // because its ragged owner has <=32 rows (different activation quant).
+        if(!(tc_ && rows>kDecodeRows && project_wide(e,owned,main)))
+            if(int x=hooks_.project(model,e,owned,main,emb_d_[e],kv_d_))return x;
+        if(dead_)k_gate_dead<<<dim3(owned,kStreams),kGateThreads,0,main>>>(T,kv_d_,wgt_d_[e],owned,dead_+row0);
+        else k_gate<<<dim3(owned,kStreams),kGateThreads,0,main>>>(T,kv_d_,wgt_d_[e],owned);
         return cudaGetLastError();
     }
 
@@ -454,6 +518,11 @@ public:
 private:
     struct Job { Engram* self; int e, rows; uint32_t* ids_h; uint8_t* stage_h; };   // the buffers of the set the job was made for
 
+    static void ka_line(const RowStore::KeepaliveStats& k)
+    {
+        fprintf(stderr, "[L001-ka] engram keepalive: ticks %llu reads %llu err %llu max_us %llu\n", (unsigned long long)k.ticks,
+                (unsigned long long)k.reads, (unsigned long long)k.errors, (unsigned long long)k.max_us);
+    }
     static void CUDART_CB fetch_cb(void* p) { Job* j = (Job*)p; j->self->do_fetch(j->e, j->rows, j->ids_h, j->stage_h); }
     void do_fetch(int e, int rows, uint32_t* ids_h, uint8_t* stage_h)
     {
@@ -461,6 +530,17 @@ private:
         const int r = store_.fetch(e, ids_h + (size_t)e * rows * kIds, (size_t)rows * kIds, stage_h, &st);
         if (r) { int z = 0; fail_.compare_exchange_strong(z, r); }
         if (verbose_) fprintf(stderr, "[L%03d] %s\n", kLayerIds[e], RowStore::line(st).c_str());
+        if (verbose_ && e == 0 && ka_ms_ > 0)
+        {   // keepalive counters on their own line: fetch 1, every 32nd L001 fetch, and a new keepalive error
+            const uint64_t n = ka_l001_n_.fetch_add(1, std::memory_order_relaxed) + 1;
+            const RowStore::KeepaliveStats k = store_.keepalive_stats();
+            const uint64_t e0 = ka_err_seen_.load(std::memory_order_relaxed);
+            if (n == 1 || n % 32 == 0 || k.errors > e0)
+            {
+                ka_err_seen_.store(k.errors, std::memory_order_relaxed);
+                ka_line(k);
+            }
+        }
         if (e == 1 && warm_on_ && warm_pending_.load(std::memory_order_acquire))
         {
             bool notify = false;
@@ -533,7 +613,7 @@ private:
         {
             const int fd = ::open(r.path.c_str(), O_RDONLY | O_CLOEXEC);
             if (fd < 0) { *err = r.path + ": open: " + strerror(errno); return false; }
-            const size_t n = (size_t)r.rows * kScaleBytes, at = (size_t)(r.row0 - t.first) * kScaleBytes;
+            const size_t n = (size_t)r.rows * kScaleBytes, at = (size_t)(t.columns.enabled ? t.columns.at((uint32_t)r.row0) : r.row0 - t.first) * kScaleBytes;
             size_t got = 0;
             while (got < n)
             {
@@ -571,6 +651,8 @@ private:
     void release()
     {
         if (side_) cudaStreamSynchronize(side_);
+        if (verbose_ && ka_ms_ > 0) ka_line(store_.keepalive_stats());
+        ka_ms_ = 0;
         stop_warm();
         use_lane(0);
         if (alt_.fork) cudaEventDestroy(alt_.fork);
@@ -611,6 +693,9 @@ private:
     RowStore store_;
     EngramHooks hooks_;
     bool ready_ = false, verbose_ = false, tc_ = false, warned_ = false;
+    int ka_ms_ = 0;                                   // keepalive interval when its thread runs (verbose [L001-ka] lines)
+    std::atomic<uint64_t> ka_l001_n_{0}, ka_err_seen_{0};
+    const unsigned char* dead_ = nullptr;   // set_dead
     uint8_t *aq_codes_ = nullptr, *aq_scales_ = nullptr;    // the quantized embedding of a W-row chunk (tc_ only)
     const uint8_t* wkv_codes_[kNE] = {};
     const uint8_t* wkv_scales_[kNE] = {};

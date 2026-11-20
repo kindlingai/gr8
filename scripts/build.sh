@@ -11,11 +11,16 @@
 #   KV_FORMAT=int4 scripts/build.sh bin   only OUT_DIR/g6m4-int4: the engine with the 4-bit KV latent (-DG6_KV4=1,
 #                                         docs/KV4.md), which `--kv-format int4` runs. The same widths.
 #   MODEL=flash scripts/build.sh bin      only OUT_DIR/g6m4_flash and OUT_DIR/m4sim_flash: GLM 5.3 Flash
-#                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h), fp8 KV only; TP = 2 and 4 unless
-#                                         GR8_WIDTHS or GR8_NR says otherwise
+#                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h); TP = 1 to 4 unless GR8_WIDTHS or
+#                                         GR8_NR says otherwise. With KV_FORMAT=int4, only OUT_DIR/g6m4_flash-int4
 #   MODEL=ds41 scripts/build.sh bin       only OUT_DIR/g6m4_ds41 and OUT_DIR/m4sim_ds41: DeepSeek-V4.1-Flash-1017
 #                                         (-DG6_MODEL_DS41=1, engine/model_geom_ds41.h, docs/DEEPSEEK.md), fp8 KV only; TP = 4
 #                                         unless GR8_WIDTHS or GR8_NR says otherwise
+#   MODEL=ink2 scripts/build.sh bin       only OUT_DIR/g6m4_ink2 and OUT_DIR/m4sim_ink2: Inkling-2-Small
+#                                         (-DG6_MODEL_INK2=1, engine/model_geom_ink2.h); TP = 1, 4 or 6
+#   GR8_DS_TRUNK_BF16=0 MODEL=ds41      the DS41 engine with the FP32 mHC trunk. Unset or 1 (the default): the BF16 trunk
+#                                         (-DDS_MHC_TRUNK_BF16, the same bits, half the trunk traffic and memory;
+#                                         scripts/ds41_build_flags.sh)
 #   GR8_TESTS=0 / GR8_TESTS=only        the GLM engine without the test binaries below it, or the tests alone (CI
 #                                         builds them on separate runners)
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
@@ -31,15 +36,18 @@ K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DP
 # the Rust pack loader (engine/loader-rs), and bin/g6load, which plans and checks the Hugging Face fetch. Where cargo is
 # missing (the CUDA image), build it on the host first: cargo build --release --manifest-path engine/loader-rs/Cargo.toml
 # (g6m4 links target/release/libg6load.a when it exists, and target/release/g6load is copied next to g6m4)
-# The S2 page allocator (engine/kvman-rs) and the knob table's C API (engine/knobs-rs) are not optional: g6m4 always
-# links target/release/libg6kvman.a and libgr8knobs.a, built the same way, and every test that reads a knob links the
-# second.
+# The knob table's C API (engine/knobs-rs) and the host Rust (engine/Cargo.toml: the S2 page allocator in kvman-rs and
+# the S2 scheduling logic in scheduler-rs) are not optional: every engine and test binary links
+# engine/knobs-rs/target/release/libgr8knobs.a and engine/target/release/libg6host.a, built the same way.
+# libgr8knobs.so is the knob table for the launcher.
 if command -v cargo > /dev/null 2>&1; then
-  cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
-  cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
-  cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
+  cargo build --release --locked --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
+  cargo build --release --locked --quiet --manifest-path "$REPO/engine/Cargo.toml"
+  cargo build --release --locked --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
+  cargo rustc --release --locked --quiet --features capi --lib --crate-type cdylib \
+    --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
 fi
-KNOBS=("$REPO/engine/knobs-rs/target/release/libgr8knobs.a" -lpthread -ldl -lm)
+KNOBS=("$REPO/engine/knobs-rs/target/release/libgr8knobs.a" "$REPO/engine/target/release/libg6host.a" -lpthread -ldl -lm)
 # the old G6_ names of these variables still work
 for v in NR WIDTHS TESTS XGRAMMAR XGRAMMAR_LIB NVCC_CACHE NVCC_CACHE_DIR; do
   o=G6_$v n=GR8_$v; if [ -n "${!o:-}" ] && [ -z "${!n:-}" ]; then export "$n=${!o}"; fi
@@ -47,10 +55,9 @@ done
 # request grammars (engine/runtime/grammar.h): XGrammar's C++, the copy the front end's xgrammar crate pins
 # (frontend/g6front-rs/Cargo.lock), so the engine's masks and the front end's checks run one grammar library.
 # GR8_XGRAMMAR=DIR names a source tree instead (the image's engine stages), GR8_XGRAMMAR=0 builds without grammars.
-# Needs cmake; GLM-5.3 only
+# Needs cmake; GLM-5.3 and Flash
 GR_OFF=""
-if [ "${MODEL:-glm}" = flash ]; then GR_OFF="MODEL=flash"
-elif [ "${MODEL:-glm}" = ds41 ]; then GR_OFF="MODEL=ds41"
+if [ "${MODEL:-glm}" = ds41 ] || [ "${MODEL:-glm}" = ink2 ]; then GR_OFF="MODEL=${MODEL}"
 elif [ "${GR8_TESTS:-1}" = only ]; then GR_OFF="GR8_TESTS=only builds no engine"
 elif [ "${GR8_XGRAMMAR:-}" = 0 ]; then GR_OFF="GR8_XGRAMMAR=0"
 fi
@@ -72,11 +79,14 @@ if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
 KNOBSO=$REPO/engine/knobs-rs/target/release/libgr8knobs.so
 if [ -f "$KNOBSO" ]; then mkdir -p "$OUT/lib" && cp "$KNOBSO" "$OUT/lib/"; fi
 # the KV node ./gr8 kv up runs
-KVNODE_BIN=$REPO/engine/kvman-rs/target/release/kvman-remote
+KVNODE_BIN=$REPO/engine/target/release/kvman-remote
 if [ -x "$KVNODE_BIN" ]; then cp "$KVNODE_BIN" "$OUT/"; fi
 # the host ledger of a Flash box that lends memory to a KV node (FLASH_KV_DONATE_GIB)
-LEDGER_BIN=$REPO/engine/kvman-rs/target/release/kvman-ledger
+LEDGER_BIN=$REPO/engine/target/release/kvman-ledger
 if [ -x "$LEDGER_BIN" ]; then cp "$LEDGER_BIN" "$OUT/"; fi
+# the store file service a scale's rewrite reads other boxes' KV stores through (./gr8 <model> scale)
+PEER_BIN=$REPO/engine/target/release/kvman-peer
+if [ -x "$PEER_BIN" ]; then cp "$PEER_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: every width has the multi-session path (DEC_S2)"; exit 2; }
 WIDTHS=${GR8_WIDTHS:-${GR8_NR:-1 2 3 4 5 6 8}}
@@ -93,52 +103,72 @@ widths_ok() {   # widths_ok <g6m4> [<m4sim>]
   done
   echo "$(basename "$1")${2:+ and $(basename "$2")} run TP = $WIDTHS"
 }
+# Shipped image targets stay shell-only: engine-src deliberately excludes the launcher.
+# test_registry.py checks every field against the registry to prevent drift.
+build_meta() {
+  BUILD_ENGINE=g6m4 BUILD_SIM=m4sim BUILD_WIDTHS='1 2 3 4 5 6 8'
+  BUILD_DEFINE= BUILD_FC2GL=6 BUILD_FLAGS_SCRIPT= BUILD_WHAT_ENV=
+  BUILD_INT4=1 BUILD_INT4_ROW=int4g32h BUILD_MARKERS=
+  case "$1" in
+    glm) ;;
+    flash)
+      BUILD_ENGINE=g6m4_flash BUILD_SIM=m4sim_flash BUILD_WIDTHS='1 2 3 4'
+      BUILD_DEFINE=G6_MODEL_FLASH BUILD_FC2GL=4 BUILD_INT4_ROW=int4nope
+      BUILD_MARKERS='flash kv: borrow-idle, %u of
+flash ckpt share: now' ;;
+    ds41)
+      BUILD_ENGINE=g6m4_ds41 BUILD_SIM=m4sim_ds41 BUILD_WIDTHS=4
+      BUILD_DEFINE=G6_MODEL_DS41 BUILD_FC2GL=4 BUILD_INT4=0
+      BUILD_FLAGS_SCRIPT=scripts/ds41_build_flags.sh BUILD_WHAT_ENV=DS41_WHAT ;;
+    ink2)
+      BUILD_ENGINE=g6m4_ink2 BUILD_SIM=m4sim_ink2 BUILD_WIDTHS='1 4 6'
+      BUILD_DEFINE=G6_MODEL_INK2 BUILD_FC2GL=4 BUILD_INT4=0
+      BUILD_WHAT_ENV=INK2_WHAT ;;
+    *)
+      if command -v python3 >/dev/null 2>&1 && [ -f "$REPO/tools/launch/models.py" ]; then
+        local metadata
+        metadata=$(python3 "$REPO/tools/launch/models.py" get "$1" build-shell) || return 2
+        eval "$metadata" # shell-quoted values from our checked-in registry
+      else
+        echo "MODEL=$MODEL: glm, flash, ds41 or ink2" >&2
+        return 2
+      fi ;;
+  esac
+}
+build_meta "${MODEL:-glm}" || exit 2
+WIDTHS=${GR8_WIDTHS:-${GR8_NR:-$BUILD_WIDTHS}}
+fx=${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=$BUILD_FC2GL}
+[ -z "$BUILD_DEFINE" ] || fx="$fx -D$BUILD_DEFINE=1"
+if [ -n "$BUILD_FLAGS_SCRIPT" ]; then fx="$fx $(bash "$REPO/$BUILD_FLAGS_SCRIPT")"; fi
 case "${KV_FORMAT:-fp8}" in
   fp8) ;;
-  int4)   # g6m4 alone, in its own object dir, installed as g6m4-int4 next to the fp8 build
-    WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS -DG6_KV4=1 ${EXTRA:-}" OUT="$OUT/int4" bash build_m4.sh "${ARCH:-121a}" g6
-    mv "$OUT/int4/g6m4" "$OUT/g6m4-int4" && rm -rf "$OUT/int4"
-    strings "$OUT/g6m4-int4" | grep -q int4g32h || { echo "g6m4-int4: not the int4 build (no int4g32h row name)"; exit 1; }
-    md5sum "$OUT/g6m4-int4"
-    widths_ok "$OUT/g6m4-int4"
+  int4)
+    [ "$BUILD_INT4" = 1 ] || { echo "MODEL=${MODEL:-glm}: KV_FORMAT=fp8 only"; exit 2; }
+    obj="$OUT/${MODEL:-glm}-int4"
+    WIDTHS="$WIDTHS" EXTRA="$fx -DG6_KV4=1 ${EXTRA:-}" OUT="$obj" bash build_m4.sh "${ARCH:-121a}" g6
+    mv "$obj/g6m4" "$OUT/$BUILD_ENGINE-int4" && rm -rf "$obj"
+    strings "$OUT/$BUILD_ENGINE-int4" | grep -q "$BUILD_INT4_ROW" || { echo "$BUILD_ENGINE-int4: wrong KV row"; exit 1; }
+    md5sum "$OUT/$BUILD_ENGINE-int4"
+    widths_ok "$OUT/$BUILD_ENGINE-int4"
     exit 0 ;;
   *) echo "KV_FORMAT=$KV_FORMAT: fp8 or int4"; exit 2 ;;
 esac
-case "${MODEL:-glm}" in
-  glm) ;;
-  flash)   # g6m4 and m4sim in their own object dir, installed as g6m4_flash / m4sim_flash next to the GLM build
-    [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=flash: KV_FORMAT=fp8 only"; exit 2; }
-    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-2 3 4}}
-    # PF_FC2GL must divide HID / 128 = 32 (GLM 48: 6); build_m4.sh leaves out PF_F12, which the Flash fp16 MoE refuses
-    WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 ${EXTRA:-}" OUT="$OUT/flash" \
-      bash build_m4.sh "${ARCH:-121a}" all
-    mv "$OUT/flash/m4sim" "$OUT/m4sim_flash" && mv "$OUT/flash/g6m4" "$OUT/g6m4_flash" && rm -rf "$OUT/flash"
-    md5sum "$OUT/m4sim_flash" "$OUT/g6m4_flash"
-    widths_ok "$OUT/g6m4_flash" "$OUT/m4sim_flash"
-    # the Flash serve's own hooks are in the binary (borrow-idle lived in GLM-only code once and no unit test saw it)
-    for m in "flash kv: borrow-idle, %u of" "flash ckpt share: now"; do
-      grep -c -a -F "$m" "$OUT/g6m4_flash" > /dev/null || { echo "$OUT/g6m4_flash lacks '$m'"; exit 1; }
-    done
-    echo "g6m4_flash has its serve hooks"
-    exit 0 ;;
-  ds41)    # g6m4 and m4sim in their own object dir, installed as g6m4_ds41 / m4sim_ds41 next to the GLM build
-    [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=ds41: KV_FORMAT=fp8 only"; exit 2; }
-    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-4}}
-    # PF_FC2GL must divide HID / 128 = 40 (GLM 48: 6; Flash 32: 4; 4 divides 40); build_m4.sh leaves out PF_F12 for every non-GLM model
-    # DS41_WHAT=sim: m4sim only (no g6m4, so no libibverbs and no fabric objects)
-    WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_DS41=1 ${EXTRA:-}" OUT="$OUT/ds41" \
-      bash build_m4.sh "${ARCH:-121a}" "${DS41_WHAT:-all}"
-    if [ "${DS41_WHAT:-all}" = sim ]; then
-      mv "$OUT/ds41/m4sim" "$OUT/m4sim_ds41" && rm -rf "$OUT/ds41"
-      md5sum "$OUT/m4sim_ds41"
-      exit 0
-    fi
-    mv "$OUT/ds41/m4sim" "$OUT/m4sim_ds41" && mv "$OUT/ds41/g6m4" "$OUT/g6m4_ds41" && rm -rf "$OUT/ds41"
-    md5sum "$OUT/m4sim_ds41" "$OUT/g6m4_ds41"
-    widths_ok "$OUT/g6m4_ds41" "$OUT/m4sim_ds41"
-    exit 0 ;;
-  *) echo "MODEL=$MODEL: glm, flash or ds41"; exit 2 ;;
-esac
+if [ -n "$BUILD_DEFINE" ]; then
+  what=all
+  [ -z "$BUILD_WHAT_ENV" ] || what=${!BUILD_WHAT_ENV:-all}
+  obj="$OUT/$MODEL"
+  WIDTHS="$WIDTHS" EXTRA="$fx ${EXTRA:-}" OUT="$obj" bash build_m4.sh "${ARCH:-121a}" "$what"
+  mv "$obj/m4sim" "$OUT/$BUILD_SIM"
+  if [ "$what" = sim ]; then rm -rf "$obj"; md5sum "$OUT/$BUILD_SIM"; exit 0; fi
+  mv "$obj/g6m4" "$OUT/$BUILD_ENGINE" && rm -rf "$obj"
+  md5sum "$OUT/$BUILD_SIM" "$OUT/$BUILD_ENGINE"
+  widths_ok "$OUT/$BUILD_ENGINE" "$OUT/$BUILD_SIM"
+  while IFS= read -r marker; do
+    [ -n "$marker" ] || continue
+    grep -c -a -F "$marker" "$OUT/$BUILD_ENGINE" > /dev/null || { echo "$BUILD_ENGINE lacks '$marker'"; exit 1; }
+  done <<< "$BUILD_MARKERS"
+  exit 0
+fi
 case "${GR8_TESTS:-1}" in 0|1|only) ;; *) echo "GR8_TESTS=$GR8_TESTS: 0, 1 or only"; exit 2 ;; esac
 if [ "${GR8_TESTS:-1}" != only ]; then
   WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
@@ -210,6 +240,20 @@ build dtr_test_tp4 $NVCC -O2 -std=c++17 $GEN $K1H2_FLAGS $f -I "$REPO/engine/ker
 build dtr_test_flash_tp4 $NVCC -O2 -std=c++17 $GEN ${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 \
   -DG6_NR=4 -DDEC_S2 -I "$REPO/engine/kernels" -o "$OUT/dtr_test_flash_tp4" "$REPO/engine/kernels/tests/dtr_test.cu" \
   -lcublas "${KNOBS[@]}"
+# Flash context-parallel decode against the replicated path (TP=2 on one GPU): build only, scripts/c1_tests.sh runs it
+build test_flash_cp $NVCC -O2 -std=c++17 $GEN -DG6_MODEL_FLASH=1 -DG6_KV4=1 -DG6_CP=1 -DDEC_S2 -DG6_NR=2 -DKP_TILE_POOLS=1024 \
+  -o "$OUT/test_flash_cp" "$REPO/engine/tests/test_flash_cp.cu" "${KNOBS[@]}"
+# the DS41 v2 prefill (GR8_DS_PF_V2) GPU tests: each against the stock kernels on synthetic data, one GPU, no model or fabric.
+# Built here (CI's tests leg compiles them), run by scripts/c1_tests.sh (TEST=ds41_v2). ds41_v2_fc2_profile is a profile.
+DS41_V2_TESTS="attn/tests/ds41_v2_attn_test attn/tests/ds41_v2_index_test kernels/tests/ds41_v2_moe_test kernels/tests/ds41_v2_fc2_profile
+runtime/tests/ds41_v2_w16k_test runtime/tests/ds41_v2_engram_test runtime/tests/ds41_v2_ffn_test runtime/tests/ds41_v2_mhc_test runtime/tests/ds41_v2_timing_test
+tests/test_ds41_v2_width tests/test_ds41_v2_wire
+attn/tests/ds41_v2_l20_tail_test tests/test_ds41_v2_send_ffn_opt_gpu tests/test_ds41_v2_s8_combo_gpu"
+for t in $DS41_V2_TESTS; do
+  case $t in *l20_tail_test) x=(-DG6_MODEL_DS41=1 "$REPO/engine/attn/ds41_bind.cu" "$REPO/engine/attn/ds41_attn.cu") ;; *w16k_test|*engram_test|*ffn_test|*send_ffn_opt_gpu|*s8_combo_gpu) x=(-DG6_MODEL_DS41=1 "$REPO/engine/attn/ds41_attn.cu") ;; *) x=() ;; esac   # the shared-expert entries
+  # shellcheck disable=SC2086
+  build "${t##*/}" $NVCC -O2 -std=c++17 $GEN -o "$OUT/${t##*/}" "$REPO/engine/$t.cu" "${x[@]}" "${KNOBS[@]}"
+done
 # TR3 / exlr8-e4m3 decode unit test; runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
 build tr3_e4m3_test $NVCC -O2 -std=c++17 $GEN -o "$OUT/tr3_e4m3_test" "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" \
   -lcublas "${KNOBS[@]}"
@@ -223,6 +267,11 @@ build l2pf_queue_test nvcc -O2 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR
 # shellcheck disable=SC2086
 build k1_split_test nvcc -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_split_test" \
   "$REPO/engine/kernels/tests/k1_split_test.cu" "${KNOBS[@]}"
+# the sampler's uniform draw (u01_top24: 0 < u < 1, a finite Gumbel noise, the old value below 1): host only, runs everywhere
+build sampler_u01_test nvcc -O2 -std=c++17 $GEN -I "$REPO/engine/kernels" -o "$OUT/sampler_u01_test" \
+  "$REPO/engine/kernels/tests/sampler_u01_test.cu"
+# the DFlash2 selector's top-16 ids (dfl_topk.h: a row with no orderable logit sends no id outside the vocabulary): host only
+build dfl_topk_test nvcc -O2 -std=c++17 $GEN -o "$OUT/dfl_topk_test" "$REPO/engine/runtime/tests/dfl_topk_test.cu"
 # flat reduce-scatter slices (Fabric::Rs::flat) over real verbs, mesh or ring: built here, run on the cluster (see its header)
 build fabric_rs_flat_test $NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_rs_flat_test" \
   "$REPO/engine/comms/tests/fabric_rs_flat_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs "${KNOBS[@]}"
@@ -237,13 +286,16 @@ check() {   # check <test>: run $OUT/<test>; print its last line, named, or all 
 }
 check l2pf_queue_test
 check k1_split_test
+check sampler_u01_test
+check dfl_topk_test
 if nvidia-smi -L > /dev/null 2>&1; then
   check tr3_e4m3_test
   for test in $STEERING; do "$OUT/$test"; done
 else
   echo "tr3_e4m3_test and the steering tests ($STEERING): compiled; no GPU visible, not run"
 fi
-echo "dtr_test_tp4, dtr_test_flash_tp4, l2pf_bench, ptab_test_tp<N>, ptab_test_flash_tp4: built (they need release files or an idle GPU)"
+echo "dtr_test_tp4, dtr_test_flash_tp4, l2pf_bench, test_flash_cp, ptab_test_tp<N>, ptab_test_flash_tp4: built (they need release files or an idle GPU)"
+echo "the DS41 v2 GPU tests ($(for t in $DS41_V2_TESTS; do printf '%s ' "${t##*/}"; done | sed 's/ $//')): built; TEST=ds41_v2 scripts/c1_tests.sh runs the 12 tests (ds41_v2_fc2_profile is a profile, built only)"
 echo "fabric_rs_flat_test: built (a cluster test, not run here)"
 [ -f "$GR8_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$GR8_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$GR8_NVCC_CACHE_LOG") miss"
 exit 0

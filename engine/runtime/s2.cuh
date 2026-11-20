@@ -37,6 +37,8 @@
 #include <memory>
 #include <tuple>
 #include "s2_cells.cuh"
+#include "s2/kv_copy_rows.h"
+#include "../kvman-rs/g6kvman.h"
 #include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt
@@ -78,8 +80,14 @@ struct S2Model
     int rp[S2N] = {};                 // per slot, that run's prefix pages: the R it was granted at / 64 (GR8_CP_R2)
     int* table[S2N] = {};             // [nslots] device: the slot's block table, table_cap entries, shared by every layer's view
     int* zero_list = nullptr;         // [pool_pages] device: the pages s2_reset_pages clears
+    uint4** copy_tab = nullptr;       // GR8_KV_SHARE_PAGES: [2 * nl] device: each pool binding's latent and index cache (s2_copy_rows)
+    g6kvcopy::Copy* copy_buf = nullptr;   // [copy_cap] device: one launch's page copies
+    int copy_cap = 0;
     G6AttnStepCell* cells = nullptr;  // [S2N][nl] device
     bool batch = true;                // one attention call per layer for the whole step (false: per session)
+    // with batch: the per-session views' one shared ids [MX][S2_SEL] and output [MX][HMAX][256] (never read, see s2_init)
+    int* view_ids = nullptr;
+    __half* view_out = nullptr;
     G6AttnStepCell* bcells = nullptr; // [nl] device: the batched cells, rows = rowcells + l * MX
     G6AttnRow* rowcells = nullptr;    // [nl][MX] device: per step row, its session's bounds and block table
     const int** tabs = nullptr;       // [S2N][nl] device: the slots' block tables (fixed addresses)
@@ -249,6 +257,13 @@ inline void s2_set_exclusive(Model& m, int q)
     m.s2->exclusive[q] = true;
 }
 
+// the first attention binding's args (Flash: the KDA layers have none)
+inline const G6Attn& s2_args0(const Model& m)
+{
+    for (const Layer& y : m.layers)
+        if (y.ab.storage) return y.ab.args;
+    die("s2: no attention binding");
+}
 // once per model, after build, before any S2 step: nslots session slots (views on the pool). The layers' own bindings
 // stay allocated but unused while s2on.
 inline void s2_init(Model& m, int nslots, cudaStream_t st)
@@ -263,7 +278,6 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
         if (!s->batch && s->graph) die("s2: GR8_TEST_S2_ATTN_PERSESSION=1 bakes the session layout into replay entries; use it without graphs");
 #if G6_MODEL_FLASH
         if (!s->batch) die("s2: Flash runs batched attention only (GR8_TEST_S2_ATTN_PERSESSION=1 is GLM's)");
-        if (m.s2_below) die("s2: Flash has no S2 below R");
 #endif
     }
     s->errs = dmalloc<unsigned*>((size_t)S2N * m.nl);
@@ -290,7 +304,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
         // differs by one page across ranks), so every rank grants the same runs.
         if (m.s2_below % 64 || m.s2_below / 64 > m.s2_run_pages) die("s2: s2_below must be a multiple of 64 and <= the capacity");
         s->run_pages = m.s2_below / 64;
-        const G6Attn& a0 = m.layers[0].ab.args;
+        const G6Attn& a0 = s2_args0(m);
         s->pool_pages = a0.page_count;
 #if defined(G6_CP) && G6_CP
         if (a0.cp_nr)
@@ -316,7 +330,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
 #endif
     }
     // S2 below R: a slot's table spans the layers' tables (a split run past R holds its CP map there, s2_set_exclusive)
-    s->table_cap = m.s2_below ? m.layers[0].ab.args.table_size : s->run_pages;
+    s->table_cap = m.s2_below ? s2_args0(m).table_size : s->run_pages;
     if (s->table_cap < s->run_pages) die("s2: the layers' tables are shorter than one run");
     size_t bytes = 0, vbytes = (size_t)s->pool_pages * 4;
     s->zero_list = dmalloc<int>(s->pool_pages);
@@ -363,10 +377,18 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
             a.table_size = s->table_cap;
             a.page_count = p->args.page_count;
             a.block_table = s->table[q];
-            a.indices = dmalloc<int>((size_t)MX * S2_SEL);
-            a.output = dmalloc<__half>((size_t)MX * a.heads * 256);
+            // with the batch view a session's view runs no attention call (s2_step's callers are the per-session path):
+            // it keeps its table and its reset, and all of them share one ids and output
+            if (s->batch && !s->view_ids)
+            {
+                s->view_ids = dmalloc<int>((size_t)MX * S2_SEL);
+                s->view_out = dmalloc<__half>((size_t)MX * g6nr::HMAX * 256);
+                vbytes += (size_t)MX * S2_SEL * 4 + (size_t)MX * g6nr::HMAX * 256 * 2;
+            }
+            a.indices = s->batch ? s->view_ids : dmalloc<int>((size_t)MX * S2_SEL);
+            a.output = s->batch ? s->view_out : dmalloc<__half>((size_t)MX * a.heads * 256);
             a.error = dmalloc<unsigned>(1);
-            vbytes += (size_t)MX * S2_SEL * 4 + (size_t)MX * a.heads * 256 * 2 + 4;
+            vbytes += (s->batch ? 0 : (size_t)MX * S2_SEL * 4 + (size_t)MX * a.heads * 256 * 2) + 4;
 #if defined(G6_CP) && G6_CP
             a.cp_nr = 0; a.cp_rank = 0;   // S2 below R: replicated path (a no-op on non-CP bindings)
 #endif
@@ -428,8 +450,8 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
 #endif
         }
     }
-    for (const G6AttnBinding* c : s->cbv)
-        if (!c) die("s2: CP and non-CP layers in one model");
+    for (size_t i = 0; i < s->cbv.size(); ++i)   // (Flash: a KDA layer has no binding, so no view)
+        if (!s->cbv[i] && m.layers[i].ab.storage) die("s2: CP and non-CP layers in one model");
     if (s->batch)
     {
         s->rowcells = dmalloc<G6AttnRow>((size_t)m.nl * MX);
@@ -449,7 +471,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     G6RT_CK(g6h2d::copy(s->errs, er.data(), er.size() * sizeof(unsigned*)));
     G6RT_CK(cudaStreamSynchronize(st));
     if (m.rank == 0)
-        fprintf(stderr, "# s2: %d session slots, runs of at most %d pages in a pool of %d pages (%s), %d layers: %.3f GB pool storage, %.3f GB new slot views (%d rows), attention %s\n",
+        fprintf(stderr, "# s2: %d session slots, runs of at most %d pages in a pool of %d pages (%s), %d layers: %.3f GB of their attention storage (allocated at bind), %.3f GB new slot views (%d rows), attention %s\n",
                 nslots, s->run_pages, s->pool_pages, fits ? "contiguous runs, base = slot x run" : "slots unbound until s2_set_pages", m.nl,
                 bytes / 1e9, vbytes / 1e9, MX, s->batch ? "batched (one call per layer)" : "per session");
     m.s2on = true;
@@ -536,6 +558,55 @@ inline void s2_copy_pages(Model& m, const std::vector<std::pair<int, int>>& move
             if (g.index_cache)
                 G6RT_CK(cudaMemcpyAsync((char*)g.index_cache + (size_t)b * ix, (const char*)g.index_cache + (size_t)a * ix, ix, cudaMemcpyDeviceToDevice, st));
         }
+    }
+}
+// GR8_KV_SHARE_PAGES: grid (bindings, copies), block 256: rows [0, rows) of page `from` -> page `to` of binding x's latent
+// and index caches (kv_copy_rows.h). No two copies of one launch write one page or read a page another writes.
+__global__ void __launch_bounds__(256) k_kv_copy_page_rows(uint4* const* tab, const g6kvcopy::Copy* copies)
+{
+    g6kvcopy::copy_page_rows<uint4>(tab[2 * blockIdx.x], tab[2 * blockIdx.x + 1], g6kv::ROW, g6kv::IDX_ROW, copies[blockIdx.y],
+                                    threadIdx.x, blockDim.x);
+}
+// the pool's copy-on-write copies (s2/pool.h RunPool::copies(), in order) on the layers' own bindings: one launch per
+// run of copies whose sources no earlier copy of the run writes. Host, at an admission fence or between rounds, on every
+// rank, main AND draft model, after the store copies (kv_drain) and before anything writes a `to` page.
+inline void s2_copy_rows(Model& m, const std::vector<g6kv_copy>& copies, cudaStream_t st)
+{
+    S2Model& s = *m.s2;
+    if (copies.empty()) return;
+    for (const g6kv_copy& c : copies)
+        if (c.from == c.to || c.rows == 0 || c.rows > 64 || (int)c.from >= s.pool_pages || (int)c.to >= s.pool_pages)
+            die("s2_copy_rows: a copy outside the pool, onto itself or of no rows");
+    const int nb = (int)s.pool.size();
+    if (!s.copy_tab)
+    {
+        std::vector<uint4*> t(2 * nb);
+        for (int l = 0; l < nb; ++l)
+        {
+            t[2 * l] = static_cast<uint4*>(s.pool[l]->args.mla_cache);
+            t[2 * l + 1] = static_cast<uint4*>(s.pool[l]->args.index_cache);
+        }
+        s.copy_tab = dmalloc<uint4*>(t.size());
+        G6RT_CK(cudaMemcpy(s.copy_tab, t.data(), t.size() * sizeof(uint4*), cudaMemcpyHostToDevice));
+    }
+    if ((int)copies.size() > s.copy_cap)
+    {
+        if (s.copy_buf) G6RT_CK(cudaFree(s.copy_buf));
+        s.copy_cap = std::max<int>(64, (int)copies.size());
+        s.copy_buf = dmalloc<g6kvcopy::Copy>(s.copy_cap);
+    }
+    std::vector<g6kvcopy::Copy> h(copies.size());
+    for (size_t i = 0; i < copies.size(); ++i) h[i] = {copies[i].from, copies[i].to, copies[i].rows};
+    G6RT_CK(g6h2d::copy(s.copy_buf, h.data(), h.size() * sizeof(g6kvcopy::Copy), st));
+    size_t i = 0;
+    while (i < h.size())
+    {
+        size_t j = i + 1;
+        auto writes = [&](uint32_t p) { for (size_t k = i; k < j; ++k) if (h[k].to == p) return true; return false; };
+        while (j < h.size() && !writes(h[j].from) && !writes(h[j].to)) ++j;
+        k_kv_copy_page_rows<<<dim3((unsigned)nb, (unsigned)(j - i)), 256, 0, st>>>(s.copy_tab, s.copy_buf + i);
+        G6RT_CK(cudaGetLastError());
+        i = j;
     }
 }
 // re-base slot q's run, keeping its pages (s2_relocate)
@@ -802,19 +873,25 @@ inline void s2_prepare(Model& m, int M, cudaStream_t st)
 #if G6_MODEL_FLASH
     // Flash: today's bound layers of M rows (no row class) and one replay entry per DSA layer on its batch view; the
     // step's rows and the kpool indexer inputs as dsa_step has them, the rows' bounds and tables in the batched cell
+    // A step whose bucket is past R (s2_cp_step) takes the CP batch view's entry instead (flash_dsa.cuh launch_dsa_cp)
     prepare_flash(m, M, st);
     const int bk = s2_bucket(s);
+    const bool cp = s2_cp_step(m);
+#if defined(G6_CP) && G6_CP
+    if (cp && M > m.cp.colls.mmax) die("s2: a CP step of " + std::to_string(M) + " rows exceeds the CP fabric's mmax " + std::to_string(m.cp.colls.mmax));
+#endif
+    auto& map = cp ? s.cbrp : s.brp;
     for (int i = 0; i < m.nl; ++i)
     {
         if (!s.bv[i]) continue;
         const auto key = std::make_tuple(bk, i, M);
-        if (s.brp.count(key)) continue;
+        if (map.count(key)) continue;
         std::unique_ptr<G6AttnReplay> r(new G6AttnReplay());
         memset(r.get(), 0, sizeof *r);
         G6AttnStep a = dsa_step(m, M, M);
         a.s2_batched = 1;
-        G6RT_CK(g6_attn_bind_replay_init(s.bv[i], &a, s.bcells + i, m.bk[bk], r.get(), st));
-        s.brp[key] = std::move(r);
+        G6RT_CK(g6_attn_bind_replay_init(cp ? s.cbv[i] : s.bv[i], &a, s.bcells + i, m.bk[bk], r.get(), st));
+        map[key] = std::move(r);
     }
 #else
     route_ovl_init(m);

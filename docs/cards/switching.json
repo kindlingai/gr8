@@ -1,0 +1,23 @@
+{
+  "title": "Switch models",
+  "subtitle": "seconds from the switch to the new model's /health ready, warm",
+  "models": [
+    {"id": "glm53", "name": "GLM-5.3", "detail": "TP=4 · four DGX Sparks"},
+    {"id": "ds41", "name": "DeepSeek-V4.1-Flash", "detail": "TP=4 · four DGX Sparks"},
+    {"id": "glm53f", "name": "GLM-5.3-Flash", "detail": "TP=2 · two DGX Sparks"}
+  ],
+  "switches": [
+    {"from": "glm53", "to": "ds41", "seconds": [22.227, 24.095]},
+    {"from": "ds41", "to": "glm53", "seconds": [24.81, 24.69]},
+    {"from": "glm53", "to": "glm53f", "seconds": [30.037, 29.408]},
+    {"from": "glm53f", "to": "glm53", "seconds": [22.786, 23.535]},
+    {"from": "ds41", "to": "glm53f", "seconds": [29.937, 29.598]},
+    {"from": "glm53f", "to": "ds41", "seconds": [23.341, 22.449]}
+  ],
+  "command": "./gr8 switch glm53 | ds41 | glm53f",
+  "notes": [
+    "Mean of two warm runs each way (n=2), alternated.",
+    "Four DGX Sparks; GLM-5.3-Flash on two of them.",
+    "./gr8 switch at gr8 d62cb6b, 2026-11-09. DeepSeek: recipe image sha-7c2088a."
+  ]
+}

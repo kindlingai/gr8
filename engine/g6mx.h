@@ -10,7 +10,8 @@
 #define G6_MX 8
 #endif
 #endif
-static_assert(G6_MX >= 8 && G6_MX <= 32 && G6_MX % 8 == 0, "G6_MX: 8, 16, 24 or 32");
+// 40 and 48: the DeepSeek build only (build_m4.sh DS41_MX), so 8 sessions x 6 DSpark verify rows are one step
+static_assert(G6_MX >= 8 && G6_MX <= 48 && G6_MX % 8 == 0, "G6_MX: 8, 16, 24, 32, 40 or 48");
 
 #ifdef __CUDACC__
 #define G6MX_HD __host__ __device__
@@ -30,6 +31,8 @@ constexpr int SLOTS = MX == 8 ? 72 : 8 * MX + 32;
 // default build (NT = 1) has the single N = 1 body. nt < 1 runs N = 1. Host (kernel launches) and device (in-kernel) forms.
 template <int N> struct NTc { static constexpr int value = N; };
 #define G6_NT_DISPATCH_BODY                                                                  \
+    if constexpr (NT >= 6) { if (nt >= 6) { f(NTc<6>()); return; } }                        \
+    if constexpr (NT >= 5) { if (nt >= 5) { f(NTc<5>()); return; } }                        \
     if constexpr (NT >= 4) { if (nt >= 4) { f(NTc<4>()); return; } }                        \
     if constexpr (NT >= 3) { if (nt == 3) { f(NTc<3>()); return; } }                        \
     if constexpr (NT >= 2) { if (nt == 2) { f(NTc<2>()); return; } }                        \

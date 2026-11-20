@@ -1,14 +1,16 @@
 //! Thinking controls: `reasoning_effort`, `thinking_budget` and the `enable_thinking` switch, read the way
 //! TensorFold 0.6.1 reads them (`server/request_options.py`), and the `response_format` guard.
 //!
-//! GLM 5.3's chat template has no way to turn thinking off: it names the efforts low, high and max, and renders
-//! anything else as max. So a request that asks for thinking off gets a 400, unless the front end runs with
-//! `--allow-thinking-off`: then the prompt drops its effort header and closes the think block (`Thinking::off`).
+//! GLM's chat template has no way to turn thinking off: it always opens `<think>` and names the efforts low, high and
+//! max, rendering anything else as max. So a request that turns thinking off (`enable_thinking: false`,
+//! `thinking: false`, `reasoning_effort: "none"`, or `--default-reasoning-effort none`) renders the template's lowest
+//! effort with the think block left open, and sets `Thinking::off` so the reasoning is withheld from the response.
 
 use serde_json::{Map, Value};
 
 use crate::api::ApiError;
 use crate::pyjson;
+use crate::sampling::Limit;
 
 /// The efforts a request may name.
 pub const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -18,9 +20,6 @@ const LADDER: [&str; 6] = ["max", "xhigh", "high", "medium", "low", "minimal"];
 
 const EFFORT_ERROR: &str = "reasoning_effort must be none, minimal, low, medium, high, xhigh or max";
 const BUDGET_ERROR: &str = "thinking_budget must be an integer or null";
-const NO_OFF: &str = "thinking cannot be disabled for this model (its chat template has no switch for it): \
-                      use reasoning_effort \"low\" or a thinking_budget to shorten the reasoning, or start the front \
-                      end with --allow-thinking-off";
 
 /// The efforts named in a chat template: a quoted minimal, low, medium, high, xhigh or max anywhere in its text
 /// (GLM 5.3: low, high and max). Highest first.
@@ -38,12 +37,12 @@ pub fn nearest(effort: &'static str, levels: &[&'static str]) -> &'static str {
     levels.iter().copied().min_by_key(|l| rung(l).map(|i| (i.abs_diff(want), i))).unwrap_or(effort)
 }
 
-/// Parse a server default (`--default-reasoning-effort`). `none` is refused: it would turn thinking off.
+/// Parse a server default (`--default-reasoning-effort`). `none` turns thinking off for requests that name no effort
+/// and no switch.
 pub fn parse_default_effort(s: &str) -> Result<&'static str, String> {
     match EFFORTS.iter().find(|e| **e == s) {
-        Some(&"none") => Err("--default-reasoning-effort none: thinking cannot be turned off for this model".into()),
         Some(e) => Ok(e),
-        None => Err(format!("--default-reasoning-effort {s}: want minimal, low, medium, high, xhigh or max")),
+        None => Err(format!("--default-reasoning-effort {s}: want none, minimal, low, medium, high, xhigh or max")),
     }
 }
 
@@ -52,22 +51,35 @@ pub fn parse_default_effort(s: &str) -> Result<&'static str, String> {
 pub struct Thinking {
     /// The effort the template renders, already one of its names; None: the template's own default.
     pub effort: Option<&'static str>,
-    /// The think block's limit in reply tokens, after which the front end closes it. 0: no limit.
-    pub budget: u64,
+    /// The think block's limit in reply tokens, after which the front end closes it (`budget_tokens`). 0: no limit.
+    pub budget: Limit,
     /// The budget is the request's own positive value, not the server default.
     pub budget_explicit: bool,
-    /// The request turned thinking off and the server allows it: the prompt has no effort header and its think block
-    /// is closed, so the reply starts on content.
+    /// The request (or the server default) turned thinking off. On GLM the prompt renders the lowest effort with the
+    /// think block open, and the response withholds the reasoning.
     pub off: bool,
+}
+
+impl Thinking {
+    /// The budget in reply tokens for a request whose effective max_tokens is `max_tokens`. 0: no limit. A server
+    /// default that scales with max_tokens gives at least 1 token: a tiny max_tokens makes the budget tighter, never
+    /// unlimited, so the close comes first.
+    pub fn budget_tokens(&self, max_tokens: u64) -> u64 {
+        match self.budget {
+            Limit::Tokens(n) => n,
+            limit => limit.resolve(max_tokens).max(1),
+        }
+    }
 }
 
 /// The server defaults (front-end flags), used where a request names nothing.
 #[derive(Clone, Copy, Default)]
 pub struct Defaults {
     pub effort: Option<&'static str>,
-    pub budget: u64,
-    /// `--allow-thinking-off`: `enable_thinking: false` and `reasoning_effort: "none"` turn thinking off instead of
-    /// being refused.
+    /// `--default-thinking-budget`: tokens, a fraction of the request's max_tokens, or both (sampling::Limit)
+    pub budget: Limit,
+    /// `--allow-thinking-off`, kept for existing callers. GLM turns thinking off whatever its value; other dialects
+    /// read it as before.
     pub allow_off: bool,
 }
 
@@ -76,14 +88,11 @@ fn non_null<'a>(m: Option<&'a Map<String, Value>>, k: &str) -> Option<&'a Value>
 }
 
 /// Read `reasoning_effort` (top level, else `chat_template_kwargs.reasoning_effort`, where vLLM's clients put it),
-/// `chat_template_kwargs.enable_thinking` and `thinking_budget`.
+/// the `chat_template_kwargs.enable_thinking` / `thinking` switch and `thinking_budget`.
 pub fn resolve(body: &Map<String, Value>, levels: &[&'static str], defaults: Defaults) -> Result<Thinking, ApiError> {
     let kw = body.get("chat_template_kwargs").and_then(Value::as_object);
-    // an explicit off is a 400 unless the server allows it
-    let switch = non_null(kw, "enable_thinking").map(|v| pyjson::truthy(Some(v)));
-    if switch == Some(false) && !defaults.allow_off {
-        return Err(ApiError::bad(format!("enable_thinking false: {NO_OFF}"), Some("chat_template_kwargs")));
-    }
+    // enable_thinking wins over thinking when both are set
+    let switch = non_null(kw, "enable_thinking").or_else(|| non_null(kw, "thinking")).map(|v| pyjson::truthy(Some(v)));
     let explicit = match non_null(Some(body), "reasoning_effort").or_else(|| non_null(kw, "reasoning_effort")) {
         None => None,
         Some(v) => match v.as_str().and_then(|s| EFFORTS.iter().find(|e| **e == s)) {
@@ -91,37 +100,28 @@ pub fn resolve(body: &Map<String, Value>, levels: &[&'static str], defaults: Def
             None => return Err(ApiError::bad(EFFORT_ERROR, Some("reasoning_effort"))),
         },
     };
-    let explicit = match explicit {
-        // as TensorFold: an explicit enable_thinking true wins over "none", which then names no effort
-        Some("none") if switch == Some(true) => None,
-        Some("none") if defaults.allow_off => None,
-        Some("none") => {
-            return Err(ApiError::bad(
-                format!("reasoning_effort \"none\" asks for no thinking: {NO_OFF}"),
-                Some("reasoning_effort"),
-            ))
-        }
-        e => e,
-    };
-    let off = defaults.allow_off && (switch == Some(false) || (switch.is_none() && explicit_none(body, kw)));
-    if off {
-        return Ok(Thinking { effort: None, budget: 0, budget_explicit: false, off });
-    }
-    let effort = explicit.or(defaults.effort).map(|e| nearest(e, levels));
     // TensorFold: int(budget or default), and a budget <= 0 is no limit. So 0 and null take the server default, and a
-    // negative budget is no limit even when the server has a default.
+    // negative budget is no limit even when the server has a default. Checked even when thinking is off.
     let (budget, budget_explicit) = match parse_budget(body.get("thinking_budget"))? {
         None | Some(0) => (defaults.budget, false),
-        Some(n) if n < 0 => (0, false),
-        Some(n) => (n as u64, true),
+        Some(n) if n < 0 => (Limit::Tokens(0), false),
+        Some(n) => (Limit::Tokens(n as u64), true),
     };
-    Ok(Thinking { effort, budget, budget_explicit, off: false })
-}
-
-/// The request names `reasoning_effort: "none"`, at the top level or in `chat_template_kwargs`.
-fn explicit_none(body: &Map<String, Value>, kw: Option<&Map<String, Value>>) -> bool {
-    non_null(Some(body), "reasoning_effort").or_else(|| non_null(kw, "reasoning_effort")).and_then(Value::as_str)
-        == Some("none")
+    // as TensorFold: an explicit switch wins over "none"; an explicit effort wins over the server default
+    let off = match switch {
+        Some(on) => !on,
+        None if explicit == Some("none") => true,
+        None if explicit.is_some() => false,
+        None => defaults.effort == Some("none"),
+    };
+    let effort = if off {
+        Some(nearest("low", levels))
+    } else {
+        let explicit = explicit.filter(|e| *e != "none");
+        let default_effort = defaults.effort.filter(|e| *e != "none");
+        explicit.or(default_effort).map(|e| nearest(e, levels))
+    };
+    Ok(Thinking { effort, budget, budget_explicit, off })
 }
 
 /// `thinking_budget`: None when absent or null. TensorFold parses it with int(): an integer, a float with no
@@ -246,58 +246,129 @@ mod tests {
     }
 
     #[test]
-    fn thinking_off_is_a_400() {
-        for off in [json!(false), json!(0), json!("")] {
-            let (m, p) = err(json!({"chat_template_kwargs": {"enable_thinking": off}}));
-            assert!(m.contains("thinking cannot be disabled") && m.contains("thinking_budget"), "{m}");
-            assert_eq!(p.as_deref(), Some("chat_template_kwargs"));
+    fn thinking_off_renders_the_lowest_effort_even_without_allow_off() {
+        let mut offs = vec![];
+        for v in [json!(false), json!(0), json!("")] {
+            offs.push(json!({"chat_template_kwargs": {"enable_thinking": v}}));
+            offs.push(json!({"chat_template_kwargs": {"thinking": v}}));
         }
-        let (m, p) = err(json!({"reasoning_effort": "none"}));
-        assert!(m.contains("\"none\" asks for no thinking") && m.contains("\"low\""), "{m}");
-        assert_eq!(p.as_deref(), Some("reasoning_effort"));
-        err(json!({"chat_template_kwargs": {"reasoning_effort": "none"}}));
-        // on or unset is fine. An explicit on wins over "none" (TensorFold)
-        for on in [json!(true), json!(null)] {
-            assert!(resolve_v(json!({"chat_template_kwargs": {"enable_thinking": on}})).is_ok());
+        offs.push(json!({"reasoning_effort": "none"}));
+        offs.push(json!({"chat_template_kwargs": {"reasoning_effort": "none"}}));
+        for d in [Defaults::default(), Defaults { allow_off: true, ..Defaults::default() }] {
+            for b in &offs {
+                let t = resolve(&body(b.clone()), &GLM, d).unwrap_or_else(|_| panic!("{b} refused"));
+                assert_eq!((t.effort, t.off), (Some("low"), true), "{b}");
+            }
         }
-        let on_none = json!({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": true}});
-        assert_eq!(resolve_v(on_none).unwrap().effort, None);
+        // the server default none turns thinking off for a request that names nothing
+        let none = Defaults { effort: Some("none"), budget: Limit::Tokens(512), allow_off: false };
+        assert_eq!(
+            resolve(&body(json!({})), &GLM, none).unwrap(),
+            Thinking { effort: Some("low"), budget: Limit::Tokens(512), budget_explicit: false, off: true }
+        );
+        // the lowest level the template names: none of the low rungs gives the lowest one there is
+        let t = resolve(&body(json!({"reasoning_effort": "none"})), &["max", "high"], Defaults::default()).unwrap();
+        assert_eq!((t.effort, t.off), (Some("high"), true));
     }
 
     #[test]
-    fn allow_off_turns_thinking_off() {
-        let allow = Defaults { effort: Some("high"), budget: 512, allow_off: true };
-        let r = |b: Value| resolve(b.as_object().unwrap(), &["max", "high", "low"], allow).unwrap();
-        let off = Thinking { effort: None, budget: 0, budget_explicit: false, off: true };
-        assert_eq!(r(json!({"chat_template_kwargs": {"enable_thinking": false}})), off);
-        assert_eq!(r(json!({"reasoning_effort": "none"})), off);
-        assert_eq!(r(json!({"chat_template_kwargs": {"reasoning_effort": "none"}})), off);
-        // an explicit on still wins over "none" (which then names no effort, so the default applies), and a request
-        // that names nothing keeps the defaults
-        let on_none = r(json!({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": true}}));
-        assert!(!on_none.off && on_none.effort == Some("high"));
-        assert_eq!(r(json!({})), Thinking { effort: Some("high"), budget: 512, budget_explicit: false, off: false });
+    fn an_explicit_switch_or_effort_wins_over_none() {
+        let none = Defaults { effort: Some("none"), budget: Limit::Tokens(0), allow_off: false };
+        let r = |b: Value, d: Defaults| resolve(&body(b), &GLM, d).unwrap();
+        // enable_thinking wins over thinking when both are set
+        let both = json!({"chat_template_kwargs": {"enable_thinking": true, "thinking": false}});
+        assert!(!r(both, Defaults::default()).off);
+        let both = json!({"chat_template_kwargs": {"enable_thinking": false, "thinking": true}});
+        assert!(r(both, Defaults::default()).off);
+        let both = json!({"chat_template_kwargs": {"enable_thinking": null, "thinking": false}});
+        assert!(r(both, Defaults::default()).off);
+        for key in ["enable_thinking", "thinking"] {
+            for d in [Defaults::default(), none] {
+                let t = r(json!({"reasoning_effort": "none", "chat_template_kwargs": {key: true}}), d);
+                assert_eq!((t.off, t.effort), (false, None), "{key}");
+                let t = r(json!({"chat_template_kwargs": {key: true}}), d);
+                assert_eq!((t.off, t.effort), (false, None), "{key}");
+            }
+        }
+        // an explicit effort wins over the server default none
+        let t = r(json!({"reasoning_effort": "high"}), none);
+        assert_eq!((t.off, t.effort), (false, Some("high")));
+        let t = r(json!({"chat_template_kwargs": {"reasoning_effort": "medium"}}), none);
+        assert_eq!((t.off, t.effort), (false, Some("high")));
+        // an explicit on with a real default keeps the default
+        let high = Defaults { effort: Some("high"), budget: Limit::Tokens(0), allow_off: false };
+        let t = r(json!({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": true}}), high);
+        assert_eq!((t.off, t.effort), (false, Some("high")));
+    }
+
+    #[test]
+    fn a_bad_budget_is_a_400_even_when_thinking_is_off() {
+        for v in [json!("abc"), json!(true), json!(1.5)] {
+            for b in [
+                json!({"chat_template_kwargs": {"enable_thinking": false}, "thinking_budget": v}),
+                json!({"chat_template_kwargs": {"thinking": false}, "thinking_budget": v}),
+                json!({"reasoning_effort": "none", "thinking_budget": v}),
+            ] {
+                let (m, p) = err(b);
+                assert_eq!((m.as_str(), p.as_deref()), (BUDGET_ERROR, Some("thinking_budget")), "{v}");
+            }
+        }
+        // a good budget is kept when thinking is off
+        let t = resolve_v(json!({"reasoning_effort": "none", "thinking_budget": 64})).unwrap();
+        assert_eq!((t.off, t.budget, t.budget_explicit), (true, Limit::Tokens(64), true));
     }
 
     #[test]
     fn the_server_defaults_fill_what_the_request_leaves_out() {
-        let d = Defaults { effort: Some("medium"), budget: 512, allow_off: false };
+        let d = Defaults { effort: Some("medium"), budget: Limit::Tokens(512), allow_off: false };
         let r = resolve(&body(json!({})), &GLM, d).unwrap();
-        assert_eq!(r, Thinking { effort: Some("high"), budget: 512, budget_explicit: false, off: false });
+        assert_eq!(
+            r,
+            Thinking { effort: Some("high"), budget: Limit::Tokens(512), budget_explicit: false, off: false }
+        );
         // 0 and null take the default, as in TensorFold; a negative budget is no limit; a positive one wins
         for b in [json!(0), json!(null), json!("0")] {
             let r = resolve(&body(json!({"reasoning_effort": "low", "thinking_budget": b})), &GLM, d).unwrap();
-            assert_eq!(r, Thinking { effort: Some("low"), budget: 512, budget_explicit: false, off: false }, "{b}");
+            assert_eq!(
+                r,
+                Thinking { effort: Some("low"), budget: Limit::Tokens(512), budget_explicit: false, off: false },
+                "{b}"
+            );
         }
         let r = resolve(&body(json!({"thinking_budget": -1})), &GLM, d).unwrap();
-        assert_eq!((r.budget, r.budget_explicit), (0, false));
+        assert_eq!((r.budget, r.budget_explicit), (Limit::Tokens(0), false));
         let r = resolve(&body(json!({"thinking_budget": 64})), &GLM, d).unwrap();
-        assert_eq!((r.budget, r.budget_explicit), (64, true));
+        assert_eq!((r.budget, r.budget_explicit), (Limit::Tokens(64), true));
         let r = resolve(&body(json!({"thinking_budget": -1})), &GLM, Defaults::default()).unwrap();
-        assert_eq!(r.budget, 0);
+        assert_eq!(r.budget, Limit::Tokens(0));
         assert_eq!(parse_default_effort("xhigh"), Ok("xhigh"));
-        assert!(parse_default_effort("none").is_err());
+        assert_eq!(parse_default_effort("none"), Ok("none"));
         assert!(parse_default_effort("auto").is_err());
+    }
+
+    #[test]
+    fn a_default_budget_resolves_against_the_request_s_max_tokens() {
+        let limit = Limit::parse("32768|0.8x").unwrap();
+        let d = Defaults { effort: None, budget: limit, allow_off: false };
+        let r = resolve(&body(json!({})), &GLM, d).unwrap();
+        assert_eq!((r.budget, r.budget_explicit), (limit, false));
+        assert_eq!(r.budget_tokens(8192), 6554);
+        assert_eq!(r.budget_tokens(40000), 32000);
+        assert_eq!(r.budget_tokens(200000), 32768);
+        // a request's own budget is a token count whatever max_tokens is
+        let r = resolve(&body(json!({"thinking_budget": 64})), &GLM, d).unwrap();
+        assert_eq!((r.budget_tokens(8192), r.budget_explicit), (64, true));
+        assert_eq!(resolve(&body(json!({"thinking_budget": -1})), &GLM, d).unwrap().budget_tokens(8192), 0);
+        // 0 alone is no limit; a fraction that rounds to 0 is 1 (the close comes first), not no limit
+        let t = |s: &str, max_tokens: u64| {
+            let d = Defaults { effort: None, budget: Limit::parse(s).unwrap(), allow_off: false };
+            resolve(&body(json!({})), &GLM, d).unwrap().budget_tokens(max_tokens)
+        };
+        assert_eq!(t("0", 8192), 0);
+        assert_eq!(t("4096", 100), 4096);
+        assert_eq!(t("0.1x", 4), 1);
+        assert_eq!(t("32768|0.8x", 1), 1);
+        assert_eq!(t("0.5x", 8192), 4096);
     }
 
     #[test]

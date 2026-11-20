@@ -104,10 +104,16 @@ struct RoScratch                                      // read-once path, M RO_FR
     __nv_bfloat16* tc_y13 = nullptr;   // [ROMAX][2 IW] fc1 out (gate | up), bf16
     uint8_t* tc_ac = nullptr;     //   [ROMAX][SH_KP] act codes (k >= IW: 0)
     uint8_t* tc_as = nullptr;     //   [ROMAX][SH_KP/32] their E8M0 bytes
+    // GR8_DS_MOE_TC=1 only (else null): the routed experts' MXFP8 activations (ds_moe_tc.cuh layouts)
+    uint8_t* mt_xq = nullptr;     // [ROMAX][HID/64][64] hc_y quantized
+    uint8_t* mt_xs = nullptr;     // [ROMAX][HID/32] its E8M0 bytes
+    uint8_t* mt_aq = nullptr;     // [tiles*8][IW/64][64] fc1's act quantized
+    uint8_t* mt_as = nullptr;     // [tiles*8][mxtc::ASP]
+    int* mt_cnt = nullptr;        // [ROMAX][moe_tc_os2()] the fused combine's route counts (DS41_TC_COMBINE); null = k_combine_mt runs after fc2
 };
 struct Scratch
 {
-    dsr::ExpertLog* elog = nullptr;   // distinct-expert ring (ds_ro.h), written by every prefill router call (rows > 32); read with elog_read
+    dsr::ExpertLog* elog = nullptr;   // distinct-expert ring (ds_ro.h), written by eager prefill router calls (rows > 32); read with elog_read
     RoScratch* ro = nullptr;   // set by prepare_moe(M >= RO_FROM)
     PwScratch* pw = nullptr;   // set by prepare_moe(M > MTMAX)
     float* logits;          // [32][NE] gate logits
@@ -117,6 +123,14 @@ struct Scratch
     __half* ypart;          // [SMAX][8][HID] routed fc2 -> combine
     __half* sh_act;         // [32][IW]
     float* sh_out;          // [32][HID] shared expert out, kept ST_SHARED -> ST_EXPERTS
+    // trellis layers (docs/DS41-TRELLIS.md)
+    __half* x16 = nullptr;  // [MTMAX][HID] the K1 input: hc_y rows in fp16
+    int* tile_ex = nullptr; // [SMAX] expert of each tile of the M 9..32 plan, then [SMAX] its tile count
+    // prefill above MTMAX rows: the GLM prefill MoE scratch for pf_rows rows and their fp16 input (prepare_moe)
+    ::bindp::Scratch pf{};
+    char* pf_blk = nullptr;
+    __half* pf_x16 = nullptr;
+    int pf_rows = 0;
 };
 struct LayerState
 {
@@ -124,15 +138,27 @@ struct LayerState
     int layer = 0;                           // checkpoint layer number (the counter's record)
     const __nv_bfloat16* gate = nullptr;     // [NE][HID]
     const float* bias = nullptr;             // [NE] e_score_correction_bias (selection only)
+    const float* bias_vl = nullptr;          // [NE] gate.bias_vl, image rows' selection bias (DS41 vision); null = none bound
     const uint8_t *sh_w1 = nullptr, *sh_w3 = nullptr, *sh_w2 = nullptr;   // MXFP8 gv records of the shared expert's I-slice
     const uint8_t *fc1 = nullptr, *fc2 = nullptr;                          // MXFP4 mx4g records of all NE experts' I-slice
     Scratch* sc = nullptr;
     // GR8_DS_SH_TC=1 only (else null): plain copies of the shared expert for ds41_gemm_mx_tc, made once at bind from the records (which decode keeps)
     const uint8_t *tc_w13 = nullptr, *tc_sw13 = nullptr;   // [2 IW][HID] codes (rows 0..IW-1 gate, IW..2IW-1 up) + [2 IW][HID/32] E8M0
     const uint8_t *tc_w2 = nullptr, *tc_sw2 = nullptr;     // [HID][SH_KP] codes (k >= IW: 0) + [HID][SH_KP/32] E8M0 (k blocks >= IW/32: 0)
+    // exlr8 trellis experts (the layer has tr3.table): the K1 kernels run its routed and shared experts, and the MXFP4 / FP8
+    // records above stay null
+    ::bind::LayerTensors* tr = nullptr;
 };
 
 inline bool elog_on() { return knob::ds_moe_elog(); }   // the distinct-expert counter (GR8_DS_MOE_ELOG, default on)
+// Log eager prefill only: startup graphs can be captured with the decode flag
+// false, but replay as decode or verification steps. Never bake log nodes in.
+inline bool elog_step_on(const Model& m, cudaStream_t st)
+{
+    if (!elog_on() || m.ds_moe_decode_step) return false;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing(st, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone;
+}
 inline bool pdl_on() { return knob::ds_moe_pdl(); }
 // GR8_DS_SH_TC=1 (default 0): the shared expert of the read-once path (rows >= RO_FROM) runs
 // act_quant(hc_y) -> TC GEMM fc1 (M x 2IW x HID) -> k_sh_swiglu_q -> TC GEMM fc2 (M x HID x SH_KP) -> bf16 Y, and the combine reads that bf16 Y (k_combine_mt_shb).
@@ -178,6 +204,25 @@ inline int ro_fc2stg() { return knob::ds_moe_fc2stg() ? 1 : 0; }
 // GR8_DS_MOE_FC1BSTG=0|1 (default off): the read-once fc1 kernel copies its
 // FP16 B fragments to a two-record cp.async shared ring before the same MMA.
 inline int ro_fc1bstg() { return knob::ds_moe_fc1bstg() ? 1 : 0; }
+// GR8_DS_MOE_TC=1 (default off): the read-once routed experts (rows >= RO_FROM) run mxtc::k_fc1_tc / k_fc2_tc (ds_moe_tc.cuh) on the block-scaled tensor
+// cores: the MXFP4 records as stored x MXFP8 activations (k_xq rounds hc_y, k_aq rounds fc1's act), fp32 accumulate. The planner, the fp16 act / ypart
+// layouts and the combine are the fp16 loop's. Not bit-equal to the fp16 loop (the activation rounding and the tensor cores' sum order); a configuration
+// choice, as GR8_DS_ATTN_TC. The shape is DS41_TC_* (ds_ro_cfg.h). Decode, the M <= 256 paths and the shared expert are not touched.
+inline bool moe_tc_on() { return knob::ds_moe_tc(); }
+// GR8_DS_MOE_TC_OS2 (default 0 = DS41_TC_OS2, 16): the CTAs k_fc2_tc splits an expert's 40 output blocks over (a slice at a time, os the slowest block index).
+// More slices = a smaller set of ypart slots live in L2 between fc2's stores and the fused combine's loads, and more re-reads of the act rows. fc2's sums and
+// the combine's route order do not depend on it, so every value gives the same output bits (tests/ds_moe_tc_bench.cu -DMXTC_OS2=N: bitEq yes).
+constexpr int MOE_TC_OS2_MAX = 40;
+inline int moe_tc_os2()
+{
+    static const int v = []
+    {
+        const int k = (int)knob::ds_moe_tc_os2(), n = k >= 1 && k <= MOE_TC_OS2_MAX ? k : DS41_TC_OS2;
+        if (k != 0) fprintf(stderr, "# DS41 GR8_DS_MOE_TC_OS2=%d: fc2 output slices %d\n", k, n);   // first use, a line a rank (nothing when 0)
+        return n;
+    }();
+    return v;
+}
 // The top-k cut GR8_DS_MOE_TOPK (quality not measured): routed experts kept per token on the main layers (384 experts). Default dsr::TOPK.
 // The kept routes are the planner's first KC picks (best biased key first); the weights renormalize over
 // them (sum of the kept scores, x ROUTE_SCALE). The DSpark draft layers (128 experts, top-3) keep their k. GR8_MOE_TOPK is the Flash model's knob, so it is not
@@ -242,10 +287,146 @@ inline Scratch* scratch_of(const Model* m)
         s->ypart = dmalloc<__half>((size_t)SMAX * 8 * HID);
         s->sh_act = dmalloc<__half>((size_t)MTMAX * IW);
         s->sh_out = dmalloc<float>((size_t)MTMAX * HID);
+        s->x16 = dmalloc<__half>((size_t)MTMAX * HID);
+        s->tile_ex = dmalloc<int>(2 * (size_t)SMAX);
         s->elog = dmalloc<dsr::ExpertLog>(1);
         cudaMemset(s->elog, 0, sizeof(dsr::ExpertLog));
     }
     return s;
+}
+
+// ---------------------------------------------------------------------------------------- trellis layers
+// docs/DS41-TRELLIS.md. The K1 kernels (k1.cuh) run the routed experts and the trellis shared expert (tr3.table row 384) of
+// the 128-blocks this rank owns, and their finalize writes the BF16 partial to part[1] with the plan's weights.
+__global__ void k_tr_x16(const __nv_bfloat16* x, __half* y, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half_rn(__bfloat162float(x[i]));
+}
+// M 9..32: a K1 slot is a tile of the plan, so each tile needs its expert, and the slot count is the tile count
+__global__ void k_tr_tiles(const dsr::PlanMT<dsr::TOPK, MTMAX>* P, int* tile_ex, int* n_tiles)
+{
+    for (int s = threadIdx.x; s < P->n_slots; s += blockDim.x)
+        for (int j = 0; j < P->slot_nt[s]; ++j) tile_ex[P->slot_tile0[s] + j] = P->slot_expert[s];
+    if (threadIdx.x == 0) *n_tiles = P->n_tiles;
+}
+
+inline const char* bind_trellis(LayerState& s, const Find& find, int l)
+{
+    s.tr = new ::bind::LayerTensors(::bind::layer_tensors(l, [&](const char* n) {
+        const TensorRef r = find(n);
+        ::bind::Tensor t;
+        t.p = r.p; t.nd = r.nd; t.fmt = r.fmt;
+        for (int k = 0; k < 4; ++k) t.shape[k] = r.shape[k];
+        return t;
+    }));
+    if (const char* e = ::bind::scan_widths(*s.tr)) return e;
+    if (!s.tr->sh_trellis) return "trellis layer without the trellis shared expert (tr3.table row 384)";
+    static const cudaError_t attr = [] {
+        cudaError_t err = cudaSuccess;
+        ::bind::k1_each([&](auto E4, auto K2, auto SH, auto CB) {
+            for (const void* f : {::bind::k1_fn_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>(), ::bind::k1_fn_fc2<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>()})
+            {
+                const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
+                if (err == cudaSuccess) err = e;
+            }
+        });
+        return err;
+    }();
+    return attr == cudaSuccess ? nullptr : "cannot set the K1 kernels' shared memory size";
+}
+
+// n <= MTMAX rows of x (bf16, routed by the plan in sc->plan) through K1, the partial to out (BF16 [n][HID])
+inline int k1_rows(Model& m, const LayerState& s, const void* x, int n, void* out, cudaStream_t st)
+{
+    Scratch& sc = *s.sc;
+    k_tr_x16<<<(n * HID + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)x, sc.x16, n * HID);
+    ::bind::PlanPtrs pp;
+    if (n <= MMAX) pp = ::bind::plan_ptrs((const dsr::PlanT<dsr::TOPK>*)sc.plan);
+    else
+    {
+        using P = dsr::PlanMT<dsr::TOPK, MTMAX>;
+        const P* p = (const P*)sc.plan;
+        k_tr_tiles<<<1, 256, 0, st>>>(p, sc.tile_ex, sc.tile_ex + SMAX);
+        pp.n_slots = sc.tile_ex + SMAX; pp.slot_expert = sc.tile_ex; pp.slot_mask = p->tile_mask;
+        pp.slot_w = &p->tile_w[0][0]; pp.slot_tok = &p->tile_tok[0][0];
+        pp.tok_slot = &p->tok_slot[0][0]; pp.tok_col = &p->tok_col[0][0]; pp.tok_w = &p->tok_w[0][0];
+    }
+    ::bind::K1 k;
+    ::bind::Tensor sh_out[3];
+    if (const char* e = ::bind::make_k1(*s.tr, n, m.sc, sc.x16, sc.xfrag, pp, out, 1, k, sh_out))
+    {
+        fprintf(stderr, "DS41 MoE layer %d, %d rows: %s\n", s.layer, n, e);
+        return ds41::NOTSUP;
+    }
+    if (k.fuse) ::bind::launch_k1_fused(k, st);
+    else
+    {
+        ::bind::launch_k1_fc1(k, st);
+        ds41_span_mark("k1_fc1", st);
+        ::bind::launch_k1_fc2(k, st);
+        ds41_span_mark("k1_fc2", st);
+    }
+    ::bind::launch_k1_fin(k, st);
+    return (int)cudaGetLastError();
+}
+
+// M 33..256 and the read-once rows come with DS41's plan of that size (op_router); its tokens' experts and weights (the 1.5
+// route scale included) become the GLM prefill MoE's routes (bindp::Expert, pre_routed), which reads each expert's units once
+// per segment of up to RS rows. The trellis shared expert runs as its own pass first (bindp::launch_shared, weight 1), and the
+// routed pass's finalize adds it, writing the BF16 partial to part[1].
+template <int MM>
+__global__ void k_tr_routes(const dsr::PlanMT<dsr::TOPK, MM>* P, int M, int* tok_e, float* tok_w)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= M * dsr::TOPK) return;
+    const int m = i / dsr::TOPK, k = i % dsr::TOPK;
+    const bool live = P->tok_slot[m][k] >= 0;
+    tok_e[i] = live ? P->tok_expert[m][k] : -1;
+    tok_w[i] = live ? P->tok_w[m][k] : 0.f;
+}
+
+inline int trellis_prefill(Model& m, const LayerState& s, int rows, cudaStream_t st)
+{
+    static_assert(dsr::TOPK == geom::TOPK && dsr::NEXP == geom::NEXP, "bindp routes are [M][geom::TOPK] over geom::NEXP experts");
+    Scratch& sc = *s.sc;
+    if (rows > sc.pf_rows) return ds41::NOTSUP;
+    const ::bindp::Scratch& q = sc.pf;
+    k_tr_x16<<<(rows * HID + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)m.hc_y, sc.pf_x16, rows * HID);
+    const int g = (rows * dsr::TOPK + 255) / 256;
+    if (rows >= RO_FROM) k_tr_routes<ROMAX><<<g, 256, 0, st>>>((const dsr::PlanMT<dsr::TOPK, ROMAX>*)sc.ro->plan, rows, q.tok_e, q.tok_w);
+    else if (rows <= 128) k_tr_routes<128><<<g, 256, 0, st>>>((const dsr::PlanMT<dsr::TOPK, 128>*)sc.pw->plan, rows, q.tok_e, q.tok_w);
+    else k_tr_routes<256><<<g, 256, 0, st>>>((const dsr::PlanMT<dsr::TOPK, 256>*)sc.pw->plan, rows, q.tok_e, q.tok_w);
+    const ::bind::LayerTensors& T = *s.tr;
+    using namespace ::bind;
+    ::bindp::Expert A;
+    A.on = 1; A.M = rows; A.maxseg = ::bindp::max_segments(rows);
+    A.topk = topk_for_step(m); A.nroutes = rows * A.topk; A.pre_routed = 1;
+    A.tok_e = q.tok_e; A.tok_w = q.tok_w; A.cnt = q.cnt;
+    A.rr_row = q.rr_row; A.rr_e = q.rr_e; A.rr_sp = q.rr_sp; A.rr_w = q.rr_w; A.pos = q.pos; A.segs = q.segs; A.n_seg = q.n_seg;
+    A.t_tab = (const long long*)T.t[T_TR3_TAB].p; A.t_kmix = (const long long*)T.t[T_TR3_KMIX].p;
+    A.k2 = T.k2; A.cb = T.cb; A.bs = 1;
+    A.t_fc1 = (const uint8_t*)T.t[T_TR3_FC1].p; A.t_wide = T.fc1_wide; A.t_fc2 = (const uint8_t*)T.t[T_TR3_FC2].p; A.t_wide2 = T.fc2_wide;
+    A.t_v2 = (const __half*)T.t[T_TR3_V2].p;
+    A.t_sg = (const __half*)T.t[T_TR3_SG].p; A.t_v1b = (const __half*)T.t[T_TR3_V1B].p; A.t_v3b = (const __half*)T.t[T_TR3_V3B].p;
+    A.x = sc.pf_x16; A.ldx = HID;
+    A.z1 = q.z1; A.x2 = q.x2; A.yw = q.yw; A.ysh = q.ysh; A.out = (uint16_t*)m.sc.part[1];
+    ::bindp::Expert S = A;
+    S.nroutes = rows; S.maxseg = (rows + ::bindp::RS - 1) / ::bindp::RS;
+    S.rr_row = q.sh_rr_row; S.rr_e = q.sh_rr_e; S.rr_sp = q.sh_rr_sp; S.rr_w = q.sh_rr_w;
+    S.segs = q.sh_segs; S.n_seg = q.sh_n_seg; S.pos = nullptr; S.yw = q.ysh;
+    ::bindp::launch_shared<g6nr::EB>(S, st);
+    ds41_span_mark("tr_shared", st);
+    ::bindp::launch_route(A, st);
+    ds41_span_mark("tr_route", st);
+    ::bindp::launch_fc1<g6nr::EB>(A, st);
+    ds41_span_mark("tr_fc1", st);
+    ::bindp::launch_mid<g6nr::EB>(A, st);
+    ds41_span_mark("tr_mid", st);
+    ::bindp::launch_fc2<g6nr::EB>(A, st);
+    ds41_span_mark("tr_fc2", st);
+    ::bindp::launch_fin(A, st);
+    return (int)cudaGetLastError();
 }
 
 // bind_moe(model, i, 0, stream): resolve and shape-check the layer's tensors, once, at build.
@@ -299,10 +480,27 @@ inline int bind_moe(void* model, int i, int, void*)
         if (first)
             fprintf(stderr, "# rank %d DS41 GR8_DS_MOE_FC1BSTG=%d k_fc1_ro_bstg=%d\n", m.rank, g, g);
     }
+    {   // GR8_DS_MOE_TC: same rule, its own boot line (the shape, for boot checks)
+        const int g = moe_tc_on() ? 1 : 0;
+        bool first = true;
+        for (int j = 0; j < i; ++j) if (m.layers[j].moe) first = false;
+        if (first)
+            fprintf(stderr, "# rank %d DS41 GR8_DS_MOE_TC=%d fc1 cw%d ntg%d st%d gy%d fc2 w%d wt%d tpc%d st%d gy%d os%d\n", m.rank, g, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_GY1,
+                    DS41_TC_W2, DS41_TC_WT, DS41_TC_TPC, DS41_TC_ST2, DS41_TC_GY2, moe_tc_os2());
+    }
     LayerState* s = new LayerState();
     s->ne = ne; s->tk = ne == dsr::NEXP ? dsr::TOPK : geom::DS_TOPK; s->layer = y.l;
     s->gate = (const __nv_bfloat16*)get("router.w", 2, {ne, HID}, 1).p;
     s->bias = (const float*)get("router.bias", 1, {ne}, 2).p;
+    if (find(lname(y.l, "router.bias_vl")).p) s->bias_vl = (const float*)get("router.bias_vl", 1, {ne}, 2).p;   // main layers of a release with vision
+    s->sc = scratch_of(&m);
+    if (find(lname(y.l, "tr3.table")).p)
+    {
+        if (ne != dsr::NEXP) die(who + "trellis experts on a DSpark layer");
+        if (const char* e = bind_trellis(*s, find, y.l)) die(who + e);
+        y.ds41_moe = s;
+        return 0;
+    }
     s->sh_w1 = (const uint8_t*)get("sh.w1.mx.gv", 3, {IW / 16, HID / 32, 528}, 0).p;
     s->sh_w3 = (const uint8_t*)get("sh.w3.mx.gv", 3, {IW / 16, HID / 32, 528}, 0).p;
     s->sh_w2 = (const uint8_t*)get("sh.w2.mx.gv", 3, {HID / 16, IW / 32, 528}, 0).p;
@@ -334,7 +532,6 @@ inline int bind_moe(void* model, int i, int, void*)
             }
         }
     }
-    s->sc = scratch_of(&m);
     y.ds41_moe = s;
     return 0;
 }
@@ -375,6 +572,14 @@ inline RoScratch* ro_alloc()
         p->tc_ac = dmalloc<uint8_t>((size_t)ROMAX * SH_KP);
         p->tc_as = dmalloc<uint8_t>((size_t)ROMAX * (SH_KP / 32));
     }
+    if (moe_tc_on())                                                      // the tensor-core routed experts' MXFP8 activations
+    {
+        p->mt_xq = dmalloc<uint8_t>((size_t)ROMAX * HID);
+        p->mt_xs = dmalloc<uint8_t>((size_t)ROMAX * (HID / 32));
+        p->mt_aq = dmalloc<uint8_t>((size_t)TILES * 8 * IW);
+        p->mt_as = dmalloc<uint8_t>((size_t)TILES * 8 * mxtc::ASP);
+        if (DS41_TC_COMBINE) p->mt_cnt = dmalloc<int>((size_t)ROMAX * moe_tc_os2());
+    }
     return p;
 }
 inline int prepare_moe(void* model, int i, int M, void*)
@@ -389,6 +594,23 @@ inline int prepare_moe(void* model, int i, int M, void*)
         std::lock_guard<std::mutex> lk(mu);
         if (M >= RO_FROM) { if (!s->sc->ro) s->sc->ro = ro_alloc(); }
         else if (!s->sc->pw) s->sc->pw = pw_alloc();
+    }
+    if (s->tr && M > MTMAX && M > s->sc->pf_rows)                         // the trellis prefill scratch for M rows (host init)
+    {
+        static std::mutex mu;
+        std::lock_guard<std::mutex> lk(mu);
+        Scratch& sc = *s->sc;
+        // a decode width above 32 rows (G6_MX 40 / 48) is captured in a graph: carve for the W prefill rows too, so a later prefill prepare
+        // never frees the block that graph holds. MX <= 32: M > MTMAX is a prefill call only, sized as before
+        const int rows = M <= MX ? std::max(M, m.hc_rows) : M;
+        if (rows > sc.pf_rows)
+        {
+            if (sc.pf_blk) { cudaFree(sc.pf_blk); cudaFree(sc.pf_x16); }
+            sc.pf_blk = dmalloc<char>(::bindp::scratch_bytes(rows));
+            sc.pf = ::bindp::scratch_at(sc.pf_blk, rows);
+            sc.pf_x16 = dmalloc<__half>((size_t)rows * HID);
+            sc.pf_rows = rows;
+        }
     }
     if (M >= RO_FROM && gate_ro_on())                                    // the smem attribute of k_gate_logits_ro is set here (host init), never inside a capture
     {
@@ -411,8 +633,8 @@ inline int router(Model& m, const LayerState& s, int M, cudaStream_t st)
     if constexpr (PD) mx4::build_xfrag_p<<<xg, 256, 0, st>>>(m.hc_y, M, HID, s.sc->xfrag);       // plain launch, the first of the chain
     else mx4::build_xfrag<<<xg, 256, 0, st>>>(m.hc_y, M, HID, s.sc->xfrag);
     launch(PD, dsr::k_gate_logits<NE, PD>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, s.sc->logits);
-    if constexpr (PD) launch(true, dsr::k_plan_p<NE, TK, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanT<TK>*)s.sc->plan);
-    else launch(false, dsr::k_plan<NE, TK, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanT<TK>*)s.sc->plan);
+    if constexpr (PD) launch(true, dsr::k_plan_p<NE, TK, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanT<TK>*)s.sc->plan, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
+    else launch(false, dsr::k_plan<NE, TK, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanT<TK>*)s.sc->plan, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
     return (int)cudaGetLastError();
 }
 template <int PD>
@@ -434,7 +656,9 @@ inline int experts(Model& m, const LayerState& s, int M, cudaStream_t st)
                  (const int*)(p + offsetof(P, n_slots)), M * TK /* grid bound: CTAs of slots >= n_slots exit */, geom::SWIGLU_LIMIT,
                  s.sc->act, s.sc->ypart};
     launch(PD, mx4::k_fc1<HID, IW, 8, 1, 2, false, PD>, dim3(M * TK * (IW / 16)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc1", st);
     launch(PD, mx4::k_fc2<IW, HID, 8, 2, false, PD>, dim3(M * TK * (HID / 16 / 8)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc2", st);
     dsh::CombineArgsT<TK> CA{(const P*)p, s.sc->ypart, s.sc->sh_out, (void*)m.sc.part[1], M};
     launch(PD, dsh::k_combine<HID, 128, gv::O_BF16, TK>, dim3(M * HID / (8 * 128)), dim3(128), st, CA);
     return (int)cudaGetLastError();
@@ -447,7 +671,7 @@ inline int router_mt(Model& m, const LayerState& s, int M, cudaStream_t st)
     const int nt = (M + 7) / 8;
     mx4::build_xfrag_mt<PD><<<(nt * HID * 4 + 255) / 256, 256, 0, st>>>(m.hc_y, M, HID, nt, s.sc->xfrag);      // plain launch, the first of the chain
     launch(PD, dsr::k_gate_logits_mt<NE, PD>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, s.sc->logits);
-    launch(PD, dsr::k_plan_mt<NE, TK, MTMAX, PD, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanMT<TK, MTMAX>*)s.sc->plan);
+    launch(PD, dsr::k_plan_mt<NE, TK, MTMAX, PD, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanMT<TK, MTMAX>*)s.sc->plan, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
     return (int)cudaGetLastError();
 }
 template <int NT, int PD>
@@ -475,7 +699,9 @@ inline int experts_mt_nt(Model& m, const LayerState& s, int M, cudaStream_t st)
                    (const int*)(p + offsetof(P, n_slots)), M * TK /* grid bound: CTAs of slots >= n_slots exit */, geom::SWIGLU_LIMIT,
                    s.sc->act, s.sc->ypart};
     launch(PD, mx4::k_fc1_mt<HID, IW, 8, 1, mx4::FC1_MT_DEPTH<NT>, NT, 0, PD>, dim3(M * TK * (IW / 16)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc1_mt", st);
     launch(PD, mx4::k_fc2_mt<IW, HID, 8, 2, NT, PD>, dim3(M * TK * (HID / 16 / 8)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc2_mt", st);
     dsh::CombineArgsMT<TK, MTMAX> CA{(const P*)p, s.sc->ypart, s.sc->sh_out, (void*)m.sc.part[1], M};
     launch(PD, dsh::k_combine_mt<HID, 128, gv::O_BF16, TK, MTMAX>, dim3(M * HID / (8 * 128)), dim3(128), st, CA);
     return (int)cudaGetLastError();
@@ -496,8 +722,8 @@ inline int router_pw(Model& m, const LayerState& s, int M, cudaStream_t st)
     const int nt = (M + MTMAX - 1) / MTMAX * 4;
     mx4::build_xfrag_mt<0><<<(nt * HID * 4 + 255) / 256, 256, 0, st>>>(m.hc_y, M, HID, nt, q.xfrag);
     launch(false, dsr::k_gate_logits_mt<NE, 0>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, q.logits);
-    launch(false, dsr::k_plan_pw<NE, TK, MM, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)q.logits, s.bias, M, (dsr::PlanMT<TK, MM>*)q.plan);
-    if (elog_on()) launch(false, dsr::k_expert_log<NE, TK, MM, KC>, dim3(1), dim3(256), st, (const dsr::PlanMT<TK, MM>*)q.plan, M, s.layer, s.sc->elog);
+    launch(false, dsr::k_plan_pw<NE, TK, MM, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)q.logits, s.bias, M, (dsr::PlanMT<TK, MM>*)q.plan, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
+    if (elog_step_on(m, st)) launch(false, dsr::k_expert_log<NE, TK, MM, KC>, dim3(1), dim3(256), st, (const dsr::PlanMT<TK, MM>*)q.plan, M, s.layer, s.sc->elog);
     return (int)cudaGetLastError();
 }
 // M 33..SH1_MAX: the shared expert in one pass, NT = 6 tiles (the 32-row chunk loop below re-reads the 9.12 MB of weights once per chunk). 6 is the most
@@ -577,12 +803,13 @@ inline int router_ro(Model& m, const LayerState& s, int M, cudaStream_t st)
         cudaLaunchKernelEx(&cfg, dsr::k_gate_logits_ro<dsr::NEXP>, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, q.logits);
     }
     else launch(false, dsr::k_gate_logits_mt<NE, 0>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, q.logits);
+    ds41_span_mark("ro_gate", st);
     cudaMemsetAsync(q.emask, 0, (size_t)NE * MW * sizeof(unsigned), st);
-    launch(false, dsr::k_route_ro<NE, TK, ROMAX, KC>, dim3((M + 7) / 8), dim3(256), st, (const float*)q.logits, s.bias, M, (P*)q.plan, q.emask);
+    launch(false, dsr::k_route_ro<NE, TK, ROMAX, KC>, dim3((M + 7) / 8), dim3(256), st, (const float*)q.logits, s.bias, M, (P*)q.plan, q.emask, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
     launch(false, dsr::k_scan_ro<NE, TK, ROMAX>, dim3(1), dim3(NE), st, (P*)q.plan, (const unsigned*)q.emask, q.tile0_of);
     launch(false, dsr::k_place_ro<NE, TK, ROMAX, KC>, dim3((M * TK + 255) / 256), dim3(256), st, (P*)q.plan, (const unsigned*)q.emask, (const int*)q.tile0_of, M);
     if (ro_order_on()) launch(false, dsr::k_order_ro<NE, TK, ROMAX>, dim3(1), dim3(NE), st, (const P*)q.plan, q.order);
-    if (elog_on()) launch(false, dsr::k_expert_log<NE, TK, ROMAX, KC>, dim3(1), dim3(256), st, (const P*)q.plan, M, s.layer, s.sc->elog);
+    if (elog_step_on(m, st)) launch(false, dsr::k_expert_log<NE, TK, ROMAX, KC>, dim3(1), dim3(256), st, (const P*)q.plan, M, s.layer, s.sc->elog);
     return (int)cudaGetLastError();
 }
 // GR8_DS_SH_TC=1: four launches, all on st (plain): act_quant(hc_y) -> fc1 GEMM -> swiglu + act_quant -> fc2 GEMM. Y bf16 [M][HID] into sh_out (aliased).
@@ -646,11 +873,13 @@ inline void fc_ro_run(const mx4::ArgsMT& RA, int sb, int bstg, cudaStream_t st)
         if (ce != cudaSuccess) die(std::string("GR8_DS_MOE_FC1BSTG launch: ") + cudaGetErrorString(ce));
     }
     else launch(false, mx4::k_fc1_ro<HID, IW, KS, CW, 1, NTG1, 0, ORD, LA, (HV >= 1)>, dim3(sb * (IW / 16 / CW)), dim3(KS * CW * 32), st, RA);
+    ds41_span_mark("ro_fc1", st);
     mx4::ArgsMT R2 = RA;
     R2.la = RA.la * 2;                                                              // fc2 runs 2 CTAs per SM
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(sb * (HID / 16 / W2)); cfg.blockDim = dim3(W2 * 32); cfg.dynamicSmemBytes = SMEM2; cfg.stream = st;
     cudaLaunchKernelEx(&cfg, k2, R2);
+    ds41_span_mark("ro_fc2", st);
 }
 template <bool ORD, bool LA, int KS, int CW, int NTG1, int W2, int D2, int NTG2>
 inline void fc_ro_hint(const mx4::ArgsMT& RA, int sb, int hv, int stg, int bstg, cudaStream_t st)
@@ -680,7 +909,20 @@ inline int experts_ro(Model& m, const LayerState& s, int M, cudaStream_t st)
                    (const int*)(p + offsetof(P, slot_expert)), (const int*)(p + offsetof(P, slot_tile0)), (const int*)(p + offsetof(P, slot_nt)),
                    (const int*)(p + offsetof(P, tile_mask)), (const float*)(p + offsetof(P, tile_w)), (const int*)(p + offsetof(P, tile_tok)),
                    (const int*)(p + offsetof(P, n_slots)), sb, geom::SWIGLU_LIMIT, q.act, q.ypart, ord ? (const int*)q.order : nullptr, la};
-    if (ord) { if (la) fc_ro_hint<true, true, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); else fc_ro_hint<true, false, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); }
+    if (q.mt_xq)                                       // GR8_DS_MOE_TC=1: the tensor-core expert loop (ds_moe_tc.cuh), the same plan, act, ypart and combine
+    {
+        const int kc = NE == dsr::NEXP ? topk_for_step(m) : TK;              // the routes the planner kept per token (op_router's cut)
+        const mxtc::Args TA{s.fc1, s.fc2, q.mt_xq, q.mt_xs, RA.slot_expert, RA.slot_tile0, RA.slot_nt, RA.tile_mask, RA.tile_w, RA.tile_tok, RA.n_slots_dev,
+                            (const int*)(p + offsetof(P, n_tiles)), sb, DS41_TC_GY1, DS41_TC_GY2, moe_tc_os2(),
+                            q.mt_cnt, kc, (const int*)(p + offsetof(P, tok_slot)), (const int*)(p + offsetof(P, tok_col)), q.sh_out, s.tc_w13 ? 1 : 0, (void*)m.sc.part[1],
+                            geom::SWIGLU_LIMIT, q.act, q.mt_aq, q.mt_as, q.ypart};
+        const cudaError_t e = mxtc::launch_layer<HID, IW, HID, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_W2, DS41_TC_WT, DS41_TC_TPC, DS41_TC_ST2>(
+            TA, (const __nv_bfloat16*)m.hc_y, M, sb, q.mt_xq, q.mt_xs, st);
+        if (e != cudaSuccess) return (int)e;
+        ds41_span_mark("ro_fc2", st);
+        if (q.mt_cnt) return (int)cudaGetLastError();                        // the combine ran inside fc2 (part[1] is written)
+    }
+    else if (ord) { if (la) fc_ro_hint<true, true, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); else fc_ro_hint<true, false, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); }
     else { if (la) fc_ro_hint<false, true, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); else fc_ro_hint<false, false, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); }
     dsh::CombineArgsMT<TK, ROMAX> CA{(const P*)p, q.ypart, q.sh_out, (void*)m.sc.part[1], M};
     if (s.tc_w13) launch(false, dsh::k_combine_mt_shb<HID, 128, gv::O_BF16, TK, ROMAX>, dim3(M * HID / (8 * 128)), dim3(128), st, CA);   // GR8_DS_SH_TC=1: sh_out holds bf16 Y
@@ -698,7 +940,7 @@ inline const LayerState* state_of(void* model, int i, int rows)
 inline void l2pf_add(const Model& m, int i, l2pf::Plan& P)
 {
     const LayerState* s = (const LayerState*)m.layers[i].ds41_moe;
-    if (s) ds41l2pf::add_moe(P, s->ne, HID, IW, s->gate, s->sh_w1, s->sh_w3, s->sh_w2);
+    if (s && !s->tr) ds41l2pf::add_moe(P, s->ne, HID, IW, s->gate, s->sh_w1, s->sh_w3, s->sh_w2);
 }
 inline int op_router(void* model, int i, int rows, void* stream)
 {
@@ -729,6 +971,7 @@ inline int op_shared(void* model, int i, int rows, void* stream)
     const LayerState* s = state_of(model, i, rows);
     if (!s) return ds41::NOTSUP;
     cudaStream_t st = (cudaStream_t)stream;
+    if (s->tr) return 0;                                                // the trellis shared expert runs inside K1
     if (rows >= RO_FROM) {
         Model& m=*(Model*)model;
         const bool direct=m.ds41_y_quant_ready && m.ds41_rowshard_chunk && rows==4096;
@@ -744,6 +987,7 @@ inline int op_experts(void* model, int i, int rows, void* stream)
     if (!s) return ds41::NOTSUP;
     Model& m = *(Model*)model;
     cudaStream_t st = (cudaStream_t)stream;
+    if (s->tr) return rows > MTMAX ? trellis_prefill(m, *s, rows, st) : k1_rows(m, *s, m.hc_y, rows, m.sc.part[1], st);
     const bool big = s->tk == dsr::TOPK, pd = pdl_on();
     if (rows >= RO_FROM)
         return big ? experts_ro<dsr::NEXP, dsr::TOPK>(m, *s, rows, st) : experts_ro<geom::DS_NEXP, geom::DS_TOPK>(m, *s, rows, st);
@@ -759,7 +1003,7 @@ inline int op_experts(void* model, int i, int rows, void* stream)
 
 // Distinct-expert counter, host side. elog_read copies the device ring (one synchronous cudaMemcpy: call it between windows or at exit, never inside a
 // capture) and returns the records in call order (oldest first; at most ELOG_N, the newest when the ring wrapped). elog_reset zeroes the ring.
-// elog_print: one line per record + the mean distinct experts per (layer, rows). Records exist for prefill calls only (rows > 32).
+// elog_print: one line per record + the mean distinct experts per (layer, rows). Records exist for eager prefill calls only (rows > 32); decode steps and CUDA graph captures are skipped.
 inline int elog_read(const Model* m, std::vector<dsr::ExpertLogRec>& out, bool reset = true)      // reset = true: the next read starts a new chunk (cursor -> 0)
 {
     dsr::ExpertLog* d = scratch_of(m)->elog;
@@ -779,8 +1023,22 @@ inline std::string elog_csv(const std::vector<dsr::ExpertLogRec>& v)
     for (size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + std::to_string(v[i].distinct);
     return s;
 }
-// elog_begin(model, first): optional, host-synchronous, before a window's launches: the window's first position, copied into every record of that window.
-inline void elog_begin(const Model* m, int first) { cudaMemcpy((char*)scratch_of(m)->elog + offsetof(dsr::ExpertLog, win_start), &first, sizeof first, cudaMemcpyHostToDevice); }
+// elog_begin(model, first): host-synchronous, before a window's launches. Serve prefill chunks reset the cursor;
+// other callers keep accumulated records unless they explicitly request a reset.
+static_assert(offsetof(dsr::ExpertLog, cursor) == 0 &&
+              offsetof(dsr::ExpertLog, win_start) == sizeof(unsigned),
+              "ExpertLog cursor and win_start must be contiguous at offset 0");
+inline void elog_begin(const Model* m, int first, bool reset_cursor = false)
+{
+    dsr::ExpertLog* d = scratch_of(m)->elog;
+    if (reset_cursor) {
+        const struct { unsigned cursor; int win_start; } hdr{0u, first};
+        static_assert(sizeof(hdr) == 2 * sizeof(unsigned));
+        cudaMemcpy(d, &hdr, sizeof(hdr), cudaMemcpyHostToDevice);
+    } else {
+        cudaMemcpy((char*)d + offsetof(dsr::ExpertLog, win_start), &first, sizeof(first), cudaMemcpyHostToDevice);
+    }
+}
 inline void elog_reset(const Model* m) { cudaMemset(scratch_of(m)->elog, 0, sizeof(dsr::ExpertLog)); }
 inline void elog_print(const Model* m, FILE* f)
 {

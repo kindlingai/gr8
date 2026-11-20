@@ -1,3 +1,4 @@
+#include "../dispram.h"
 #include "bind.h"
 #include "../g6nr.h"
 #include "../h2d.h"
@@ -55,7 +56,7 @@ constexpr int invalid = (int)cudaErrorInvalidValue;
 
 #if defined(G6_CP) && G6_CP
 static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity, int max_rows,
-    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr, int cp_phys);
+    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr, int cp_phys, int pages = 0);
 #endif
 extern "C" size_t g6a_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile) {
     if (capacity <= 0 || max_rows <= 0 || query_tile <= 0 || query_tile > 64 || capacity > INT_MAX / query_tile) return 0;
@@ -74,6 +75,11 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
     return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, 0, 0, 0);
 }
+extern "C" int g6a_bind_create_pages(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity,
+    int pages, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
+    if (pages <= 0) return invalid;
+    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, 0, 0, 0, pages);
+}
 extern "C" int g6a_bind_create_cp(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity,
     int max_rows, int query_tile, int cp_R, int cp_nr, void* s, void* ext_scratch, size_t ext_bytes) {
     return g6a_bind_create_cp_phys(out, p, rank, layer, capacity, max_rows, query_tile, cp_R, cp_nr, 0, s, ext_scratch, ext_bytes);
@@ -84,7 +90,7 @@ extern "C" int g6a_bind_create_cp_phys(G6AttnBinding* out, const G6AttnPack* p, 
     return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, cp_R, cp_nr, cp_phys);
 }
 static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity, int max_rows,
-    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr, int cp_phys) {
+    int query_tile, void* s, void* ext_scratch, size_t ext_bytes, int cp_R, int cp_nr, int cp_phys, int pages) {
 #else
 extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
@@ -122,6 +128,12 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
             cp_table[lp] = (lp < cp_R / 64 || lp % cp_nr == rank) ? (cp_phys && phys >= cp_phys ? -1 : phys++) : G6_CP_REMOTE;
         a.page_count = phys;   // cp_phys: at most that many; the pages past it have none in the table as built
     }
+    // pages: a pool of more physical pages than one table has entries (GR8_CAP_TOTAL's drafter binding). The kernels
+    // bound each table entry by page_count; the table as built still maps logical page i to page i
+    if (pages) {
+        if (cp_nr || pages < a.table_size) return invalid;
+        a.page_count = pages;
+    }
 #endif
     a.query_tile = query_tile;
     a.kv_norm = p->kv_norm.data; a.uv = p->uv.data; a.uvs = fp8 ? (const float*)p->uvs.data : nullptr;
@@ -136,6 +148,8 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     b.scratch_bytes = g6a_scratch_bytes(&a);
 #endif
     if (!b.scratch_bytes || (ext_scratch && ext_bytes < b.scratch_bytes)) return invalid;
+    const bool ext_io = p->ext_indices || p->ext_output;
+    if (ext_io && !(p->ext_indices && p->ext_output && p->ext_rows >= max_rows && p->ext_heads >= h)) return invalid;
     size_t used = 0;
     auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return at; };
     const size_t uk = take((size_t)h * 512 * 192 * (fp8 ? 1 : 2));
@@ -146,18 +160,18 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     const int ix_pages = a.page_count;
     const size_t ix = take(full ? (size_t)ix_pages * 64 * g6kv::IDX_ROW : 0);
     const size_t table = take((size_t)a.table_size * sizeof(int));
-    const size_t ids = take((size_t)max_rows * 2048 * sizeof(int));
-    const size_t output = take((size_t)max_rows * h * 256 * 2);
+    const size_t ids = take(ext_io ? 0 : (size_t)max_rows * 2048 * sizeof(int));
+    const size_t output = take(ext_io ? 0 : (size_t)max_rows * h * 256 * 2);
     const size_t error = take(sizeof(unsigned));
     const size_t scratch = take(ext_scratch ? 0 : b.scratch_bytes);   // ext: caller-owned, shared, not freed here
     b.storage_bytes = used;
-    cudaError_t e = cudaMalloc(&b.storage, used);
+    cudaError_t e = g6dispram::alloc_kv(&b.storage, used);
     if (e != cudaSuccess) return (int)e;
     char* base = (char*)b.storage;
     a.uk = base + uk; a.uks = fp8 ? (const float*)(base + uks) : nullptr; a.mla_cache = base + kv;
     a.index_cache = full ? base + ix : nullptr;
-    a.block_table = (int*)(base + table); a.indices = (int*)(base + ids);
-    a.output = base + output; a.error = (unsigned*)(base + error);
+    a.block_table = (int*)(base + table); a.indices = ext_io ? (int*)p->ext_indices : (int*)(base + ids);
+    a.output = ext_io ? p->ext_output : base + output; a.error = (unsigned*)(base + error);
     b.scratch = ext_scratch ? ext_scratch : base + scratch;
     cudaStream_t stream = (cudaStream_t)s;
     e = cudaMemsetAsync(b.storage, 0, used, stream);
@@ -176,12 +190,12 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
         }
         else
 #endif
-        identity_pages<<<(a.page_count + 255) / 256,256,0,stream>>>(
-            (int*)const_cast<int*>(a.block_table), a.page_count);
+        identity_pages<<<(a.table_size + 255) / 256,256,0,stream>>>(
+            (int*)const_cast<int*>(a.block_table), a.table_size);
         if (e == cudaSuccess) e = cudaGetLastError();
     }
     if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)max_rows * 2048 * 4, stream);
-    if (e != cudaSuccess) { cudaFree(b.storage); return (int)e; }
+    if (e != cudaSuccess) { g6dispram::free_kv(b.storage); return (int)e; }
     *out = b;
     return (int)cudaSuccess;
 }
@@ -247,7 +261,7 @@ extern "C" int g6a_kvb_bf16(const void* fp8, const float* scale, void* bf16, int
 }
 extern "C" int g6a_bind_release(G6AttnBinding* b) {
     if (!b) return invalid;
-    cudaError_t e = b->storage ? cudaFree(b->storage) : cudaSuccess;
+    cudaError_t e = b->storage ? g6dispram::free_kv(b->storage) : cudaSuccess;
     if (e == cudaSuccess) *b = G6AttnBinding{};
     return (int)e;
 }

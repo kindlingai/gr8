@@ -1,7 +1,7 @@
 //! src/dflash2.rs against tests/data/dflash2: a small synthetic drafter converted at TP=4, and at TP=6 in the replicated
 //! layout, gives the checked-in manifests and packs byte for byte. flash/: one of GLM 5.3 Flash's shape (five taps,
 //! four q heads per KV head, rope_theta 1e4), at TP=4 and TP=2; its packs come from the same Python converter, with
-//! D.meta's fields from the tap count.
+//! D.meta's fields from the tap count. At TP=3 its replicated K-slices are checked against TP=4's records.
 
 use g6load::dflash2::{self, Dims, St};
 use g6load::json::{self, Json};
@@ -67,6 +67,31 @@ fn flash_every_rank_matches_the_python_converter() {
 #[test]
 fn flash_tp2_matches_the_python_converter() {
     converts_as_python("flash/src", &SMALL_FLASH, "flash/mxfp8-tp2", 2, &[0, 1], &[]);
+}
+
+/// TP=3 replicates the body, and its o_proj / down_proj K-slices are the records of TP=4's ranks, so the drafts are TP=4's.
+#[test]
+fn flash_tp3_replicates_tp4s_k_slices() {
+    let out = std::env::temp_dir().join(format!("g6load-dflash2-flash-tp3-{}", std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    let cfg = config_of("flash/src");
+    let st = St::open(&format!("{D}/flash/src/model.safetensors")).unwrap();
+    let sha = |m: &Json, name: &str| {
+        let t = m.get("tensors").and_then(|t| t.arr()).unwrap().iter().find(|t| t.get("name").and_then(|n| n.str()) == Some(name));
+        t.and_then(|t| t.get("sha256")).and_then(|s| s.str()).unwrap_or_else(|| panic!("no {name}")).to_string()
+    };
+    for r in 0..3 {
+        let rep = dflash2::convert_rank(&st, &cfg, &SMALL_FLASH, 3, r, out.to_str().unwrap(), &[]).unwrap();
+        assert_eq!(rep.get("replicated_ks").and_then(|k| k.int()), Some(4));
+        for v in 0..4 {
+            let tp4 = json::parse(&std::fs::read_to_string(format!("{D}/flash/mxfp8/dflash.r{v}.manifest.json")).unwrap()).unwrap();
+            for j in 0..2 {
+                assert_eq!(sha(&rep, &format!("D{j}.o{v}.gv")), sha(&tp4, &format!("D{j}.o.gv")));
+                assert_eq!(sha(&rep, &format!("D{j}.down{v}.gv")), sha(&tp4, &format!("D{j}.down.gv")));
+            }
+        }
+    }
+    std::fs::remove_dir_all(&out).unwrap();
 }
 
 #[test]

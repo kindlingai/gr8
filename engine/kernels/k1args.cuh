@@ -40,6 +40,8 @@ struct K1Args
     int t_wide2;               // K3 experts of t_fc2 are in the wide order (k_tr3_widen2 ran on it)
     const uint8_t* const* t_ptab;   // EL3 (#151): the layer's piece table [E][EB][2] (tr3.cuh tr3_fc1_unit / tr3_fc2_block), or
                                // nullptr = t_fc1 / t_fc2 at the table offsets. A fixed device address per layer
+    int t_wide4 = 0;           // K4 experts of t_fc1 are in the wide-K4 order (k_tr4_widen ran on it)
+    int t_wide42 = 0;          // K4 experts of t_fc2 are in the wide-K4 order (k_tr4_widen2 ran on it)
     const __half* t_v1;        // [block row][2][6144]  suh gate, suh up
     const __half* t_v2;        // [block row][3][128]   svh gate, svh up, suh down
     const __half* t_v3;        // [block row][6144]     svh down
@@ -81,7 +83,7 @@ struct K1Args
     float steer_alpha = 0.f;
     const int* steer_slot = nullptr;   // several profiles: [G6_MX] row profile; steer_dir is [profiles][HID]
     const float* steer_slot_alpha = nullptr;
-    float* steer_part = nullptr;       // [G6_MX][48]
+    float* steer_part = nullptr;       // [G6_MX][HB]
     unsigned* steer_count = nullptr;   // [G6_MX], zero between finalize launches
 #ifdef DEC_SLOT
     dslot::Slot slot;          // send = nullptr: out as above; else out is this rank's send slot of slot.c (decslot.cuh)

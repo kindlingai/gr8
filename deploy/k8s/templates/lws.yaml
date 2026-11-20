@@ -195,10 +195,16 @@ spec:
                 mountPath: /dev/shm
               - name: tmp
                 mountPath: /tmp
+              - name: dispram
+                mountPath: /run/dispram
               {{- with .Values.extraVolumeMounts }}
               {{- toYaml . | nindent 14 }}
               {{- end }}
         volumes:
+          - name: dispram
+            hostPath:
+              path: /run/dispram
+              type: DirectoryOrCreate
           {{- range $name, $v := .Values.storage }}
           {{- if not (and $ml (eq $name "cache")) }}
           {{- with $v.hostPath }}

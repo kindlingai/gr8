@@ -152,7 +152,7 @@ static bind::Tensor mk(const void* p, int nd, long long a, long long b = 0, long
 
 static std::vector<int> row_list()
 {
-    const int all[] = {1, 2, 3, 5, 7, 8, 9, 12, 16, 17, 24, 31, 32};
+    const int all[] = {1, 2, 3, 5, 7, 8, 9, 12, 16, 17, 24, 31, 32, 33, 40, 41, 47, 48};   // 33..48: DS41_MX 40 / 48 (n=8 tiles 5 and 6)
     std::vector<int> v;
     for (int m : all)
         if (m <= G6_MX) v.push_back(m);
@@ -933,7 +933,12 @@ int main(int argc, char** argv)
     }
     const std::vector<int> Ms = row_list();
     if (do_gv) test_gv(Ms);
-    if (do_k1) test_k1(Ms);
+    if (do_k1)                                       // the K1 stream (glue plan) stays at <= 32 rows; DS41 runs 33..48 through ds41_moe_ops (ds41_moe_pw_test)
+    {
+        std::vector<int> Mk;
+        for (int m : Ms) if (m <= 32) Mk.push_back(m);
+        test_k1(Mk);
+    }
     printf("%s: %d passed, %d failed\n", g_fail ? "FAILED" : "OK", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

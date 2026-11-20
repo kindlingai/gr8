@@ -27,7 +27,12 @@
 // the same index (the same captures in the same order, the same sizes), and the index digest joins the pool digest
 // every rank compares.
 //
-// A group lease (--kv-store ...,group=, s2/kv_share.h, D-331 M8 (c)): the store shares its KV node with other clusters
+// persist=on (an ssd: store): the index is written next to the blocks after every capture and resize
+// (flash_ckpt_index.h), and a boot whose compat line and store size match takes back each entry whose stored manifest,
+// pages and KDA state still match its manifest's checksums (flash_entry_check, FlashCheckpoints::settle) and that every
+// other rank kept too (the bootstrap's agreement, flash_keep_agreed).
+//
+// A group lease (--kv-store ...,group=, s2/kv_share.h): the store shares its KV node with other clusters
 // (the full model's pool) and changes size by whole segments at a Resize event. The index reports what the pool stash
 // reports: its counters as g6kv_tier_totals (share_want asks from them) and the ages of what a give would drop
 // (coldest). A shrink drops the least recently used entries until the rest fit, then packs them below the new end:
@@ -91,7 +96,9 @@ inline uint64_t fnv64(const void* p, size_t n, uint64_t h = 14695981039346656037
 // complete is not a checkpoint (a torn write, a reused range).
 struct FlashManifest {
     static constexpr uint64_t MAGIC = 0x31544b4348534c46ull;   // "FLSHCKT1"
-    static constexpr uint32_t FORMAT = 1;                     // FLASH_RUN_FORMAT: bump when what an entry holds changes
+    static constexpr uint32_t FORMAT = 3;                     // FLASH_RUN_FORMAT: bump when what an entry holds changes
+                                                              // (2: pooled index keys only, the raw rings in the state;
+                                                              // 3: a CP binding keeps only this rank's pages)
     uint64_t magic = 0;
     uint32_t format = 0, complete = 0;
     uint64_t generation = 0;         // the entry's id, the same on every rank
@@ -99,15 +106,21 @@ struct FlashManifest {
     uint64_t position = 0;           // p: rows [0, p) are in the pages and the KDA state is after them
     uint64_t tokens = 0, token_hash = 0, ns_hash = 0;   // the p + 1 tokens and their namespace
     uint64_t pages = 0, page_bytes = 0, page_sum = 0;   // pages [0, pages) of every binding, their checksum
-    uint64_t state_bytes = 0, state_sum = 0;            // the KDA state after rows [0, p), its checksum
+    uint64_t state_bytes = 0, state_sum = 0;            // the KDA state after rows [0, p) and the raw rings, the checksum
     uint64_t self_sum = 0;           // fnv64 of every field above
     uint64_t own_sum() const { return fnv64(this, offsetof(FlashManifest, self_sum)); }
     void seal() { magic = MAGIC; format = FORMAT; complete = 1; self_sum = own_sum(); }
-    // why this block is not the manifest of `want` (nullptr: it is)
-    const char* differs(const FlashManifest& want) const {
+    // why this is not a sealed manifest (nullptr: it is)
+    const char* unsealed() const {
         if (magic != MAGIC || format != FORMAT) return "no manifest";
         if (self_sum != own_sum()) return "manifest checksum";
         if (!complete) return "incomplete";
+        return nullptr;
+    }
+    bool sealed() const { return !unsealed(); }
+    // why this block is not the manifest of `want` (nullptr: it is)
+    const char* differs(const FlashManifest& want) const {
+        if (const char* why = unsealed()) return why;
         if (generation != want.generation) return "another entry";
         if (compat != want.compat) return "another engine or layout";
         if (position != want.position || tokens != want.tokens || token_hash != want.token_hash || ns_hash != want.ns_hash)
@@ -201,6 +214,24 @@ public:
         return true;
     }
     uint64_t next_generation() const { return next_; }
+    uint64_t clock() const { return clock_; }
+    // a persisted index back (FlashCheckpoints, persist=on): the entries that passed their checks, in any order. Throws
+    // when one lies past the store, two overlap, two share a generation, or a generation or use is not below next / clock.
+    void adopt(uint64_t next, uint64_t clock, std::vector<FlashEntry> v) {
+        std::sort(v.begin(), v.end(), [](const FlashEntry& a, const FlashEntry& b) { return a.base < b.base; });
+        uint64_t end = 0;
+        std::vector<uint64_t> gens;
+        for (const auto& x : v) {
+            if (!x.blocks || x.base < end || x.blocks > blocks_ || x.base > blocks_ - x.blocks || x.generation >= next || x.used > clock)
+                throw std::runtime_error("Flash checkpoint: persisted entry " + std::to_string(x.generation) + " does not fit the store");
+            end = x.base + x.blocks;
+            gens.push_back(x.generation);
+        }
+        std::sort(gens.begin(), gens.end());
+        if (std::adjacent_find(gens.begin(), gens.end()) != gens.end())
+            throw std::runtime_error("Flash checkpoint: two persisted entries share a generation");
+        e_ = std::move(v); next_ = next; clock_ = clock;
+    }
     // publish an entry whose blocks are written (reserve gave `base`)
     void add(FlashEntry x) {
         if (x.generation != next_) throw std::runtime_error("Flash checkpoint: generation out of order");

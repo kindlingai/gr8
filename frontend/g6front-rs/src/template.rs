@@ -2,7 +2,7 @@
 //!
 //! Two layers:
 //! - `normalize_messages()`: vLLM's message parsing for an "openai"-content-format template (string content -> text
-//!   parts, tool results -> one string, assistant `reasoning` -> `reasoning_content`, tool-call `arguments` JSON
+//!   parts, tool results -> one string, assistant `reasoning_content` or `reasoning` -> both, tool-call `arguments` JSON
 //!   strings -> objects, `developer` -> merged `system`).
 //! - `ChatTemplate::render()`: minijinja configured like transformers' jinja environment (trim_blocks,
 //!   lstrip_blocks, loop controls, Python string/dict methods, `tojson` as `json.dumps(ensure_ascii=False)`,
@@ -35,30 +35,93 @@ pub struct ChatTemplate {
     env: Environment<'static>,
     special: Vec<(&'static str, Value)>,
     supports_developer: bool,
-    /// Flash-only explicit empty think block; never changes the full-GLM template.
-    pub flash_thinking_off: bool,
+    hf_content: bool,
+    /// a content list of one text part goes to the template as its string (`single_text()`)
+    single_text: bool,
     /// the reasoning efforts the template names (`thinking::template_levels`), highest first
     pub levels: Vec<&'static str>,
+    /// the text the template writes for one image part: `<|image|>`, or `processor_config.json`'s `image_token`
+    pub image_mark: String,
+    /// the template writes `<|video|>` for a video part (GLM), so `render_images` can probe with video parts
+    video_parts: bool,
+    /// the template source holds the rule that infers reasoning from a `</think>` in an assistant content
+    inline_reasoning: bool,
+    /// a release that keeps control-token spellings in content literal breaks them before the render (`literal.rs`)
+    protect: Option<crate::literal::Protect>,
 }
 
 /// Keyword args the renderer owns; a request cannot override them through chat_template_kwargs.
 const RESERVED: [&str; 5] = ["messages", "tools", "documents", "chat_template", "tokenize"];
 
+fn normalize_special_token(v: Value) -> Value {
+    match &v {
+        Value::Object(_) => crate::tok::token_text(&v).map_or(Value::Null, Value::from),
+        _ => v,
+    }
+}
+
+fn extract_chat_template(cfg: &Value) -> Option<String> {
+    match cfg.get("chat_template")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => items
+            .iter()
+            .find(|it| it.get("name").and_then(Value::as_str) == Some("default"))
+            .and_then(|it| it.get("template"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Value::Object(map) => map.get("default").and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
 impl ChatTemplate {
     pub fn load(dir: &Path, eos_token: Value, pad_token: Value) -> Result<ChatTemplate, String> {
         let p = dir.join("chat_template.jinja");
-        let source = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let tok_cfg_path = dir.join("tokenizer_config.json");
+        let tok_cfg = std::fs::read_to_string(&tok_cfg_path).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        let source = match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match tok_cfg.as_ref().and_then(extract_chat_template) {
+                    Some(s) => s,
+                    None => {
+                        return Err(format!(
+                            "{}: {e} (and no chat_template in {})",
+                            p.display(),
+                            tok_cfg_path.display()
+                        ))
+                    }
+                }
+            }
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        };
         let mut template = Self::from_source(source, eos_token, pad_token)?;
-        let config =
-            std::fs::read_to_string(dir.join("config.json")).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
-        template.flash_thinking_off =
-            config.as_ref().and_then(|c| c.get("model_type")).and_then(Value::as_str) == Some("glm5_next");
+        if let Some(cfg) = tok_cfg.as_ref() {
+            for key in ["bos_token", "unk_token"] {
+                if let Some(v) = cfg.get(key).filter(|v| !v.is_null()).cloned() {
+                    let norm = normalize_special_token(v);
+                    if !norm.is_null() {
+                        template.special.push((key, norm));
+                    }
+                }
+            }
+        }
+        let processor = std::fs::read_to_string(dir.join("processor_config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        if let Some(mark) = processor.as_ref().and_then(|c| c.get("image_token")?.as_str()).filter(|m| !m.is_empty()) {
+            template.image_mark = mark.to_string();
+        }
         Ok(template)
     }
 
     pub fn from_source(source: String, eos_token: Value, pad_token: Value) -> Result<ChatTemplate, String> {
+        let eos_token = normalize_special_token(eos_token);
+        let pad_token = normalize_special_token(pad_token);
         let levels = crate::thinking::template_levels(&source);
         let supports_developer = source.contains("\"developer\"") || source.contains("'developer'");
+        let video_parts = source.contains(VIDEO_MARK);
+        let inline_reasoning = crate::literal::has_inline_reasoning_rule(&source);
         let mut env = Environment::new();
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
@@ -76,9 +139,36 @@ impl ChatTemplate {
             env,
             special: vec![("eos_token", eos_token), ("pad_token", pad_token)],
             supports_developer,
-            flash_thinking_off: false,
+            hf_content: false,
+            single_text: false,
             levels,
+            image_mark: IMAGE_MARK.to_string(),
+            video_parts,
+            inline_reasoning,
+            protect: None,
         })
+    }
+
+    /// Break the control-token spellings in the caller's strings before every render, for a release that keeps them
+    /// literal in message content (`literal.rs`). The spellings come from the tokenizer (`Tok::literal_spellings`),
+    /// which is also what takes the marks out again in its encode; `None`, for every other release, renders as before.
+    pub fn with_literal_content(mut self, spellings: Option<crate::literal::Spellings>) -> Self {
+        self.protect = spellings.map(|s| crate::literal::Protect::new(s, self.inline_reasoning));
+        self
+    }
+
+    /// Standard text HF templates consume strings, not GLM's OpenAI content-part lists.
+    pub fn hf(mut self) -> Self {
+        self.hf_content = true;
+        self
+    }
+
+    /// Inkling-2's template takes content as a string or as a list of parts, and treats the two differently: an
+    /// assistant turn with tool calls and the content `""` has no text block, while one empty text part is an empty
+    /// block. A request's string content is one text part after `normalize_messages`, so hand it back as the string.
+    pub fn single_text(mut self) -> Self {
+        self.single_text = true;
+        self
     }
 
     pub fn resolve_thinking(
@@ -86,31 +176,7 @@ impl ChatTemplate {
         body: &Map<String, Value>,
         defaults: crate::thinking::Defaults,
     ) -> Result<crate::thinking::Thinking, crate::api::ApiError> {
-        if self.flash_thinking_off
-            && body.get("chat_template_kwargs").and_then(|k| k.get("enable_thinking")) == Some(&Value::Bool(false))
-        {
-            let mut checked = body.clone();
-            checked.get_mut("chat_template_kwargs").and_then(Value::as_object_mut).unwrap().remove("enable_thinking");
-            crate::thinking::resolve(&checked, &self.levels, defaults)
-        } else {
-            crate::thinking::resolve(body, &self.levels, defaults)
-        }
-    }
-
-    /// A GLM-5.3 prompt with thinking off (`Thinking::off`, `--allow-thinking-off`): without the template's
-    /// `<|system|>Reasoning Effort: ...` turn, and with the generation prompt's think block closed, so the reply starts
-    /// on content. Text without them is returned as it is.
-    pub fn thinking_off(&self, mut text: String, add_generation_prompt: bool) -> String {
-        const HEADER: &str = "<|system|>Reasoning Effort: ";
-        if let Some(i) = text.find(HEADER) {
-            let start = i + HEADER.len();
-            let end = text[start..].find(|c: char| !c.is_ascii_alphabetic()).map_or(text.len(), |n| start + n);
-            text.replace_range(i..end, "");
-        }
-        if add_generation_prompt && text.ends_with("<think>") {
-            text.push_str("</think>");
-        }
-        text
+        crate::thinking::resolve(body, &self.levels, defaults)
     }
 
     /// `kw` is the output of `build_template_kwargs()`.
@@ -127,13 +193,36 @@ impl ChatTemplate {
         if continue_final_message && add_generation_prompt {
             return Err("Cannot set both `continue_final_message` and `add_generation_prompt` to True.".into());
         }
-        let close_think =
-            self.flash_thinking_off && add_generation_prompt && kw.get("enable_thinking") == Some(&Value::Bool(false));
-        let conv = normalize_messages(messages, self.supports_developer)?;
+        let mut conv = normalize_messages(messages, self.supports_developer)?;
+        if self.hf_content {
+            for m in &mut conv {
+                if let Some(parts) = m["content"].as_array() {
+                    if parts.iter().all(|p| p["type"] == "text") {
+                        m["content"] =
+                            Value::from(parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"));
+                    }
+                }
+            }
+        }
+        if self.single_text {
+            for m in &mut conv {
+                if let Some([part]) = m["content"].as_array().map(Vec::as_slice) {
+                    if let (Some("text"), Some(text)) = (part["type"].as_str(), part["text"].as_str()) {
+                        m["content"] = Value::from(text);
+                    }
+                }
+            }
+        }
+        // A release that keeps a control-token spelling in content literal breaks the spellings in every string the
+        // template reads, here, where the messages are what it will render (`literal.rs`).
+        let (conv, tools, documents) = match &self.protect {
+            Some(p) => (p.messages(&conv), tools.map(|t| p.value(t)), p.value(&documents)),
+            None => (conv, tools.cloned(), documents),
+        };
         // render(messages=, tools=, documents=, add_generation_prompt=, continue_final_message=, **special, **kw)
         let mut ctx = Map::new();
         ctx.insert("messages".into(), Value::Array(conv));
-        ctx.insert("tools".into(), tools.cloned().unwrap_or(Value::Null));
+        ctx.insert("tools".into(), tools.unwrap_or(Value::Null));
         ctx.insert("documents".into(), documents);
         ctx.insert("add_generation_prompt".into(), Value::Bool(add_generation_prompt));
         ctx.insert("continue_final_message".into(), Value::Bool(continue_final_message));
@@ -148,7 +237,7 @@ impl ChatTemplate {
         let ctx = Value::Object(ctx);
         let tmpl = self.env.get_template("chat").map_err(|e| TemplateError(e.to_string()))?;
         RAISED.with(|r| *r.borrow_mut() = None);
-        let mut text = match tmpl.render(J::from_serialize(&ctx)) {
+        let text = match tmpl.render(J::from_serialize(&ctx)) {
             Ok(t) => t,
             Err(e) => {
                 if let Some(msg) = RAISED.with(|r| r.borrow_mut().take()) {
@@ -157,17 +246,151 @@ impl ChatTemplate {
                 return Err(TemplateError(format!("chat template error: {}", e.detail().unwrap_or(&e.to_string()))));
             }
         };
-        if close_think {
-            if !text.ends_with("<think>") {
-                return Err("Flash thinking-off needs a template ending in <think>".into());
-            }
-            text.push_str("</think>\n\n");
-        }
         if continue_final_message {
             let conv = ctx.get("messages").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
             return trim_to_final_message(text, conv);
         }
         Ok(text)
+    }
+}
+
+// ---- image blocks in the rendered prompt (GLM-5.3-Flash image input) ----------------------------------------------
+
+/// The text a template writes for an image part unless the model's `processor_config.json` names another, and the
+/// text GLM's template writes for a video part.
+const IMAGE_MARK: &str = "<|image|>";
+const VIDEO_MARK: &str = "<|video|>";
+
+/// What a probe render puts in place of an image part that is switched off, on a template with no video parts: a text
+/// part with this text. It holds no character a template's JSON or HTML escaping would change.
+const OFF_MARK: &str = "[[g6_img_off]]";
+
+/// f on each image part (`image`, `image_url`, `input_image`) in the messages' content and tool outputs, in a fixed walk
+/// order.
+fn for_each_image(v: &mut Value, f: &mut dyn FnMut(&mut Map<String, Value>)) {
+    match v {
+        Value::Array(a) => a.iter_mut().for_each(|x| for_each_image(x, f)),
+        Value::Object(o) => {
+            if matches!(o.get("type").and_then(Value::as_str), Some("image" | "image_url" | "input_image")) {
+                f(o);
+            } else {
+                for k in ["content", "output"] {
+                    if let Some(x) = o.get_mut(k) {
+                        for_each_image(x, f);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether the messages hold an image part (the walk of for_each_image).
+pub fn has_images(v: &Value) -> bool {
+    match v {
+        Value::Array(a) => a.iter().any(has_images),
+        Value::Object(o) => {
+            matches!(o.get("type").and_then(Value::as_str), Some("image" | "image_url" | "input_image"))
+                || ["content", "output"].iter().any(|k| o.get(*k).is_some_and(has_images))
+        }
+        _ => false,
+    }
+}
+
+/// The marks of a rendered prompt, in order: true for `image_mark`, false for `off_mark`.
+fn marks_of(text: &str, image_mark: &str, off_mark: Option<&str>) -> Vec<bool> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    loop {
+        let image = text[at..].find(image_mark);
+        let off = off_mark.and_then(|m| text[at..].find(m).map(|i| (i, m.len())));
+        match (image, off) {
+            (image, Some((o, len))) if image.is_none_or(|i| o < i) => {
+                out.push(false);
+                at += o + len;
+            }
+            (Some(i), _) => {
+                out.push(true);
+                at += i + image_mark.len();
+            }
+            (None, _) => return out,
+        }
+    }
+}
+
+impl ChatTemplate {
+    /// `render()`, and the image parts in the order the prompt holds their placeholders (`image_mark`). An
+    /// `input_image` part renders as an `image` part. The template places each part where it likes (it can sort tool
+    /// results), so the order comes from the template itself: with n parts, ceil(log2 n) more renders each keep part i
+    /// as an image when bit b of i is set and switch it off otherwise, and the bits read off each placeholder name its
+    /// part. One more render switches every part off, to find a literal placeholder in the text, which is refused, as
+    /// is a template that places a different number of parts between those renders. A part that is off is a video part
+    /// when the template writes `<|video|>` for one (GLM), and else a text part that holds a sentinel (a template such
+    /// as Inkling-2's raises on a video part).
+    pub fn render_images(
+        &self,
+        messages: Option<&Value>,
+        tools: Option<&Value>,
+        kw: Map<String, Value>,
+    ) -> Result<(String, Vec<Value>), TemplateError> {
+        let mut msgs = messages.cloned().unwrap_or(Value::Null);
+        let mut blocks = Vec::new();
+        for_each_image(&mut msgs, &mut |p| {
+            if p.get("type").and_then(Value::as_str) == Some("input_image") {
+                p.insert("type".into(), Value::from("image"));
+            }
+            blocks.push(Value::Object(p.clone()));
+        });
+        let n = blocks.len();
+        let text = self.render(Some(&msgs), tools, kw.clone())?;
+        if text.contains(VIDEO_MARK) {
+            return Err("the prompt holds a video placeholder; videos are not supported".into());
+        }
+        let literal = || TemplateError(format!("the prompt text holds an image placeholder ({})", self.image_mark));
+        let placed = marks_of(&text, &self.image_mark, None);
+        if n == 0 {
+            return if placed.is_empty() { Ok((text, Vec::new())) } else { Err(literal()) };
+        }
+        // The sentinel must be the probes' own: lengthen it until neither the prompt nor the image mark holds it.
+        let mut off_mark = if self.video_parts { VIDEO_MARK.to_string() } else { OFF_MARK.to_string() };
+        while !self.video_parts && (text.contains(&off_mark) || self.image_mark.contains(&off_mark)) {
+            off_mark.push('_');
+        }
+        // Probe 0 switches every part off, so a placeholder still there is the text's own. Probe b + 1 keeps part i
+        // as an image when bit b of i is set.
+        let bits = usize::BITS - (n - 1).leading_zeros();
+        let mut index = vec![0usize; placed.len()];
+        for probe in 0..=bits {
+            let mut i = 0usize;
+            let mut m = msgs.clone();
+            for_each_image(&mut m, &mut |p| {
+                let image = probe > 0 && (i >> (probe - 1)) & 1 == 1;
+                if !image && self.video_parts {
+                    p.insert("type".into(), Value::from("video"));
+                } else if !image {
+                    p.clear();
+                    p.insert("type".into(), Value::from("text"));
+                    p.insert("text".into(), Value::from(off_mark.as_str()));
+                }
+                i += 1;
+            });
+            let got = marks_of(&self.render(Some(&m), tools, kw.clone())?, &self.image_mark, Some(&off_mark));
+            if got.len() != placed.len() {
+                return Err("the chat template places the images inconsistently".into());
+            }
+            for (k, &m) in got.iter().enumerate() {
+                if probe == 0 && m {
+                    return Err(literal());
+                }
+                if probe > 0 {
+                    index[k] |= (m as usize) << (probe - 1);
+                }
+            }
+        }
+        if index.iter().any(|&i| i >= n) {
+            return Err("the chat template places the images inconsistently".into());
+        }
+        Ok((text, index.into_iter().map(|i| blocks[i].clone()).collect()))
     }
 }
 
@@ -200,11 +423,14 @@ fn py_format(out: &mut minijinja::Output, _: &minijinja::State, v: &J) -> Result
 }
 
 /// Python's printable test for repr(), close enough for prompt text: controls, separators other than the space,
-/// format characters and private use are escaped.
+/// format characters, private use and the noncharacters are escaped. U+FDD0..U+FDEF and U+FFFE..U+FFFF are
+/// unassigned (category Cn), so CPython escapes them, and the mark `literal.rs` writes is two of them: a mapping
+/// a template prints with str() therefore holds `\ufdd0\ufdd1` as twelve ASCII characters, as it does under the
+/// release's own tokenizer.
 fn py_printable(c: char) -> bool {
     !matches!(c as u32,
         0..=0x1f | 0x7f..=0xa0 | 0xad | 0x1680 | 0x180e | 0x2000..=0x200f | 0x2028..=0x202f | 0x205f..=0x2064
-        | 0x3000 | 0xd800..=0xf8ff | 0xfeff | 0xfff9..=0xfffb | 0xf0000..)
+        | 0x3000 | 0xd800..=0xf8ff | 0xfdd0..=0xfdef | 0xfeff | 0xfff9..=0xfffb | 0xfffe..=0xffff | 0xf0000..)
 }
 
 fn py_repr_str(out: &mut String, s: &str) {
@@ -510,7 +736,10 @@ pub fn normalize_messages(messages: Option<&Value>, supports_developer: bool) ->
                         }
                     }
                 }
-                if let Some(r) = m.get("reasoning").filter(|r| !r.is_null()) {
+                // Clients send back whichever field the server wrote (`--reasoning-fields`). Dropping one renders
+                // the turn as an empty think block, which GLM 5.3's template keeps on every turn by default.
+                let r = m.get("reasoning_content").filter(|r| !r.is_null());
+                if let Some(r) = r.or_else(|| m.get("reasoning").filter(|r| !r.is_null())) {
                     c.insert("reasoning".into(), r.clone());
                     c.insert("reasoning_content".into(), r.clone());
                 }
@@ -685,25 +914,21 @@ pub fn build_template_kwargs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn flash_thinking_off_is_model_scoped() {
-        let source = "{% if add_generation_prompt %}<|assistant|><think>{% endif %}";
-        let mut t = ChatTemplate::from_source(source.into(), Value::Null, Value::Null).unwrap();
-        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
-            "chat_template_kwargs": {"enable_thinking": false}});
-        let body = body.as_object().unwrap();
-        assert!(t.resolve_thinking(body, Defaults::default()).is_err());
-        t.flash_thinking_off = true;
-        assert!(t.resolve_thinking(body, Defaults::default()).is_ok());
-        let kw = serde_json::json!({"enable_thinking": false}).as_object().unwrap().clone();
-        assert_eq!(t.render(body.get("messages"), None, kw).unwrap(), "<|assistant|><think></think>\n\n");
-        assert_eq!(t.render(body.get("messages"), None, Map::new()).unwrap(), "<|assistant|><think>");
-        t.flash_thinking_off = false;
-        let kw = serde_json::json!({"enable_thinking": false}).as_object().unwrap().clone();
-        assert_eq!(t.render(body.get("messages"), None, kw).unwrap(), "<|assistant|><think>");
-    }
     use crate::thinking::{resolve, Defaults};
     use serde_json::json;
+
+    #[test]
+    fn assistant_reasoning_content_is_kept() {
+        let r = |m: Value| normalize_messages(Some(&json!([m])), false).unwrap()[0].clone();
+        let m = r(json!({"role": "assistant", "content": "a", "reasoning_content": "rc"}));
+        assert_eq!((&m["reasoning"], &m["reasoning_content"]), (&json!("rc"), &json!("rc")));
+        let m = r(json!({"role": "assistant", "content": "a", "reasoning": "r"}));
+        assert_eq!(m["reasoning_content"], json!("r"));
+        let m = r(json!({"role": "assistant", "content": "a", "reasoning_content": "rc", "reasoning": "r"}));
+        assert_eq!(m["reasoning_content"], json!("rc"));
+        let m = r(json!({"role": "assistant", "content": "a", "reasoning_content": null, "reasoning": "r"}));
+        assert_eq!(m["reasoning_content"], json!("r"));
+    }
 
     /// GLM 5.3's effort lines and generation prompt, with a minimal message loop.
     const GLM_HEAD: &str = r#"[gMASK]<sop>
@@ -711,6 +936,25 @@ mod tests {
 {%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
 {%- for m in messages -%}{%- if m.role == 'user' -%}<|user|>{{ m.content[0].text }}{%- endif -%}{%- endfor -%}
 {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}"#;
+
+    /// `{{ value }}` of a mapping is Python's `str()`, which calls `repr()` on the strings inside it, and CPython
+    /// escapes an unassigned character: the mark `literal.rs` writes is two of them, so a tool output given as a
+    /// mapping holds `\ufdd0\ufdd1` as text, exactly as it does under the release's own tokenizer.
+    #[test]
+    fn a_mapping_escapes_the_noncharacters_python_escapes() {
+        let t = ChatTemplate::from_source(
+            "{%- for m in messages -%}{{ m['content'][0]['output'] }}{%- endfor -%}".to_string(),
+            Value::Null,
+            Value::Null,
+        )
+        .unwrap();
+        let msg = |v: Value| json!([{"role": "tool", "content": [{"tool_call_id": "c1", "output": v}]}]);
+        let out = t.render(Some(&msg(json!({"k": "see <\u{fdd0}\u{fdd1}/think>"}))), None, Map::new()).unwrap();
+        assert_eq!(out, r"{'k': 'see <\ufdd0\ufdd1/think>'}");
+        // a printable character is still printed as itself
+        let out = t.render(Some(&msg(json!({"k": "plain \u{4f60}"}))), None, Map::new()).unwrap();
+        assert_eq!(out, "{'k': 'plain \u{4f60}'}");
+    }
 
     fn render(t: &ChatTemplate, body: Value) -> String {
         let body = body.as_object().unwrap();
@@ -727,13 +971,18 @@ mod tests {
     }
 
     #[test]
-    fn thinking_off_drops_the_effort_turn_and_closes_the_think_block() {
+    fn thinking_off_renders_low_effort_and_keeps_think_open() {
         let t = ChatTemplate::from_source(GLM_HEAD.into(), Value::Null, Value::Null).unwrap();
-        let text = render(&t, json!({}));
-        assert_eq!(text, "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>");
-        assert_eq!(t.thinking_off(text.clone(), true), "[gMASK]<sop><|user|>hi<|assistant|><think></think>");
-        assert_eq!(t.thinking_off(text, false), "[gMASK]<sop><|user|>hi<|assistant|><think>");
-        assert_eq!(t.thinking_off("<|user|>hi".into(), true), "<|user|>hi");
+        assert_eq!(render(&t, json!({})), "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>hi<|assistant|><think>");
+        for b in [
+            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+            json!({"chat_template_kwargs": {"thinking": false}}),
+            json!({"reasoning_effort": "none"}),
+        ] {
+            let th = t.resolve_thinking(b.as_object().unwrap(), Defaults::default()).unwrap();
+            assert!(th.off, "{b}");
+            assert_eq!(render(&t, b), "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>hi<|assistant|><think>");
+        }
     }
 
     fn effort_lines(t: &ChatTemplate) {
@@ -767,6 +1016,66 @@ mod tests {
         effort_lines(&t);
     }
 
+    /// A template that writes the messages in reverse, with GLM-5.3-Flash's media macros: the image parts come back in
+    /// the order of their placeholders in the prompt.
+    #[test]
+    fn render_images_follows_the_template() {
+        let src = r#"{%- macro v(c) -%}{%- for i in c -%}{%- if i.type == 'text' -%}{{ i.text }}{%- elif i.type in ['image', 'image_url'] -%}<|begin_of_image|><|image|><|end_of_image|>{%- elif i.type in ['video', 'video_url'] -%}<|begin_of_video|><|video|><|end_of_video|>{%- endif -%}{%- endfor -%}{%- endmacro -%}{%- for m in messages | reverse -%}<|{{ m.role }}|>{{ v(m.content) }}{%- endfor -%}"#;
+        let t = ChatTemplate::from_source(src.into(), Value::Null, Value::Null).unwrap();
+        let img = |k: u32| json!({"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{k}")}});
+        let msgs = json!([
+            {"role": "user", "content": [img(0), {"type": "text", "text": "a"}, img(1)]},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": [{"type": "text", "text": "c"}, img(2), {"type": "input_image", "image_url": "data:image/png;base64,3"}]},
+        ]);
+        let (text, blocks) = t.render_images(Some(&msgs), None, Map::new()).unwrap();
+        let im = "<|begin_of_image|><|image|><|end_of_image|>";
+        assert_eq!(text, format!("<|user|>c{im}{im}<|assistant|>b<|user|>{im}a{im}"));
+        let urls: Vec<String> = blocks.iter().map(|b| crate::vision::block_b64(b).unwrap().to_string()).collect();
+        assert_eq!(urls, ["2", "3", "0", "1"]);
+        // one image takes the literal probe alone, and no image gives the text render() makes
+        let one = json!([{"role": "user", "content": [img(7)]}]);
+        assert_eq!(t.render_images(Some(&one), None, Map::new()).unwrap().1.len(), 1);
+        let none = json!([{"role": "user", "content": "hi"}]);
+        assert_eq!(t.render_images(Some(&none), None, Map::new()).unwrap(), ("<|user|>hi".to_string(), vec![]));
+        // a literal placeholder in the text is refused, with or without images
+        let lit = json!([{"role": "user", "content": [img(0), {"type": "text", "text": "<|image|>"}]}]);
+        assert!(t.render_images(Some(&lit), None, Map::new()).is_err());
+        let lit = json!([{"role": "user", "content": "<|image|>"}]);
+        assert!(t.render_images(Some(&lit), None, Map::new()).is_err());
+    }
+
+    /// The real GLM-5.3-Flash template (GR8_TEST_TOKENIZER_DIR, as below): images in a user message, a system message and
+    /// two tool results that the template sorts into its tool calls' order.
+    #[test]
+    fn render_images_in_the_flash_template() {
+        let Some(dir) = gr8knobs::TEST_TOKENIZER_DIR.get() else {
+            eprintln!("GR8_TEST_TOKENIZER_DIR not set; skipping");
+            return;
+        };
+        let t = ChatTemplate::load(Path::new(&dir), Value::Null, Value::Null).unwrap();
+        let cfg = std::fs::read_to_string(Path::new(&dir).join("config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        if cfg.as_ref().and_then(|c| c.get("model_type")).and_then(Value::as_str) != Some("glm5_next") {
+            eprintln!("GR8_TEST_TOKENIZER_DIR is not GLM-5.3-Flash; skipping");
+            return;
+        }
+        let img = |k: u32| json!({"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{k}")}});
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "f", "arguments": "{}"}});
+        let msgs = json!([
+            {"role": "system", "content": [{"type": "text", "text": "s"}, img(0)]},
+            {"role": "user", "content": [img(1), {"type": "text", "text": "what is this?"}]},
+            {"role": "assistant", "content": "", "tool_calls": [call("a"), call("b")]},
+            {"role": "tool", "tool_call_id": "b", "content": [img(3)]},
+            {"role": "tool", "tool_call_id": "a", "content": [img(2)]},
+        ]);
+        let (text, blocks) = t.render_images(Some(&msgs), None, Map::new()).unwrap();
+        assert_eq!(text.matches("<|begin_of_image|><|image|><|end_of_image|>").count(), 4, "{text}");
+        let urls: Vec<String> = blocks.iter().map(|b| crate::vision::block_b64(b).unwrap().to_string()).collect();
+        assert_eq!(urls, ["0", "1", "2", "3"], "{text}");
+    }
+
     /// The real template: GR8_TEST_TOKENIZER_DIR=<dir with chat_template.jinja ...> cargo test --release
     #[test]
     fn each_effort_renders_the_nearest_named_level_in_the_model_template() {
@@ -777,5 +1086,323 @@ mod tests {
         let t = ChatTemplate::load(Path::new(&dir), Value::Null, Value::Null).unwrap();
         assert_eq!(t.levels, vec!["max", "high", "low"]);
         effort_lines(&t);
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("g6front-tpl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_prefers_chat_template_jinja_then_falls_back_to_tokenizer_config() {
+        // 1. String chat_template in tokenizer_config.json when chat_template.jinja is absent
+        let d_str = temp_dir("str");
+        std::fs::write(
+            d_str.join("tokenizer_config.json"),
+            json!({
+                "chat_template": "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content[0].text }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}",
+                "eos_token": "<|im_end|>"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let t_str = ChatTemplate::load(&d_str, json!("<|im_end|>"), Value::Null).unwrap();
+        let msgs = json!([{"role": "user", "content": "hello"}]);
+        let mut kw_on = Map::new();
+        kw_on.insert("add_generation_prompt".into(), Value::Bool(true));
+        assert_eq!(
+            t_str.render(Some(&msgs), None, kw_on).unwrap(),
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let mut kw_off = Map::new();
+        kw_off.insert("add_generation_prompt".into(), Value::Bool(true));
+        kw_off.insert("enable_thinking".into(), Value::Bool(false));
+        assert_eq!(
+            t_str.render(Some(&msgs), None, kw_off).unwrap(),
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+
+        // 2. chat_template.jinja takes priority over tokenizer_config.json when both exist
+        std::fs::write(d_str.join("chat_template.jinja"), "JINJA:{{ messages[0].content[0].text }}").unwrap();
+        let t_jinja = ChatTemplate::load(&d_str, json!("<|im_end|>"), Value::Null).unwrap();
+        assert_eq!(t_jinja.render(Some(&msgs), None, Map::new()).unwrap(), "JINJA:hello");
+        let _ = std::fs::remove_dir_all(&d_str);
+
+        // 3. Array-of-dicts chat_template in tokenizer_config.json picks the "default" entry, and AddedToken objects
+        //    for bos_token / eos_token render as token strings
+        let d_arr = temp_dir("arr");
+        std::fs::write(
+            d_arr.join("tokenizer_config.json"),
+            json!({
+                "bos_token": {"__type": "AddedToken", "content": "<|begin_of_text|>"},
+                "eos_token": {"__type": "AddedToken", "content": "<|eot_id|>"},
+                "chat_template": [
+                    {"name": "rag", "template": "RAG:{{ messages[0].content[0].text }}"},
+                    {"name": "default", "template": "{{ bos_token }}[{{ messages[0].content[0].text }}]{{ eos_token }}"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let eos_obj = json!({"__type": "AddedToken", "content": "<|eot_id|>"});
+        let t_arr = ChatTemplate::load(&d_arr, eos_obj, Value::Null).unwrap();
+        assert_eq!(t_arr.render(Some(&msgs), None, Map::new()).unwrap(), "<|begin_of_text|>[hello]<|eot_id|>");
+        let _ = std::fs::remove_dir_all(&d_arr);
+
+        // 4. Missing both chat_template.jinja and tokenizer_config.json chat_template returns an error
+        let d_empty = temp_dir("empty");
+        std::fs::write(d_empty.join("tokenizer_config.json"), "{}").unwrap();
+        assert!(ChatTemplate::load(&d_empty, Value::Null, Value::Null).is_err());
+        let _ = std::fs::remove_dir_all(&d_empty);
+    }
+    #[test]
+    fn hf_templates_receive_text_and_tool_arguments() {
+        let t = ChatTemplate::from_source(
+            "{% for m in messages %}{{ m.role }}:{{ m.content }}{% if m.tool_calls %}:{{ m.tool_calls[0].function.arguments.x }}{% endif %};{% endfor %}".into(),
+            Value::Null, Value::Null).unwrap().hf();
+        let messages = json!([
+            {"role":"user", "content":[{"type":"text", "text":"Hello"}]},
+            {"role":"assistant", "content":null, "tool_calls":[{"function":{"name":"f", "arguments":"{\"x\":2}"}}]},
+            {"role":"tool", "content":"result", "tool_call_id":"1"}
+        ]);
+        assert_eq!(t.render(Some(&messages), None, Map::new()).unwrap(), "user:Hello;assistant::2;tool:result;");
+        assert!(extract_chat_template(&json!({"chat_template":[{"name":"special", "template":"no"}]})).is_none());
+    }
+
+    /// A template with the structure of Inkling-2's: a system line for the thinking effort (a level name or a number
+    /// from 0.0 to 0.99, default 0.9), a compact sorted tool declaration, one tagged block per content part, JSON
+    /// tool-call blocks, and an exception on any part it does not know (a video part among them).
+    const INK_STYLE: &str = r#"{%- set levels = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99} -%}
+{%- set heads = {"user": "<|message_user|>", "assistant": "<|message_model|>", "system": "<|message_system|>", "tool": "<|message_tool|>"} -%}
+{%- macro effort_line() -%}
+{%- set e = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}
+{%- if e is string -%}
+{%- if e not in levels -%}{{- raise_exception("Unknown reasoning_effort: " ~ e) -}}{%- endif -%}
+{%- set n = levels[e] -%}
+{%- else -%}
+{%- set n = e | float -%}
+{%- endif -%}
+{%- if n < 0.0 or n > 0.99 -%}{{- raise_exception("reasoning_effort must be in [0.0, 0.99]") -}}{%- endif -%}
+{{- "<|message_system|><|content_text|>Thinking effort level: " -}}{%- if n == 0.0 -%}0{%- else -%}{{ n }}{%- endif -%}{{- "<|end_message|>" -}}
+{%- endmacro -%}
+{%- if tools -%}
+{%- set acc = namespace(specs=[]) -%}
+{%- for tool in tools -%}
+{%- set f = tool.function -%}
+{%- set acc.specs = acc.specs + [{"description": f.description if f.description else "", "name": f.name, "parameters": f.parameters if f.parameters else {}, "type": "function"}] -%}
+{%- endfor -%}
+{{- "<|message_system|>tool_declare<|content_xml|>" ~ (acc.specs | tojson(sort_keys=true, separators=(",", ":"))) ~ "<|end_message|>" -}}
+{%- endif -%}
+{%- set seen = namespace(effort=false) -%}
+{%- for m in messages -%}
+{%- if not seen.effort and m.role != "system" -%}{{- effort_line() -}}{%- set seen.effort = true -%}{%- endif -%}
+{%- set head = heads[m.role] ~ (m.name if m.role in ("tool", "assistant") and m.name else "") -%}
+{%- if m.role == "assistant" and m.reasoning_content -%}{{- head ~ "<|content_thinking|>" ~ m.reasoning_content ~ "<|end_message|>" -}}{%- endif -%}
+{%- if m.content is string -%}
+{%- if m.content or not (m.role == "assistant" and (m.tool_calls or m.reasoning_content)) -%}{{- head ~ "<|content_text|>" ~ m.content ~ "<|end_message|>" -}}{%- endif -%}
+{%- elif m.content -%}
+{%- for part in m.content -%}
+{%- if part.type == "text" -%}{{- head ~ "<|content_text|>" ~ part.text ~ "<|end_message|>" -}}
+{%- elif part.type in ("image", "input_image", "image_url") -%}
+{%- if m.role not in ("user", "tool") -%}{{- raise_exception("Image content is only supported for user and tool messages") -}}{%- endif -%}
+{{- head ~ "<|content_image|><|unused_200054|><|end_message|>" -}}
+{%- else -%}{{- raise_exception("Unsupported content part type: " ~ part.type) -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- if m.role == "assistant" and m.tool_calls -%}
+{%- for call in m.tool_calls -%}
+{{- "<|message_model|>" ~ call.function.name ~ "<|content_invoke_tool_json|>" ~ '{"name":' ~ (call.function.name | tojson) ~ ',"args":' ~ (call.function.arguments | tojson(sort_keys=true, separators=(",", ":"))) ~ "}<|end_message|>" -}}
+{%- endfor -%}
+{%- endif -%}
+{%- if m.role == "assistant" -%}{{- "<|content_model_end_sampling|>" -}}{%- endif -%}
+{%- endfor -%}
+{%- if not seen.effort -%}{{- effort_line() -}}{%- endif -%}"#;
+
+    fn ink_style() -> ChatTemplate {
+        let mut t = ChatTemplate::from_source(INK_STYLE.into(), Value::Null, Value::Null).unwrap().single_text();
+        assert_eq!(t.image_mark, "<|image|>");
+        t.image_mark = "<|unused_200054|>".into();
+        t
+    }
+
+    /// What the chat handler does on `--dialect inkling`: `resolve_inkling`, then the effort into the kwargs.
+    fn ink_render(t: &ChatTemplate, body: Value, messages: Value, tools: Option<Value>) -> Result<String, String> {
+        let body = body.as_object().unwrap().clone();
+        let d = crate::thinking::Defaults { effort: None, budget: crate::sampling::Limit::Tokens(0), allow_off: true };
+        let (th, effort) = crate::dialect::resolve_inkling(&body, d, None).map_err(|e| e.message)?;
+        let mut kw = build_template_kwargs(
+            body.get("chat_template_kwargs"),
+            Value::Bool(true),
+            Value::Bool(false),
+            th.effort,
+            None,
+        )
+        .unwrap();
+        if let Some(e) = effort {
+            kw.insert("reasoning_effort".into(), e);
+        }
+        let tools = normalize_tools(tools.as_ref()).unwrap();
+        t.render(Some(&messages), tools.as_ref(), kw).map_err(|e| e.0)
+    }
+
+    #[test]
+    fn an_inkling_style_template_prints_the_effort_the_request_resolves_to() {
+        let t = ink_style();
+        let hi = || json!([{"role": "user", "content": "hi"}]);
+        let line = |body: Value| {
+            let text = ink_render(&t, body, hi(), None).unwrap();
+            let want_tail = "<|end_message|><|message_user|><|content_text|>hi<|end_message|>";
+            let head = "<|message_system|><|content_text|>Thinking effort level: ";
+            assert!(text.starts_with(head) && text.ends_with(want_tail), "{text}");
+            text[head.len()..text.len() - want_tail.len()].to_string()
+        };
+        assert_eq!(line(json!({})), "0.9");
+        assert_eq!(line(json!({"reasoning_effort": "none"})), "0");
+        assert_eq!(line(json!({"reasoning_effort": 0.0})), "0");
+        assert_eq!(line(json!({"reasoning_effort": 0})), "0");
+        assert_eq!(line(json!({"chat_template_kwargs": {"enable_thinking": false}})), "0");
+        assert_eq!(line(json!({"chat_template_kwargs": {"thinking": false}})), "0");
+        assert_eq!(line(json!({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": false}})), "0");
+        assert_eq!(line(json!({"reasoning_effort": "minimal"})), "0.1");
+        assert_eq!(line(json!({"reasoning_effort": "medium"})), "0.7");
+        assert_eq!(line(json!({"chat_template_kwargs": {"reasoning_effort": "low"}})), "0.2");
+        assert_eq!(line(json!({"reasoning_effort": "max"})), "0.99");
+        assert_eq!(line(json!({"reasoning_effort": 0.35})), "0.35");
+        assert_eq!(line(json!({"chat_template_kwargs": {"reasoning_effort": 0.35}})), "0.35");
+        // effort none with the switch on: the template's default
+        assert_eq!(line(json!({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": true}})), "0.9");
+        // refused before the template sees it
+        for bad in [json!(1.5), json!("bogus"), json!(-1)] {
+            let e = ink_render(&t, json!({"reasoning_effort": bad}), hi(), None).unwrap_err();
+            assert!(e.starts_with("reasoning_effort must be none, minimal"), "{e}");
+        }
+        // the effort line goes after the leading system messages, or last when there is nothing else
+        let msgs = json!([{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}]);
+        assert_eq!(
+            ink_render(&t, json!({"reasoning_effort": "low"}), msgs, None).unwrap(),
+            "<|message_system|><|content_text|>be brief<|end_message|>\
+             <|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|>\
+             <|message_user|><|content_text|>hi<|end_message|>"
+        );
+    }
+
+    #[test]
+    fn an_inkling_style_template_declares_tools_and_replays_calls_as_compact_json() {
+        let t = ink_style();
+        let tools = json!([{"type": "function", "function": {
+            "name": "get_weather", "description": "Weather by city",
+            "parameters": {"type": "object", "required": ["city"], "properties": {"city": {"type": "string"}}}}}]);
+        let msgs = json!([
+            {"role": "user", "content": "weather in SF?"},
+            {"role": "assistant", "content": "", "reasoning_content": "look it up", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"unit\": \"C\", \"city\": \"SF\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "name": "get_weather", "content": "18C"},
+            {"role": "assistant", "content": "It is 18C."},
+            {"role": "user", "content": "thanks"},
+        ]);
+        let text = ink_render(&t, json!({}), msgs, Some(tools)).unwrap();
+        assert_eq!(
+            text,
+            "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather by city\",\"name\":\"get_weather\",\
+             \"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\
+             \"type\":\"function\"}]<|end_message|>\
+             <|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>\
+             <|message_user|><|content_text|>weather in SF?<|end_message|>\
+             <|message_model|><|content_thinking|>look it up<|end_message|>\
+             <|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\",\"unit\":\"C\"}}<|end_message|>\
+             <|content_model_end_sampling|>\
+             <|message_tool|>get_weather<|content_text|>18C<|end_message|>\
+             <|message_model|><|content_text|>It is 18C.<|end_message|><|content_model_end_sampling|>\
+             <|message_user|><|content_text|>thanks<|end_message|>"
+        );
+    }
+
+    #[test]
+    fn render_images_orders_the_parts_on_a_template_that_raises_on_video() {
+        let t = ink_style();
+        let img = |k: u32| json!({"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{k}")}});
+        let urls = |blocks: &[Value]| -> Vec<String> {
+            blocks.iter().map(|b| crate::vision::block_b64(b).unwrap().to_string()).collect()
+        };
+        let block = "<|content_image|><|unused_200054|><|end_message|>";
+        // the template raises on a video part, so the probes cannot use one
+        let video = json!([{"role": "user", "content": [{"type": "video", "video": "v"}]}]);
+        assert_eq!(t.render(Some(&video), None, Map::new()).unwrap_err().0, "Unsupported content part type: video");
+        assert!(t.render_images(Some(&video), None, Map::new()).is_err());
+
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "f", "arguments": "{}"}});
+        let msgs = json!([
+            {"role": "user", "content": [img(0), {"type": "text", "text": "compare"}, img(1),
+                                         {"type": "input_image", "image_url": "data:image/png;base64,2"}]},
+            {"role": "assistant", "content": "", "tool_calls": [call("a"), call("b")]},
+            {"role": "tool", "tool_call_id": "a", "name": "f", "content": [img(3)]},
+            {"role": "tool", "tool_call_id": "b", "name": "f", "content": [{"type": "text", "text": "shot"}, img(4)]},
+            {"role": "user", "content": [img(5)]},
+        ]);
+        let (text, blocks) = t.render_images(Some(&msgs), None, Map::new()).unwrap();
+        assert_eq!(text.matches(block).count(), 6, "{text}");
+        assert_eq!(text.matches(&format!("<|message_tool|>f{block}")).count(), 2, "{text}");
+        assert!(!text.contains("g6_img_off"), "{text}");
+        assert_eq!(urls(&blocks), ["0", "1", "2", "3", "4", "5"], "{text}");
+        assert_eq!(blocks[2]["type"], "image");
+
+        // one image, and none
+        let one = json!([{"role": "user", "content": [{"type": "text", "text": "a"}, img(7)]}]);
+        let (text, blocks) = t.render_images(Some(&one), None, Map::new()).unwrap();
+        assert!(text.ends_with(&format!("<|message_user|><|content_text|>a<|end_message|><|message_user|>{block}")));
+        assert_eq!(urls(&blocks), ["7"]);
+        let none = json!([{"role": "user", "content": "hi"}]);
+        assert_eq!(t.render_images(Some(&none), None, Map::new()).unwrap().1, Vec::<Value>::new());
+
+        // the model's placeholder in the text is refused, with or without images; `<|image|>` is plain text here
+        let want = "the prompt text holds an image placeholder (<|unused_200054|>)";
+        let lit = json!([{"role": "user", "content": [img(0), {"type": "text", "text": "<|unused_200054|>"}]}]);
+        assert_eq!(t.render_images(Some(&lit), None, Map::new()).unwrap_err().0, want);
+        let lit = json!([{"role": "user", "content": "see <|unused_200054|>"}]);
+        assert_eq!(t.render_images(Some(&lit), None, Map::new()).unwrap_err().0, want);
+        let plain = json!([{"role": "user", "content": [img(0), {"type": "text", "text": "<|image|>"}, img(1)]}]);
+        assert_eq!(urls(&t.render_images(Some(&plain), None, Map::new()).unwrap().1), ["0", "1"]);
+        // a `<|video|>` in the text is still refused
+        let vid = json!([{"role": "user", "content": [img(0), {"type": "text", "text": "<|video|>"}]}]);
+        assert_eq!(
+            t.render_images(Some(&vid), None, Map::new()).unwrap_err().0,
+            "the prompt holds a video placeholder; videos are not supported"
+        );
+        // the probes' sentinel in the text does not confuse them
+        let sent = json!([{"role": "user", "content": [img(0), {"type": "text", "text": "[[g6_img_off]]"}, img(1)]}]);
+        assert_eq!(urls(&t.render_images(Some(&sent), None, Map::new()).unwrap().1), ["0", "1"]);
+        // an image where the template takes none is the template's own error
+        let sys = json!([{"role": "system", "content": [img(0)]}]);
+        assert_eq!(
+            t.render_images(Some(&sys), None, Map::new()).unwrap_err().0,
+            "Image content is only supported for user and tool messages"
+        );
+    }
+
+    #[test]
+    fn marks_are_read_in_order() {
+        assert_eq!(marks_of("a<|image|>b[[x]]<|image|>", "<|image|>", Some("[[x]]")), [true, false, true]);
+        assert_eq!(marks_of("a<|image|>b[[x]]", "<|image|>", None), [true]);
+        assert_eq!(marks_of("[[x]][[x]]", "<|image|>", Some("[[x]]")), [false, false]);
+        assert_eq!(marks_of("", "<|image|>", Some("[[x]]")), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn the_image_mark_comes_from_the_processor_config() {
+        let dir = temp_dir("image-mark");
+        std::fs::write(dir.join("chat_template.jinja"), "{{ messages[0].content }}").unwrap();
+        let load = || ChatTemplate::load(&dir, Value::Null, Value::Null).unwrap().image_mark;
+        assert_eq!(load(), "<|image|>");
+        std::fs::write(dir.join("processor_config.json"), r#"{"image_token": ""}"#).unwrap();
+        assert_eq!(load(), "<|image|>");
+        std::fs::write(dir.join("processor_config.json"), r#"{"image_token": 7}"#).unwrap();
+        assert_eq!(load(), "<|image|>");
+        std::fs::write(dir.join("processor_config.json"), r#"{"image_token": "<|unused_200054|>"}"#).unwrap();
+        assert_eq!(load(), "<|unused_200054|>");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
