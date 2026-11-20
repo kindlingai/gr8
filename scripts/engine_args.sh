@@ -354,6 +354,13 @@ engine_defaults() {
        tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
        tp4_default IDX_VEC 1; tp4_default DEC_BK 2048; tp4_default DEC_BK_MAX 2048; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
        tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248
+       # bit-exact decode, prefill and DFlash2 kernel variants (#542; KL=0, +9.9% 32K / +8.4% 128K prefill at TP=4);
+       # DFL_DEDUP only with DFLASH=1 (the engine refuses GR8_DFL_DEDUP=1 without --dflash-manifest)
+       tp4_default DEC_DENSE_OPT 1; tp4_default DTR_EXACT_OPT 1; tp4_default MOE_RTR_FIN_OPT 1
+       tp4_default TR3_WIDE4 1; tp4_default PF_ATTN_OPT 1; tp4_default PF_DENSE_OPT 1
+       tp4_default PF_ISGRT_CLEAN 1; [ "${DFLASH:-0}" = 0 ] || tp4_default DFL_DEDUP 1
+       # batch-budgeted MoE union cap (#548): 48 = nearly lossless TP=4 default; 32 = faster concurrency; 0 = uncapped
+       tp4_default MOE_UNION_CAP 48
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then
          tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
          case " ${EXTRA_ENV:-} " in *" GR8_ATTN_FLIP=1 "*) ;; *) tp4_default CP_ONECHAIN 1 ;; esac
@@ -607,6 +614,18 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   ENGINE_ENV="$ENGINE_ENV${MTP_KSTOPB_WIDTHS:+ GR8_MTP_KSTOPB_WIDTHS=$MTP_KSTOPB_WIDTHS}"
   # the window-2 fc1 split on every MoE layer at M > 1 (TR3_W2ALL; docs/SETTINGS.md): off unless set; on at TP=4
   ENGINE_ENV="$ENGINE_ENV${TR3_W2ALL:+ GR8_TR3_W2ALL=$TR3_W2ALL}"
+  # bit-exact decode, prefill and DFlash2 kernel variants (#542; docs/ENV.md): off unless set; on at TP=4
+  ENGINE_ENV="$ENGINE_ENV${DEC_DENSE_OPT:+ GR8_DEC_DENSE_OPT=$DEC_DENSE_OPT}"
+  ENGINE_ENV="$ENGINE_ENV${DTR_EXACT_OPT:+ GR8_DTR_EXACT_OPT=$DTR_EXACT_OPT}"
+  ENGINE_ENV="$ENGINE_ENV${MOE_RTR_FIN_OPT:+ GR8_MOE_RTR_FIN_OPT=$MOE_RTR_FIN_OPT}"
+  ENGINE_ENV="$ENGINE_ENV${TR3_WIDE4:+ GR8_TR3_WIDE4=$TR3_WIDE4}"
+  ENGINE_ENV="$ENGINE_ENV${PF_ATTN_OPT:+ GR8_PF_ATTN_OPT=$PF_ATTN_OPT}"
+  ENGINE_ENV="$ENGINE_ENV${PF_DENSE_OPT:+ GR8_PF_DENSE_OPT=$PF_DENSE_OPT}"
+  ENGINE_ENV="$ENGINE_ENV${PF_ISGRT_CLEAN:+ GR8_PF_ISGRT_CLEAN=$PF_ISGRT_CLEAN}"
+  ENGINE_ENV="$ENGINE_ENV${DFL_DEDUP:+ GR8_DFL_DEDUP=$DFL_DEDUP}"
+  # batch-budgeted MoE union cap (#548; docs/ENV.md): 0 leaves the engine uncapped; TP=4 defaults to 48
+  [ "${MOE_UNION_CAP:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_MOE_UNION_CAP=$MOE_UNION_CAP"
+  ENGINE_ENV="$ENGINE_ENV${MOE_UNION_MODE:+ GR8_MOE_UNION_MODE=$MOE_UNION_MODE}"
   # routed experts through a per-layer piece table (PTAB, EL3 #151; docs/SETTINGS.md): off unless set (the pack layout)
   ENGINE_ENV="$ENGINE_ENV${PTAB:+ GR8_PTAB=$PTAB}"
   # QO cache, prefill index-score rows, fc1 kernels, P11 attention, dense trellis (QO_CACHE, PF_ISGRT_RG, PF_F12,
