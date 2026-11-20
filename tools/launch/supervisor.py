@@ -1140,8 +1140,9 @@ class Supervisor:
         tmo = float(plan['knobs'].get('READY_TMO') or 1800)
         t0, ask_at = time.monotonic(), tmo
         log(f'engine started (epoch {hs["epoch"]}); waiting for it to load (up to {tmo:.0f}s)')
-        relay = StageRelay(os.path.join(self.out, f'g6m4.r{r}.err'), SCALE_STAGE if self.pending else BOOT_STAGE) \
-            if models.of(o).stage_relay else None
+        err = os.path.join(self.out, f'g6m4.r{r}.err')
+        # a scale's boot relays its stage lines for every model (the hold's parts); other boots where the model asks
+        relay = StageRelay(err, SCALE_STAGE) if self.pending else StageRelay(err) if models.of(o).stage_relay else None
         while True:
             self.watch()
             for line in relay.new() if relay else ():

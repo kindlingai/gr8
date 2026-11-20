@@ -23,6 +23,9 @@ with open('out/stub.json', 'w') as f:
     json.dump({'argv': argv, 'env': {k: v for k, v in os.environ.items() if k.startswith(('GR8_', 'G6_'))},
                'ld': os.environ.get('LD_LIBRARY_PATH'), 'cwd': os.getcwd()}, f)
 d = val('--serve')
+if os.environ.get('GR8_KV_REWIDTH'):   # what the engine says when it rewrites the old width's store (a scale)
+    print(f'# rank {rank}: flash ckpt rewidth carried 0 entries from TP={os.environ["GR8_KV_REWIDTH"].split(",")[0]}',
+          file=sys.stderr, flush=True)
 if os.path.exists(f'fail.tp{len(val("--ips").split(","))}'):
     sys.exit('g6: stub: this box cannot boot this width (fail.tp file)')
 # the waits run under another name: the boxes of a test share one process table, and a box's checks refuse to boot

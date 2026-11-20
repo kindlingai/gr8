@@ -271,6 +271,9 @@ class Scale(unittest.TestCase):
         for i in range(3):
             self.assertEqual(sorted(os.listdir(os.path.join(self.homes[i], 'store', f'r{i}'))), ['index'])
         log3 = read(os.path.join(self.homes[3], 'out', 'supervisor.log'))
+        # the scale's boot relays the engine's store rewrite to the supervisor log, whatever the model's stage_relay
+        self.assertRegex(read(os.path.join(self.homes[2], 'out', 'supervisor.log')),
+                         r'\d+s rank 2: flash ckpt rewidth carried 0 entries from TP=4')
         self.assertIn('this box leaves', log3)
         self.assertIn('served to the new ranks' if peer else 'kvman-peer: the new ranks start', log3)
         self.assertEqual(sorted(os.listdir(os.path.join(self.homes[3], 'store', 'r3'))), ['index'])
