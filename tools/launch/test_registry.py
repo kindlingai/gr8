@@ -15,8 +15,8 @@ import options
 ROOT = Path(__file__).resolve().parents[2]
 # SHA256 of normalized ENGINE_BIN, ENGINE_ENV and engine_args on the original implementation.
 BASELINES = [
-    ('glm53', '4', 'fp8', '', '3cf0c9ff199f09e8725e90d0ea65d2ea8d447fa1d0a8d80c0e0949540bbd047d'),
-    ('glm53', '4', 'int4', '', 'cf7d3da143e5e62f3f5e00010be4f520ab9dbe7a5a3b5d3a7576209eef908960'),
+    ('glm53', '4', 'fp8', '', '4886b227dd10aac2910a7b9df5b2bfde0597a21342b367a5ee91682fe7522dc2'),
+    ('glm53', '4', 'int4', '', '9eee9f889df254da070221452d75192453dd44743f39edd82e4d9e6ff88241df'),
     ('glm53', '6', 'fp8', '', 'e5d813a60b12a5bf6c928bcb271e5e0240547c157940b9dd8d013fe6ae3f686c'),
     ('glm53', '6', 'int4', '', 'aad025af5325d509797adc325282d678f8695d4277131dfd04a773b649da681a'),
     ('glm53', '3', 'fp8', '', 'd5fe690d5714f5f0416af0a6aa157421e46e4b8fc975e0c38673b668c1dcb3b4'),

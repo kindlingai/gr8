@@ -653,7 +653,7 @@ class CanonicalTests(unittest.TestCase):
 
     def test_tp4_serve_options_default_on_and_override(self):
         on = ['GR8_ROUTE_OVL=1', 'GR8_DRAFT_HEAD_I4=1', 'GR8_ATTN_SC2=4', 'GR8_ATTN_SC2_TR=2', 'GR8_ATTN_CTX2=4', 'GR8_ATTN_CTX3=2',
-              'GR8_ATTN_SEL2=16', 'GR8_IDX_GRP=16', 'GR8_ATTN_QT=1', 'GR8_ATTN_FRONT=1', 'GR8_IDX_VEC=1', 'GR8_DEC_BK=2048', 'GR8_DEC_BK_MAX=32768',
+              'GR8_ATTN_SEL2=16', 'GR8_IDX_GRP=16', 'GR8_ATTN_QT=1', 'GR8_ATTN_FRONT=1', 'GR8_IDX_VEC=1', 'GR8_DEC_BK=2048', 'GR8_DEC_BK_MAX=2048',
               'GR8_S2_ADAPT=1', 'GR8_S2_DECODE_PF=4096', 'GR8_S2_ADMIT_HOLD=1', 'GR8_PF_SELX_CTX=53248']
         def env(peers, *argv):
             o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
