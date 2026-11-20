@@ -375,6 +375,9 @@ class Supervisor:
         self.scale_seen = set()       # every member of a scale, old and new: they keep asking status and logs
         self.peer_proc = None         # bin/kvman-peer
         self.hello_poll = handshake.POLL_S   # a worker's verdict poll: shorter while a scale's hold runs
+        # POOL: every box that may serve, resolved; the planned layout of the running width (the head's, for adopt); and
+        # the TP and POOL this head booted under, which its kept width (out/scale.json) must match at the next up
+        self.pool, self.layout_text, self.base = [], None, [o.get('TP'), o.get('POOL')]
 
     # ---- state ----------------------------------------------------------------------------------------------------
     def set_state(self, state, **meta):
@@ -395,7 +398,10 @@ class Supervisor:
 
     # ---- the control port -----------------------------------------------------------------------------------------
     def serve(self, addrs):
+        listening = {s.server_address[0] for s in self.servers}
         for a in dict.fromkeys(addrs):
+            if a in listening:
+                continue
             try:
                 s = Server((a, self.port), Handler)
             except OSError as e:
@@ -408,6 +414,7 @@ class Supervisor:
     def allowed(self, peer):
         """The members' LAN and fabric addresses, and this box's own. Known once the members are."""
         known = set(self.members) | set(self.rails) | set(self.hs.get('ips', [])) | set(self.hs.get('ips2', []))
+        known |= set(self.pool)
         known |= {a for r in self.elected or [] for a in r} | self.scale_seen
         if self.head:
             known |= {a for h in self.head.have.values() for a in h['rails']}
@@ -444,6 +451,10 @@ class Supervisor:
                         return {'t': 'scale', **s['msg']}
                 return {'t': 'retry', 'detail': 'the cluster is rolling back to its old member list' if rolling
                         else f'the cluster is changing its member list (scale {s["phase"]})'}
+            if t == 'hello' and self.pool and m.get('members') != self.members and not self.stop_ev.is_set():
+                # a box of the pool that counted another member list (another TP, or the width the head kept from its
+                # last scale): it takes this one, or waits as a standby
+                return self.adopt_msg()
             if not self.head_ready.is_set():
                 return {'t': 'retry', 'detail': 'the head has not finished its checks' if self.state == 'preparing'
                         else f'the head is {self.state}'}
@@ -451,6 +462,8 @@ class Supervisor:
                 # a booted cluster going down: a box that restarted already (a container) waits for the next boot
                 return {'t': 'retry', 'detail': 'the head is stopping its boot'}
             return self.head.rpc(m, peer)
+        if t == 'pool':
+            return self.on_pool(peer)
         if t == 'dispram_fallback':
             epoch = m.get('epoch')
             why = m.get('why') or 'dispram shortfall'
@@ -651,16 +664,20 @@ class Supervisor:
         self.offers = None if self.ms else []     # a release serves any rank; a box without a model serves none
         log(f'this box can serve rank {mentat.format_offers(self.offers) or "none"} of the model set')
         self.rendezvous(tp)
-        self.cluster_opts()
-        log(f'rank {self.rank} of {tp} ({self.lan}, rails {self.rails[0]} {self.rails[1]}), cluster options '
-            f'{self.digest[:16]}, engine {self.build[:16]}')
-        if self.agent:
-            self.agent.set_meta(**{'gr8.set': self.model_id or 'none', 'gr8.variant': str(self.variant or ''),
-                                   'gr8.opts': self.digest,
-                                   'gr8.ips': ','.join(self.rails)})
-        self.serve([a for a in (self.lan, *self.rails, *self.rdma) if a])
-        self.set_state('preparing')
-        fails = self.checks()
+        if self.rank is None:   # a box of POOL outside the member list
+            self.serve([self.lan])
+            fails = self.standby()
+        else:
+            self.cluster_opts()
+            log(f'rank {self.rank} of {tp} ({self.lan}, rails {self.rails[0]} {self.rails[1]}), cluster options '
+                f'{self.digest[:16]}, engine {self.build[:16]}')
+            if self.agent:
+                self.agent.set_meta(**{'gr8.set': self.model_id or 'none', 'gr8.variant': str(self.variant or ''),
+                                       'gr8.opts': self.digest,
+                                       'gr8.ips': ','.join(self.rails)})
+            self.serve([a for a in (self.lan, *self.rails, *self.rdma) if a])
+            self.set_state('preparing')
+            fails = self.checks()
         for f in fails:
             log(f'check failed: {f}')
         while True:
@@ -677,6 +694,9 @@ class Supervisor:
                 verdict = self.handshake(hello)
                 if verdict.get('t') == 'scale':   # this box joins a running cluster's scale
                     fails = self.join_scale(verdict)
+                    continue
+                if verdict.get('t') == 'adopt':   # a pool's head runs another member list: take it, or stand by
+                    fails = self.adopt(verdict)
                     continue
                 if verdict.get('t') == 'dispram_fallback':
                     raise DispramFallback(verdict.get('detail') or 'dispram shortfall')
@@ -733,9 +753,11 @@ class Supervisor:
                 fails = self.rollback()
             except Stop as e:
                 p = self.pending
-                if not (p and p.get('switched')) or self.stop_ev.is_set():
+                pool_joiner = p and p.get('joiner') and self.pool
+                if not (p and (p.get('switched') or pool_joiner)) or self.stop_ev.is_set():
                     raise
-                # the new member list failed to boot: every box of the old one boots it again
+                # the new member list failed to boot: every box of the old one boots it again (a standby that joined
+                # stands by again)
                 log(f'scale {p["id"]}: the new member list failed here: {e}')
                 if self.rank == 0 and self.scale:
                     self.scale_abort_all(self.scale, f'rank 0: {str(e).splitlines()[0] if str(e) else e}')
@@ -748,11 +770,23 @@ class Supervisor:
     def rendezvous(self, tp):
         o = self.o
         if opt.mode(o) == 'peers':
-            self.members = opt.resolve_peers(o)
+            self.members = self.names(lambda: opt.resolve_peers(o))
+            if o.get('POOL'):
+                self.pool = self.names(lambda: opt.resolve_peers(o, 'POOL'))
+                if not set(self.members) <= set(self.pool) or self.members[0] != self.pool[0]:
+                    raise Stop(2, 'PEERS must be boxes of POOL, with the same head first')
             try:
                 self.rank = fabric.own_index(self.members, o.get('NODE_IP'))
             except RuntimeError as e:
-                raise Stop(2, str(e))
+                try:
+                    i = fabric.own_index(self.pool, o.get('NODE_IP')) if self.pool else None
+                except RuntimeError:
+                    i = None
+                if i is None:
+                    raise Stop(2, str(e))
+                self.rank, self.lan = None, self.pool[i]
+                log(f'pool: {",".join(self.pool)}; members {",".join(self.members)}; this box ({self.lan}) is a standby')
+                return
             self.lan = self.members[self.rank]
             log(f'peers: {",".join(self.members)}; this box is rank {self.rank}')
         else:
@@ -1376,6 +1410,8 @@ class Supervisor:
         if self.stop_ev.is_set():
             raise Stop(1 if self.stop_failed else 0, self.stop_why)
         p = self.pending
+        if p and p.get('joiner') and self.pool and self.scale_abort.is_set():
+            raise Rollback()   # a standby that joined an aborted scale stands by again
         if p and not p.get('joiner'):
             if p.get('switched') and self.scale_abort.is_set():
                 raise Rollback()
@@ -1426,9 +1462,13 @@ class Supervisor:
         if why:
             return {'t': 'error', 'error': why}
         words = [str(w) for w in m.get('argv') or []]
-        delta = scale_argv(self.scale_words) + words + scale_pins(self.o, self.variant, self.tmpl['knobs'])
+        if not self.pool and not names_peers(words):
+            return {'t': 'error', 'error': 'scale needs --peers LIST, the new member list with the head first (or a '
+                                           'cluster booted with --pool)'}
+        drops = scale_drops(self.pool, words)
+        delta = scale_argv(self.scale_words, drops) + words + scale_pins(self.o, self.variant, self.tmpl['knobs'])
         try:
-            o = opt.parse(scale_argv(self.o.argv) + delta)
+            o = opt.parse(scale_argv(self.o.argv, drops) + delta)
             opt.validate(o)
             members = opt.resolve_peers(o)
         except opt.OptionError as e:
@@ -1437,6 +1477,7 @@ class Supervisor:
         why = ('scale needs --peers, the new member list' if opt.mode(o) != 'peers' else
                f'TP={tp}: ./gr8 {model.name} serves TP {model.tp_sizes}' if tp not in model.tp else
                f'the head {self.lan} stays the first member: --peers {self.lan},...' if members[0] != self.lan else
+               'the new member list must be boxes of POOL' if self.pool and not set(members) <= set(self.pool) else
                scale_fit(model, self.variant, tp))
         if why:
             return {'t': 'error', 'error': why}
@@ -1454,7 +1495,7 @@ class Supervisor:
         self.scale = s
         log(f'scale {s["id"]}: TP={self.o.get("TP")} {",".join(self.members)} -> TP={tp} {",".join(members)}')
         threading.Thread(target=self.scale_run, args=(s,), daemon=True).start()
-        return {'t': 'ok', 'id': s['id'], 'joiners': [a for a in members if a not in self.members]}
+        return {'t': 'ok', 'id': s['id'], 'joiners': [a for a in members if a not in self.members and a not in self.pool]}
 
     def scale_run(self, s):
         """The head's coordinator: plan the layout, every box of the new member list makes its files ready while the
@@ -1472,10 +1513,13 @@ class Supervisor:
                     r = self.call(a, {'t': 'scale_prepare', **s['msg']}, timeout=10)
                     if not r or r.get('t') != 'ok':
                         raise RuntimeError(f'{a} did not take the scale: {r}')
-            joiners = [a for a in s['members'] if a not in s['old_members']]
+            joiners = [a for a in s['members'] if a not in s['old_members'] and a not in self.pool]
+            standbys = [a for a in s['members'] if a not in s['old_members'] and a in self.pool]
             if joiners:
                 log(f'scale {s["id"]}: waiting for {", ".join(joiners)}: run ./gr8 {models.of(self.o).name} up with '
                     f'--tp {len(s["members"])} --peers {",".join(s["members"])} there')
+            if standbys:
+                log(f'scale {s["id"]}: waiting for the standbys {", ".join(standbys)} to take the scale')
             s['ready'][self.lan] = self.scale_prepare(s['msg'])
             need, end = set(s['members']) | set(s['old_members']), time.monotonic() + opt_timeout(self.o)
             while not need <= set(s['ready']):
@@ -1546,7 +1590,7 @@ class Supervisor:
         os.write(fd, (m['token'] + '\n').encode())
         os.close(fd)
         extra = ['--layout', layout_file(d, m['layout'])] if m.get('layout') else []
-        o = opt.parse(scale_argv(self.o.argv) + list(m['argv']) + extra)
+        o = opt.parse(scale_argv(self.o.argv, scale_drops(self.pool, m['argv'])) + list(m['argv']) + extra)
         opt.validate(o)
         members, old = list(m['members']), list(m['old_members'])
         rank = members.index(self.lan) if self.lan in members else None
@@ -1608,6 +1652,81 @@ class Supervisor:
             raise Stop(4, 'scale: this box failed its checks: ' + '; '.join(fails))
         return fails
 
+    # ---- POOL: standbys -------------------------------------------------------------------------------------------
+    def names(self, fn):
+        """fn(), a resolution of names. With POOL, again every 2 s while it fails (a pod's name resolves once the pod
+        exists), until JOIN_TIMEOUT (0: forever) or a stop; then Stop(2). Without POOL a failure raises at once."""
+        end, said = time.monotonic() + opt_timeout(self.o), False
+        while True:
+            try:
+                return fn()
+            except opt.OptionError as e:
+                if not self.o.get('POOL'):
+                    raise
+                if not said:
+                    log(f'waiting for the pool\'s names to resolve: {e}')
+                    said = True
+                if self.stop_ev.wait(2) or (opt_timeout(self.o) and time.monotonic() > end):
+                    raise Stop(2, str(e))
+
+    def standby(self):
+        """A box of POOL outside the member list: no engine, no handshake. It asks the head every 2 s for a scale that
+        names it (it joins as join_scale does) or for the running member list, which it takes when it holds this box
+        (adopt). Returns the failed checks of the boot it joins."""
+        self.rank, self.hs = None, {}
+        try:
+            os.unlink(os.path.join(self.out, 'handshake.json'))
+        except FileNotFoundError:
+            pass
+        self.set_state('standby')
+        skip = None
+        while True:
+            if self.stop_ev.is_set():
+                raise Stop(1 if self.stop_failed else 0, self.stop_why)
+            try:
+                v = handshake.call(self.pool[0], self.port, {'t': 'pool'}, timeout=5, bind=self.lan)
+            except (OSError, ValueError):
+                v = {}
+            if v.get('t') == 'scale' and v.get('id') != skip:
+                try:
+                    return self.join_scale(v)
+                except Stop as e:
+                    if self.stop_ev.is_set():
+                        raise
+                    log(f'scale {v["id"]}: {e}; this box stays a standby')
+                    self.pending, self.rank, skip = None, None, v['id']
+                    self.set_state('standby')
+            elif v.get('t') == 'adopt' and self.lan in (v.get('members') or []):
+                return self.adopt(v)
+            self.stop_ev.wait(2)
+
+    def adopt(self, v):
+        """The head's running member list and options (adopt_msg): this box boots its rank in them, or stands by when it
+        has none. Returns the failed checks."""
+        p = self.scale_pending({'id': 'adopt', 'argv': v['argv'], 'members': v['members'], 'old_members': [],
+                                'layout': v.get('layout'), 'token': '', 'old_set': ''}, joiner=True)
+        self.pending = None
+        if p['rank'] is None:
+            return self.standby()
+        log(f'the head runs TP={len(p["members"])} {",".join(p["members"])}: this box takes rank {p["rank"]}')
+        self.swap_in(p)
+        return self.checks()
+
+    def adopt_msg(self):
+        return {'t': 'adopt', 'argv': self.scale_words, 'members': self.members, 'layout': self.layout_text}
+
+    def on_pool(self, peer):
+        """A standby asks the pool's head what to do: join the scale that names it, wait, or take the member list."""
+        if self.rank != 0 or not self.pool:
+            return {'t': 'error', 'error': f'{self.lan} is not the head of a pool'}
+        s = self.scale
+        if s and s['phase'] in ('prepare', 'drain') and s.get('msg') and peer in s['members'] and \
+                peer not in s['old_members'] and peer not in s['ready']:
+            return {'t': 'scale', **s['msg']}
+        if s and (s['phase'] in ('prepare', 'drain', 'switch') or (s['phase'] == 'failed' and not s.get('closed'))):
+            return {'t': 'retry', 'detail': f'scale {s["id"]} is running ({s["phase"]})'}
+        return self.adopt_msg()
+
     def scale_compact_prepare(self, p):
         """GR8_LOAD_COMPACT: this box writes its new rank's compact copies (scale_compact names the directory) while the
         old width serves. Without them the new engine reads the release files, as it would anyway."""
@@ -1631,6 +1750,10 @@ class Supervisor:
         self.model_error, self.fabric_error, self.elected = p['model_error'], p['fabric_error'], None
         self.reset_boot()
         self.cluster_opts()
+        try:   # a standby listened on its LAN address only; the head's rail check pings the rails
+            self.serve([a for a in (self.lan, *self.rails, *self.rdma) if a])
+        except Stop as e:
+            log(f'warning: {e}')
 
     def reset_boot(self):
         """Forget the last boot's handshake, as a boot that starts again does."""
@@ -1700,6 +1823,12 @@ class Supervisor:
             if p.get('dir'):
                 store_undo(p['store'], p['old_rank'], p['rank'], models.of(self.o).checkpoint_cache)
             self.pending = None
+            if self.pool:
+                self.reset_boot()
+                self.scale_go.clear()
+                self.scale_done.clear()
+                log(f'scale {p["id"]}: this box left the member list; it stays in the pool as a standby')
+                return self.standby()
             raise Stop(0, f'scale {p["id"]}: this box left the cluster ({new} serves)')
         self.hello_poll = 0.1
         self.prev = {'o': self.o, 'members': self.members, 'rank': self.rank, 'rails': self.rails, 'ms': self.ms,
@@ -1727,18 +1856,20 @@ class Supervisor:
         self.pending = self.prev = None
         self.scale_go.clear()
         self.scale_abort.clear()
+        if p['joiner']:   # a standby that joined (a joiner from `up` stops instead: on_scale_abort)
+            return self.standby()
         self.cluster_opts()
         return self.checks(copy=False)
 
     def on_scale_abort(self, sid, why):
-        """scale_abort: a joiner stops; an old member that switched rolls back (watch raises Rollback); before the switch
-        nothing changed."""
+        """scale_abort: a joiner stops (a standby that joined stands by again: watch raises Rollback); an old member that
+        switched rolls back (watch raises Rollback); before the switch nothing changed."""
         p = self.pending
         if not p or p['id'] != sid:
             return
-        if p['joiner']:
+        if p['joiner'] and not self.pool:
             self.request_stop(f'scale {sid} was aborted: {why}', failed=True)
-        elif p['switched']:
+        elif p['joiner'] or p['switched']:
             self.scale_abort.set()
         else:
             log(f'scale {sid}: aborted before the switch ({why}); nothing changed here')
@@ -1785,10 +1916,16 @@ class Supervisor:
         s['timeline'] = ', '.join(parts)
         log(f'scale {s["id"]}: timeline: {s["timeline"]}')
         if s['phase'] == 'switch':
-            s['phase'] = 'done'
             self.scale_words = s['argv']
+            s['phase'] = 'done'
             config = {opt.KEY_OF_FLAG[f]: v for f, v in zip(s['argv'][::2], s['argv'][1::2]) if f in opt.KEY_OF_FLAG}
             s['config'] = [f'{k}={v}' for k, v in config.items()]
+            if self.pool:   # the width this head boots at its next up, while TP and POOL stay (pool_resume)
+                self.layout_text = s['msg'].get('layout')
+                keep = os.path.join(self.out, 'scale.json')
+                with open(keep + '.tmp', 'w') as f:
+                    json.dump({'argv': s['argv'], 'layout': self.layout_text, 'base': self.base}, f)
+                os.replace(keep + '.tmp', keep)
             for a in sorted((set(s['old_members']) | set(s['members'])) - {self.lan}):
                 threading.Thread(target=self.send_done, args=(a, s['id']), daemon=True).start()
             self.finish_scale()
@@ -2149,17 +2286,28 @@ class Either:
 SCALE_DROPS = ('MENTAT', 'IPS', 'IPS2')
 
 
-def scale_argv(argv):
+def names_peers(words):
+    """Whether a command line's words name PEERS."""
+    return any(w.partition('=')[0] in (opt.flag_of('PEERS'), 'PEERS') for w in words)
+
+
+def scale_drops(pool, words):
+    """What a scale drops from the earlier command lines: SCALE_DROPS, and in a pool PEERS too unless the scale's words
+    name it (the members are then POOL's first TP)."""
+    return SCALE_DROPS + ('PEERS',) if pool and not names_peers(words) else SCALE_DROPS
+
+
+def scale_argv(argv, drops=SCALE_DROPS):
     """An up command line without --mentat (a scale names its members with --peers, and the cluster runs in peers mode
     from then on) and without --ips/--ips2, which list the old members' rails: the scale command gives the new ones."""
-    flags = {opt.flag_of(k) for k in SCALE_DROPS}
+    flags = {opt.flag_of(k) for k in drops}
     out, i = [], 0
     while i < len(argv):
         a = argv[i]
         if a in flags:
             i += 2
             continue
-        if not (a.partition('=')[0] in flags or a.partition('=')[0] in SCALE_DROPS):
+        if not (a.partition('=')[0] in flags or a.partition('=')[0] in drops):
             out.append(a)
         i += 1
     return out
@@ -2338,8 +2486,41 @@ def store_commit(d, flash):
         rm(os.path.join(d, n + '.prev'))
 
 
+def pool_resume(o):
+    """A pool's head boots the width of its last scale (out/scale.json, scale_served) while the up's TP and POOL are
+    the ones that scale ran under: (options, record), or (o, None). A record for other TP or POOL goes."""
+    if not o.get('POOL'):
+        return o, None
+    out = os.path.join(os.path.abspath(o.get('GR8_WORK_DIR')), 'out')
+    path = os.path.join(out, 'scale.json')
+    try:
+        with open(path) as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return o, None
+    if rec.get('base') != [o.get('TP'), o.get('POOL')]:
+        os.unlink(path)
+        return o, None
+    try:
+        extra = []
+        if rec.get('layout'):
+            os.makedirs(os.path.join(out, 'scale'), exist_ok=True)
+            extra = ['--layout', layout_file(os.path.join(out, 'scale'), rec['layout'])]
+        n = opt.parse(scale_argv(o.argv, scale_drops(True, rec['argv'])) + rec['argv'] + extra)
+        opt.validate(n)
+    except (OSError, opt.OptionError) as e:
+        log(f'warning: {path}: {e}; booting the configured width')
+        return o, None
+    return n, rec
+
+
 def main(o):
+    o, kept = pool_resume(o)
     sup = Supervisor(o)
+    if kept:
+        sup.scale_words, sup.layout_text, sup.base = kept['argv'], kept.get('layout'), kept['base']
+        log(f'the pool\'s last scale left TP={o.get("TP")}: booting that width ({os.path.join(sup.out, "scale.json")}; '
+            f'up with another --tp or --pool forgets it)')
     signal.signal(signal.SIGTERM, lambda *_: sup.request_stop('SIGTERM'))
     # Ctrl-C on `up --foreground`: stop as for SIGTERM. Uncaught, KeyboardInterrupt skipped shutdown() and left
     # the engine (in its own session) running.
