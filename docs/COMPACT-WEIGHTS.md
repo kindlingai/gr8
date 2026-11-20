@@ -39,6 +39,13 @@ generated tensors and any unmapped ranges. Keep the normal boot weight hash chec
 on: the reader checks source sizes and bounds, but the map itself is not a content
 identity. Copies must match the release, rank and layout being loaded.
 
+`./gr8 <model> scale` keeps this rule for each width: when the cluster's `EXTRA_ENV` names `GR8_LOAD_COMPACT=DIR`
+(on the `up` or the `scale` command), the scale boots the new width with `DIR.tp<N>-<tag>` (the tag hashes the variant,
+the new member list and the planned layout, so every box names the same path) and each box writes its new rank's
+copies there while the old width still serves. A box that cannot write them logs a warning and boots from the release
+files. Once a later scale is done, each box removes its `DIR.tp*-*` directories other than the current one; `DIR`
+itself is never removed.
+
 ## Map format
 
 For source file `<name>`, the directory contains `<name>` (dense bytes) and

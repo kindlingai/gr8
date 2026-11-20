@@ -10,6 +10,12 @@ Format and release rules live in [`RELEASING.md`](RELEASING.md).
 
 Changes merged on `main` since `v1.1.0` that are not yet cut in a numbered `v*` release tag.
 
+- `scale` prepares the new width's load files before the hold: with `GR8_LOAD_COMPACT=DIR` in `EXTRA_ENV`, each box
+  writes its new rank's compact copies into `DIR.tp<N>-<tag>` while the old width serves (older widths' copies go once
+  a later scale is done), and the planned layout file is named by its content, so a repeated transition keeps its
+  `GR8_GEN_CACHE` entries. The config lines `scale` prints now come from the finished scale.
+- **Breaking changes:** None.
+
 ---
 
 ## [v1.1.0] — 2026-11-20
