@@ -138,6 +138,7 @@ class Scale(unittest.TestCase):
         self.assertIn('serving TP=3 on 127.0.0.1,127.0.0.2,127.0.0.3', out)
         self.assertIn('SHARE_LIMIT=', out)
         self.assertEqual(self.holds()[-1], 0)
+        self.assertRegex(out, r'timeline: drained \+')
         self.assertEqual([self.stub_tp(i) for i in range(3)], [3, 3, 3])
         st = self.gr8(0, 'status')
         self.assertEqual(st.stdout.count(': serving, engine running'), 3, st.stdout)
@@ -211,6 +212,25 @@ class Scale(unittest.TestCase):
         self.request(b)
         self.assertEqual(b, [(200, 8)])
 
+    def test_a_rollback_stops_engines_that_never_served_at_once(self):
+        """With a store that keeps sessions an orderly quit gets 120 s, but a new engine that never served never reads
+        s2/quit: the rollback stops it at once. The box that left waits for the head's rollback (retry), not refused."""
+        self.extra = ('--kv-store', 'ssd:store,size=1G,persist=on,keep=sessions')
+        self.up(4)
+        open(os.path.join(self.homes[2], 'fail.tp3'), 'w').close()       # rank 2's new engine fails...
+        for i in (0, 1):                                                  # ...while the others still load
+            open(os.path.join(self.homes[i], 'ignore.quit.tp3'), 'w').close()
+        sup3 = int(read(os.path.join(self.homes[3], 'out', 'supervisor.pid')))
+        rc, out = self.finish(self.scale(1, 3))
+        self.assertEqual(rc, 1, out)
+        self.wait_for(lambda: self.gr8(0, 'status').stdout.count(': serving, engine running') == 4, 'TP=4 again', 60)
+        b = []
+        self.request(b)
+        self.assertEqual(b, [(200, 8)])
+        self.assertNotIn('handshake refused', read(os.path.join(self.homes[3], 'out', 'supervisor.log')))
+        self.assertEqual(int(read(os.path.join(self.homes[3], 'out', 'supervisor.pid'))), sup3)
+        self.assertTrue(running(sup3))
+
     def test_a_box_outside_the_cluster_is_refused(self):
         """With no scale running, a box that names itself in a longer member list is refused as before (here the boxes
         share loopback, which the head answers; on a LAN the head answers members only: refused 'member list')."""
@@ -251,6 +271,9 @@ class Scale(unittest.TestCase):
         for i in range(3):
             self.assertEqual(sorted(os.listdir(os.path.join(self.homes[i], 'store', f'r{i}'))), ['index'])
         log3 = read(os.path.join(self.homes[3], 'out', 'supervisor.log'))
+        # the scale's boot relays the engine's store rewrite to the supervisor log, whatever the model's stage_relay
+        self.assertRegex(read(os.path.join(self.homes[2], 'out', 'supervisor.log')),
+                         r'\d+s rank 2: flash ckpt rewidth carried 0 entries from TP=4')
         self.assertIn('this box leaves', log3)
         self.assertIn('served to the new ranks' if peer else 'kvman-peer: the new ranks start', log3)
         self.assertEqual(sorted(os.listdir(os.path.join(self.homes[3], 'store', 'r3'))), ['index'])
@@ -313,8 +336,10 @@ class ScalePlan(unittest.TestCase):
         sup.head_ready, sup.stop_ev = threading.Event(), threading.Event()
         sup.head_ready.set()
         hello = {'t': 'hello', 'members': LAN[:4], 'attempt': 0}
-        for phase, want in (('switch', 'retry'), ('done', 'refused'), ('failed', 'refused')):
-            sup.scale = {'phase': phase, 'members': LAN[:3], 'old_members': LAN[:4], 'msg': None, 'ready': {}}
+        for phase, closed, want in (('switch', False, 'retry'), ('done', True, 'refused'), ('failed', True, 'refused'),
+                                    ('failed', False, 'retry')):   # failed, not closed: the head rolls back
+            sup.scale = {'phase': phase, 'members': LAN[:3], 'old_members': LAN[:4], 'msg': None, 'ready': {},
+                         **({'closed': True} if closed else {})}
             self.assertEqual(sup.on_rpc(dict(hello), LAN[3])['t'], want, phase)
 
 

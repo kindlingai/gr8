@@ -228,13 +228,18 @@ not an in-process switch:
    (`FLASH_CACHE=aligned` with a persisted SSD store; not with `GR8_CP=1`). A chat's next turn then reads its run from
    the store instead of prefilling it again. Without such a store the scale works and sessions prefill again. The
    store must be on each box's local disk: the scale moves rank folders within it.
-4. When the head's API answers, the hold ends and the held requests run on the new width. A box that left exits.
+4. When the head's API answers, the hold ends and the held requests run on the new width. A box that left exits. The
+   head logs, and the scale command prints, a timeline of the hold (`timeline: drained +0.1s, stopped +6.2s,
+   handshake +1.4s, started +0.3s, ready +52.0s, serving +0.4s`: each part the seconds since the one before), and a
+   scale's boot relays each rank's store rewrite, weight check, boot capture and load-cache lines to its supervisor log.
 
 If the new width fails to boot (a refused handshake, an engine that exits, `READY_TMO`), every box of the old list
-puts its store back and boots the old list again, and the held requests run there. The hold lasts the drain plus a
-boot (`READY_TMO` + 120 s, at least 900 s), and a rollback sets it again for the old list's boot: clients need a
-request timeout at least that long. A supervisor that dies mid-scale is not resumed: `down` and `up` as after any
-failure; a box that leaves stops after `JOIN_TIMEOUT` + `READY_TMO` without word from the head.
+puts its store back and boots the old list again, and the held requests run there. The new engines never served, so
+they stop at once (SIGTERM, not the orderly quit), and a box of the old list that asks the head during its rollback
+waits for it. The hold lasts the drain plus a boot (`READY_TMO` + 120 s, at least 900 s), and a rollback sets it again
+for the old list's boot: clients need a request timeout at least that long. A supervisor that dies mid-scale is not
+resumed: `down` and `up` as after any failure; a box that leaves stops after `JOIN_TIMEOUT` + `READY_TMO` without word
+from the head.
 
 What the scale keeps the same, so the store's blocks stay valid: the running variant (`--variant`), the KV format
 (`--kv-format`, also when a TP default chose it, as int4 at GLM-5.3 TP=4), `SHARE_LIMIT` and `REUSE_GRID` are pinned.

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Stub engine for the supervisor tests: records its argv and environment, then plays one rank's file side. Rank 0 runs
 frontend/tests/fake_s2_engine.py on its --serve directory; the other ranks wait for quit. A file fail.tp<N> in the
-working directory makes a boot at TP=N (N --ips addresses) fail at once, as an engine that cannot boot that width."""
+working directory makes a boot at TP=N (N --ips addresses) fail at once, as an engine that cannot boot that width; a file
+ignore.quit.tp<N> makes a rank at TP=N never get ready nor read quit, as an engine still loading (SIGTERM stops it)."""
 import json
 import os
 import sys
@@ -22,15 +23,20 @@ with open('out/stub.json', 'w') as f:
     json.dump({'argv': argv, 'env': {k: v for k, v in os.environ.items() if k.startswith(('GR8_', 'G6_'))},
                'ld': os.environ.get('LD_LIBRARY_PATH'), 'cwd': os.getcwd()}, f)
 d = val('--serve')
+if os.environ.get('GR8_KV_REWIDTH'):   # what the engine says when it rewrites the old width's store (a scale)
+    print(f'# rank {rank}: flash ckpt rewidth carried 0 entries from TP={os.environ["GR8_KV_REWIDTH"].split(",")[0]}',
+          file=sys.stderr, flush=True)
 if os.path.exists(f'fail.tp{len(val("--ips").split(","))}'):
     sys.exit('g6: stub: this box cannot boot this width (fail.tp file)')
+# the waits run under another name: the boxes of a test share one process table, and a box's checks refuse to boot
+# beside a `g6m4 --rank` process (supervisor.py running_engines)
+if os.path.exists(f'ignore.quit.tp{len(val("--ips").split(","))}'):
+    os.execv(sys.executable, [sys.executable, '-c', 'import time\nwhile True: time.sleep(1)'])
 if rank == 0:
     # a file ready.delay: the real head is ready only once every rank's engine is; a test that reads what the workers'
     # engines started with waits for them this long (seconds)
     delay = open('ready.delay').read().strip() if os.path.exists('ready.delay') else '0.5'
     os.execv(sys.executable, [sys.executable, os.path.join(REPO, 'frontend', 'tests', 'fake_s2_engine.py'), d,
                               '--epoch', val('--s2-epoch'), '--mtp', val('--mtp', '2'), '--ready-delay', delay])
-# the other ranks wait for quit under another name: the boxes of a test share one process table, and a box's checks
-# refuse to boot beside a `g6m4 --rank` process (supervisor.py running_engines)
 os.execv(sys.executable, [sys.executable, '-c', 'import os, sys, time\nwhile not os.path.exists(sys.argv[1]): time.sleep(0.2)',
                           os.path.join(d, 'quit')])
