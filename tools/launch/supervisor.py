@@ -373,6 +373,7 @@ class Supervisor:
         self.scale_words = []
         self.scale_seen = set()       # every member of a scale, old and new: they keep asking status and logs
         self.peer_proc = None         # bin/kvman-peer
+        self.hello_poll = handshake.POLL_S   # a worker's verdict poll: shorter while a scale's hold runs
 
     # ---- state ----------------------------------------------------------------------------------------------------
     def set_state(self, state, **meta):
@@ -429,16 +430,19 @@ class Supervisor:
             if self.rank not in (0, None):
                 return {'t': 'refused', 'field': 'rank', 'values': {}, 'exit': 4,
                         'detail': f'{self.lan} is rank {self.rank}, not the head'}
-            if t == 'hello' and self.scale and self.scale['phase'] in ('prepare', 'drain', 'switch') and \
+            s = self.scale
+            rolling = s and s['phase'] == 'failed' and not s.get('closed')   # the head boots the old list again
+            if t == 'hello' and s and (s['phase'] in ('prepare', 'drain', 'switch') or rolling) and \
                     m.get('members') != self.members:
-                # a hello for another member list while a scale runs: a box that joins it, or a late one. After the
-                # scale (done or failed) such a box gets the handshake's refusal, so a restart policy does not loop
-                s = self.scale
+                # a hello for another member list while a scale runs: a box that joins it, or a late one, or one of the
+                # old list during the head's rollback. After the scale (done, or failed and closed) such a box gets the
+                # handshake's refusal, so a restart policy does not loop
                 if s['phase'] in ('prepare', 'drain') and m.get('members') == s['members'] and \
                         peer not in s['old_members'] and s.get('msg'):
                     if peer not in s['ready']:
                         return {'t': 'scale', **s['msg']}
-                return {'t': 'retry', 'detail': f'the cluster is changing its member list (scale {s["phase"]})'}
+                return {'t': 'retry', 'detail': 'the cluster is rolling back to its old member list' if rolling
+                        else f'the cluster is changing its member list (scale {s["phase"]})'}
             if not self.head_ready.is_set():
                 return {'t': 'retry', 'detail': 'the head has not finished its checks' if self.state == 'preparing'
                         else f'the head is {self.state}'}
@@ -544,7 +548,7 @@ class Supervisor:
                 s[p] = bool(recorded(os.path.join(self.out, f'{p}.pid')))
             if self.scale:
                 s['scale'] = {k: self.scale.get(k) for k in ('id', 'phase', 'error', 'members', 'old_members', 'pause_s',
-                                                             'drain_s')}
+                                                             'drain_s', 'timeline')}
         return s
 
     def local_check(self, timeout=60):
@@ -685,6 +689,7 @@ class Supervisor:
                     raise e
                 with self.state_lock:
                     self.hs = verdict
+                    self.mark('handshake')
                     self.fallback_by_epoch = {e: w for e, w in self.fallback_by_epoch.items() if e == verdict['epoch']}
                     self.serving_urls = {e: url for e, url in self.serving_urls.items() if e == verdict['epoch']}
                 if verdict.get('ips'):     # the head's rails for this box, which may differ from its own election's
@@ -1024,7 +1029,7 @@ class Supervisor:
     def handshake_worker(self, hello):
         log(f'sending the hello to the head {self.members[0]}:{self.port}')
         v = handshake.send_hello(self.members[0], self.port, hello, self.lan, opt_timeout(self.o), log,
-                                 Either(self.stop_ev, self.scale_abort))
+                                 Either(self.stop_ev, self.scale_abort), poll_s=self.hello_poll)
         if v.get('t') == 'error':   # the head answers members only: a box its cluster does not list (no scale adds it)
             v = {'t': 'refused', 'field': 'member list', 'values': {}, 'exit': 4,
                  'detail': f'the head {self.members[0]}: {v.get("error")}'}
@@ -1127,6 +1132,7 @@ class Supervisor:
         with open(os.path.join(self.out, 'g6m4.pid'), 'w') as f:
             f.write(f'{self.engine.pid}\n')
         self.started = True
+        self.mark('started')
         self.set_state('loading')
         if r == 0 and 'front' not in self.helpers:   # a scale keeps the front end, which holds requests through it
             self.start_front(plan)
@@ -1134,13 +1140,15 @@ class Supervisor:
         tmo = float(plan['knobs'].get('READY_TMO') or 1800)
         t0, ask_at = time.monotonic(), tmo
         log(f'engine started (epoch {hs["epoch"]}); waiting for it to load (up to {tmo:.0f}s)')
-        relay = StageRelay(os.path.join(self.out, f'g6m4.r{r}.err')) if models.of(o).stage_relay else None
+        relay = StageRelay(os.path.join(self.out, f'g6m4.r{r}.err'), SCALE_STAGE if self.pending else BOOT_STAGE) \
+            if models.of(o).stage_relay else None
         while True:
             self.watch()
             for line in relay.new() if relay else ():
                 log(f'{time.monotonic() - t0:6.0f}s {line}')
             if r == 0:
                 if os.path.exists(ready):
+                    self.mark('ready')
                     break
                 if time.monotonic() - t0 > tmo:
                     raise Stop(1, f'the engines did not load within {tmo:.0f}s')
@@ -1395,6 +1403,7 @@ class Supervisor:
                            tail(os.path.join(self.out, f'{name}.log'), 20))
 
     def run_forever(self):
+        self.hello_poll = handshake.POLL_S
         while True:
             self.watch()
             time.sleep(0.5 if self.pending else 2)
@@ -1437,7 +1446,7 @@ class Supervisor:
         self.scale_n += 1
         s = {'id': f'{self.hs["epoch"]}.{self.scale_n}', 'members': members, 'old_members': list(self.members),
              'argv': delta, 'phase': 'prepare', 'error': '', 'ready': {}, 'msg': None, 'token': secrets.token_hex(16),
-             'drain': float(m.get('drain_timeout') or 300), 'boot_s': max(900.0, ready + 120)}
+             'drain': float(m.get('drain_timeout') or 300), 'boot_s': max(900.0, ready + 120), 'marks': []}
         self.scale_seen |= set(members) | set(self.members)
         self.scale = s
         log(f'scale {s["id"]}: TP={self.o.get("TP")} {",".join(self.members)} -> TP={tp} {",".join(members)}')
@@ -1487,7 +1496,8 @@ class Supervisor:
                     raise RuntimeError(f'{h["running"]} requests still running after {s["drain"]:.0f}s (--drain-timeout)')
                 if self.stop_ev.is_set() or s['phase'] != 'drain':
                     return
-                time.sleep(0.5)
+                time.sleep(0.1)
+            self.mark('drained')
             s['drain_s'] = round(time.time() - s['held'], 1)
             s['phase'] = 'switch'
             log(f'scale {s["id"]}: drained in {s["drain_s"]}s; switching')
@@ -1586,6 +1596,7 @@ class Supervisor:
             raise Stop(2, f'scale options: {e}')
         if p['rank'] is None:
             raise Stop(1, f'scale {v["id"]}: {self.lan} is not in {",".join(p["members"])}')
+        self.hello_poll = 0.1
         self.swap_in(p)
         fails = self.checks()
         self.tell(0, {'t': 'scale_ready', 'id': p['id'], 'lan': self.lan, 'ok': not fails, 'why': '; '.join(fails)})
@@ -1611,9 +1622,11 @@ class Supervisor:
         self.head_ready.clear()
         self.lingered = self.refusal_logged = False
 
-    def stop_engine(self):
-        """This box's engine and shim stop (an orderly quit: the KV store keeps the pool's runs); the front end stays."""
-        stop_local(self.home, log, quit_wait(self.o), keep=('front',))
+    def stop_engine(self, served=True):
+        """This box's engine and shim stop (an orderly quit: the KV store keeps the pool's runs); the front end stays.
+        served=False: the engine never reached its serve loop, the only place it reads s2/quit, so it gets SIGTERM at
+        once (it has written nothing an orderly quit would keep)."""
+        stop_local(self.home, log, quit_wait(self.o) if served else 0, keep=('front',))
         for child in (self.helpers.pop('shim', None), self.engine):
             if child is not None:
                 try:
@@ -1622,6 +1635,16 @@ class Supervisor:
                     child.kill()
                     child.wait()
         self.engine = None
+        if served:   # what the quit stored and how long it took
+            for line in tail(os.path.join(self.out, f'g6m4.r{self.rank}.err'), 40).splitlines():
+                if 'quit s' in line or 'quit fast' in line:
+                    log(line.removeprefix('# '))
+
+    def mark(self, name):
+        """The head notes when a phase of a scale's hold ended, for its timeline (scale_served)."""
+        s = self.scale
+        if self.rank == 0 and s and s.get('held') and not s.get('closed'):
+            s['marks'].append((name, time.time()))
 
     def rescale(self):
         """scale_go: this box's engine quits and its KV store is kept for the new ranks (served by kvman-peer). A box
@@ -1633,6 +1656,7 @@ class Supervisor:
         log(f'scale {p["id"]}: stopping the engine for {new}')
         self.set_state('switching')
         self.stop_engine()
+        self.mark('stopped')
         if p['store']:
             p['dir'] = store_prep(p['store'], p['old_rank'], p['rank'], models.of(self.o).checkpoint_cache)
             self.start_peer(p['dir'], os.path.join(self.out, 'scale', 'token'))
@@ -1657,6 +1681,7 @@ class Supervisor:
                 store_undo(p['store'], p['old_rank'], p['rank'], models.of(self.o).checkpoint_cache)
             self.pending = None
             raise Stop(0, f'scale {p["id"]}: this box left the cluster ({new} serves)')
+        self.hello_poll = 0.1
         self.prev = {'o': self.o, 'members': self.members, 'rank': self.rank, 'rails': self.rails, 'ms': self.ms,
                      'variant': self.variant, 'model_id': self.model_id, 'model_error': self.model_error,
                      'fabric_error': self.fabric_error, 'elected': self.elected}
@@ -1669,17 +1694,19 @@ class Supervisor:
         p = self.pending
         log(f'scale {p["id"]}: rolling back to TP={(self.prev or {"o": self.o})["o"].get("TP")}')
         self.set_state('rolling back')
-        self.stop_engine()
+        self.stop_engine(served=False)
+        self.mark('stopped')
+        self.hello_poll = 0.1
         self.stop_peer()
         if p.get('dir'):
             store_undo(p['store'], p['old_rank'], p['rank'], models.of(self.o).checkpoint_cache)
+        self.reset_boot()   # head_ready clears before self.members is the old list again: its hellos wait (on_rpc)
         if self.prev:
             for k, v in self.prev.items():
                 setattr(self, k, v)
         self.pending = self.prev = None
         self.scale_go.clear()
         self.scale_abort.clear()
-        self.reset_boot()
         self.cluster_opts()
         return self.checks(copy=False)
 
@@ -1707,6 +1734,8 @@ class Supervisor:
             switched = s['phase'] == 'switch'
             s['phase'], s['error'] = 'failed', why
         log(f'scale {s["id"]}: failed: {why}; ' + ('the old member list boots again' if switched else 'nothing changed'))
+        if switched:
+            self.mark('failed')
         if switched and s.get('held'):   # the old member list's boot: the hold lasts it out
             try:
                 self.front_hold(s.get('boot_s', 900))
@@ -1726,8 +1755,15 @@ class Supervisor:
         s = self.scale
         if not s or s.get('closed'):
             return
+        self.mark('serving')
         s['closed'] = True
         self.release_hold(s)
+        prev, parts = s.get('held'), []
+        for name, t in s['marks'] if prev else ():
+            parts.append(f'{name} +{t - prev:.1f}s')
+            prev = t
+        s['timeline'] = ', '.join(parts)
+        log(f'scale {s["id"]}: timeline: {s["timeline"]}')
         if s['phase'] == 'switch':
             s['phase'] = 'done'
             self.scale_words = s['argv']
@@ -1914,14 +1950,17 @@ def opt_timeout(o):
 # The engine's boot-stage lines on stderr: "# rank R: boot 41.3 s <phase>" at each phase of the boot (connect, weights, graph
 # capture), and the loader's "# rank R: pack 72.1 GB loaded + sha256-checked in 190.2 s (0.38 GB/s)" / "... -> device image".
 BOOT_STAGE = re.compile(r'^# rank (\d+): (boot \d+(?:\.\d+)? s .*|pack \d.*|.* -> device image .*)$')
+# A scale's boot also relays the store rewrite, the weight check, the boot capture and the load caches: the hold's parts.
+SCALE_STAGE = re.compile(BOOT_STAGE.pattern + r'|^# rank \d+: .*(?: rewidth |weight check: |entries verified).*$'
+                         r'|^# (?:s2 boot capture|flash serve capture|gen-cache|load-compact): .*$')
 
 
 class StageRelay:
     """Reads a rank's engine stderr as it grows and returns the boot-stage lines, so the supervisor log shows each rank's
     breakdown while the engine loads (startup first: where the minutes go, per rank)."""
 
-    def __init__(self, path):
-        self.path, self.pos, self.partial = path, 0, b''
+    def __init__(self, path, pattern=BOOT_STAGE):
+        self.path, self.pos, self.partial, self.pattern = path, 0, b'', pattern
 
     def new(self):
         try:
@@ -1932,7 +1971,7 @@ class StageRelay:
             return []
         self.pos += len(data)
         *whole, self.partial = (self.partial + data).split(b'\n')
-        return [m.group(0)[2:] for m in (BOOT_STAGE.match(ln.decode(errors='replace')) for ln in whole) if m]
+        return [m.group(0)[2:] for m in (self.pattern.match(ln.decode(errors='replace')) for ln in whole) if m]
 
 
 def tail(path, n, nbytes=65536):

@@ -223,6 +223,7 @@ def cmd_status(argv):
 
 def cmd_scale(argv):
     """Send `scale` to the head, then follow it in the head's status until it is done (0) or failed (1)."""
+    sys.stdout.reconfigure(line_buffering=True)   # a pipe (a CI log, a kubectl exec) sees each phase as it happens
     drain, rest = '300', []
     it = iter(argv)
     for a in it:
@@ -282,6 +283,8 @@ def cmd_scale(argv):
             said = now
             print(f'{time.strftime("%H:%M:%S")} scale {sc["phase"]}, head {s.get("state")}')
         if sc['phase'] == 'done' and s.get('state') == 'serving':
+            if sc.get('timeline'):
+                print(f'timeline: {sc["timeline"]}')
             print(f'serving TP={len(sc["members"])} on {",".join(sc["members"])}; requests waited {sc.get("pause_s")}s '
                   f'(drain {sc.get("drain_s")}s)')
             print('for later boots, put these in every box\'s config (the scale changed the running cluster only):')

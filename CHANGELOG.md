@@ -16,6 +16,10 @@ Changes merged on `main` since `v1.0.1` that are not yet cut in a numbered `v*` 
   With a persisted SSD KV store the new ranks rewrite the old width's store for themselves (`GR8_KV_REWIDTH`, set by
   `scale` only; `bin/kvman-peer` serves each box's store to the others), so stored sessions continue without a
   re-prefill. Default boots are unchanged.
+- `scale` follow-ups: a rollback stops the new engines at once (they never served, so they do not read the orderly
+  quit; before, it waited up to 120 s with a store that keeps sessions), a box of the old member list that says hello
+  during the head's rollback waits instead of being refused (`booted`, exit 4), the CLI's output is line-buffered, the
+  head logs and the CLI prints the hold's timeline, and the workers poll the head every 0.1 s during a scale.
 - The front end's 503 `engine not connected` now carries `Retry-After: 5`.
 - **Breaking changes:** None.
 
