@@ -1,0 +1,647 @@
+{
+  "schema_version": 1,
+  "version": "1.1.0",
+  "tag": "v1.1.0",
+  "previous_tag": "v1.0.1",
+  "date": "2026-11-20",
+  "commit": "cdd1e0931047f55bba8f682a0ae79c4198668ca3",
+  "release_url": "https://github.com/kindlingai/gr8/releases/tag/v1.1.0",
+  "validation_gate": "Full CI build and CPU test suite across all seven engine legs plus live 4x GB10 (TP=4, 200G switch, uncapped clocks) GLM-5.3 bench/bench.py verification for standard bit325 quality default (MOE_UNION_CAP=48), fast preset (MOE_UNION_CAP=32), and K4 bit387 uncapped pure quality (MOE_UNION_CAP=0), plus C=4 GSM8K-250, HumanEval-164, and sustained 4x153.6K long-context concurrency.",
+  "container": {
+    "image": "ghcr.io/kindlingai/gr8:v1.1.0",
+    "digest": "sha256:b22eedbd7902f65dbf2090897d75f5d92276cbf78a16bcde1f958aa56a306cf7",
+    "pinned": "ghcr.io/kindlingai/gr8:v1.1.0@sha256:b22eedbd7902f65dbf2090897d75f5d92276cbf78a16bcde1f958aa56a306cf7",
+    "platforms": [
+      "linux/arm64"
+    ],
+    "target_arch": "sm_121a"
+  },
+  "toolchain": {
+    "cuda": "13.0.1",
+    "base_os": "ubuntu24.04",
+    "rust": "1.94.1",
+    "runtime_apt": [
+      "libibverbs1",
+      "ibverbs-providers",
+      "ibverbs-utils",
+      "python3",
+      "python3-yaml",
+      "curl",
+      "jq"
+    ]
+  },
+  "binaries": [
+    "bin/g6m4",
+    "bin/g6m4-int4",
+    "bin/g6m4_flash",
+    "bin/g6m4_flash-int4",
+    "bin/g6m4_ds41",
+    "bin/g6m4_ink2",
+    "bin/m4sim",
+    "bin/m4sim_flash",
+    "bin/m4sim_ds41",
+    "bin/m4sim_ink2",
+    "bin/g6front-rs",
+    "bin/g6load",
+    "bin/kvman-remote",
+    "bin/kvman-peer",
+    "bin/gpuprobe",
+    "bin/tr3_e4m3_test",
+    "bin/lib/libgr8knobs.so"
+  ],
+  "api": {
+    "protocol": "openai",
+    "http_port": 8100,
+    "control_port": 7340,
+    "s2_port": 7341,
+    "endpoints": [
+      "POST /v1/chat/completions",
+      "POST /v1/completions",
+      "POST /tokenize",
+      "POST /detokenize",
+      "GET /v1/models",
+      "GET /health",
+      "GET /health?deep",
+      "GET /metrics"
+    ]
+  },
+  "models": [
+    {
+      "id": "glm53",
+      "title": "GLM-5.3",
+      "architecture": "GlmMoeDsaForCausalLM",
+      "served_names": [
+        "glm-5.3",
+        "glm53"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4",
+      "drafter": "https://huggingface.co/incoai/GLM-5.3-DFlash2",
+      "engine_binaries": [
+        "bin/g6m4",
+        "bin/g6m4-int4"
+      ],
+      "tp_supported": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "variants": [
+        "bit200",
+        "bit225",
+        "bit239",
+        "bit260",
+        "bit273",
+        "bit300",
+        "bit325",
+        "bit332",
+        "bit390",
+        "bit400"
+      ],
+      "default_variant_by_tp": {
+        "3": "bit260",
+        "4": "bit325",
+        "5": "bit325",
+        "6": "bit325"
+      },
+      "int4_kv": true,
+      "defaults_by_tp": {
+        "3": {
+          "kv_format": "fp8",
+          "cap": 307136,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "4": {
+          "kv_format": "int4",
+          "cap": 513536,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 1,
+          "share_limit": 32768,
+          "dec_bk": 2048,
+          "dec_bk_max": 2048,
+          "reuse_grid": 64,
+          "moe_union_cap": 48,
+          "exact_kernel_opts": [
+            "DEC_DENSE_OPT",
+            "DTR_EXACT_OPT",
+            "MOE_RTR_FIN_OPT",
+            "TR3_WIDE4",
+            "PF_ATTN_OPT",
+            "PF_DENSE_OPT",
+            "PF_ISGRT_CLEAN",
+            "DFL_DEDUP"
+          ]
+        },
+        "5": {
+          "kv_format": "fp8",
+          "cap": 502848,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "6": {
+          "kv_format": "fp8",
+          "cap": 614400,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 131072
+        }
+      }
+    },
+    {
+      "id": "glm53f",
+      "title": "GLM-5.3-Flash",
+      "architecture": "Glm5NextForConditionalGeneration",
+      "served_names": [
+        "glm-5.3-flash",
+        "glm53f"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4",
+      "drafter": "https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2",
+      "engine_binaries": [
+        "bin/g6m4_flash",
+        "bin/g6m4_flash-int4"
+      ],
+      "tp_supported": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "variants": [
+        "k2",
+        "k3",
+        "k4"
+      ],
+      "default_variant_by_tp": {
+        "1": "k2",
+        "2": "k4",
+        "3": "k4",
+        "4": "k4"
+      },
+      "int4_kv": true,
+      "defaults_by_tp": {
+        "1": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 1,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768
+        },
+        "2": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 1,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768,
+          "int4_override_defaults": {
+            "sess": 4,
+            "mtp": 3,
+            "s2_shared_waterfill": 1,
+            "s2_shared_wf_margin": 0.02
+          }
+        },
+        "3": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 4,
+          "mtp": 1,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 8,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768
+        }
+      }
+    },
+    {
+      "id": "ds41",
+      "title": "DeepSeek-V4.1-Flash",
+      "architecture": "DeepseekV41ForCausalLM",
+      "served_names": [
+        "deepseek-v4.1-flash"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native",
+      "drafter": null,
+      "engine_binaries": [
+        "bin/g6m4_ds41"
+      ],
+      "tp_supported": [
+        4
+      ],
+      "variants": [],
+      "default_variant_by_tp": {},
+      "int4_kv": false,
+      "defaults_by_tp": {
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 5,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "exact": 0,
+          "ds_pf_v2": 1,
+          "ds_prefill_w": 12288,
+          "default_max_tokens": 32768,
+          "default_reasoning_effort": "low"
+        }
+      }
+    },
+    {
+      "id": "ink2",
+      "title": "Inkling-2-Small",
+      "architecture": "Inkling2ForConditionalGeneration",
+      "served_names": [
+        "inkling-2-small",
+        "ink2"
+      ],
+      "checkpoint": "https://huggingface.co/thinkingmachines/Inkling-2-Small",
+      "drafter": null,
+      "engine_binaries": [
+        "bin/g6m4_ink2"
+      ],
+      "tp_supported": [
+        4,
+        6
+      ],
+      "variants": [],
+      "default_variant_by_tp": {},
+      "int4_kv": false,
+      "defaults_by_tp": {
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 4,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "chunk": 8
+        },
+        "6": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 4,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "chunk": 8
+        }
+      }
+    }
+  ],
+  "breaking": false,
+  "breaking_changes": [],
+  "default_or_cache_changes": [
+    {
+      "scope": "glm53 TP=4",
+      "change": "All 8 bit-exact #542 decode, prefill, and DFlash2 kernels enabled by default (KL=0.00000); DEC_BK_MAX=2048 (#549) and REUSE_GRID=64 (#524, #527) defaulted at TP=4 int4; MOE_UNION_CAP=48 defaulted at TP=4 (#551).",
+      "rollback": "Set MOE_UNION_CAP=0 (--moe-union-cap 0) for strict uncapped exact routing (KL=0.00000); set MOE_UNION_CAP=32 for fast mode; set DEC_BK_MAX=32768 to restore prior decode buckets."
+    },
+    {
+      "scope": "glm53 TP=4/5/6",
+      "change": "Default width variant moved to bit325 (v0.6 release profile, #539).",
+      "rollback": "Pass VARIANT=home (--variant home) when booting older v0.5 checkpoints."
+    },
+    {
+      "scope": "ds41 TP=4",
+      "change": "V2 BF16 tensor-core projections enabled by default (#510); forced tools default to native non-thinking mode with parked chats (#519).",
+      "rollback": "Set EXACT=1 for exact math; pass --forced-tool-thinking 1 and --extra-env GR8_DS_PARK=0 to restore earlier behavior."
+    },
+    {
+      "scope": "KV_STORE=ssd:...",
+      "change": "Persistent session index resets once on binary upgrade while preserving the preallocated SSD block file.",
+      "rollback": "None required; active sessions prefill once on first boot."
+    }
+  ],
+  "toolchain_changes": [
+    "Dockerfile adds bin/kvman-peer (#538) and bin/g6m4_ink2 / bin/m4sim_ink2 (#512) to dist; CUDA (13.0.1), base OS (ubuntu24.04), Rust (1.94.1), and runtime apt packages are unchanged."
+  ],
+  "operational_notes": [
+    "Use v0.6 bit325 checkpoint (3e388b45) with default glm53 TP=4 launches, or pass VARIANT=home for older v0.5 checkpoints.",
+    "Quality-first recipes (such as K4 bit387) should explicitly set MOE_UNION_CAP=0 to opt out of TP=4's default MOE_UNION_CAP=48.",
+    "New ./gr8 <model> scale --tp N --peers LIST supports orderly hold/drain/rollback cluster width scaling with SSD KV carry."
+  ],
+  "prs": [
+    {
+      "number": 499,
+      "commit": "61cceede",
+      "summary": "README: update Building on gr8 current release pin to v1.0.1"
+    },
+    {
+      "number": 500,
+      "commit": "2df2460b",
+      "summary": "kv store: add boundary state and declarative slot-slab mover"
+    },
+    {
+      "number": 501,
+      "commit": "f6a9053b",
+      "summary": "ds41: persist exact session state in tiered KV stores"
+    },
+    {
+      "number": 502,
+      "commit": "999ff2a5",
+      "summary": "front: add generic HF templates and JSON tool-call dialect"
+    },
+    {
+      "number": 503,
+      "commit": "c8acdfab",
+      "summary": "Centralize launcher model metadata and add model integration guide"
+    },
+    {
+      "number": 504,
+      "commit": "24ef0faa",
+      "summary": "front: add the Inkling dialect (parser, effort controls, image placeholder)"
+    },
+    {
+      "number": 505,
+      "commit": "a32f9840",
+      "summary": "loader: reusable NVFP4 records and the Inkling 2 Small weight loader"
+    },
+    {
+      "number": 506,
+      "commit": "ab5ea892",
+      "summary": "kernels: NVFP4 and MXFP8 routed experts for Inkling-2-Small on sm_121a"
+    },
+    {
+      "number": 507,
+      "commit": "e8566bb3",
+      "summary": "ink2: geometry, trunk attention, short convolutions, depth attention, norms and head"
+    },
+    {
+      "number": 508,
+      "commit": "2498aa43",
+      "summary": "Fix expert-log cursor hygiene across decode and prefill"
+    },
+    {
+      "number": 510,
+      "commit": "933c8856",
+      "summary": "ds41: enable V2 BF16 tensor-core projections by default"
+    },
+    {
+      "number": 512,
+      "commit": "6735a9eb",
+      "summary": "ink2: full Inkling 2 Small text model on 4 and 6 Sparks"
+    },
+    {
+      "number": 513,
+      "commit": "17bd8636",
+      "summary": "docs: add CHANGELOG.md and per-version release specs (v1.0, v1.0.1)"
+    },
+    {
+      "number": 514,
+      "commit": "a2c3db26",
+      "summary": "Add opt-in native dispramd KV backing and coordinated capacity fallback"
+    },
+    {
+      "number": 515,
+      "commit": "18a28fbe",
+      "summary": "docs: have installing agents offer Kindling OS before first boot"
+    },
+    {
+      "number": 516,
+      "commit": "5625ed67",
+      "summary": "Busy guard (GR8_BUSY_*): refuse with 429 instead of evicting a live session's cache"
+    },
+    {
+      "number": 517,
+      "commit": "4a6091f9",
+      "summary": "ink2: MTP speculative decode for Inkling 2 Small"
+    },
+    {
+      "number": 518,
+      "commit": "9349daf1",
+      "summary": "Inkling 2 Small: image input (GR8_INK2_VISION)"
+    },
+    {
+      "number": 519,
+      "commit": "79bea6e0",
+      "summary": "Fix DS41 tool-turn cache accounting and reversible defaults"
+    },
+    {
+      "number": 520,
+      "commit": "dcdf683c",
+      "summary": "ink2: speed paths for Inkling 2 Small (fast all-reduce on by default; three opt-in paths)"
+    },
+    {
+      "number": 521,
+      "commit": "89a26df7",
+      "summary": "GR8_CAP_TOTAL: an S2 page pool larger than one session"
+    },
+    {
+      "number": 523,
+      "commit": "bc4c154a",
+      "summary": "DS41: fix v2 Engram col-shard + attention gather; retune launch interleave"
+    },
+    {
+      "number": 524,
+      "commit": "4057009e",
+      "summary": "GLM-5.3 TP=4 int4: default the prefix-reuse grid to 64 rows (REUSE_GRID=64)"
+    },
+    {
+      "number": 526,
+      "commit": "9120b2f7",
+      "summary": "front end: GLM thinking off renders the lowest effort and withholds the reasoning"
+    },
+    {
+      "number": 527,
+      "commit": "36a8968b",
+      "summary": "GLM-5.3 TP=4 int4: default the prefix-reuse grid to 64 rows with --kv-store too"
+    },
+    {
+      "number": 528,
+      "commit": "0b47cb50",
+      "summary": "Cache DS41 prompt token prefixes at verified turn boundaries and add lossless draft telemetry"
+    },
+    {
+      "number": 529,
+      "commit": "b417bbe1",
+      "summary": "Project the DS41 Engram wkv in one weight pass for up to 32 rows"
+    },
+    {
+      "number": 530,
+      "commit": "4fd22436",
+      "summary": "Run DS41 multi-row decode projections in single-pass attention GEMV and 8-row compressor GEMV up to 32 rows"
+    },
+    {
+      "number": 531,
+      "commit": "45ee4705",
+      "summary": "Keep the DS41 Engram drive awake between decode steps"
+    },
+    {
+      "number": 532,
+      "commit": "ed92a525",
+      "summary": "Boot log: MemAvailable at every phase; count attention storage once"
+    },
+    {
+      "number": 533,
+      "commit": "e054e1a1",
+      "summary": "Size GLM's reduce-scatter prefill fabric slots by what each collective carries"
+    },
+    {
+      "number": 534,
+      "commit": "6bc28466",
+      "summary": "Share attention ids, output, decode scratch and the prefill key table across layers, the MTP draft and paths"
+    },
+    {
+      "number": 535,
+      "commit": "6ee9de69",
+      "summary": "Size the SEL32 index workspaces; the MTP draft prefill borrows the target lane's step buffers"
+    },
+    {
+      "number": 536,
+      "commit": "2f3b287c",
+      "summary": "Bound the doubled decode buckets (TP=4 drops 512/1K); the MTP draft build keeps the memory floor once"
+    },
+    {
+      "number": 537,
+      "commit": "9f6052aa",
+      "summary": "DFlash2 selector: a row with no orderable logit fails the draft step instead of reading out of bounds"
+    },
+    {
+      "number": 538,
+      "commit": "a206abdc",
+      "summary": "scale: change a serving cluster's width by an orderly restart (hold, KV store carry, rollback)"
+    },
+    {
+      "number": 539,
+      "commit": "538f2d74",
+      "summary": "glm53: width profiles of release v0.6; bit325 at TP=4, 5 and 6"
+    },
+    {
+      "number": 540,
+      "commit": "c6194312",
+      "summary": "Add shared prefix pages and gated session forks"
+    },
+    {
+      "number": 541,
+      "commit": "ca7e8744",
+      "summary": "front end: a control-token spelling in message content stays text when the release declares its own tokenizer"
+    },
+    {
+      "number": 542,
+      "commit": "5d6c710a",
+      "summary": "Bit-exact decode, prefill and DFlash2 kernel knobs (all default 0)"
+    },
+    {
+      "number": 543,
+      "commit": "4964aab7",
+      "summary": "Fill only the table's entries in a binding with more pages than its table"
+    },
+    {
+      "number": 544,
+      "commit": "e2a664fc",
+      "summary": "scale: a rollback stops engines that never served at once; a hello during it waits; the hold's timeline"
+    },
+    {
+      "number": 548,
+      "commit": "4e568641",
+      "summary": "Add opt-in batch-budgeted MoE union cap knobs (GR8_MOE_UNION_CAP, default 0)"
+    },
+    {
+      "number": 549,
+      "commit": "be1410dc",
+      "summary": "TP=4 launcher: default DEC_BK_MAX to 2048 (three decode buckets)"
+    },
+    {
+      "number": 267,
+      "commit": "cb4766e0",
+      "summary": "EL3 (#151): routed-expert pieces through a device table (stage 1)"
+    },
+    {
+      "number": 551,
+      "commit": "cdd1e093",
+      "summary": "TP=4 launcher: default 8 bit-exact #542 kernels ON and MOE_UNION_CAP=48"
+    }
+  ],
+  "benchmarks": [
+    {
+      "model": "glm53",
+      "tp": 4,
+      "config": "bit325 v0.6 @ 3e388b45, int4 KV, DFlash2 + MTP, default quality (MOE_UNION_CAP=48, 8 exact kernels ON, DEC_BK_MAX=2048), 200G switch",
+      "decode_tps": {
+        "code": 67.1,
+        "prose": 39.9,
+        "structured": 78.7,
+        "counting": 83.2
+      },
+      "prefill_tps": {
+        "8k": 1457,
+        "32k": 1605,
+        "128k": 1470
+      },
+      "concurrency_agg_tps": {
+        "c1": 50.6,
+        "c2": 62.1,
+        "c4": 83.3,
+        "c8": 120.5
+      },
+      "lowest_mem_available_gib": 13.53,
+      "smoke_pass": "14/14",
+      "needle_128k_pass": true,
+      "gsm8k_250_c4": "246/250",
+      "humaneval_164_c4": "156/164"
+    },
+    {
+      "model": "glm53",
+      "tp": 4,
+      "config": "bit325 v0.6 @ 3e388b45, int4 KV, DFlash2 + MTP, fast preset (MOE_UNION_CAP=32, bench.py --quick), 200G switch",
+      "decode_tps": {
+        "code": 73.2,
+        "prose": 38.9
+      },
+      "prefill_tps": {
+        "8k": 1597,
+        "32k": 1587,
+        "128k": 1469
+      },
+      "concurrency_agg_tps": {
+        "c1": 51.8,
+        "c2": 68.1,
+        "c4": 97.1,
+        "c8": 139.0
+      },
+      "lowest_mem_available_gib": 13.26,
+      "gsm8k_250_c4": "242/250",
+      "humaneval_164_c4": "153/164"
+    },
+    {
+      "model": "glm53",
+      "tp": 4,
+      "config": "K4 bit387 v0.7 @ 9e25c28a, int4 KV, DFlash2 + MTP, MOE_UNION_CAP=0 (uncapped pure quality), DEC_BK=2048 DEC_BK_MAX=2048, CAP=442368",
+      "decode_tps": {
+        "code": 60.8,
+        "prose": 36.2,
+        "structured": 72.9,
+        "counting": 76.5
+      },
+      "prefill_tps": {
+        "8k": 1530,
+        "32k": 1570,
+        "128k": 1434
+      },
+      "concurrency_agg_tps": {
+        "c1": 44.2,
+        "c2": 57.1,
+        "c4": 62.3,
+        "c8": 82.0
+      },
+      "lowest_mem_available_gib": 3.78,
+      "smoke_pass": "14/14",
+      "needle_128k_pass": true
+    }
+  ]
+}
