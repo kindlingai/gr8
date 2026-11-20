@@ -247,6 +247,14 @@ for the old list's boot: clients need a request timeout at least that long. A su
 resumed: `down` and `up` as after any failure; a box that leaves stops after `JOIN_TIMEOUT` + `READY_TMO` without word
 from the head.
 
+With `POOL` (every box that may serve, head first, with `TP` the boxes that serve now; `deploy/k8s` sets both with
+`tp`), `scale --tp N` needs no `--peers`: the new member list is the pool's first N. A box of the pool outside the
+member list is a standby: it runs its supervisor only (state `standby`, `health` true), joins the scale that names
+it, and a box that leaves stands by again instead of exiting. The head writes the last scale's options to
+`out/scale.json` and boots that width at its next `up` while `TP` and `POOL` are the ones it was written under; the
+other boxes take the head's member list when theirs differs. While the head's front end holds requests, the head's
+`health` is true too (`the front end holds requests through a scale`), so a readiness probe keeps it in service.
+
 What the scale keeps the same, so the store's blocks stay valid: the running variant (`--variant`), the KV format
 (`--kv-format`, also when a TP default chose it, as int4 at GLM-5.3 TP=4), `SHARE_LIMIT` and `REUSE_GRID` are pinned.
 It refuses `SHAPE=ring`, and a variant larger than the new width's default: a GLM-5.3 cluster that will scale to TP=3

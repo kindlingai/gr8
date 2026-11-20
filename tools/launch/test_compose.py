@@ -161,6 +161,19 @@ class ChartTests(unittest.TestCase):
         self.assertIn('path: /run/dispram', out)
         self.assertEqual(out.count('readOnly: true'), 2)             # gr8 and the init container both read-only
 
+    def test_a_pool_with_tp(self):
+        out = self.render('tp=3', 'size=4')
+        env = self.env(out)
+        self.assertEqual(env['TP'], '"3"')
+        self.assertEqual(env['POOL'], '"gr8-0.gr8.default,gr8-0-1.gr8.default,gr8-0-2.gr8.default,gr8-0-3.gr8.default"')
+        self.assertNotIn('HEAD', env)
+        env = self.env(self.render())
+        self.assertEqual((env['TP'], env['HEAD']), ('$(LWS_GROUP_SIZE)', '$(LWS_LEADER_ADDRESS)'))
+        self.assertNotIn('POOL', env)
+        for bad in (('tp=5', 'size=4'), ('tp=3', 'options.SHAPE=ring'), ('tp=3', 'options.POOL=a')):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.render(*bad)
+
 
 class DispramMountTests(unittest.TestCase):
     def test_writable_socket_mount(self):
