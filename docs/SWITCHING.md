@@ -233,6 +233,12 @@ not an in-process switch:
    handshake +1.4s, started +0.3s, ready +52.0s, serving +0.4s`: each part the seconds since the one before), and a
    scale's boot relays each rank's store rewrite, weight check, boot capture and load-cache lines to its supervisor log.
 
+A scale also prepares what the new width loads, before the hold: with `GR8_LOAD_COMPACT=DIR` in the cluster's
+`EXTRA_ENV` every box writes its new rank's compact copies into `DIR.tp<N>-<tag>` while the old width serves
+([COMPACT-WEIGHTS.md](COMPACT-WEIGHTS.md)), and GLM-5.3's planned layout is kept as `out/scale/layout-<hash>.json`, so
+a scale back to a layout seen before keeps its `GR8_GEN_CACHE` entries. The scale never turns compact copies on by
+itself (about 75 GB of disk a box); name the knob on the `scale` command (`--extra-env`) to start using them.
+
 If the new width fails to boot (a refused handshake, an engine that exits, `READY_TMO`), every box of the old list
 puts its store back and boots the old list again, and the held requests run there. The new engines never served, so
 they stop at once (SIGTERM, not the orderly quit), and a box of the old list that asks the head during its rollback
