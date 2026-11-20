@@ -290,7 +290,8 @@ struct Layer
     void *ds41_attn = nullptr, *ds41_moe = nullptr;   // opaque per-layer state of the attention / index ops and the MoE ops; set by Table::bind_attn / bind_moe
 #endif
     bind::LayerTensors T;
-    ptab::Table ptab;                 // EL3 (#151): the layer's piece table (G6_PTAB); T.ptab points at it when built
+    std::shared_ptr<ptab::Table> ptab;   // EL3 (#151): the layer's piece table (GR8_PTAB), shared by a copy of the Model (DS41 lane B
+                                         // shares the weights); T.ptab points at it when built
     bind::Layer L[MX + 1];
     bool built[MX + 1] = {};
     G6AttnPack ap{};
@@ -458,7 +459,7 @@ struct Model
 #endif
     bool graph = false;               // attention through the replay entry (set before prepare)
     bool wide = false;                // set before build: tr3.fc1 K3 records into the wide order, in place (bind::widen_fc1)
-    ptab::Pool ppool;                 // EL3 (#151): the slab pool of the piece tables (GR8_PTAB=2 copies pieces into it)
+    std::shared_ptr<ptab::Pool> ppool;   // EL3 (#151): the slab pool of the piece tables (GR8_PTAB=2 copies pieces into it); shared like ptab
     // graph form: captured attention capacities, ascending, the last = the binding's capacity. GR8_DEC_BK=B (read at
     // build, default 2048): B, 2B, 4B, ... (7 at most) below the capacity, then the capacity, and CP's R when it is not one
     // of them; 0 = one bucket (the capacity). A step runs the graph of the smallest bucket >= its context (bucket_of);
@@ -807,17 +808,20 @@ inline void build_ptab(Model& m, Layer& y, int rank, bool say, cudaStream_t st)
     const ptab::Mode pm = ptab::mode_env();
     if (pm == ptab::OFF || !y.T.t[bind::T_TR3_TAB].p) return;
     const bind::Tensor& tab = y.T.t[bind::T_TR3_TAB];
-    if (const char* e = ptab::build(y.ptab, tab.p, y.T.t[bind::T_TR3_KMIX].p, static_cast<const uint8_t*>(y.T.t[bind::T_TR3_FC1].p),
-                                    static_cast<const uint8_t*>(y.T.t[bind::T_TR3_FC2].p), static_cast<int>(tab.shape[0]), g6nr::EB, pm, m.ppool, st))
+    if (!m.ppool) m.ppool = std::make_shared<ptab::Pool>();
+    auto t = std::make_shared<ptab::Table>();
+    if (const char* e = ptab::build(*t, tab.p, y.T.t[bind::T_TR3_KMIX].p, static_cast<const uint8_t*>(y.T.t[bind::T_TR3_FC1].p),
+                                    static_cast<const uint8_t*>(y.T.t[bind::T_TR3_FC2].p), static_cast<int>(tab.shape[0]), g6nr::EB, pm, *m.ppool, st))
         die("layer " + std::to_string(y.l) + ": " + e);
-    y.T.ptab = y.ptab.dev;
+    y.ptab = t;
+    y.T.ptab = t->dev;
 #if G6_MODEL_FLASH
-    y.flash_mlp_w.experts.ptab = y.ptab.dev;      // decode K1 binds from this copy (flash_mlp::make -> make_k1(w.experts))
+    y.flash_mlp_w.experts.ptab = t->dev;          // decode K1 binds from this copy (flash_mlp::make -> make_k1(w.experts))
 #endif
     if (say)
         fprintf(stderr, "# rank %d: GR8_PTAB=%d: layer %d routed experts through a piece table (%d x %d x 2 entries%s%s)\n", rank, (int)pm, y.l,
-                y.ptab.rows, y.ptab.eb, pm == ptab::SCATTER ? (", " + std::to_string(y.ptab.slab_bytes >> 20) + " MB of slabs").c_str() : "",
-                y.ptab.reshuffles ? (", " + std::to_string(y.ptab.reshuffles) + " reshuffles").c_str() : "");
+                t->rows, t->eb, pm == ptab::SCATTER ? (", " + std::to_string(t->slab_bytes >> 20) + " MB of slabs").c_str() : "",
+                t->reshuffles ? (", " + std::to_string(t->reshuffles) + " reshuffles").c_str() : "");
 }
 
 // capacity = longest sequence (tokens) the attention caches of this model hold; max_rows = most rows one attention
