@@ -1,14 +1,15 @@
 // Run on a GB10: can a weight image outlive the process that made it? (Phase B probe P0, gr8-private#156)
 // Three processes over a Unix socket, the allocations' file descriptors passed with SCM_RIGHTS:
-//   export SOCK GIB   cuMemCreate chunks (exportable as POSIX fds), mapped and filled, each exported and sent to the
-//                     holder; then it exits without unmapping
+//   export SOCK GIB [CHUNK_MIB]   cuMemCreate chunks (exportable as POSIX fds), mapped and filled, each exported and
+//                     sent to the holder; then it exits without unmapping
 //   hold SOCK         no CUDA: takes the exporter's fds, hands them to the importer, exits when the importer is done
-//   import SOCK GIB   imports every fd, maps them into one range, verifies every word, prints the import + map time
-// With no role (or `run GIB`), the test runs all three and checks MemAvailable around them. Five PASS lines, one per
-// condition: export succeeds; the memory stays allocated after the exporter exits; 0 bad words; import + map under
-// 2 s; the memory comes back once importer and holder exit. Exit 0 = all PASS, 1 = a FAIL, 2 = CUDA error,
-// 0 with SKIP = no VMM or no fd export on this driver.
-//   TEST=img_handoff_test scripts/c1_tests.sh [bin_dir] [GIB]      (64 by default)
+//   import SOCK       imports every fd, maps them into one range, verifies every word, prints the import + map time
+// With no role (or `run GIB [CHUNK_MIB]`), the test runs all three and checks MemAvailable around them. Five PASS
+// lines, one per condition: export succeeds; the memory stays allocated after the exporter exits; 0 bad words; import +
+// map under 2 s; the memory comes back once importer and holder exit. Exit 0 = all PASS, 1 = a FAIL, 2 = CUDA error,
+// 0 with SKIP = no VMM or no fd export on this driver. CHUNK_MIB: the chunk size (default the recommended granularity;
+// import + map costs about the same per chunk, so larger chunks import faster).
+//   TEST=img_handoff_test scripts/c1_tests.sh [bin_dir] [GIB [CHUNK_MIB]]      (64 by default)
 #include "../../vmm.h"
 #include <cerrno>
 #include <chrono>
@@ -156,7 +157,7 @@ static int connect_to(const char* path)
 }
 
 // ---- the roles ------------------------------------------------------------------------------------------------------
-static int role_export(const char* sock, double gib)
+static int role_export(const char* sock, double gib, size_t chunk_mib)
 {
     check(cudaSetDevice(0));
     check(cudaFree(nullptr));
@@ -165,7 +166,9 @@ static int role_export(const char* sock, double gib)
     g6vmm::granularity(0, gmin, grec);
     if (!gmin) { puts("SKIP img handoff: no VMM granularity"); return 77; }
     const size_t want = size_t(gib * double(1ull << 30));
-    const size_t chunk = chunk_for(want, gmin, grec), n = (want + chunk - 1) / chunk, total = n * chunk;
+    size_t chunk = chunk_mib ? (chunk_mib << 20) / gmin * gmin : 0;
+    if (!chunk) chunk = chunk_for(want, gmin, grec);
+    const size_t n = (want + chunk - 1) / chunk, total = n * chunk;
     const auto& a = g6vmm::api();
     const CUmemAllocationProp p = share_prop(0);
     CUdeviceptr base = 0;
@@ -308,7 +311,7 @@ static int wait_rc(pid_t p)
     if (waitpid(p, &st, 0) != p || !WIFEXITED(st)) return 98;
     return WEXITSTATUS(st);
 }
-static int run(char* self, double gib)
+static int run(char* self, double gib, const char* chunk_mib)
 {
     char sock[] = "/tmp/gr8-img-handoff-XXXXXX";
     int t = mkstemp(sock);
@@ -317,7 +320,7 @@ static int run(char* self, double gib)
     const std::string g = std::to_string(gib);
     const double m0 = mem_available_gib();
     pid_t holder = spawn(self, {"hold", sock});
-    int rc = wait_rc(spawn(self, {"export", sock, g}));
+    int rc = wait_rc(spawn(self, {"export", sock, g, chunk_mib}));
     if (rc == 77) { kill(holder, SIGKILL); waitpid(holder, nullptr, 0); unlink(sock); return 0; }
     if (rc) { kill(holder, SIGKILL); waitpid(holder, nullptr, 0); unlink(sock); return rc == 2 ? 2 : 1; }
     sleep(1);
@@ -342,11 +345,12 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     const std::string role = argc > 1 ? argv[1] : "run";
-    if (role == "export" && argc > 3) return role_export(argv[2], atof(argv[3]));
+    if (role == "export" && argc > 3) return role_export(argv[2], atof(argv[3]), argc > 4 ? strtoull(argv[4], nullptr, 10) : 0);
     if (role == "hold" && argc > 2) return role_hold(argv[2]);
     if (role == "import" && argc > 2) return role_import(argv[2]);
-    if (role == "run") return run(argv[0], argc > 2 ? atof(argv[2]) : 64.0);
-    if (argc > 1 && atof(argv[1]) > 0) return run(argv[0], atof(argv[1]));   // c1_tests.sh passes GIB alone
-    fprintf(stderr, "usage: %s [run] [GIB] | export SOCK GIB | hold SOCK | import SOCK\n", argv[0]);
+    const int at = role == "run" ? 2 : 1;   // c1_tests.sh passes GIB [CHUNK_MIB] alone
+    if (role == "run" || atof(argv[1]) > 0)
+        return run(argv[0], argc > at ? atof(argv[at]) : 64.0, argc > at + 1 ? argv[at + 1] : "0");
+    fprintf(stderr, "usage: %s [run] [GIB [CHUNK_MIB]] | export SOCK GIB [CHUNK_MIB] | hold SOCK | import SOCK\n", argv[0]);
     return 2;
 }
