@@ -302,6 +302,8 @@ boots. Requests sent meanwhile wait and are answered by the new width. With a pe
 over, so a chat goes on without a re-prefill. The head stays first in the list; a box new to the cluster runs
 `./gr8 glm53 up --tp 3 --peers A,B,C` once the scale has started. If the new width fails to boot, the old one boots
 again. The scale changes the running cluster only: put the lines it prints into every box's config for later boots.
+With `--pool A,B,C,D --tp 3` (or the Helm chart's `tp`), the boxes past the first three stand by and
+`scale --tp 4` takes them in without a new `up`; the head keeps the last scaled width for its next boot.
 [docs/SWITCHING.md](docs/SWITCHING.md#changing-width-gr8-model-scale) has the details.
 
 ## Troubleshooting

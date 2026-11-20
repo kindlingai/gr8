@@ -124,7 +124,7 @@ def cmd_up(argv):
                 if rc is not None:
                     sys.stdout.write(f.read().decode(errors='replace'))
                     return rc
-                if st == 'serving' and read_state(out).get('pid') == child.pid:
+                if st in ('serving', 'standby') and read_state(out).get('pid') == child.pid:
                     return 0
                 time.sleep(0.5)
     except KeyboardInterrupt:
@@ -238,10 +238,10 @@ def cmd_scale(argv):
         return 2
     o = parse(rest, check=False)
     words = []
-    for k in ('TP', 'PEERS'):
-        if o.origin.get(k) != 'command line':
-            print('gr8: scale needs --tp N and --peers LIST (the new member list, the head first)', file=sys.stderr)
-            return 2
+    if o.origin.get('TP') != 'command line':
+        print('gr8: scale needs --tp N, and --peers LIST (the new member list, the head first) unless the cluster '
+              'booted with --pool', file=sys.stderr)
+        return 2
     for k, v in o.values.items():   # the options this command names: the head adds them to the boot's own
         if o.origin.get(k) == 'command line' and k not in ('GR8_WORK_DIR', 'GR8_MODEL', 'MENTAT') and v is not None:
             words += [opt.flag_of(k), v]
@@ -341,7 +341,11 @@ def health(out, port, timeout=2, proc='/proc'):
     pid = sv.read_pid(os.path.join(out, 'supervisor.pid'))
     if not pid or pid != st.get('pid') or not is_supervisor(pid, proc):
         return False, f'{who}: not serving, no supervisor runs (last state {state})'
+    if state == 'standby':
+        return True, f'{who}: standby (in the pool, not serving), supervisor pid {pid}'
     if state != 'serving':
+        if rank == 0 and front_holds(port, timeout):
+            return True, f'{who}: {state}, supervisor pid {pid}; the front end holds requests through a scale'
         return False, f'{who}: {state}, supervisor pid {pid}'
     if rank != 0:
         return True, f'{who}: serving, supervisor pid {pid}'
@@ -359,6 +363,15 @@ def health(out, port, timeout=2, proc='/proc'):
         return False, f'{who}: serving, supervisor pid {pid}, but the API /health ' + \
             (f'answers {code}' if code else f'on port {port} answers nothing')
     return True, f'{who}: serving, supervisor pid {pid}, API /health 200'
+
+
+def front_holds(port, timeout):
+    """Whether the head's front end holds requests (/internal/hold): a scale's switch, during which the API waits."""
+    try:
+        with NO_PROXY.open(f'http://127.0.0.1:{port}/internal/hold', timeout=timeout) as r:
+            return json.load(r).get('hold') is True
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
 
 
 def cmd_health(argv):

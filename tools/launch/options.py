@@ -215,6 +215,12 @@ def parse(argv, environ=None):
             break
     else:
         values['MENTAT'], origin['MENTAT'] = 'localhost', 'default'
+    if values.get('POOL'):   # the boxes that may serve: the first TP of them serve unless PEERS names them
+        if values.get('MENTAT') and origin['MENTAT'] != 'default':
+            raise OptionError('POOL names the boxes: it takes no MENTAT (--mentat)')
+        values['MENTAT'] = None
+        if not values.get('PEERS') and str(values.get('TP') or '').isdigit():
+            values['PEERS'], origin['PEERS'] = ','.join(split_list(values['POOL'])[:int(values['TP'])]), 'POOL'
     if '--no-check' in switches:
         values['CHECK'], origin['CHECK'] = '0', 'command line'
     # A box that names its model-loader fetches through it: model-loader's own deploy trees (deploy/compose/gr8.yml,
@@ -433,6 +439,13 @@ def validate(o):
                           f'GR8_MODEL, or run ./gr8 {other}')
     model = models.of(o)
     tp = o.get('TP')
+    if o.get('POOL'):
+        if not o.get('TP') and not o.get('PEERS'):
+            raise OptionError('--pool needs --tp: how many of its boxes serve')
+        if o.get('TP') and str(o.get('TP')).isdigit() and int(o.get('TP')) > len(split_list(o.get('POOL'))):
+            raise OptionError(f'--tp {o.get("TP")}: POOL names {len(split_list(o.get("POOL")))} boxes')
+        if o.get('SHAPE') == 'ring':
+            raise OptionError('POOL needs the mesh: SHAPE=ring is refused (a scale cannot rewire a ring)')
     if tp is None:
         if mode(o) == 'peers':
             tp = str(len(split_list(o.get('PEERS'))))
@@ -1107,20 +1120,20 @@ def split_list(v):
     return [x for x in re.split(r'[,\s]+', v or '') if x]
 
 
-def resolve_peers(o):
-    """The peer list as IPv4 addresses, resolved on this box."""
+def resolve_peers(o, key='PEERS'):
+    """The peer list (or POOL's) as IPv4 addresses, resolved on this box."""
     out = []
-    for name in split_list(o.get('PEERS')):
+    for name in split_list(o.get(key)):
         try:
             addr = socket.getaddrinfo(name, None, socket.AF_INET)[0][4][0]
         except OSError:
             raise OptionError(f'cannot resolve peer {name!r}. PEERS (or HOSTS) must be LAN addresses or names every box '
                               'resolves, not ssh aliases; literal addresses are best')
-        if ipaddress.ip_address(addr).is_loopback and name != addr and len(split_list(o.get('PEERS'))) > 1:
+        if ipaddress.ip_address(addr).is_loopback and name != addr and len(split_list(o.get(key))) > 1:
             raise OptionError(f'peer {name!r} resolves to {addr} here; name the LAN address instead')
         out.append(addr)
     if len(set(out)) != len(out):
-        raise OptionError(f'the peer list names one box twice: {",".join(out)}')
+        raise OptionError(f'the {"peer list" if key == "PEERS" else key} names one box twice: {",".join(out)}')
     return out
 
 
@@ -1195,6 +1208,8 @@ def canonical(o, plan, members, variant=None, ring=''):
     else:
         c['group'] = o.get('GROUP')
         c['head'] = o.get('HEAD', '')
+    if o.get('POOL'):
+        c['pool'] = ','.join(split_list(o.get('POOL')))
     for k in ('IPS', 'IPS2', 'CONTROL_PORT', 'PORT'):
         c[k] = o.get(k) or ''
     # Every knob that reaches the engine is in engine.env and engine.args below. CAP is also here by name, so a refusal

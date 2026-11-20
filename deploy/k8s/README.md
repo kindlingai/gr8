@@ -73,6 +73,21 @@ pod's ports with them. `HF_TOKEN`, for a gated repo, belongs in a Secret:
 `extraEnvFrom: [{secretRef: {name: <secret>}}]`. A second group on the same mentat network is a second release with its
 own `GROUP`.
 
+### Changing the width live: `tp`
+
+LeaderWorkerSet recreates every pod when `size` changes, so a live width change keeps `size` and moves `tp`. With `tp`
+set, the group is a pool: all `size` pods run, the chart sets `TP` to `tp` and `POOL` to every pod's DNS name (the
+leader first) instead of `HEAD`, and the boxes find each other by those names (peers mode, no mentat). The first `tp`
+pods serve; the others stand by, and their readiness probe is true. Then
+
+    kubectl -n gr8 exec gr8-0 -- /opt/gr8/gr8 glm53 scale --tp 4
+
+moves the cluster to 4 of the pods without a pod restarting, holding requests meanwhile
+([docs/SWITCHING.md](../../docs/SWITCHING.md#changing-width-gr8-model-scale)); the leader stays Ready through the hold,
+and a pod that leaves stands by again. A group restart boots the last scaled
+width (the leader keeps it in its `home`), until `tp` or `size` changes. `tp` needs the mesh (no `options.SHAPE: ring`)
+and refuses `options.POOL`; `status` and `down` reach the serving pods only. Unset (the default), nothing changes.
+
 ### Storage
 
 Each pod has `cache` (this box's part of the model, about 90 GB at TP=4 and 85 GB at TP=3, one cache for both) and

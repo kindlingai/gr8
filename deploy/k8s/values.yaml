@@ -8,6 +8,11 @@ imagePullSecrets: []
 
 # The boxes in the group: TP, 3, 4, 5 or 6.
 size: 4
+# With tp set, the group is a pool: all `size` pods run, the first tp serve and the others stand by, and
+# `kubectl -n <ns> exec <release>-0 -- /opt/gr8/gr8 <model> scale --tp N` changes the width (1 to size) without a pod
+# restarting (LWS recreates every pod when size changes). A group restart boots the last scaled width. Unset: TP is
+# size and the boxes find each other through mentat, as before. Needs the mesh (no options.SHAPE ring).
+tp: null
 # 0 stops every box, 1 boots them. One group per release: a second group is a second release, with its own GROUP.
 replicas: 1
 

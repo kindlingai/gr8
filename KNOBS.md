@@ -51,6 +51,10 @@ mentat group, the ports, every engine knob (`./gr8 knobs` lists them after `CAP`
 arguments they produce. Per-box values, such as paths and the proxy CPU, do not count. Any difference stops every
 box, with the option and each box's value.
 
+`POOL` names every box that may serve (the head first) and takes `TP`: `PEERS` is then the pool's first `TP` unless
+`PEERS` is set (its boxes must be in the pool, with the same head), the boxes run in peers mode, and `MENTAT` and
+`SHAPE=ring` are refused. The pool joins the cluster options the handshake compares.
+
 The engine does not inherit `G6_*` variables from the environment, and `./gr8 glm53 up` refuses to start while one is
 set. Pass engine variables with `--extra-env "NAME=value ..."` so that every box compares them.
 
