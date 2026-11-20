@@ -4,6 +4,7 @@
 # needs EXTRA=-DDEC_S2, else it only prints SKIP) and kv4_test (the KV latent row: append round trip, and decode /
 # prefill / row-owner attention against a host reference; EXTRA=-DG6_KV4=1 tests the INT4 row, docs/KV4.md) and
 # weight_check_test (the weight check's GPU sums against the CPU's, and one changed byte caught in its own chunk) and
+# img_handoff_test (VMM chunks passed as fds outlive the process that made them: Phase B probe P0, 8 GiB in the full run) and
 # canon_test (a session's KV exported and imported across page lists and layouts, then a decode step on it; #152) and
 # kv_resize_test (the KV pool's chunks shrunk and grown under live sessions, on caches in virtual memory, against caches
 # that never resized; #153) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same weights,
@@ -95,6 +96,11 @@ rc=0
 if [ "$TEST" = all ] || [ "$TEST" = dispram_gpu_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run dispram_gpu_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = img_handoff_test ]; then
+  [ "$TEST" = all ] && ARGS=(8)   # GiB; alone it runs the probe's 64 GiB, or the size its argument gives
+  build_run img_handoff_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  if [ "$TEST" = all ]; then ARGS=(); fi
 fi
 if [ "$TEST" = all ] || [ "$TEST" = row_budget_test ]; then
   build_run row_budget_test || rc=$?
