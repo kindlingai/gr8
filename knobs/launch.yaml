@@ -677,7 +677,8 @@ options:
     scope: cluster
     doc: >-
       GLM-5.3: the largest doubled decode context bucket; past it the buckets are R and CAP (GR8_DEC_BK_MAX; 0 = no
-      bound). Each bucket holds about 0.9 GiB of step graphs a rank at TP=4
+      bound). Each bucket holds about 0.9 GiB of step graphs a rank at TP=4. Default: TP=4 2048 (with DEC_BK 2048 and
+      CP, three buckets: 2048, R and CAP; same tokens as 32768)
   S2_ADAPT:
     scope: cluster
     doc: >-

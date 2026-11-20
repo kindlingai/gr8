@@ -463,6 +463,10 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o 
 "$T/pf_peer_stage_test"
 g++ -std=c++17 -O2 -I "$REPO/engine/kernels" "$REPO/engine/tests/test_topk.cpp" -o "$T/test_topk" "${KNOBS[@]}"
 "$T/test_topk"
+# GR8_MOE_UNION_CAP / GR8_MOE_UNION_MODE: 256-entry bitonic union cap, renorm modes, dense packing, and RoutePlan invariants
+g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_moe_union_cap.cpp" -o "$T/test_moe_union_cap"
+"$T/test_moe_union_cap" > "$T/test_moe_union_cap.out" || { cat "$T/test_moe_union_cap.out"; exit 1; }
+head -n 2 "$T/test_moe_union_cap.out"
 # DS41 S2 host tests: prefill admission, its two lanes, 32-session steps, the 32-session 64K config, the DSpark round,
 # prefix reuse rows with drafts off (a forced tool call's insert rule at MTP 0)
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" -I "$REPO/engine/comms" "$REPO/engine/runtime/s2/tests/ds41_prefill_test.cpp" -o "$T/ds41_prefill_test" "${KNOBS[@]}"

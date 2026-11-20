@@ -352,7 +352,7 @@ engine_defaults() {
        tp4_default ROUTE_OVL 1; [ "$MTP" = 0 ] || tp4_default DRAFT_HEAD_I4 1
        tp4_default ATTN_SC2 4; tp4_default ATTN_SC2_TR 2; tp4_default ATTN_CTX2 4; tp4_default ATTN_CTX3 2
        tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
-       tp4_default IDX_VEC 1; tp4_default DEC_BK 2048; tp4_default DEC_BK_MAX 32768; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
+       tp4_default IDX_VEC 1; tp4_default DEC_BK 2048; tp4_default DEC_BK_MAX 2048; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
        tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then
          tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1

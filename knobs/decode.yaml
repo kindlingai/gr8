@@ -246,6 +246,27 @@ knobs:
     values: "1..8"
     doc: >-
       Keeps only this many routed experts per token and renormalizes their weights. A model change for screens.
+  GR8_MOE_UNION_CAP:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..256"
+    legacy: []
+    doc: >-
+      Caps the distinct routed experts executed per GLM-5.3 decode MoE layer across the batch to at most this many
+      experts (0 = off, exact stock path). Opt-in approximate batch-budgeted routing knob; priority and
+      renormalization are selected by GR8_MOE_UNION_MODE.
+  GR8_MOE_UNION_MODE:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..8"
+    legacy: []
+    doc: >-
+      Selects priority and renormalization policy for GR8_MOE_UNION_CAP: policy = mode % 3 (0 = balanced batch mass
+      with per-row top-1 floor, 1 = anchor0 exact row-0 top-8 + causal row decay + per-row top-1 floor, 2 = pure batch
+      mass), renorm = mode / 3 (0 = L2 variance-preserving, 1 = L1 sum-preserving, 2 = no renorm). Ignored when
+      GR8_MOE_UNION_CAP is 0.
   GR8_NOWIDE2:
     scope: agree
     kind: flag
