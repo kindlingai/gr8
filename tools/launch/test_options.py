@@ -744,6 +744,38 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(env(PEERS, '--extra-env', 'GR8_TR3_W2ALL=0'), ['GR8_TR3_W2ALL=0'])   # EXTRA_ENV keeps its value, no second copy
         self.assertEqual(env('10.0.0.1,10.0.0.2,10.0.0.3'), [])   # TP=3 unchanged
 
+    def test_tp4_exact_knobs_and_union_cap_defaults_and_overrides(self):
+        exact = ['GR8_DEC_DENSE_OPT=1', 'GR8_DTR_EXACT_OPT=1', 'GR8_MOE_RTR_FIN_OPT=1', 'GR8_TR3_WIDE4=1',
+                 'GR8_PF_ATTN_OPT=1', 'GR8_PF_DENSE_OPT=1', 'GR8_PF_ISGRT_CLEAN=1', 'GR8_DFL_DEDUP=1']
+        def env(peers, *argv):
+            o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
+            opt.validate(o)
+            return opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env']
+        e = env(PEERS)
+        for v in exact:
+            self.assertIn(v, e)
+        self.assertIn('GR8_MOE_UNION_CAP=48', e)
+        # DFL_DEDUP must stay off when DFLASH=0 (engine refuses GR8_DFL_DEDUP=1 without --dflash-manifest)
+        e_nodfl = env(PEERS, '--dflash', '0')
+        self.assertFalse(any(a.startswith('GR8_DFL_DEDUP=') for a in e_nodfl))
+        self.assertIn('GR8_DEC_DENSE_OPT=1', e_nodfl)
+        # explicit overrides and rollback to 0
+        e_off = env(PEERS, '--dec-dense-opt', '0', '--moe-union-cap', '0')
+        self.assertIn('GR8_DEC_DENSE_OPT=0', e_off)
+        self.assertFalse(any(a.startswith('GR8_MOE_UNION_CAP=') for a in e_off))
+        # fast concurrency cap and mode pass-through
+        e_fast = env(PEERS, '--moe-union-cap', '32', '--moe-union-mode', '1')
+        self.assertIn('GR8_MOE_UNION_CAP=32', e_fast)
+        self.assertIn('GR8_MOE_UNION_MODE=1', e_fast)
+        # EXTRA_ENV keeps its own value with no second copy
+        e_extra = env(PEERS, '--extra-env', 'GR8_DEC_DENSE_OPT=0 GR8_MOE_UNION_CAP=0')
+        self.assertEqual([a for a in e_extra if a.startswith(('GR8_DEC_DENSE_OPT=', 'GR8_MOE_UNION_CAP='))],
+                         ['GR8_DEC_DENSE_OPT=0', 'GR8_MOE_UNION_CAP=0'])
+        # other TP widths stay untouched
+        e_tp3 = env('10.0.0.1,10.0.0.2,10.0.0.3')
+        keys = {v.split('=')[0] for v in exact} | {'GR8_MOE_UNION_CAP', 'GR8_MOE_UNION_MODE'}
+        self.assertFalse(any(a.split('=')[0] in keys for a in e_tp3))
+
     def test_ptab_off_unless_set(self):
         # PTAB (EL3 #151): unset = no GR8_PTAB in the engine environment (the pack layout); set = passed through, as a
         # cluster option (the handshake compares it)
