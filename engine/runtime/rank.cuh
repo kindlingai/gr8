@@ -43,6 +43,7 @@
 #include "host_reclaim.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
+#include "../kernels/ptab.cuh"
 #include "../kernels/dec_dense_opt.cuh"
 #include "../kernels/dtr_exact_opt.cuh"
 #include "../kernels/moe_rtr_fin_opt.cuh"
@@ -290,6 +291,8 @@ struct Layer
     void *ds41_attn = nullptr, *ds41_moe = nullptr;   // opaque per-layer state of the attention / index ops and the MoE ops; set by Table::bind_attn / bind_moe
 #endif
     bind::LayerTensors T;
+    std::shared_ptr<ptab::Table> ptab;   // EL3 (#151): the layer's piece table (GR8_PTAB), shared by a copy of the Model (DS41 lane B
+                                         // shares the weights); T.ptab points at it when built
     bind::Layer L[MX + 1];
     bool built[MX + 1] = {};
     G6AttnPack ap{};
@@ -457,6 +460,7 @@ struct Model
 #endif
     bool graph = false;               // attention through the replay entry (set before prepare)
     bool wide = false;                // set before build: tr3.fc1 K3 records into the wide order, in place (bind::widen_fc1)
+    std::shared_ptr<ptab::Pool> ppool;   // EL3 (#151): the slab pool of the piece tables (GR8_PTAB=2 copies pieces into it); shared like ptab
     // graph form: captured attention capacities, ascending, the last = the binding's capacity. GR8_DEC_BK=B (read at
     // build, default 2048): B, 2B, 4B, ... (7 at most) below the capacity, then the capacity, and CP's R when it is not one
     // of them; 0 = one bucket (the capacity). A step runs the graph of the smallest bucket >= its context (bucket_of);
@@ -797,6 +801,30 @@ inline bind::Tensor as_bind(const TensorRef& r)
     return b;
 }
 
+// GR8_PTAB (EL3, #151): builds layer y's piece table from its tr3 tensors as they are now (call after the wide reorder:
+// a SCATTER slab holds the order the kernels read) and points y.T.ptab at it; the Flash build also points its decode
+// binder's copy (flash_mlp_w.experts) at it. Off: nothing (the pack layout). Dies on a build error. Synchronous.
+inline void build_ptab(Model& m, Layer& y, int rank, bool say, cudaStream_t st)
+{
+    const ptab::Mode pm = ptab::mode_env();
+    if (pm == ptab::OFF || !y.T.t[bind::T_TR3_TAB].p) return;
+    const bind::Tensor& tab = y.T.t[bind::T_TR3_TAB];
+    if (!m.ppool) m.ppool = std::make_shared<ptab::Pool>();
+    auto t = std::make_shared<ptab::Table>();
+    if (const char* e = ptab::build(*t, tab.p, y.T.t[bind::T_TR3_KMIX].p, static_cast<const uint8_t*>(y.T.t[bind::T_TR3_FC1].p),
+                                    static_cast<const uint8_t*>(y.T.t[bind::T_TR3_FC2].p), static_cast<int>(tab.shape[0]), g6nr::EB, pm, *m.ppool, st))
+        die("layer " + std::to_string(y.l) + ": " + e);
+    y.ptab = t;
+    y.T.ptab = t->dev;
+#if G6_MODEL_FLASH
+    y.flash_mlp_w.experts.ptab = t->dev;          // decode K1 binds from this copy (flash_mlp::make -> make_k1(w.experts))
+#endif
+    if (say)
+        fprintf(stderr, "# rank %d: GR8_PTAB=%d: layer %d routed experts through a piece table (%d x %d x 2 entries%s%s)\n", rank, (int)pm, y.l,
+                t->rows, t->eb, pm == ptab::SCATTER ? (", " + std::to_string(t->slab_bytes >> 20) + " MB of slabs").c_str() : "",
+                t->reshuffles ? (", " + std::to_string(t->reshuffles) + " reshuffles").c_str() : "");
+}
+
 // capacity = longest sequence (tokens) the attention caches of this model hold; max_rows = most rows one attention
 // call may carry (MX for decode only, the prefill sub-batch size with prefill.cuh)
 inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& find, int capacity, const g6::FabricDev& f,
@@ -918,6 +946,10 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
 #endif
             G6RT_CK(cudaStreamSynchronize(st));
         }
+        // GR8_PTAB (EL3, #151): the routed experts read through a per-layer piece table (ptab.cuh); 1 = entries into the
+        // image, 2 = pieces copied into scattered slabs from the pool. Off: the pack layout, as before. After the wide
+        // reorder, so a slab holds the order the kernels read.
+        build_ptab(m, y, rank, i == 0 || i == m.nl - 1, st);
 #if DEC_I4PAIR
         bind::i4pair(y.T, st);
         G6RT_CK(cudaStreamSynchronize(st));
