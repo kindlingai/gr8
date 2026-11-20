@@ -20,6 +20,10 @@ Changes merged on `main` since `v1.0.1` that are not yet cut in a numbered `v*` 
   quit; before, it waited up to 120 s with a store that keeps sessions), a box of the old member list that says hello
   during the head's rollback waits instead of being refused (`booted`, exit 4), the CLI's output is line-buffered, the
   head logs and the CLI prints the hold's timeline, and the workers poll the head every 0.1 s during a scale.
+- `scale` prepares the new width's load files before the hold: with `GR8_LOAD_COMPACT=DIR` in `EXTRA_ENV`, each box
+  writes its new rank's compact copies into `DIR.tp<N>-<tag>` while the old width serves (older widths' copies go once
+  a later scale is done), and the planned layout file is named by its content, so a repeated transition keeps its
+  `GR8_GEN_CACHE` entries. The config lines `scale` prints now come from the finished scale.
 - The front end's 503 `engine not connected` now carries `Retry-After: 5`.
 - **Breaking changes:** None.
 
