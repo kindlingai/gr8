@@ -5,6 +5,7 @@ shim and the stub front end, which holds requests as the real one does (/interna
     python3 -m unittest discover -s tools/launch -p 'test_scale.py'"""
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -241,12 +242,17 @@ class Scale(unittest.TestCase):
 
     def test_4_to_3_hands_the_kv_store_to_the_new_ranks(self):
         """A persisted store: the boxes that stay boot with GR8_KV_REWIDTH naming the old ranks' kvman-peer, box 3's
-        store folder is served until the scale is done, and the old width's index.prev goes then."""
-        self.extra = ('--kv-store', 'ssd:store,size=1G,persist=on,keep=sessions')
+        store folder is served until the scale is done, and the old width's index.prev goes then. GR8_LOAD_COMPACT
+        becomes the new width's directory on every box; a box that cannot write the copies says so and boots anyway."""
+        self.extra = ('--kv-store', 'ssd:store,size=1G,persist=on,keep=sessions',
+                      '--extra-env', f'GR8_LOAD_COMPACT={self.t}/compact')
         peer = os.environ.get('KVMAN_PEER')
         for h in self.homes:
             if peer:
                 os.symlink(peer, os.path.join(h, 'bin', 'kvman-peer'))
+            with open(os.path.join(h, 'bin', 'g6load'), 'w') as f:   # a CI checkout builds the real one
+                f.write('#!/bin/sh\necho "stub g6load: no compact copies here" >&2\nexit 1\n')
+            os.chmod(os.path.join(h, 'bin', 'g6load'), 0o755)
         self.up(4)
         with open(os.path.join(self.homes[0], 'ready.delay'), 'w') as f:   # every worker's new engine starts first
             f.write('4')
@@ -277,6 +283,12 @@ class Scale(unittest.TestCase):
         self.assertIn('this box leaves', log3)
         self.assertIn('served to the new ranks' if peer else 'kvman-peer: the new ranks start', log3)
         self.assertEqual(sorted(os.listdir(os.path.join(self.homes[3], 'store', 'r3'))), ['index'])
+        for i in range(3):
+            with open(os.path.join(self.homes[i], 'out', 'stub.json')) as f:
+                self.assertRegex(json.load(f)['env'].get('GR8_LOAD_COMPACT', ''),
+                                 '^' + re.escape(f'{self.t}/compact.tp3-') + '[0-9a-f]{8}$')
+            self.assertIn('warning: no compact copies for the new width (g6load compact: stub g6load',
+                          read(os.path.join(self.homes[i], 'out', 'supervisor.log')))
 
 
 GLM = {'GR8_MODEL': 'glm53'}

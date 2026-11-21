@@ -12,6 +12,7 @@ ones finish, then the old engines quit (their KV store kept for the new ranks, G
 boots. A failure after the switch boots the old member list again (a rollback).
 """
 import fcntl
+import glob
 import hashlib
 import json
 import os
@@ -548,7 +549,7 @@ class Supervisor:
                 s[p] = bool(recorded(os.path.join(self.out, f'{p}.pid')))
             if self.scale:
                 s['scale'] = {k: self.scale.get(k) for k in ('id', 'phase', 'error', 'members', 'old_members', 'pause_s',
-                                                             'drain_s', 'timeline')}
+                                                             'drain_s', 'timeline', 'config')}
         return s
 
     def local_check(self, timeout=60):
@@ -1447,14 +1448,13 @@ class Supervisor:
         self.scale_n += 1
         s = {'id': f'{self.hs["epoch"]}.{self.scale_n}', 'members': members, 'old_members': list(self.members),
              'argv': delta, 'phase': 'prepare', 'error': '', 'ready': {}, 'msg': None, 'token': secrets.token_hex(16),
-             'drain': float(m.get('drain_timeout') or 300), 'boot_s': max(900.0, ready + 120), 'marks': []}
+             'drain': float(m.get('drain_timeout') or 300), 'boot_s': max(900.0, ready + 120), 'marks': [],
+             'extra_env': o.get('EXTRA_ENV')}
         self.scale_seen |= set(members) | set(self.members)
         self.scale = s
         log(f'scale {s["id"]}: TP={self.o.get("TP")} {",".join(self.members)} -> TP={tp} {",".join(members)}')
         threading.Thread(target=self.scale_run, args=(s,), daemon=True).start()
-        config = {opt.KEY_OF_FLAG[f]: v for f, v in zip(delta[::2], delta[1::2]) if f in opt.KEY_OF_FLAG}
-        return {'t': 'ok', 'id': s['id'], 'config': [f'{k}={v}' for k, v in config.items()],
-                'joiners': [a for a in members if a not in self.members]}
+        return {'t': 'ok', 'id': s['id'], 'joiners': [a for a in members if a not in self.members]}
 
     def scale_run(self, s):
         """The head's coordinator: plan the layout, every box of the new member list makes its files ready while the
@@ -1462,8 +1462,11 @@ class Supervisor:
         then every old member switches (scale_go). Any failure before the switch leaves the cluster as it was."""
         try:
             # old_set: the running model set id, which names the width; the new ranks check the old store against it
+            layout = self.scale_layout(s)
+            s['argv'] = s['argv'] + scale_compact(s['extra_env'], len(s['members']),
+                                                  self.variant.name if self.variant else '', s['members'], layout)
             s['msg'] = {'id': s['id'], 'argv': s['argv'], 'members': s['members'], 'old_members': s['old_members'],
-                        'layout': self.scale_layout(s), 'token': s['token'], 'old_set': self.model_id}
+                        'layout': layout, 'token': s['token'], 'old_set': self.model_id}
             for a in s['old_members']:
                 if a != self.lan:
                     r = self.call(a, {'t': 'scale_prepare', **s['msg']}, timeout=10)
@@ -1542,11 +1545,7 @@ class Supervisor:
         fd = os.open(token, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.write(fd, (m['token'] + '\n').encode())
         os.close(fd)
-        extra = []
-        if m.get('layout'):
-            with open(os.path.join(d, 'layout.json'), 'w') as f:
-                f.write(m['layout'])
-            extra = ['--layout', os.path.join(d, 'layout.json')]
+        extra = ['--layout', layout_file(d, m['layout'])] if m.get('layout') else []
         o = opt.parse(scale_argv(self.o.argv) + list(m['argv']) + extra)
         opt.validate(o)
         members, old = list(m['members']), list(m['old_members'])
@@ -1582,6 +1581,8 @@ class Supervisor:
             if p['leaves']:
                 return True, 'leaves'
             fails = self.checks(p=p)
+            if not fails:
+                self.scale_compact_prepare(p)
             return not fails, '; '.join(fails)
         except Exception as e:   # noqa: BLE001 - the head hears why
             return False, f'{type(e).__name__}: {e}'
@@ -1600,10 +1601,28 @@ class Supervisor:
         self.hello_poll = 0.1
         self.swap_in(p)
         fails = self.checks()
+        if not fails:
+            self.scale_compact_prepare(p)
         self.tell(0, {'t': 'scale_ready', 'id': p['id'], 'lan': self.lan, 'ok': not fails, 'why': '; '.join(fails)})
         if fails:
             raise Stop(4, 'scale: this box failed its checks: ' + '; '.join(fails))
         return fails
+
+    def scale_compact_prepare(self, p):
+        """GR8_LOAD_COMPACT: this box writes its new rank's compact copies (scale_compact names the directory) while the
+        old width serves. Without them the new engine reads the release files, as it would anyway."""
+        words = (p['o'].get('EXTRA_ENV') or '').split()
+        i = compact_word(words)
+        if i is None or not words[i].partition('=')[2]:   # only the scale's own knob: the engine reads no other
+            return
+        try:
+            done = prepare_compact(p['o'], p['rank'], p['variant'])
+        except (modelset.ModelError, OSError, RuntimeError, ValueError) as e:
+            first = (str(e).splitlines() or [type(e).__name__])[0]
+            log(f'scale {p["id"]}: warning: no compact copies for the new width ({first}); it reads the release files')
+            return
+        if done:
+            log(f'scale {p["id"]}: compact copies: {done[1]["checked"]} halves in {done[0]}')
 
     def swap_in(self, p):
         """This box takes the scale's options, members and rank (peers mode from now on)."""
@@ -1768,6 +1787,8 @@ class Supervisor:
         if s['phase'] == 'switch':
             s['phase'] = 'done'
             self.scale_words = s['argv']
+            config = {opt.KEY_OF_FLAG[f]: v for f, v in zip(s['argv'][::2], s['argv'][1::2]) if f in opt.KEY_OF_FLAG}
+            s['config'] = [f'{k}={v}' for k, v in config.items()]
             for a in sorted((set(s['old_members']) | set(s['members'])) - {self.lan}):
                 threading.Thread(target=self.send_done, args=(a, s['id']), daemon=True).start()
             self.finish_scale()
@@ -1795,7 +1816,8 @@ class Supervisor:
         s['pause_s'] = round(time.time() - s['held'], 1) if s.get('held') else 0.0
 
     def finish_scale(self):
-        """scale_done: the new member list serves. The old width's store files and the store service go."""
+        """scale_done: the new member list serves. The old width's store files and the store service go, and so do the
+        compact copies of earlier widths (scale_compact's names; the operator's own directory stays)."""
         p = self.pending
         if not p:
             return
@@ -1805,6 +1827,14 @@ class Supervisor:
         self.pending = self.prev = None
         for e in (self.scale_go, self.scale_abort, self.scale_done):
             e.clear()
+        words = (self.o.get('EXTRA_ENV') or '').split()
+        i = compact_word(words)
+        cur = os.path.join(self.home, words[i].partition('=')[2]) if i is not None else ''   # the engine runs in home
+        if COMPACT_SUFFIX.search(cur):
+            for d in glob.glob(glob.escape(COMPACT_SUFFIX.sub('', cur)) + '.tp*-*'):
+                if d != cur and COMPACT_SUFFIX.search(d) and os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
+                    log(f'scale: removed the compact copies of an earlier width, {d}')
 
     def front_hold(self, seconds=None):
         """The head's front end's request hold (/internal/hold): set for `seconds` (0 ends it), or read. Its JSON."""
@@ -2187,6 +2217,61 @@ def scale_store(o):
     if models.of(o).checkpoint_cache:
         stores = stores[:1]
     return next((t['path'] for t in stores if t['kind'] == 'ssd' and t['persist']), None)
+
+
+def layout_file(d, text):
+    """d/layout-<sha256 of text>.json, written once (tmp + rename): the engine's gen cache keys on the layout file's path,
+    size, mtime and inode, so a scale that plans a layout seen before keeps its GR8_GEN_CACHE entries. Its path."""
+    p = os.path.join(d, f'layout-{hashlib.sha256(text.encode()).hexdigest()[:16]}.json')
+    if not os.path.exists(p):
+        with open(p + '.tmp', 'w') as f:
+            f.write(text)
+        os.replace(p + '.tmp', p)
+    return p
+
+
+# a compact directory scale_compact named for one width: <the operator's directory>.tp<N>-<tag>
+COMPACT_SUFFIX = re.compile(r'\.tp\d+-[0-9a-f]{8}$')
+COMPACT_KEYS = ('GR8_LOAD_COMPACT', 'G6_LOAD_COMPACT')
+
+
+def compact_word(words):
+    """The index of the last GR8_LOAD_COMPACT= (or G6_LOAD_COMPACT=) word of EXTRA_ENV's words, the one engine_args.sh
+    applies, or None."""
+    return next((i for i in range(len(words) - 1, -1, -1)
+                 if words[i].partition('=')[1] and words[i].partition('=')[0] in COMPACT_KEYS), None)
+
+
+def scale_compact(extra_env, tp, variant, members, layout):
+    """The scale's --extra-env with GR8_LOAD_COMPACT renamed for the new width: <dir>.tp<N>-<tag>, tag from the variant,
+    the members and the layout (the halves each rank holds), the same path on every box. [] without the knob (or with
+    it empty)."""
+    words = (extra_env or '').split()
+    i = compact_word(words)
+    if i is None or not words[i].partition('=')[2]:
+        return []
+    key, _, d = words[i].partition('=')
+    tag = hashlib.sha256(f'{variant}\n{",".join(members)}\n{layout or ""}'.encode()).hexdigest()[:8]
+    words[i] = f'{key}={COMPACT_SUFFIX.sub("", d)}.tp{tp}-{tag}'
+    return [opt.flag_of('EXTRA_ENV'), ' '.join(words)]
+
+
+def prepare_compact(o, rank, variant):
+    """An opt-in prepare step, never a boot-time rewrite: this rank's compact copies in GR8_LOAD_COMPACT, the same
+    local directory the engine reads. (directory, g6load's result), or None when no directory is named."""
+    directory = os.environ.get('GR8_LOAD_COMPACT', os.environ.get('G6_LOAD_COMPACT', ''))
+    # engine_args.sh splits EXTRA_ENV on whitespace, normalizes legacy names and applies the last assignment.
+    for word in (o.get('EXTRA_ENV') or '').split():
+        key, sep, value = word.partition('=')
+        if sep and key in COMPACT_KEYS:
+            directory = value
+    if not directory:
+        return None
+    if not variant.path or not o.get('V2_SLICES'):
+        raise modelset.ModelError('GR8_LOAD_COMPACT prepare needs an exlr8 v2 release with index slices and a width manifest')
+    import fetch_ranks
+    return directory, fetch_ranks.compact_rank(o.get('V2'), directory, o.get('V2_SLICES'), int(o.get('TP')), rank,
+                                               variant.path, o.get('LAYOUT'))
 
 
 # GLM-5.3-Flash's checkpoint store files (engine/runtime/s2/flash_ckpt_index.h); GLM-5.3's store keeps `blocks` in
