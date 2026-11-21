@@ -82,6 +82,7 @@ one GPU and makes its own synthetic weights.
 | `kv_resize_test` | the KV pool shrunk and grown under live sessions (#153) |
 | `flash_kv_chunks_test` | `GR8_GLM53F_KV_CHUNKS`: Flash's caches in kvchunks regions under one chunk map |
 | `weight_check_test` | the weight check's sums, GPU against CPU |
+| `img_handoff_test` | Phase B probe P0: VMM chunks exported as POSIX fds outlive the exporter, through a process with no CUDA, and import, map and verify in another (every word, under 2 s); MemAvailable stays down while the fds live and comes back after. `TEST=img_handoff_test` runs 64 GiB in chunks of the recommended granularity (arguments: GiB, then a chunk size in MiB); the full run, 8 GiB |
 | `steering_boot_cuda_test`, `steering_consume_test`, `steering_cuda_test`, `steering_shared_test` | the steering kernels against the stock ones |
 | `s2_steer_test` | S2 batched decode steers each row as solo decode does (S2 builds) |
 | `headgroup_test` | sparse prefill attention for more than 16 heads, against a CPU reference |
