@@ -67,6 +67,9 @@ One of:
   OpenAI API, on port 8100. The TP is the number of addresses.
 - mentat: without `PEERS`, the boxes find each other through the mentat daemon (mentatd) on each box
   (`MENTAT=localhost`, the default), and `TP` must be set. The lowest address is the head, or `HEAD`.
+- `POOL` with `TP`: every box that may serve, in rank order (the head first). The first `TP` serve and the others stand
+  by, and `./gr8 <model> scale --tp N` moves the width within the pool without a new `up` (a box that leaves stands by
+  again). The head boots the last scaled width at its next `up` while `TP` and `POOL` are unchanged.
 
 Boxes cabled without a switch (TP=3 or 4) add `SHAPE=ring`. With `PEERS`, list the boxes in cable order: each box's f0
 port cabled to the next box's f1. With mentat (mentatd 0.24.0 or later, both addresses of each ConnectX port tagged
@@ -175,7 +178,9 @@ Then, from a checkout:
 
 The leader is `gr8-0`, and the Service `gr8-api` reaches its API. A cold boot downloads first: the startup probe allows
 4 hours. `kubectl -n gr8 scale leaderworkerset gr8 --replicas 0` stops every box, and `--replicas 1` boots them again.
-The chart's [README](../deploy/k8s/README.md) has every value, storage, placement and updating.
+The chart's [README](../deploy/k8s/README.md) has every value, storage, placement and updating. With `tp: 3` (and
+`size: 4`) the group is a pool, and `kubectl -n gr8 exec gr8-0 -- /opt/gr8/gr8 glm53 scale --tp 4` changes the width
+without a pod restarting ([the chart's README](../deploy/k8s/README.md#changing-the-width-live-tp)).
 
 ## With model-loader
 

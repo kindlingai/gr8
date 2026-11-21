@@ -14,6 +14,12 @@ Changes merged on `main` since `v1.1.0` that are not yet cut in a numbered `v*` 
   writes its new rank's compact copies into `DIR.tp<N>-<tag>` while the old width serves (older widths' copies go once
   a later scale is done), and the planned layout file is named by its content, so a repeated transition keeps its
   `GR8_GEN_CACHE` entries. The config lines `scale` prints now come from the finished scale.
+- **`POOL`** (`--pool`): every box that may serve, head first; with `--tp N` the first N serve and the others stand by.
+  `scale --tp M` then needs no `--peers` and no new `up`, a box that leaves stands by instead of exiting, and the head
+  boots the last scaled width at its next `up` (`out/scale.json`, while `TP` and `POOL` are unchanged). `health` is
+  true on a standby, and on the head while its front end holds requests. The Helm chart's new `tp` value runs the group
+  as such a pool, so `kubectl exec <release>-0 -- /opt/gr8/gr8 <model> scale --tp N` changes the width without a pod
+  restarting; unset, the chart renders as before.
 - **Breaking changes:** None.
 
 ---

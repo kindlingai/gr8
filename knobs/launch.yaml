@@ -29,6 +29,13 @@ options:
     doc: >-
       the boxes' LAN addresses in rank order, the same on every box. The first is the head. HOSTS in an old config file
       is read as PEERS
+  POOL:
+    scope: cluster
+    doc: >-
+      every box that may serve, as LAN addresses or names in rank order, the head first. With --tp N the first N serve
+      (PEERS is those N unless set) and the others wait as standbys, which a later `scale --tp M` takes in without a
+      new up; a box that leaves stays as a standby. The head keeps the last scale's width for its next up
+      (out/scale.json) while TP and POOL stay as they were. Needs the mesh; takes no MENTAT
   MENTAT:
     scope: box
     doc: >-

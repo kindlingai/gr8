@@ -5,11 +5,23 @@
 # The boxes find each other through the mentat daemon on each box (no PEERS), and every pod has the same options: TP is
 # the group's size, and the head (rank 0, which serves the API) is the leader pod, wherever the scheduler put it. LWS
 # puts LWS_GROUP_SIZE and LWS_LEADER_ADDRESS (the leader pod's DNS name) first in every container's env, so the env
-# below can use them. The leader's name resolves to its box's address: the pod is on the host network.
+# below can use them. The leader's name resolves to its box's address: the pod is on the host network. With tp set
+# (values.yaml) the group is a pool instead: TP and POOL (every pod's name, the leader first) in peers mode, no mentat.
 {{- $claims := dict }}
 {{- $ml := .Values.modelLoader.enabled }}
 {{- range $name, $v := .Values.storage }}
 {{- if and (not $v.hostPath) (not (and $ml (eq $name "cache"))) }}{{ $_ := set $claims $name $v }}{{ end }}
+{{- end }}
+{{- if .Values.tp }}
+{{- if or (lt (int .Values.tp) 1) (gt (int .Values.tp) (int .Values.size)) }}
+{{- fail (printf "tp %v: want 1 to size (%v), the pods of the group that serve" .Values.tp .Values.size) }}
+{{- end }}
+{{- if eq (toString (.Values.options.SHAPE | default "")) "ring" }}
+{{- fail "tp: a pool needs the mesh, and options.SHAPE is ring (a scale cannot rewire a ring)" }}
+{{- end }}
+{{- if hasKey .Values.options "POOL" }}
+{{- fail "options.POOL: with tp set the chart names the pool, the group's pods" }}
+{{- end }}
 {{- end }}
 apiVersion: leaderworkerset.x-k8s.io/v1
 kind: LeaderWorkerSet
@@ -130,10 +142,24 @@ spec:
               {{- end }}
             # Set here, the same on every pod, and over any ConfigMap line of the same name.
             env:
+              {{- if .Values.tp }}
+              # A pool: every pod of the group by its DNS name, the leader first. The first tp serve; the others stand
+              # by for `scale` (their readiness probe is true then).
+              - name: TP
+                value: {{ .Values.tp | quote }}
+              {{- $r := .Release.Name }}
+              {{- $names := list (printf "%s-0.%s.%s" $r $r .Release.Namespace) }}
+              {{- range $i := until (int .Values.size) }}
+              {{- if $i }}{{ $names = append $names (printf "%s-0-%d.%s.%s" $r $i $r $.Release.Namespace) }}{{ end }}
+              {{- end }}
+              - name: POOL
+                value: {{ join "," $names | quote }}
+              {{- else }}
               - name: TP
                 value: $(LWS_GROUP_SIZE)
               - name: HEAD
                 value: $(LWS_LEADER_ADDRESS)
+              {{- end }}
               # The container's own paths, so an option meant for a bare-metal box cannot point the launcher elsewhere.
               - name: GR8_WORK_DIR
                 value: /var/lib/gr8/home

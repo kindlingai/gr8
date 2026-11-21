@@ -290,6 +290,71 @@ class Scale(unittest.TestCase):
             self.assertIn('warning: no compact copies for the new width (g6load compact: stub g6load',
                           read(os.path.join(self.homes[i], 'out', 'supervisor.log')))
 
+    def pool_argv(self, i):
+        """Box i's up options in a pool of the four boxes, three of them serving."""
+        a = self.argv(i, 3)
+        k = a.index('--peers')
+        return a[:k] + a[k + 2:] + ['--pool', ','.join(LAN)]
+
+    def pool_up(self):
+        procs = [subprocess.Popen([sys.executable, os.path.join(HERE, 'launch.py'), 'up', *self.pool_argv(i)],
+                                  env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                 for i in range(4)]
+        for i, p in enumerate(procs):
+            rc, out = self.finish(p)
+            self.assertEqual(rc, 0, f'box {i}:\n{out}')
+
+    def pool_scale(self, n):
+        p = subprocess.Popen([sys.executable, os.path.join(HERE, 'launch.py'), 'scale', '--work-dir', self.homes[0],
+                              '--tp', str(n), '--ips', ips(n, 1), '--ips2', ips(n, 2)],
+                             env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        rc, out = self.finish(p)
+        self.assertEqual(rc, 0, out)
+
+    def state(self, i):
+        return json.loads(read(os.path.join(self.homes[i], 'out', 'gr8.state')))['state']
+
+    def test_a_pool_scales_without_a_new_up_and_keeps_the_width(self):
+        """--pool of four with --tp 3: box 3 stands by (healthy), a scale to 4 takes it in and one back to 3 leaves it
+        standing by, the same supervisor throughout. The head keeps the last width for its next up."""
+        self.pool_up()
+        self.assertEqual(self.state(3), 'standby')
+        self.assertEqual([self.stub_tp(i) for i in range(3)], [3, 3, 3])
+        self.assertEqual(self.gr8(3, 'health').returncode, 0)
+        sup3 = int(read(os.path.join(self.homes[3], 'out', 'supervisor.pid')))
+        self.pool_scale(4)
+        self.wait_for(lambda: self.gr8(0, 'status').stdout.count(': serving, engine running') == 4, 'TP=4')
+        self.assertEqual([self.stub_tp(i) for i in range(4)], [4, 4, 4, 4])
+        self.pool_scale(3)
+        self.wait_for(lambda: self.state(3) == 'standby', 'box 3 to stand by again')
+        self.assertEqual(int(read(os.path.join(self.homes[3], 'out', 'supervisor.pid'))), sup3)
+        self.assertTrue(running(sup3))
+        self.assertEqual([self.stub_tp(i) for i in range(3)], [3, 3, 3])
+        self.pool_scale(4)
+        self.wait_for(lambda: self.gr8(0, 'status').stdout.count(': serving, engine running') == 4, 'TP=4 again')
+        for i in range(4):
+            self.gr8(i, 'down', timeout=180)
+        self.assertTrue(os.path.exists(os.path.join(self.homes[0], 'out', 'scale.json')))
+        os.unlink(os.path.join(self.homes[3], 'out', 'stub.json'))
+        self.pool_up()   # the configured --tp 3; the head boots the kept TP=4 and the others take it
+        self.wait_for(lambda: self.gr8(0, 'status').stdout.count(': serving, engine running') == 4, 'TP=4 after up')
+        self.assertEqual([self.stub_tp(i) for i in range(4)], [4, 4, 4, 4])
+        b = []
+        self.request(b)
+        self.assertEqual(b, [(200, 8)])
+
+    def test_the_head_is_healthy_while_it_holds_requests(self):
+        self.up(4)
+        with open(os.path.join(self.homes[0], 'ready.delay'), 'w') as f:   # the new width loads for 4 s
+            f.write('4')
+        p = self.scale(1, 3)
+        self.wait_for(lambda: self.holds() and self.holds()[-1] > 0 and self.state(0) != 'serving', 'the switch')
+        r = self.gr8(0, 'health')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('holds requests through a scale', r.stdout)
+        rc, out = self.finish(p)
+        self.assertEqual(rc, 0, out)
+
 
 GLM = {'GR8_MODEL': 'glm53'}
 
@@ -345,6 +410,7 @@ class ScalePlan(unittest.TestCase):
         sup = sv.Supervisor.__new__(sv.Supervisor)
         sup.allowed = lambda peer: True
         sup.boot_attempt, sup.rank, sup.members, sup.head, sup.state = 0, 0, LAN[:3], Head(), 'serving'
+        sup.pool = []
         sup.head_ready, sup.stop_ev = threading.Event(), threading.Event()
         sup.head_ready.set()
         hello = {'t': 'hello', 'members': LAN[:4], 'attempt': 0}
@@ -353,6 +419,10 @@ class ScalePlan(unittest.TestCase):
             sup.scale = {'phase': phase, 'members': LAN[:3], 'old_members': LAN[:4], 'msg': None, 'ready': {},
                          **({'closed': True} if closed else {})}
             self.assertEqual(sup.on_rpc(dict(hello), LAN[3])['t'], want, phase)
+        sup.pool, sup.scale_words, sup.layout_text, sup.scale = LAN[:4], ['--tp', '3'], None, None
+        self.assertEqual(sup.on_rpc(dict(hello), LAN[3]),   # a pool: a box that counted another list takes this one
+                         {'t': 'adopt', 'argv': ['--tp', '3'], 'members': LAN[:3], 'layout': None})
+        self.assertEqual(sup.on_rpc({'t': 'pool'}, LAN[3])['t'], 'adopt')
 
 
 class StorePrep(unittest.TestCase):
