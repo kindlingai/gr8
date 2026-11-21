@@ -86,9 +86,10 @@ __global__ void __launch_bounds__(256) k_vget(g6::VSlotDev v, int j, const u64* 
 {
     const uint4* src = reinterpret_cast<const uint4*>(vrecv(v, *stepp, j));
     for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n / 16; i += (size_t)gridDim.x * 256)
-        reinterpret_cast<uint4*>(dst)[i] = src[i];
+        reinterpret_cast<uint4*>(dst)[i] = __ldcv(src + i);
     if (blockIdx.x == 0 && threadIdx.x < (n % 16) / 4)
-        reinterpret_cast<unsigned*>(reinterpret_cast<uint4*>(dst) + n / 16)[threadIdx.x] = reinterpret_cast<const unsigned*>(src + n / 16)[threadIdx.x];
+        reinterpret_cast<unsigned*>(reinterpret_cast<uint4*>(dst) + n / 16)[threadIdx.x] =
+            __ldcv(reinterpret_cast<const unsigned*>(src + n / 16) + threadIdx.x);
 }
 // GR8_CP_ONECHAIN (rank.cuh launch_attn_cp): the q all-gather payloads of n head groups side by side, for one attention
 // call over all of them. grid (G, n), block 256: source j[y]'s recv slot of v (after k_vwait; q [M][hd][512] then rope
@@ -105,11 +106,11 @@ __global__ void __launch_bounds__(256) k_vget_heads(g6::VSlotDev v, VHeads s, co
     const size_t qr = (size_t)hd * 128, rr = (size_t)hd * 16, nq = (size_t)M * qr, nt = nq + (size_t)M * rr;   // uint4 a row
     for (size_t i = blockIdx.x * 256 + threadIdx.x; i < nt; i += (size_t)gridDim.x * 256)
     {
-        if (i < nq) reinterpret_cast<uint4*>(q)[(i / qr * n + y) * qr + i % qr] = src[i];
+        if (i < nq) reinterpret_cast<uint4*>(q)[(i / qr * n + y) * qr + i % qr] = __ldcv(src + i);
         else
         {
             const size_t k = i - nq;
-            reinterpret_cast<uint4*>(rope)[(k / rr * n + y) * rr + k % rr] = src[i];
+            reinterpret_cast<uint4*>(rope)[(k / rr * n + y) * rr + k % rr] = __ldcv(src + i);
         }
     }
 }

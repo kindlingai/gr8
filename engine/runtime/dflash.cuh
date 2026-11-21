@@ -447,6 +447,12 @@ __global__ void __launch_bounds__(256) k_silu_xf(const __half* gu, __half* act, 
 
 // ---------------------------------------------------------------- selector head
 struct Cand { float logit; int id; };
+__device__ __forceinline__ Cand ldcv_cand(const Cand* p)
+{
+    static_assert(sizeof(Cand) == sizeof(uint2), "Cand is 8 bytes on the wire");
+    const uint2 v = __ldcv(reinterpret_cast<const uint2*>(p));
+    return Cand{__uint_as_float(v.x), static_cast<int>(v.y)};
+}
 __device__ __forceinline__ bool cand_before(float la, int ia, float lb, int ib) { return la > lb || (la == lb && ia < ib); }
 // this rank's top-16 (logit desc, id asc) of rows 1..7 -> send slot of collective c ([K][TOPK] Cand), then publish.
 // grid K, block 1024: 16 rounds of a block argmax over the slice, excluding the ones taken
@@ -523,7 +529,7 @@ __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
             const Cand* src = reinterpret_cast<const Cand*>(glue::peer_slot(a.f, step, a.c, p)) + (size_t)w * TOPK;
             for (int k = 0; k < TOPK; ++k)
             {
-                const Cand x = src[k];
+                const Cand x = ldcv_cand(src + k);
                 if (n == TOPK && !cand_before(x.logit, x.id, bl[TOPK - 1], bi[TOPK - 1])) break;   // a rank's list is sorted
                 int at = n < TOPK ? n++ : TOPK - 1;
                 while (at > 0 && cand_before(x.logit, x.id, bl[at - 1], bi[at - 1])) { bl[at] = bl[at - 1]; bi[at] = bi[at - 1]; --at; }
@@ -592,7 +598,7 @@ __global__ void __launch_bounds__(256) k_walk_dedup(WalkArgs a)
             const Cand* src = reinterpret_cast<const Cand*>(glue::peer_slot(a.f, step, a.c, p)) + (size_t)w * TOPK;
             for (int k = 0; k < TOPK; ++k)
             {
-                const Cand x = src[k];
+                const Cand x = ldcv_cand(src + k);
                 if (n == TOPK && !cand_before(x.logit, x.id, bl[TOPK - 1], bi[TOPK - 1])) break;
                 int at = n < TOPK ? n++ : TOPK - 1;
                 while (at > 0 && cand_before(x.logit, x.id, bl[at - 1], bi[at - 1])) { bl[at] = bl[at - 1]; bi[at] = bi[at - 1]; --at; }

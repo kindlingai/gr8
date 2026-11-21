@@ -965,6 +965,13 @@ __device__ __forceinline__ TkEnt head_tk_peer(const HeadArgs& a, u64 step, int p
     const float2 v = __ldcv(reinterpret_cast<const float2*>(peer_slot(a.f, step, a.c, p) + head_bytes(a.M, a.nc)) + (size_t)m * LP_K + i);
     return TkEnt{v.x, __float_as_int(v.y)};
 }
+// peer p's top_p candidate of row m: entry k
+__device__ __forceinline__ HeadCand head_cand_peer(const HeadArgs& a, u64 step, int p, int m, int k)
+{
+    static_assert(sizeof(HeadCand) == sizeof(uint2), "HeadCand is 8 bytes on the wire");
+    const uint2 v = __ldcv(reinterpret_cast<const uint2*>(peer_slot(a.f, step, a.c, p) + (size_t)a.M * sizeof(HeadRec)) + (size_t)m * a.nc + k);
+    return HeadCand{__uint_as_float(v.x), static_cast<int>(v.y)};
+}
 
 // top_p part of k_head_local (block 1024, after the record is stored; s_mx = the 32 warp maxima): the slice's
 // highest raw logits (at most nc, whole histogram bins of lmax - logit) -> candidates, pad_[1] / pad_[2] of the record.
@@ -1365,7 +1372,7 @@ template <bool RS> __device__ __forceinline__ void head_merge_tp(const HeadArgs&
             if (i < n)
             {
                 const int p = i / a.nc, k = i - p * a.nc;
-                const HeadCand c = reinterpret_cast<const HeadCand*>(peer_slot(a.f, step, a.c, p) + (size_t)a.M * sizeof(HeadRec))[(size_t)m * a.nc + k];
+                const HeadCand c = head_cand_peer(a, step, p, m, k);
                 if (c.id >= 0 && c.logit > cut) { lg = c.logit; id = c.id; }
             }
             s_l[i] = lg; s_id[i] = id;
@@ -1594,7 +1601,7 @@ __global__ void __launch_bounds__(256) k_head_relax(HeadArgs a, const int* tok, 
         for (int i = t; i < a.f.nr * a.nc; i += 256)
         {
             const int p = i / a.nc, k = i - p * a.nc;
-            const HeadCand c = reinterpret_cast<const HeadCand*>(peer_slot(a.f, step, a.c, p) + (size_t)a.M * sizeof(HeadRec))[(size_t)m * a.nc + k];
+            const HeadCand c = head_cand_peer(a, step, p, m, k);
             if (c.id >= 0 && c.logit > tl) above += expf(c.logit - mx);
         }
     #pragma unroll

@@ -38,7 +38,7 @@ if [ "$PART" != frontend ]; then
   python3 -m unittest discover -s bench/tests
   python3 -m unittest discover -s tools/ngram/tests
   python3 -m unittest discover -s tools/query
-  (cd engine/tests && python3 -m unittest test_prefix_reuse)
+  (cd engine/tests && python3 -m unittest test_prefix_reuse test_cp_pf_ix_order)
   # the container's compose file and entrypoint
   if docker compose version > /dev/null 2>&1; then docker compose -f docker/compose.yaml config -q
   else echo "(no docker compose here: compose.yaml not checked)"; fi
