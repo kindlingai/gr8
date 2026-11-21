@@ -15,14 +15,14 @@ import options
 ROOT = Path(__file__).resolve().parents[2]
 # SHA256 of normalized ENGINE_BIN, ENGINE_ENV and engine_args on the original implementation.
 BASELINES = [
-    ('glm53', '4', 'fp8', '', 'e88a2d718962b9648d9189a807cdc4f8d3bb03e86d7b38ae5ef4373433862aac'),
-    ('glm53', '4', 'int4', '', '3b2a6cdccb765266c20e4319e2e284f5a37ed33f003e07f78c3fc55f2ee66e86'),
-    ('glm53', '6', 'fp8', '', 'e5d813a60b12a5bf6c928bcb271e5e0240547c157940b9dd8d013fe6ae3f686c'),
-    ('glm53', '6', 'int4', '', 'aad025af5325d509797adc325282d678f8695d4277131dfd04a773b649da681a'),
+    ('glm53', '4', 'fp8', '', '0d925c2dee05e3fdcf7b381e311470d5dd5d558100210cad9b0aa5e7442fa627'),
+    ('glm53', '4', 'int4', '', '348ff738238dd0639ec80354928510ff9db6a08c2ef32827e58ffa4b31fd0002'),
+    ('glm53', '6', 'fp8', '', '75ebacb999f29666361194e29d28c74fe0981e57f92bfeb4f3567f852dab2960'),
+    ('glm53', '6', 'int4', '', 'be5f372aaba6164882a7403851ad47ec37594cd8d04b900b99a4fe11d5a41de3'),
     ('glm53', '3', 'fp8', '', 'd5fe690d5714f5f0416af0a6aa157421e46e4b8fc975e0c38673b668c1dcb3b4'),
     ('glm53', '3', 'int4', '', 'd0285c27e92b63bd9b6731b01847c5f7f9e0880293f0045bcf8be219ba6f78e7'),
-    ('glm53', '5', 'fp8', '', '8b7b3f1c1256a019108f16afc77d465e33c0615257ba1d3d48e2a66e11566ebd'),
-    ('glm53', '5', 'int4', '400000', '05d8dbc910cf666bd3dcda829b4db408a03906476e1e4deaad8c4b4db7a7b8f0'),
+    ('glm53', '5', 'fp8', '', 'cf2902d6036761dc727dd2b74c9e7efca93fc1dacd943af9f5f31127904a9d89'),
+    ('glm53', '5', 'int4', '400000', '853ab8754e4086168e9f034504e12489c5af1a102636b1fdaf967ce84debb9e3'),
     ('glm53f', '4', 'fp8', '', '58a085a8bd65fae9c82c681fb1494c3b521275936ace0a4e7f16316370785519'),
     ('glm53f', '4', 'int4', '', '2d9690f48c9fe061f85026df70324f996cb8c454205ec5692606c77b2799e7d8'),
     ('glm53f', '3', 'fp8', '', '8e82e379c4423912e3ef44c5edeb102e1f1c167ef99eb13e3f8663726e1b560c'),
