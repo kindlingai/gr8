@@ -272,12 +272,13 @@ def skipped_file(path):
 
 
 # Each binary has the same path under --bin and in the zip.
-BINARIES = ['bin/g6m4', 'bin/g6m4-int4', 'bin/m4sim', 'bin/gpuprobe', 'bin/tr3_e4m3_test', 'bin/g6front-rs', 'bin/g6load']
+BINARIES = ['bin/g6m4', 'bin/g6m4-int4', 'bin/m4sim', 'bin/gpuprobe', 'bin/tr3_e4m3_test', 'bin/g6front-rs', 'bin/g6load', 'bin/g6layout']
 
 HEADER = """gr8 {short} (commit {commit}, {date})
 
 bin/   the engine for every TP width (scripts/build.sh: g6m4 takes the width from --ips), the Rust front end
-       g6front-rs, and g6load, which plans and checks the Hugging Face fetch (engine/loader-rs)
+       g6front-rs, g6load, which plans and checks the Hugging Face fetch (engine/loader-rs), and g6layout, which
+       plans rank layouts across width changes (gr8 scale)
 Built for GB10 (aarch64, CUDA 13, sm_121a). The binaries link cuBLAS 13 and libibverbs at run time: a node needs the
 CUDA 13 runtime libraries (DGX OS has them) and rdma-core. With the prebuilt bin/, skip the engine and front end builds
 in README.md: copy it to bin/ on every box, whatever the TP. g6m4-int4 is the same engine with the 4-bit KV latent,
