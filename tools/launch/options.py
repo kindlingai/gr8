@@ -529,8 +529,6 @@ def validate(o):
     if busy is not None:
         if not (str(busy).isdigit() and int(busy) >= 4096 and int(busy) % 64 == 0 and int(busy) < int(share or 32768)):
             raise OptionError(f'--share-limit-busy {busy}: want a multiple of 64 from 4096, below SHARE_LIMIT')
-        if 'local=' not in str(o.get('KV_ROWS') or ''):
-            raise OptionError('--share-limit-busy needs KV_ROWS with local= (the rows past it come from the rows store)')
     big = o.get('SHARE_BIG')
     if big is not None and not (str(big).isdigit() and busy is not None):
         raise OptionError(f'--share-big {big}: want a whole number, with SHARE_LIMIT_BUSY')

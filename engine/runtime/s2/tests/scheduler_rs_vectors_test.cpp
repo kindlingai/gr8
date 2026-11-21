@@ -34,10 +34,9 @@ int main(int argc, char** argv)
 {
     struct Shape { int max_sessions; bool mtp0, pack, park; uint64_t scheduler, driver, driver_pool; };
     const Shape shapes[] = {
-        // scheduler and driver rerecorded when decode_rounds > 1 stopped holding a session's first quantum and tail: the
-        // first config whose transcript differs has decode_rounds 12, and every config before it is unchanged
-        {8, false, false, false, 0x3fb23a6a6ed0ac39ull, 0x622220d892f7a115ull, 0xaebb24ec50c72c50ull},   // GLM-5.3 and Flash
-        {32, true, true, true, 0xb2293e00ff04224bull, 0xfc732d21cc91f7c5ull, 0x75108cfa718bede4ull},     // DS41
+        // scheduler rerecorded for plain in-RAM GR8_CP_R2 dynamic sharding (r2_rows without window_pages + revision bump on R1 PREFILL->DECODE)
+        {8, false, false, false, 0x517aeaf71eecd501ull, 0x622220d892f7a115ull, 0xaebb24ec50c72c50ull},   // GLM-5.3 and Flash
+        {32, true, true, true, 0xcce96e77a48bb9d1ull, 0xfc732d21cc91f7c5ull, 0x75108cfa718bede4ull},     // DS41
     };
     const int ms = int(g6mod::INFO.max_sessions);
     const bool mtp0 = g6mod::has(G6_CAP_MTP0), pack = g6mod::has(G6_CAP_PACK), park = g6mod::has(G6_CAP_PARK);

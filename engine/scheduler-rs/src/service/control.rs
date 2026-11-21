@@ -1187,7 +1187,13 @@ impl Control {
             }
         }
         inn.attempted_head = id;
-        inn.attempted_revision = admit::attempted_revision(st.revision);
+        // If this commit shrank a live session without admitting yet, keep retry armed so the next boundary can
+        // shrink another session if needed instead of stalling until a session retires.
+        inn.attempted_revision = if cm.c.has_shrink && !cm.c.has_admit {
+            st.revision
+        } else {
+            admit::attempted_revision(st.revision)
+        };
         if cm.c.has_admit {
             if let Some(t) = self.trace() {
                 let args = format!(
