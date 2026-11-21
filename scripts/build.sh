@@ -75,6 +75,8 @@ elif [ -n "$GR_OFF" ]; then echo "request grammars: off ($GR_OFF)"
 else echo "request grammars: off (no XGrammar source; it needs cargo and cmake, or GR8_XGRAMMAR=DIR)"; fi
 G6LOAD_BIN=$REPO/engine/loader-rs/target/release/g6load
 if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
+G6LAYOUT_BIN=$REPO/engine/loader-rs/target/release/g6layout
+if [ -x "$G6LAYOUT_BIN" ]; then cp "$G6LAYOUT_BIN" "$OUT/"; fi
 # the knob table the launcher reads (tools/launch/knobs.py)
 KNOBSO=$REPO/engine/knobs-rs/target/release/libgr8knobs.so
 if [ -f "$KNOBSO" ]; then mkdir -p "$OUT/lib" && cp "$KNOBSO" "$OUT/lib/"; fi

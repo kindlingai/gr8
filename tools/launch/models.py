@@ -230,7 +230,7 @@ def image_binaries():
     binaries = []
     for m in SERVED:
         binaries += [m.engine, *([m.engine + '-int4'] if m.int4_kv else []), m.simulator]
-    return tuple(dict.fromkeys(b for b in binaries + ['gpuprobe', 'g6front-rs', 'g6load', 'kvman-remote', 'kvman-peer'] if b))
+    return tuple(dict.fromkeys(b for b in binaries + ['gpuprobe', 'g6front-rs', 'g6load', 'g6layout', 'kvman-remote', 'kvman-peer'] if b))
 
 
 def query(argv):
