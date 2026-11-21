@@ -473,10 +473,10 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
 #endif
         p.cp_mmax = cp_mmax;
         if (p.cp_R < 0 || p.cp_R % 64) return "GR8_CP_R must be a multiple of 64";
-        // GR8_CP_R2: a session may take a smaller R; every step past it runs the CP block (CpState::step_R)
+        // GR8_CP_R2: a session may take a smaller R; buckets in (R2, R] run CP only when an active session needs it
         p.cp_R2 = (int)k.cp_r2.value_or(0);
-        if (p.cp_R2 && (p.cp_R2 < 64 || p.cp_R2 % 64 || p.cp_R2 >= p.cp_R || !p.cp_on || !s2mode || !eo.rt_win))
-            return "GR8_CP_R2 must be a multiple of 64 below GR8_CP_R, with GR8_CP on, --serve and GR8_RT_LOCAL";
+        if (p.cp_R2 && (p.cp_R2 < 64 || p.cp_R2 % 64 || p.cp_R2 >= p.cp_R || !p.cp_on || !s2mode))
+            return "GR8_CP_R2 must be a multiple of 64 below GR8_CP_R, with GR8_CP on and --serve";
         p.cp_step_R = p.cp_R2 ? p.cp_R2 : p.cp_R;
         p.cp_colls.make(in.full_index, (int)cfg.ips.size(), cp_mmax, in.attn);
         if (p.cp_on) {

@@ -528,9 +528,11 @@ int main(int argc, char** argv)
     const g6::CpColls& cp_colls = fplan.cp_colls;
     // enqueue the CP collectives of a step that runs the CP block (context > CpState::step_R), before its GPU work
     auto cp_enqueue = [&](unsigned long long step, int M, int context) { if (cp_on && context > cp_step_R) fabc.enqueue_step(step, cp_colls.sizes(M)); };
+    auto cp_enqueue_if = [&](unsigned long long step, int M, bool use_cp) { if (cp_on && use_cp) fabc.enqueue_step(step, cp_colls.sizes(M)); };
     auto cp_error = [&]() -> unsigned { return (cp_on ? *fabc.dev().error : 0u) | qs_err(); };   // + the GR8_QA_SPLIT proxy
 #else
     auto cp_enqueue = [&](unsigned long long, int, int) {};
+    auto cp_enqueue_if = [&](unsigned long long, int, bool) {};
     auto cp_error = [&]() -> unsigned { return qs_err(); };   // the GR8_QA_SPLIT proxy
 #endif
     G6RT_CK(bind::init());
@@ -1238,6 +1240,7 @@ int main(int argc, char** argv)
     }
 #endif
     cudaGraphExec_t exec2[NBK][MX + 1] = {};
+    cudaGraphExec_t exec_nocp[NBK][MX + 1] = {}, exec2_nocp[NBK][MX + 1] = {};   // GR8_CP_R2: non-CP solo graphs for buckets in (R2, R]
 #if G6_MODEL_DS41
     const bool ds_moe_decode_graph = s2mode && ds_moe_decode_topk != ds_moe_main_topk;
     cudaGraphExec_t exec_dec[NBK][MX + 1] = {};
@@ -1312,6 +1315,20 @@ int main(int argc, char** argv)
                     capture([&] { launch_step(m, M, 0, st, 1, gsplit, residual_copy); }, &exec2[k][M], "split part B ", M);
                 }
                 else capture([&] { launch_step(m, M, 0, st, -1, 0, residual_copy); }, &exec[k][M], "", M);
+#if defined(G6_CP) && G6_CP
+            if (cp_dual_bucket(m, k))
+            {
+                m.cp.force_nocp = true;
+                for (int M : row_counts)
+                    if (gsplit)
+                    {
+                        capture([&] { launch_step(m, M, 0, st, 0, gsplit, residual_copy); }, &exec_nocp[k][M], "nocp split part A ", M);
+                        capture([&] { launch_step(m, M, 0, st, 1, gsplit, residual_copy); }, &exec2_nocp[k][M], "nocp split part B ", M);
+                    }
+                    else capture([&] { launch_step(m, M, 0, st, -1, 0, residual_copy); }, &exec_nocp[k][M], "nocp ", M);
+                m.cp.force_nocp = false;
+            }
+#endif
 #if G6_MODEL_DS41
             if (ds_moe_decode_graph) {
                 m.ds_moe_decode_step = true;
@@ -2616,15 +2633,23 @@ int main(int argc, char** argv)
         const bool dfl_tl = R == 0 && knob::s2_roundlog();
         std::chrono::steady_clock::time_point dfl_t0;
         g6s2::NativeContext nx{m, D, P, P2, DQ, fab, fabd, fabp, fabp2, st, pf_streams ? &lanes2 : nullptr, in, in_d, out, out_d, MP, gsplit, two,
-            [&](const StepIn& si) {
+            [&](const StepIn& si, bool use_cp) {
                 std::vector<uint32_t> sizes(NC, (uint32_t)(si.M * HID * 2));
                 sizes[2 * NL] = head_size(si, nc);
                 extra_coll_sizes(sizes, NL, si.M);
                 fab.enqueue_step(si.step, sizes);
-                cp_enqueue(si.step, si.M, si.context);
+                cp_enqueue_if(si.step, si.M, use_cp);
                 qs_enqueue(si.step, si.M);
             },
-            [&](int k, int M) {
+            [&](int k, int M, bool use_cp) {
+                if (!use_cp && cp_dual_bucket(m, k))
+                {
+                    g6s2::require(k >= 0 && k < m.nbk && M >= 1 && M <= MX && exec_nocp[k][M] && (!gsplit || exec2_nocp[k][M]),
+                                  "S=1 non-CP target graph not captured");
+                    G6RT_CK(cudaGraphLaunch(exec_nocp[k][M], st));
+                    if (gsplit) G6RT_CK(cudaGraphLaunch(exec2_nocp[k][M], st));
+                    return;
+                }
                 g6s2::require(k >= 0 && k < m.nbk && M >= 1 && M <= MX && exec[k][M] && exec2[k][M], "S=1 target graph not captured");
                 launch_main(k, M);
             },
@@ -2847,9 +2872,11 @@ int main(int argc, char** argv)
                     return pool.window_runs(0) < big && pool.fits(rows, worst, 0) ? 0 : (uint32_t)cp_R2;
                 }
                 std::optional<g6s2::Shrink> on_make_room(const std::array<g6s2::Slot, g6s2::MAX_SESSIONS>& slots, const g6s2::Request&, uint64_t, uint64_t) {
+                    const g6s2::Slot* best = nullptr;
                     for (const g6s2::Slot& sl : slots)
                         if (sl.phase == g6s2::Phase::Decode && !sl.req.r_rows && pool.shrinkable(sl.run, (uint32_t)cp_R2))
-                            return g6s2::Shrink{sl.key, (uint32_t)cp_R2, pool.shrink(sl.run, (uint32_t)cp_R2)};
+                            if (!best || sl.run.pages > best->run.pages) best = &sl;
+                    if (best) return g6s2::Shrink{best->key, (uint32_t)cp_R2, pool.shrink(best->run, (uint32_t)cp_R2)};
                     return std::nullopt;
                 }
                 std::vector<g6kv_tier_totals> on_tiers() { return pool.tiers(); }
@@ -2984,23 +3011,53 @@ int main(int argc, char** argv)
             // rows store, then the tables
                 void on_shrink(const g6s2::Shrink& k, const g6s2::Run&, uint64_t length) {
                     kv_drain();   // retained runs the shrink evicted, out first
-                    if (!rtt || !rtt->local) die("a shrink without GR8_RT_LOCAL");
-                    rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
-                    const int q = (int)k.key.slot, rp = (int)k.r_rows / 64, was_rp = m.s2->rp[q], win = rtt->local;
+                    const int q = (int)k.key.slot, rp = (int)k.r_rows / 64;
                     const std::vector<int> was = m.s2->run[q], list = pool.list(k.run);
                     const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
-                    std::vector<std::pair<int, int>> moves;
-                    for (int lp = rp; lp < was_rp; ++lp) moves.push_back({was[lp], list[rp + win + (lp - rp)]});
-                    s2_copy_pages(D.d, moves, most, st);
-                    rt_shrink(m, *rtt, q, was, list, (int)k.r_rows, (int)length - 1, st);
-                    for (Model* x : {&m, &D.d}) s2_set_exclusive(*x, q, list, most, rp);
-                    if (rt_layers == q)   // it runs alone: the layers' tables hold its run
+                    if (rtt && rtt->local)
                     {
-                        s2_solo_cp_pages(m, list, most, rp);
-                        s2_solo_cp_pages(D.d, list, most, rp);
+                        rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
+                        const int was_rp = m.s2->rp[q], win = rtt->local;
+                        std::vector<std::pair<int, int>> moves;
+                        for (int lp = rp; lp < was_rp; ++lp) moves.push_back({was[lp], list[rp + win + (lp - rp)]});
+                        s2_copy_pages(D.d, moves, most, st);
+                        rt_shrink(m, *rtt, q, was, list, (int)k.r_rows, (int)length - 1, st);
+                        for (Model* x : {&m, &D.d}) s2_set_exclusive(*x, q, list, most, rp);
+                        if (rt_layers == q)   // it runs alone: the layers' tables hold its run
+                        {
+                            s2_solo_cp_pages(m, list, most, rp);
+                            s2_solo_cp_pages(D.d, list, most, rp);
+                        }
+                        G6RT_CK(cudaStreamSynchronize(st));
+                        if (R == 0) fprintf(stderr, "# rank 0: GR8_CP_R2: slot %d takes R %u, %d prefix pages back below place\n", q, k.r_rows, was_rp - rp);
+                        return;
+                    }
+                    // Plain in-RAM dynamic shrink: migrate every live owned logical page [0, live_pages) to its new
+                    // physical page on both main (CP-sharded) and draft (full tail), then rewrite the tables.
+                    const bool was_ex = m.s2->ex_split[q];
+                    const int was_rp = was_ex ? m.s2->rp[q] : (m.s2_below / 64);
+                    const int live_pages = (int)((length + 63) / 64);
+                    std::vector<bool> in_was(most, false);
+                    for (int p : was) if (p >= 0 && p < most) in_was[p] = true;
+                    for (Model* x : {&m, &D.d})
+                    {
+                        const S2Model& sx = *x->s2;
+                        const G6Attn& a0 = sx.pool[0]->args;
+                        std::vector<int> t_old((size_t)sx.table_cap, -1);
+                        if (was_ex) t_old = s2_cp_map(sx, a0, was, was_rp, (size_t)sx.table_cap);
+                        else for (size_t i = 0; i < was.size() && i < t_old.size(); ++i) t_old[i] = was[i];
+                        const std::vector<int> t_new = s2_cp_map(sx, a0, list, rp, (size_t)sx.table_cap);
+                        std::vector<int> fresh;
+                        for (int p : list) if (p >= 0 && p < sx.pool_pages && !in_was[p]) fresh.push_back(p);
+                        if (!fresh.empty()) s2_zero_pages(*x, fresh, st);
+                        s2_migrate_pages(*x, t_old, t_new, live_pages, st);
+                        s2_set_exclusive(*x, q, list, most, rp);
+                        if (!x->s2on) s2_solo_cp_pages(*x, list, most, rp);
                     }
                     G6RT_CK(cudaStreamSynchronize(st));
-                    if (R == 0) fprintf(stderr, "# rank 0: GR8_CP_R2: slot %d takes R %u, %d prefix pages back below place\n", q, k.r_rows, was_rp - rp);
+                    if (R == 0)
+                        fprintf(stderr, "# rank 0: GR8_CP_R2: slot %d takes R %u (in-RAM shrink, was %s rp %d -> %d, %d live pages)\n",
+                                q, k.r_rows, was_ex ? "split" : "below-R", was_rp, rp, live_pages);
                 }
                 void on_grown(unsigned q, const g6s2::Run& r) {
                     kv_drain();   // runs the growth evicted, out before the zeroing below

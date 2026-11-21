@@ -637,8 +637,9 @@ impl Pool {
     }
 
     /// With window: the window runs live now at R = r rows (0 = the pool's R); 0 for an R the pool refuses.
+    /// Without window (in-RAM split pool, nr > 0): counts live split runs at R = r rows.
     pub fn window_runs_r(&self, r: u32) -> u32 {
-        let Some(rp) = self.rp_of(r).filter(|_| self.window > 0) else { return 0 };
+        let Some(rp) = self.rp_of(r).filter(|_| self.window > 0 || self.nr > 0) else { return 0 };
         self.held.values().filter(|h| h.exclusive && h.rp as u64 == rp).count() as u32
     }
 
@@ -921,10 +922,13 @@ impl Pool {
     // evicted retained runs go to the store, when there is one. The prompts of the live runs, the retained runs and the
     // request being granted are what a prefix base is shared with
     fn spill(&mut self, gone: &[Kept]) {
-        // a window run's tail is in its rows store records, not in pool memory: the stores never take one
+        // a window run's tail is in its rows store records, not in pool memory, and a run at a smaller R than the
+        // pool's holds its tail in that R's layout (stores hold tails at the pool's R only): the stores never take them
+        let rp0 = self.rp0();
+        let skip_store = |k: &Kept| k.exclusive && (self.window > 0 || k.rp as u64 != rp0);
         let kept: Vec<Kept>;
-        let gone = if self.window > 0 && gone.iter().any(|k| k.exclusive) {
-            kept = gone.iter().filter(|k| !k.exclusive).cloned().collect();
+        let gone = if gone.iter().any(skip_store) {
+            kept = gone.iter().filter(|k| !skip_store(k)).cloned().collect();
             &kept[..]
         } else {
             gone
@@ -1022,12 +1026,13 @@ impl Pool {
     }
 
     // The prefix pages of a grant at R = r rows: 0 or the pool's R gives the pool's. A smaller R, a multiple of 64,
-    // needs the window: a window run never reaches a store, whose tails are laid out at the pool's R. None otherwise.
+    // needs the split page classes (nr > 0): runs at a smaller R never spill or restore tails through the stores,
+    // whose tails are laid out at the pool's R. None otherwise.
     fn rp_of(&self, r: u32) -> Option<u64> {
         if r == 0 || r == self.below_rows {
             return Some(self.rp0());
         }
-        (self.window > 0 && r < self.below_rows && (r as u64).is_multiple_of(PAGE)).then_some(r as u64 / PAGE)
+        (self.nr > 0 && r < self.below_rows && (r as u64).is_multiple_of(PAGE)).then_some(r as u64 / PAGE)
     }
 
     // Whether a grant at prefix pages rp may adopt the first a pages of retained run k. A run past R holds its pages
@@ -1301,25 +1306,68 @@ impl Pool {
         Ok(Some(g))
     }
 
-    /// Whether live window run r can shrink to R = r2 rows (shrink_run): it holds a larger R, and the drafter's class
-    /// and every rank's records have room for the tail it gains.
+    /// Whether live run r can shrink to R = r2 rows (shrink_run):
+    /// - window mode (self.window > 0): an exclusive window run at a larger R, with room above place and in record ids.
+    /// - in-RAM split mode (self.window == 0, self.nr > 0): either an exclusive split run at a larger R, or a below-R
+    ///   run whose worst case exceeds r2 (and whose pages >= r2/64 are not shared with another live run), whenever
+    ///   shrinking strictly reduces its low-class worst-case footprint and both classes have room.
     pub fn shrinkable(&self, r: &Run, r2: u32) -> bool {
         let Ok(h) = self.held(r) else { return false };
         let Some(rp) = self.rp_of(r2) else { return false };
-        if !h.exclusive || self.window == 0 || rp >= h.rp as u64 || self.exclusive {
+        if rp >= h.rp as u64 || self.exclusive {
             return false;
         }
-        let d = h.rp as u64 - rp;
-        let tail = h.list.len() as u64 - h.rp as u64 - self.window as u64;
-        let gained = (tail + d).div_ceil(self.nr as u64) - self.ids_of(h);
-        d <= self.hi_free() as u64 && self.ids_room().is_none_or(|f| gained <= f)
+        if self.window > 0 {
+            if !h.exclusive {
+                return false;
+            }
+            let d = h.rp as u64 - rp;
+            let tail = h.list.len() as u64 - h.rp as u64 - self.window as u64;
+            let gained = (tail + d).div_ceil(self.nr as u64) - self.ids_of(h);
+            return d <= self.hi_free() as u64 && self.ids_room().is_none_or(|f| gained <= f);
+        }
+        if self.nr == 0 {
+            return false;
+        }
+        if h.exclusive {
+            let w = h.list.len() as u64;
+            let old_main = h.list.iter().filter(|&&p| p < self.place).count() as u64;
+            let old_draft = w - old_main;
+            let (new_main, new_draft) = self.exclusive_pages(w * PAGE, rp);
+            let need_hi = new_draft.saturating_sub(old_draft);
+            old_main > new_main && need_hi <= self.hi_free() as u64
+        } else {
+            let w = h.worst as u64;
+            if w <= rp {
+                return false;
+            }
+            // Pages >= rp will be compacted or freed below place: never touch pages shared with another live run.
+            if self.share && h.list.len() > rp as usize && h.list[rp as usize..].iter().any(|&p| self.live_ref[p as usize] > 1) {
+                return false;
+            }
+            let (new_main, new_draft) = self.exclusive_pages(w * PAGE, rp);
+            if new_main >= w || new_draft > self.hi_free() as u64 {
+                return false;
+            }
+            let n = h.list.len() as u64;
+            if new_main <= n {
+                true
+            } else {
+                let add_lo = new_main - n;
+                add_lo <= self.lo_free() as u64 && self.safe_with(self.place_online(), None, Some((r.table_version, add_lo)), None)
+            }
+        }
     }
 
-    /// Live window run r takes R = r2 rows: its logical pages between the two Rs leave its prefix and join its tail.
-    /// Its list becomes its first r2 / 64 pages, its window, fresh pages above place for the drafter's copy of those
-    /// pages (lowest first, evicting retained runs as reserve() does), then its old drafter tail. The pages below place
-    /// it no longer lists are free. The run keeps its table version and its worst case. Err(NoRoom) when shrinkable()
-    /// is false for it, Err(BadArgument) for an R the pool refuses.
+    /// Live run r takes R = r2 rows: its logical pages between the two Rs leave its replicated prefix and join its
+    /// CP-sharded tail.
+    /// - window mode: list becomes first r2/64 pages, window, fresh drafter pages above place, old drafter tail.
+    /// - in-RAM split mode (exclusive): frees (old_main - new_main) pages below place identically on every rank,
+    ///   keeping prefix [..rp] and [rp..rp+kept_shard] below place, filling [rp+kept_shard..old_rp] above place for
+    ///   the drafter, and leaving [old_rp..] untouched.
+    /// - in-RAM split mode (below-R run with worst > r2): converts to an exclusive split run at rp, keeping/growing
+    ///   new_main pages below place (freeing excess if n > new_main) and allocating new_draft pages above place.
+    /// Keeps table_version and worst case. Err(NoRoom) when shrinkable() is false, Err(BadArgument) for bad r2.
     pub fn shrink_run(&mut self, r: &Run, r2: u32) -> Result<Run, Error> {
         self.pending()?;
         let rp = self.rp_of(r2).ok_or(Error::BadArgument)?;
@@ -1327,18 +1375,68 @@ impl Pool {
             return Err(Error::NoRoom);
         }
         let mut h = self.held.remove(&r.table_version).expect("shrinkable() found it");
-        let (old, w) = (h.rp as usize, self.window as usize);
-        let freed: Vec<u32> = h.list[rp as usize..old].to_vec();
-        self.mark(&freed, false);
-        let mut list: Vec<u32> = h.list[..rp as usize].iter().chain(&h.list[old..old + w]).copied().collect();
-        let mut gone = self.fill_range(&mut list, old - rp as usize, self.place, self.pages);
-        let fresh = list[rp as usize + w..].to_vec();
-        list.extend_from_slice(&h.list[old + w..]);
-        gone.extend(self.evict_for_ids(((list.len() - rp as usize - w) as u64).div_ceil(self.nr as u64)));
-        self.spill(&gone);
-        self.mark(&fresh, true);
-        h.list = list;
-        h.rp = rp as u32;
+        let gone: Vec<Kept>;
+        if self.window > 0 {
+            let (old, w) = (h.rp as usize, self.window as usize);
+            let freed: Vec<u32> = h.list[rp as usize..old].to_vec();
+            self.mark(&freed, false);
+            let mut list: Vec<u32> = h.list[..rp as usize].iter().chain(&h.list[old..old + w]).copied().collect();
+            let mut g = self.fill_range(&mut list, old - rp as usize, self.place, self.pages);
+            let fresh = list[rp as usize + w..].to_vec();
+            list.extend_from_slice(&h.list[old + w..]);
+            g.extend(self.evict_for_ids(((list.len() - rp as usize - w) as u64).div_ceil(self.nr as u64)));
+            self.spill(&g);
+            self.mark(&fresh, true);
+            h.list = list;
+            h.rp = rp as u32;
+            gone = g;
+        } else if h.exclusive {
+            let old = h.rp as usize;
+            let w = h.list.len() as u64;
+            let old_main = h.list.iter().filter(|&&p| p < self.place).count() as u64;
+            let (new_main, _) = self.exclusive_pages(w * PAGE, rp);
+            let d_lo = (old_main - new_main) as usize;
+            let kept_shard = (old - rp as usize) - d_lo;
+            let freed: Vec<u32> = h.list[rp as usize + kept_shard..old].to_vec();
+            self.mark(&freed, false);
+            let mut list: Vec<u32> = Vec::with_capacity(w as usize);
+            list.extend_from_slice(&h.list[..rp as usize + kept_shard]);
+            let g = self.fill_range(&mut list, d_lo, self.place, self.pages);
+            let fresh = list[rp as usize + kept_shard..].to_vec();
+            list.extend_from_slice(&h.list[old..]);
+            self.spill(&g);
+            self.mark(&fresh, true);
+            h.list = list;
+            h.rp = rp as u32;
+            gone = g;
+        } else {
+            let w = h.worst as u64;
+            let n = h.list.len() as u64;
+            let (new_main, new_draft) = self.exclusive_pages(w * PAGE, rp);
+            let mut list: Vec<u32> = Vec::with_capacity(w as usize);
+            let mut fresh: Vec<u32> = Vec::new();
+            let mut g: Vec<Kept> = Vec::new();
+            if n >= new_main {
+                let freed: Vec<u32> = h.list[new_main as usize..].to_vec();
+                self.mark(&freed, false);
+                list.extend_from_slice(&h.list[..new_main as usize]);
+            } else {
+                list.extend_from_slice(&h.list);
+                let add_lo = (new_main - n) as usize;
+                g.extend(self.fill_range(&mut list, add_lo, 0, self.place));
+                fresh.extend_from_slice(&list[n as usize..]);
+            }
+            let hi_start = list.len();
+            g.extend(self.fill_range(&mut list, new_draft as usize, self.place, self.pages));
+            fresh.extend_from_slice(&list[hi_start..]);
+            self.spill(&g);
+            self.mark(&fresh, true);
+            h.list = list;
+            h.exclusive = true;
+            h.rp = rp as u32;
+            h.sp = None;
+            gone = g;
+        }
         let g = Run {
             first_page: h.list[0],
             pages: h.list.len() as u32,
@@ -1659,8 +1757,9 @@ impl Pool {
             let room = (self.live == 0 || self.nr > 0)
                 && !self.exclusive
                 && n <= self.pages as u64
-                // a window run's list past its prefix is its window, not its logical tail: only the prefix restores
-                && ((tail && self.window == 0) || a <= rp);
+                // a window run's list past its prefix is its window, not its logical tail, and stored tails are laid
+                // out at the pool's R only: only the prefix restores otherwise
+                && ((tail && self.window == 0 && rp == self.rp0()) || a <= rp);
             if self.nr == 0 || !room {
                 return room && n <= self.prefix_online() as u64;
             }

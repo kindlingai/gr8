@@ -130,8 +130,8 @@ struct NativeContext {
     g6rt::StepOut *output, *draft_output;
     int prefill_rows = 0, split = 3;
     bool two_lanes = true;
-    std::function<void(const g6rt::StepIn&)> enqueue_main; // main fabric (head payload from the rows' top-list flags) + CP collectives past R
-    std::function<void(int bucket, int rows)> solo_main;
+    std::function<void(const g6rt::StepIn&, bool use_cp)> enqueue_main; // main fabric (head payload from the rows' top-list flags) + CP collectives when use_cp
+    std::function<void(int bucket, int rows, bool use_cp)> solo_main;
     std::function<void(int bucket, bool chain, int rows)> solo_draft;
     // Must select the canonical run in BOTH main and draft prefill bindings,
     // including QO offsets. begin/end cannot reset KV or other sessions.
@@ -267,9 +267,11 @@ class NativeDispatch {
         model.s2->h = layout;
         model.s2->bucket = l.bucket;
         for (int j = 0; j < g6rt::S2N; ++j) model.s2->bk[j] = l.bucket;   // until the attention reads its contexts from the cells (S2_ATTN_LAYOUT_FREE)
+        const bool use_cp = !draft && g6rt::s2_step_needs_cp(c_.main, l.bucket, l.solo, layout, input.context);
+        const std::string gkey = (!draft && !use_cp && g6rt::cp_dual_bucket(c_.main, l.bucket)) ? (l.graph_key + ":nocp") : l.graph_key;
         // every reachable key is captured at boot (capture_all); an S2 launch never captures
-        if (l.solo < 0 && !graphs_.count(l.graph_key))
-            throw std::runtime_error("S2 launch of an uncaptured graph key " + l.graph_key + " (" + step_kind(l) + " M " + std::to_string(rows) +
+        if (l.solo < 0 && !graphs_.count(gkey))
+            throw std::runtime_error("S2 launch of an uncaptured graph key " + gkey + " (" + step_kind(l) + " M " + std::to_string(rows) +
                  " bucket " + std::to_string(l.bucket) + "): not in the boot capture set");
         *(draft ? c_.draft_input : c_.input) = input;
         *(draft ? draft_layout_ : layout_) = layout;
@@ -277,13 +279,13 @@ class NativeDispatch {
             std::vector<uint32_t> sizes(3,uint32_t(rows*::HID*2));
             sizes[2] = uint32_t(glue::head_bytes(rows,model.nc)); c_.draft_fabric.enqueue_step(input.step,sizes);
             if (c_.enqueue_draft_extra) c_.enqueue_draft_extra(input.step,rows);
-        } else c_.enqueue_main(input); // preserves existing RS order/fabric layout
+        } else c_.enqueue_main(input, use_cp); // preserves existing RS order/fabric layout
         const auto tl0 = tmr_ || rlog_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; // after fabric enqueue, BEFORE the solo/S2 launch branches (design r4 fix 2)
         tl.pre(c_.stream);
         if (l.solo >= 0) {
-            if (draft) c_.solo_draft(l.buckets[0],chain,rows); else c_.solo_main(l.buckets[0],rows);
+            if (draft) c_.solo_draft(l.buckets[0],chain,rows); else c_.solo_main(l.buckets[0],rows,use_cp);
         } else {
-            const auto& g = graphs_.at(l.graph_key); G6RT_CK(cudaGraphLaunch(g.a,c_.stream));
+            const auto& g = graphs_.at(gkey); G6RT_CK(cudaGraphLaunch(g.a,c_.stream));
             if (g.b) G6RT_CK(cudaGraphLaunch(g.b,c_.stream));
         }
         tl.post(c_.stream);
@@ -432,7 +434,7 @@ public:
         c_.main.s2on = c_.draft.d.s2on = true; fence();
         size_t keys = 0, graphs = 0, cp_skipped = 0;
         // one synthetic step: ns sessions of rows each (first form: one session of M rows; chain: M sessions of one row)
-        auto one = [&](bool draft, bool chain, int M, int k, int cls) {
+        auto one = [&](bool draft, bool chain, int M, int k, int cls, bool nocp = false) {
             auto& model = draft ? c_.draft.d : c_.main;
             g6rt::S2In h{};
             h.ns = chain ? M : 1; h.cls = cls;
@@ -441,6 +443,9 @@ public:
             }
             model.s2->h = h; model.s2->bucket = k;
             for (int j = 0; j < g6rt::S2N; ++j) model.s2->bk[j] = k;
+#if defined(G6_CP) && G6_CP
+            if (!draft) c_.main.cp.force_nocp = nocp;
+#endif
             g6rt::s2_prepare(model,M,c_.stream); fence();
             Graphs g;
             if (draft) g.a = capture([&]{g6rt::launch_draft_step(c_.draft,M,model.bk[k],chain,c_.stream);});
@@ -448,15 +453,21 @@ public:
                 g.a = capture([&]{g6rt::launch_step(c_.main,M,model.bk[k],c_.stream,0,c_.split);});
                 g.b = capture([&]{g6rt::launch_step(c_.main,M,model.bk[k],c_.stream,1,c_.split);});
             }
+#if defined(G6_CP) && G6_CP
+            if (!draft) c_.main.cp.force_nocp = false;
+#endif
             const std::string key = launch_key(draft ? std::string(chain ? "c" : "d") + std::to_string(M)
-                                                     : "m" + std::to_string(M) + "c" + std::to_string(cls), k);   // = Dispatch graph_key (s2::Step::key)
+                                                     : "m" + std::to_string(M) + "c" + std::to_string(cls), k) +
+                                    (nocp ? ":nocp" : "");   // = Dispatch graph_key (s2::Step::key)
             graphs += g.b ? 2 : 1; ++keys;
             graphs_.emplace(key,std::move(g));
         };
         for (int k = 0; k < nbk; ++k) {
+            const bool dual = g6rt::cp_dual_bucket(c_.main, k);
             for (const auto& mc : mains) {
                 if (cp_rows && mc.first > cp_rows && g6rt::s2_cp_bucket(c_.main,k)) { ++cp_skipped; continue; }
-                one(false,false,mc.first,k,mc.second);
+                one(false,false,mc.first,k,mc.second,false);
+                if (dual) one(false,false,mc.first,k,mc.second,true);
             }
             for (int M : drafts) one(true,false,M,k,s2::row_class(M));
             for (int M : chains) one(true,true,M,k,s2::row_class(M));

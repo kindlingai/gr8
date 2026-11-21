@@ -312,8 +312,10 @@ struct CpState
     bool on = false;
     int R = 0, s3 = 1;                // s3: GR8_CP_S3 (1 = head-group overlap order, 0 = S1 order; same arithmetic)
     // GR8_CP_R2: the smaller R a session may take (0 = none). R stays the bindings' layout; a session at R2 has R2 / 64
-    // prefix pages in its own table. Steps switch to the CP block past step_R() for every session
+    // prefix pages in its own table. Buckets in (R2, R] capture both CP and non-CP graphs (force_nocp = true during the
+    // non-CP capture) so unsharded sessions skip CP collectives until a sharded session shares their step.
     int R2 = 0;
+    bool force_nocp = false;
     int step_R() const { return R2 ? R2 : R; }
     int pf_R = 0;                     // the R of the session whose prefill quantum runs (0 = R): which pages it stages
     g6::CpColls colls;                // numbering + capacities (colls.mmax >= any M of a CP step)
@@ -844,6 +846,17 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         if (m.cp.on) cp_r = m.cp.step_R();
 #endif
         m.nbk = context_buckets(m.bk, b, capacity, cp_r, NBK - 2, (int)knob::dec_bk_max());   // a power-of-two R: the 8-slot list of before
+#if defined(G6_CP) && G6_CP
+        // GR8_CP_R2: keep R as a bucket boundary too, so buckets in (R2, R] can run unsharded (non-CP) when every
+        // active session in the step is replicated up to its context.
+        if (m.cp.on && m.cp.R2 > 0 && m.cp.R > m.cp.R2 && m.cp.R < capacity &&
+            std::find(m.bk, m.bk + m.nbk, m.cp.R) == m.bk + m.nbk)
+        {
+            if (m.nbk == NBK) { std::move(m.bk + 1, m.bk + m.nbk, m.bk); --m.nbk; }
+            m.bk[m.nbk++] = m.cp.R;
+            std::sort(m.bk, m.bk + m.nbk);
+        }
+#endif
     }
     m.cells = dmalloc<G6AttnStepCell>(m.nl);
     m.shared = dmalloc<int>(m.nl);
@@ -1612,7 +1625,14 @@ inline void launch_layer_in(Model& m, int i, const Layer& y, const bind::Layer& 
 }
 
 #if defined(G6_CP) && G6_CP
-inline bool cp_active(const Model& m, int context) { return m.cp.on && (m.graph ? m.bk[m.cur] : context) > m.cp.step_R(); }
+inline bool cp_dual_bucket(const Model& m, int bk)
+{
+    return m.cp.on && m.cp.R2 > 0 && m.bk[bk] > m.cp.R2 && m.bk[bk] <= m.cp.R;
+}
+inline bool cp_active(const Model& m, int context)
+{
+    return m.cp.on && !m.cp.force_nocp && (m.graph ? m.bk[m.cur] : context) > m.cp.step_R();
+}
 // the step takes the CP block. S2 below R: when its bucket is past R (a split run past R among its sessions,
 // s2_cp_step), on the CP batch views; m.cur is not the S2 step's bucket (S2Model::bucket), so cp_active does not apply
 inline bool cp_block(const Model& m, int context)
@@ -1779,6 +1799,8 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
 #endif
     dmark(DP_OPROJ, st);
 }
+#else
+inline bool cp_dual_bucket(const Model&, int) { return false; }
 #endif
 
 // rows at positions m.pos[0..M-1] (device), context = last position + 1 (plain form; the graph form reads the cell)

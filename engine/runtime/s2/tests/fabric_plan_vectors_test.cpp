@@ -218,13 +218,14 @@ int main(int argc, char** argv)
     for (int i = 0; i < n; ++i) one(r, k0, tx, kinds, refused);
     struct Want { const char* shape; uint64_t hash; };
     const Want wants[] = {
-        {"glm nr6 mx8", 0x2d0841bc835be633ull},
-        {"glm nr4 mx32", 0x911d3212eb519af1ull},
-        {"glm nr3 mx32", 0xac395b8e6af2be5bull},
-        {"flash nr4 mx32", 0x623b99a841ce800aull},
-        {"flash nr3 mx32", 0xf9dc44042fc2de31ull},
-        {"flash nr2 mx32", 0x4cf96175c8f81c0eull},
-        {"ds41 nr4 mx48", 0xc406a4de0972ea85ull},
+        // rerecorded when GR8_CP_R2 stopped requiring GR8_RT_LOCAL (plain in-RAM dynamic capacity-scaled sharding)
+        {"glm nr6 mx8", 0x0a39562d63d047daull},
+        {"glm nr4 mx32", 0x3defaf8f2d3bfdd3ull},
+        {"glm nr3 mx32", 0xf9130b2591efce29ull},
+        {"flash nr4 mx32", 0x7367774cd6f779f5ull},
+        {"flash nr3 mx32", 0xb703c4a05017be29ull},
+        {"flash nr2 mx32", 0x7449f15bf0958e04ull},
+        {"ds41 nr4 mx48", 0x8935ab9eed9987c4ull},
     };
     const Want* w = nullptr;
     for (const Want& x : wants) if (shape == x.shape) w = &x;
