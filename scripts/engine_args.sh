@@ -352,8 +352,17 @@ engine_defaults() {
        tp4_default ROUTE_OVL 1; [ "$MTP" = 0 ] || tp4_default DRAFT_HEAD_I4 1
        tp4_default ATTN_SC2 4; tp4_default ATTN_SC2_TR 2; tp4_default ATTN_CTX2 4; tp4_default ATTN_CTX3 2
        tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
-       tp4_default IDX_VEC 1; tp4_default DEC_BK 2048; tp4_default DEC_BK_MAX 32768; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
+       tp4_default IDX_VEC 1; tp4_default DEC_BK 2048; tp4_default DEC_BK_MAX 2048; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
        tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248
+       # bit-exact decode, prefill and DFlash2 kernel variants (#542; KL=0, +9.9% 32K / +8.4% 128K prefill at TP=4);
+       # DFL_DEDUP and DFL_REUSE_MIN only with DFLASH=1 (the engine refuses GR8_DFL_DEDUP=1 without --dflash-manifest)
+       tp4_default DEC_DENSE_OPT 1; tp4_default DTR_EXACT_OPT 1; tp4_default MOE_RTR_FIN_OPT 1
+       tp4_default TR3_WIDE4 1; tp4_default PF_ATTN_OPT 1; tp4_default PF_DENSE_OPT 1
+       tp4_default PF_ISGRT_CLEAN 1; [ "${DFLASH:-0}" = 0 ] || { tp4_default DFL_DEDUP 1; tp4_default DFL_REUSE_MIN 0; }
+       tp4_default L2PF 31; tp4_default PF_GEMMF32 1
+       [ "$MTP" = 0 ] || { tp4_default MTP_L2PF 3; tp4_default MTP_LASTROW 1; tp4_default DRAFT_HEAD2 1; }
+       # batch-budgeted MoE union cap (#548): 48 = nearly lossless default; 32 = faster concurrency; 0 = uncapped
+       tp4_default MOE_UNION_CAP 48
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then
          tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
          case " ${EXTRA_ENV:-} " in *" GR8_ATTN_FLIP=1 "*) ;; *) tp4_default CP_ONECHAIN 1 ;; esac
@@ -376,7 +385,12 @@ engine_defaults() {
        else [[ "$SHARE_LIMIT" = 32768 || "$SHARE_LIMIT" = 131072 ]] && CAP=${CAP:-614400} || { _base_p=2026; CAP=${CAP:-$(pool_cap 2026)}; } || return 2; fi; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        # DFLASH=1: the DFlash2 drafter with its body replicated on every rank (dflash.cuh dfl::REP; the drafter
        # converted per rank in the replicated layout, --drafter). Off unless set
-       DFLASH=${DFLASH:-0}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
+       DFLASH=${DFLASH:-0}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1}
+       tp4_default DEC_BK_MAX 2048; tp4_default L2PF 31; tp4_default PF_GEMMF32 1
+       [ "$MTP" = 0 ] || { tp4_default MTP_L2PF 3; tp4_default MTP_LASTROW 1; tp4_default DRAFT_HEAD2 1; }
+       tp4_default DEC_DENSE_OPT 1; tp4_default DTR_EXACT_OPT 1; tp4_default MOE_RTR_FIN_OPT 1
+       tp4_default TR3_WIDE4 1; tp4_default PF_ATTN_OPT 1; tp4_default PF_DENSE_OPT 1; tp4_default PF_ISGRT_CLEAN 1
+       tp4_default MOE_UNION_CAP 48 ;;
     3) SHARE_LIMIT=${SHARE_LIMIT:-32768}; _base_p=1941; CAP=${CAP:-$(pool_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
        DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
@@ -385,7 +399,12 @@ engine_defaults() {
        # 1,981 pages a rank = TP4's default (not boot-proven at TP5; a rank holds about 1/5 of the experts, so more fit)
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=5: the drafter's 8 KV heads do not split five ways" >&2; return 2; }
        # PF_OWN=3: cold 8K prefill 1,554 tok/s against 935 with 1, at the same CAP; decode within 1 %
-       DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
+       DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1}
+       tp4_default DEC_BK_MAX 2048; tp4_default L2PF 31; tp4_default PF_GEMMF32 1
+       [ "$MTP" = 0 ] || { tp4_default MTP_L2PF 3; tp4_default MTP_LASTROW 1; tp4_default DRAFT_HEAD2 1; }
+       tp4_default DEC_DENSE_OPT 1; tp4_default DTR_EXACT_OPT 1; tp4_default MOE_RTR_FIN_OPT 1
+       tp4_default TR3_WIDE4 1; tp4_default PF_ATTN_OPT 1; tp4_default PF_DENSE_OPT 1; tp4_default PF_ISGRT_CLEAN 1
+       tp4_default MOE_UNION_CAP 48 ;;
     *) echo "engine_defaults: TP=$TP; want 4, 6, 3 or 5" >&2; return 2 ;;
   esac
   if [ -z "$_cap_set" ] && [ "$_base_p" -gt 0 ] && [ "${DISPRAM:-0}" = 1 ] && [[ ${DISPRAM_BYTES:-0} =~ ^[0-9]+$ ]] && [ "${DISPRAM_BYTES:-0}" -gt 0 ]; then
@@ -607,6 +626,20 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   ENGINE_ENV="$ENGINE_ENV${MTP_KSTOPB_WIDTHS:+ GR8_MTP_KSTOPB_WIDTHS=$MTP_KSTOPB_WIDTHS}"
   # the window-2 fc1 split on every MoE layer at M > 1 (TR3_W2ALL; docs/SETTINGS.md): off unless set; on at TP=4
   ENGINE_ENV="$ENGINE_ENV${TR3_W2ALL:+ GR8_TR3_W2ALL=$TR3_W2ALL}"
+  # bit-exact decode, prefill and DFlash2 kernel variants (#542; docs/ENV.md): off unless set; on at TP=4
+  ENGINE_ENV="$ENGINE_ENV${DEC_DENSE_OPT:+ GR8_DEC_DENSE_OPT=$DEC_DENSE_OPT}"
+  ENGINE_ENV="$ENGINE_ENV${DTR_EXACT_OPT:+ GR8_DTR_EXACT_OPT=$DTR_EXACT_OPT}"
+  ENGINE_ENV="$ENGINE_ENV${MOE_RTR_FIN_OPT:+ GR8_MOE_RTR_FIN_OPT=$MOE_RTR_FIN_OPT}"
+  ENGINE_ENV="$ENGINE_ENV${TR3_WIDE4:+ GR8_TR3_WIDE4=$TR3_WIDE4}"
+  ENGINE_ENV="$ENGINE_ENV${PF_ATTN_OPT:+ GR8_PF_ATTN_OPT=$PF_ATTN_OPT}"
+  ENGINE_ENV="$ENGINE_ENV${PF_DENSE_OPT:+ GR8_PF_DENSE_OPT=$PF_DENSE_OPT}"
+  ENGINE_ENV="$ENGINE_ENV${PF_ISGRT_CLEAN:+ GR8_PF_ISGRT_CLEAN=$PF_ISGRT_CLEAN}"
+  ENGINE_ENV="$ENGINE_ENV${DFL_DEDUP:+ GR8_DFL_DEDUP=$DFL_DEDUP}"
+  # batch-budgeted MoE union cap (#548; docs/ENV.md): 0 leaves the engine uncapped; TP=4 defaults to 48
+  [ "${MOE_UNION_CAP:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_MOE_UNION_CAP=$MOE_UNION_CAP"
+  ENGINE_ENV="$ENGINE_ENV${MOE_UNION_MODE:+ GR8_MOE_UNION_MODE=$MOE_UNION_MODE}"
+  # routed experts through a per-layer piece table (PTAB, EL3 #151; docs/SETTINGS.md): off unless set (the pack layout)
+  ENGINE_ENV="$ENGINE_ENV${PTAB:+ GR8_PTAB=$PTAB}"
   # QO cache, prefill index-score rows, fc1 kernels, P11 attention, dense trellis (QO_CACHE, PF_ISGRT_RG, PF_F12,
   # ATTN_P11, DTR, PF_AOP; docs/SETTINGS.md): the engine default unless set
   ENGINE_ENV="$ENGINE_ENV${QO_CACHE:+ GR8_QO_CACHE=$QO_CACHE}"

@@ -8,16 +8,86 @@ Format and release rules live in [`RELEASING.md`](RELEASING.md).
 
 ## [Unreleased]
 
-Changes merged on `main` since `v1.0.1` that are not yet cut in a numbered `v*` release tag.
+Changes merged on `main` since `v1.1.0` that are not yet cut in a numbered `v*` release tag.
 
-- **`./gr8 <model> scale --tp N --peers LIST`** (GLM-5.3 and GLM-5.3-Flash): change a serving cluster's width and
-  boxes by an orderly restart. The front end holds new requests (`POST /internal/hold`, localhost only) while the
-  running ones finish, the old engines quit, and the new member list boots; a failed boot rolls back to the old list.
-  With a persisted SSD KV store the new ranks rewrite the old width's store for themselves (`GR8_KV_REWIDTH`, set by
-  `scale` only; `bin/kvman-peer` serves each box's store to the others), so stored sessions continue without a
-  re-prefill. Default boots are unchanged.
-- The front end's 503 `engine not connected` now carries `Retry-After: 5`.
+- `scale` prepares the new width's load files before the hold: with `GR8_LOAD_COMPACT=DIR` in `EXTRA_ENV`, each box
+  writes its new rank's compact copies into `DIR.tp<N>-<tag>` while the old width serves (older widths' copies go once
+  a later scale is done), and the planned layout file is named by its content, so a repeated transition keeps its
+  `GR8_GEN_CACHE` entries. The config lines `scale` prints now come from the finished scale.
+- **`POOL`** (`--pool`): every box that may serve, head first; with `--tp N` the first N serve and the others stand by.
+  `scale --tp M` then needs no `--peers` and no new `up`, a box that leaves stands by instead of exiting, and the head
+  boots the last scaled width at its next `up` (`out/scale.json`, while `TP` and `POOL` are unchanged). `health` is
+  true on a standby, and on the head while its front end holds requests. The Helm chart's new `tp` value runs the group
+  as such a pool, so `kubectl exec <release>-0 -- /opt/gr8/gr8 <model> scale --tp N` changes the width without a pod
+  restarting; unset, the chart renders as before.
 - **Breaking changes:** None.
+
+---
+
+## [v1.1.0] — 2026-11-20
+
+- **Tag / commit:** [`v1.1.0`](https://github.com/kindlingai/gr8/releases/tag/v1.1.0) · `cdd1e0931047f55bba8f682a0ae79c4198668ca3`
+- **Container image:** `ghcr.io/kindlingai/gr8:v1.1.0@sha256:b22eedbd7902f65dbf2090897d75f5d92276cbf78a16bcde1f958aa56a306cf7`
+- **Version spec:** [`releases/v1.1.0.json`](releases/v1.1.0.json)
+- **Validation gate:** Full CI build across all seven engine legs plus live `4x GB10` (`TP=4`, 200G switch, uncapped clocks)
+  `bench/bench.py` runs for GLM-5.3 `bit325` quality default (`MOE_UNION_CAP=48`), fast preset (`MOE_UNION_CAP=32`), and
+  K4 `bit387` uncapped pure quality (`MOE_UNION_CAP=0`), alongside C=4 GSM8K-250, HumanEval-164, and sustained 4×153.6K
+  long-context concurrency checks.
+
+### Highlights and measured numbers
+
+- **GLM-5.3 TP=4 default speedup, memory headroom, and quality/fast presets (`#532`–`#536`, `#539`, `#542`, `#548`, `#549`, `#551`):**
+  - Enables all eight bit-exact decode, prefill, and DFlash2 kernel paths (`KL = 0.00000`) by default at TP=4 (`#542`, `#551`).
+  - Defaults `DEC_BK_MAX=2048` (three decode graph buckets, `#549`) and shares scratch/workspace allocations (`#532`–`#536`),
+    raising lowest `MemAvailable` after a full benchmark from **2.3 GB to 13.53 GiB** per box.
+  - Adds batch-budgeted MoE expert union capping (`GR8_MOE_UNION_CAP` / `MOE_UNION_CAP`, `#548`), defaulting to **48** at TP=4
+    (`#551`) for nearly lossless quality, with **32** as a fast preset and **0** for strict uncapped exactness (`KL = 0.00000`).
+  - **Live `4x GB10` (`TP=4`, `bit325` v0.6 @ `3e388b45`, `int4` KV, DFlash2 + MTP, `bench/bench.py`, 2026-11-20):**
+    - **Quality default (`MOE_UNION_CAP=48`):** code **67.1 tok/s** (+6.0% vs v1.0.1 `63.3`), prose **39.9** (+5.6%),
+      structured **78.7**, counting **83.2**; cold prefill **1,457** (8K) / **1,605** (32K) / **1,470 tok/s** (128K, +8.0%);
+      concurrency C=1 **50.6**, C=2 **62.1**, C=4 **83.3** (+19.9%), C=8 **120.5 tok/s** (+40.4% vs `85.8`);
+      lowest `MemAvailable` **13.53 GiB** (`13.98–14.54 GiB` after boot); smoke `14/14`, 128K needle PASS (`130,813` tok),
+      count `3/3` clean, cache `422/423`, `0` suspect chars; C=4 quality GSM8K-250 **246/250 (98.4%)**, HumanEval-164 **156/164 (95.1%)**.
+    - **Fast preset (`MOE_UNION_CAP=32`, `--quick`):** code **73.2 tok/s**, prose **38.9**; concurrency C=4 **97.1** (+39.7%),
+      C=8 **139.0 tok/s** (+62.0%); cold prefill **1,597 / 1,587 / 1,469 tok/s**; lowest `MemAvailable` **13.26 GiB**;
+      `0` suspect chars; C=4 quality GSM8K-250 **242/250 (96.8%)**, HumanEval-164 **153/164 (93.3%)**, 8/8 needles at 4×153.6K.
+    - **K4 (`bit387` @ `9e25c28a`, `MOE_UNION_CAP=0` uncapped, `DEC_BK=2048 DEC_BK_MAX=2048`, `CAP=442368`):**
+      code **60.8 tok/s**, prose **36.2**, structured **72.9**, counting **76.5**; cold prefill **1,530 / 1,570 / 1,434 tok/s**;
+      concurrency C=4 **62.3**, C=8 **82.0 tok/s**; lowest `MemAvailable` **3.78 GiB** (`4.32–4.72 GiB` after boot);
+      smoke `14/14`, 128K needle PASS (`131,475` tok), count `3/3` clean, `0` suspect chars.
+- **Live cluster width scaling (`./gr8 <model> scale --tp N --peers LIST`, `#538`, `#544`):** Orderly hold/drain/restart
+  scaling for GLM-5.3 and GLM-5.3-Flash with automatic SSD KV store re-sharding (`GR8_KV_REWIDTH`, `bin/kvman-peer`),
+  immediate rollback cleanup, hold timeline logging, and `Retry-After: 5` on front-end 503.
+- **Inkling-2-Small (`ink2`, `#504`–`#507`, `#512`, `#517`, `#518`, `#520`):** Full text + vision (`GR8_INK2_VISION`) +
+  MTP speculative decode on 4 and 6 Sparks (`bin/g6m4_ink2`, `bin/m4sim_ink2`).
+- **DeepSeek-V4.1-Flash (`ds41`, `#500`, `#501`, `#510`, `#519`, `#523`, `#528`–`#531`):** V2 BF16 tensor-core projections on
+  by default, multi-row decode GEMV and Engram optimizations, tool-turn cache fixes, and tiered session-store boundary state.
+- **KV pool, prefix reuse, and front-end upgrades (`#502`, `#503`, `#514`, `#516`, `#521`, `#524`, `#526`, `#527`, `#540`, `#541`, `#543`, `#267`):**
+  `REUSE_GRID=64` default at GLM-5.3 TP=4 int4, shared prefix pages and gated forks (`#540`), `GR8_CAP_TOTAL` (`#521`),
+  `GR8_BUSY_*` 429 guard (`#516`), opt-in native `dispramd` KV backing (`#514`), literal control-token encoding (`#541`),
+  GLM thinking-off control (`#526`), 1M+ token pool boot fix (`#543`), and device-table routed-expert stage 1 (`#267`).
+
+### Breaking changes
+
+None. `./gr8` CLI commands and flags, port `8100` HTTP endpoints and payloads, Hugging Face `exlr8` weight and steering
+profile schemas, and 128 GB GB10 runtime memory and numerical contracts remain backward-compatible with `v1.0.1`.
+
+### Default or cache-key changes
+
+- **GLM-5.3 TP=4 defaults (`#524`, `#527`, `#539`, `#549`, `#551`):** Default width variant at TP=4/5/6 is `bit325` (`v0.6`;
+  pass `VARIANT=home` for earlier `v0.5` checkpoints). `DEC_BK_MAX=2048`, `REUSE_GRID=64`, all 8 bit-exact `#542` kernels
+  (`KL = 0.00000`), and `MOE_UNION_CAP=48` are enabled by default at TP=4. Roll back to strict uncapped exact routing with
+  `MOE_UNION_CAP=0` (`--moe-union-cap 0`); opt in to fast mode with `MOE_UNION_CAP=32`.
+- **DeepSeek-V4.1-Flash defaults (`#510`, `#519`):** V2 BF16 tensor-core projections on by default (`EXACT=1` restores exact
+  path); forced tools default to native non-thinking mode (`--forced-tool-thinking 1` restores the old prompt).
+- **Persistent `KV_STORE`:** As on any engine binary upgrade, the persistent session index resets once on first boot of
+  `v1.1.0` while preserving the preallocated SSD block file.
+
+### Toolchain / Dockerfile sync
+
+Base CUDA (`13.0.1`), OS (`ubuntu24.04`), Rust (`1.94.1`), and runtime `apt` packages are unchanged from `v1.0.1`.
+`Dockerfile` adds `bin/kvman-peer` (`#538`) and `bin/g6m4_ink2` / `bin/m4sim_ink2` (`#512`) to `dist`. Downstream GLM-5.3,
+Flash, and DeepSeek recipe Dockerfiles need no toolchain changes.
 
 ---
 

@@ -45,8 +45,10 @@ int main()
         a.skip_prefill(a.slots()[0].key);
         const Quantum q = a.next();   // its prompt tail: then it decodes
         CHECK(q.kind == Kind::PromptTail);
+        const uint64_t rev0 = a.revision();
         a.complete_tail(Completion{q.keys[0], 1, false, 0});
         CHECK(a.slots()[0].phase == Phase::Decode);
+        CHECK(a.revision() == rev0 + 1);   // R1 entering Decode wakes queued admissions for live shrink
         const Slot was = a.slots()[0];
         auto shrink = [&](uint32_t r, uint32_t version) {
             Commit cm;
@@ -63,11 +65,13 @@ int main()
         CHECK(!shrink(16384, was.run.table_version));   // once only
     }
 
-    // without r2_rows only the engine's R is granted, and r2_rows needs the window
+    // without r2_rows only the engine's R is granted; r2_rows also works without window_pages (plain in-RAM split)
     Config plain = cfg(); plain.r2_rows = 0;
     Scheduler p(plain), q(plain);
     CHECK(admit(p, 0) && !admit(q, 16384));
-    Config bad = cfg(); bad.window_pages = 0;
+    Config ram = cfg(); ram.window_pages = 0;
+    ram.validate();
+    Config bad = cfg(); bad.r2_rows = 100;
     bool refused = false;
     try { bad.validate(); } catch (const std::exception&) { refused = true; }
     CHECK(refused);

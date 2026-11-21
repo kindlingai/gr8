@@ -140,11 +140,69 @@ fn an_r_the_pool_cannot_lay_out_is_refused() {
         assert_eq!(p.reserve_r(WORST, WORST, r), Err(Error::BadArgument), "R {r}");
         assert!(!p.fits_r(WORST, WORST, r) && p.split_view_r(WORST, r).is_none());
     }
-    // without the window a run past R reaches the stores, which hold tails at the pool's R only
+    // without split page classes (nr == 0) a smaller R is refused
     let mut q = Pool::new(400, 40, BIG).unwrap();
-    q.tail(4, 0);
     assert_eq!(q.reserve_r(WORST, WORST, SMALL), Err(Error::BadArgument));
     assert!(q.reserve_r(WORST, WORST, BIG).is_ok());
+}
+
+// plain in-RAM split pool (no window): place 40, nr 4, R = 8 pages, R2 = 4 pages
+fn ram_pool() -> Pool {
+    let mut p = Pool::new(400, 40, BIG).unwrap();
+    p.keep(RULES);
+    p.tail(4, 0);
+    p
+}
+
+#[test]
+fn in_ram_split_run_shrinks_and_frees_low_pages() {
+    let mut p = ram_pool();
+    // 20 pages at R=8 -> main = 8 + ceil(12/4) = 11 below place, draft = 9 above place
+    let a = p.reserve(WORST, WORST).unwrap();
+    let old = p.list(&a).unwrap().to_vec();
+    assert_eq!(old.iter().filter(|&&q| q < 40).count(), 11);
+    assert_eq!(old.iter().filter(|&&q| q >= 40).count(), 9);
+    assert!(p.shrinkable(&a, SMALL));
+    // Shrink to R2=4 -> main = 4 + ceil(16/4) = 8 below place (frees 3 low pages!), draft = 12 above place
+    let b = p.shrink_run(&a, SMALL).unwrap();
+    let l = p.list(&b).unwrap().to_vec();
+    assert_eq!(l.len(), 20);
+    assert_eq!(l.iter().filter(|&&q| q < 40).count(), 8);
+    assert_eq!(l.iter().filter(|&&q| q >= 40).count(), 12);
+    assert_eq!(&l[..5], &old[..5], "prefix [..4] + 1 kept shard slot stay in place");
+    assert!(l[5..8].iter().all(|&q| q >= 40 && !old.contains(&q)), "3 fresh drafter pages above place");
+    assert_eq!(&l[8..], &old[8..], "tail past old R stays untouched");
+    assert!(old[5..8].iter().all(|&q| !p.used(q)), "3 freed low pages are now free");
+    assert!(!p.shrinkable(&b, SMALL));
+
+    // Deterministic across ranks (same digest)
+    let mut q = ram_pool();
+    let qa = q.reserve(WORST, WORST).unwrap();
+    q.shrink_run(&qa, SMALL).unwrap();
+    assert_eq!(p.digest(), q.digest());
+}
+
+#[test]
+fn in_ram_below_r_run_past_r2_shrinks_into_split_run() {
+    let mut p = ram_pool();
+    // 8-page unsharded run (below R=8, past R2=4): holds 8 low pages
+    let a = p.reserve(8 * PAGE, 8 * PAGE).unwrap();
+    let old = p.list(&a).unwrap().to_vec();
+    assert_eq!(old.len(), 8);
+    assert!(!p.exclusive_r(8 * PAGE, 0).unwrap());
+    assert!(p.exclusive_r(8 * PAGE, SMALL).unwrap());
+    assert!(p.shrinkable(&a, SMALL));
+    // Shrinking to R2=4 -> main = 4 + ceil(4/4) = 5 low pages (frees 3 low pages!), draft = 3 above place
+    let b = p.shrink_run(&a, SMALL).unwrap();
+    let l = p.list(&b).unwrap().to_vec();
+    assert_eq!(l.len(), 8);
+    assert_eq!(&l[..5], &old[..5], "first 5 low pages stay in place");
+    assert!(l[5..8].iter().all(|&q| q >= 40), "3 drafter pages above place");
+    assert!(old[5..8].iter().all(|&q| !p.used(q)), "3 excess low pages freed");
+    assert!(!p.shrinkable(&b, SMALL));
+    // A run with worst <= SMALL cannot shrink
+    let tiny = p.reserve(4 * PAGE, 4 * PAGE).unwrap();
+    assert!(!p.shrinkable(&tiny, SMALL));
 }
 
 #[test]

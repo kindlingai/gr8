@@ -35,7 +35,7 @@ COPY knobs knobs
 COPY engine/loader-rs engine/loader-rs
 RUN mkdir -p /out \
  && cargo build --release --locked --manifest-path engine/loader-rs/Cargo.toml \
- && cp engine/loader-rs/target/release/libg6load.a engine/loader-rs/target/release/g6load /out/ \
+ && cp engine/loader-rs/target/release/libg6load.a engine/loader-rs/target/release/g6load engine/loader-rs/target/release/g6layout /out/ \
  && rm -rf engine/loader-rs/target
 
 FROM rust AS kvman
@@ -189,13 +189,14 @@ RUN --mount=type=cache,id=gr8-nvcc-int4,target=/var/cache/gr8-nvcc \
 # rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a,
 # libg6host.a and libgr8knobs.a
 FROM scratch AS rust-dist
-COPY --from=loader /out/libg6load.a /out/g6load /
+COPY --from=loader /out/libg6load.a /out/g6load /out/g6layout /
 COPY --from=kvman /out/libg6host.a /
 COPY --from=knobs /out/libgr8knobs.a /
 COPY --from=front /out/g6front-rs /
 
 # dist holds the shipped binaries in bin/: g6m4 (fp8 KV) and g6m4-int4 (--kv-format int4), both for every TP width,
-# and g6load (the Hugging Face fetch's planner and checker). build.sh's CPU test binaries and objects stay behind.
+# g6load (the Hugging Face fetch's planner and checker), and g6layout (the width-change layout planner for gr8 scale).
+# build.sh's CPU test binaries and objects stay behind.
 # tr3_e4m3_test is the GPU decode check build.sh cannot run without a GPU.
 # dist-fp8, dist-int4, dist-flash, dist-flash-int4, dist-ds41, dist-ink2 and dist-tests are the seven parts of dist. Their
 # stages are the whole cost of a build and they share nothing, so CI builds each
@@ -204,7 +205,7 @@ COPY --from=front /out/g6front-rs /
 FROM scratch AS dist-fp8
 COPY --from=engine /out/bin/g6m4 /out/bin/m4sim /bin/
 COPY --from=front /out/g6front-rs /bin/
-COPY --from=loader /out/g6load /bin/
+COPY --from=loader /out/g6load /out/g6layout /bin/
 COPY --from=kvman /out/kvman-remote /out/kvman-peer /bin/
 # the knob table the launcher reads (tools/launch/knobs.py)
 COPY --from=knobs /out/libgr8knobs.so /bin/lib/

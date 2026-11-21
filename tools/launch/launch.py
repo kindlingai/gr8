@@ -124,7 +124,7 @@ def cmd_up(argv):
                 if rc is not None:
                     sys.stdout.write(f.read().decode(errors='replace'))
                     return rc
-                if st == 'serving' and read_state(out).get('pid') == child.pid:
+                if st in ('serving', 'standby') and read_state(out).get('pid') == child.pid:
                     return 0
                 time.sleep(0.5)
     except KeyboardInterrupt:
@@ -223,6 +223,7 @@ def cmd_status(argv):
 
 def cmd_scale(argv):
     """Send `scale` to the head, then follow it in the head's status until it is done (0) or failed (1)."""
+    sys.stdout.reconfigure(line_buffering=True)   # a pipe (a CI log, a kubectl exec) sees each phase as it happens
     drain, rest = '300', []
     it = iter(argv)
     for a in it:
@@ -237,10 +238,10 @@ def cmd_scale(argv):
         return 2
     o = parse(rest, check=False)
     words = []
-    for k in ('TP', 'PEERS'):
-        if o.origin.get(k) != 'command line':
-            print('gr8: scale needs --tp N and --peers LIST (the new member list, the head first)', file=sys.stderr)
-            return 2
+    if o.origin.get('TP') != 'command line':
+        print('gr8: scale needs --tp N, and --peers LIST (the new member list, the head first) unless the cluster '
+              'booted with --pool', file=sys.stderr)
+        return 2
     for k, v in o.values.items():   # the options this command names: the head adds them to the boot's own
         if o.origin.get(k) == 'command line' and k not in ('GR8_WORK_DIR', 'GR8_MODEL', 'MENTAT') and v is not None:
             words += [opt.flag_of(k), v]
@@ -282,10 +283,12 @@ def cmd_scale(argv):
             said = now
             print(f'{time.strftime("%H:%M:%S")} scale {sc["phase"]}, head {s.get("state")}')
         if sc['phase'] == 'done' and s.get('state') == 'serving':
+            if sc.get('timeline'):
+                print(f'timeline: {sc["timeline"]}')
             print(f'serving TP={len(sc["members"])} on {",".join(sc["members"])}; requests waited {sc.get("pause_s")}s '
                   f'(drain {sc.get("drain_s")}s)')
             print('for later boots, put these in every box\'s config (the scale changed the running cluster only):')
-            for line in r.get('config') or []:
+            for line in sc.get('config') or []:
                 print(f'  {line}')
             return 0
         if sc['phase'] == 'failed':
@@ -338,7 +341,11 @@ def health(out, port, timeout=2, proc='/proc'):
     pid = sv.read_pid(os.path.join(out, 'supervisor.pid'))
     if not pid or pid != st.get('pid') or not is_supervisor(pid, proc):
         return False, f'{who}: not serving, no supervisor runs (last state {state})'
+    if state == 'standby':
+        return True, f'{who}: standby (in the pool, not serving), supervisor pid {pid}'
     if state != 'serving':
+        if rank == 0 and front_holds(port, timeout):
+            return True, f'{who}: {state}, supervisor pid {pid}; the front end holds requests through a scale'
         return False, f'{who}: {state}, supervisor pid {pid}'
     if rank != 0:
         return True, f'{who}: serving, supervisor pid {pid}'
@@ -356,6 +363,15 @@ def health(out, port, timeout=2, proc='/proc'):
         return False, f'{who}: serving, supervisor pid {pid}, but the API /health ' + \
             (f'answers {code}' if code else f'on port {port} answers nothing')
     return True, f'{who}: serving, supervisor pid {pid}, API /health 200'
+
+
+def front_holds(port, timeout):
+    """Whether the head's front end holds requests (/internal/hold): a scale's switch, during which the API waits."""
+    try:
+        with NO_PROXY.open(f'http://127.0.0.1:{port}/internal/hold', timeout=timeout) as r:
+            return json.load(r).get('hold') is True
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
 
 
 def cmd_health(argv):
@@ -490,24 +506,6 @@ def cmd_check(argv):
     return 1 if fails else 0
 
 
-def prepare_compact(o, rank, variant):
-    """An opt-in prepare step, never a boot-time rewrite. Use the same local directory assignment as the engine."""
-    directory = os.environ.get('GR8_LOAD_COMPACT', os.environ.get('G6_LOAD_COMPACT', ''))
-    # engine_args.sh splits EXTRA_ENV on whitespace, normalizes legacy names and applies the last assignment.
-    for word in (o.get('EXTRA_ENV') or '').split():
-        key, sep, value = word.partition('=')
-        if sep and key in ('GR8_LOAD_COMPACT', 'G6_LOAD_COMPACT'):
-            directory = value
-    if not directory:
-        return
-    if not variant.path or not o.get('V2_SLICES'):
-        raise modelset.ModelError('GR8_LOAD_COMPACT prepare needs an exlr8 v2 release with index slices and a width manifest')
-    import fetch_ranks
-    result = fetch_ranks.compact_rank(o.get('V2'), directory, o.get('V2_SLICES'), int(o.get('TP')), rank,
-                                      variant.path, o.get('LAYOUT'))
-    print(f'compact copies: {result["checked"]} halves verified in {directory}')
-
-
 def cmd_prepare(argv):
     o = parse(argv)
     rank = int(o.get('RANK')) if o.get('RANK') else next((int(a) for a in o.args if a.isdigit()), None)
@@ -538,8 +536,8 @@ def cmd_prepare(argv):
             if getattr(ms.drafter, 'pins', False) or ms.drafter.check(rank):
                 ms.drafter.fetch_rank(rank)
             bad += ms.drafter.check(rank)
-        if not bad:
-            prepare_compact(o, rank, variant)
+        if not bad and (done := sv.prepare_compact(o, rank, variant)):
+            print(f'compact copies: {done[1]["checked"]} halves verified in {done[0]}')
     except (modelset.ModelError, OSError, RuntimeError) as e:
         print(f'gr8: {e}', file=sys.stderr)
         return 1

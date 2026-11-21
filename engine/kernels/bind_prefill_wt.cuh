@@ -288,9 +288,8 @@ __global__ void __launch_bounds__(WT_NTH, 1) k_pf_fc1t(Expert A)
     const int r0 = w[1], rows = w[2];
     if (threadIdx.x < WT_R) sRow[threadIdx.x] = static_cast<int>(threadIdx.x) < rows ? A.rr_row[r0 + threadIdx.x] : 0;
     __syncthreads();
-    size_t off;
-    const int k = tr3_unit(A.t_kmix, w[0], tr, b * 2 + mat, off);
-    const uint8_t* mw = A.t_fc1 + off;
+    const uint8_t* mw;
+    const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, w[0], tr, b * 2 + mat, mw);
     const __half* v1b = A.t_v1b + ((static_cast<size_t>(tr[2]) + b) * 2 + mat) * (HID / 128);
     if (k == 4) fc1t_nm<4, false, CB, EB>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS);
     else if (k == 3) fc1t_nm<3, true, CB, EB>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS);
@@ -310,8 +309,9 @@ __device__ __forceinline__ void fc2t_body(const Expert& A, const long long* tr, 
     const int nb = static_cast<int>(tr[3]);
     Tr3Lane<BITS, false, CB> ld;
     ld.init(lane);
+    const int pe = static_cast<int>((tr - A.t_tab) / 6);          // the row's index, for the piece table (#151)
     auto wptr = [&](int b) {
-        return A.t_fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB) + static_cast<size_t>(G * 8 + warp) * 8 * TB;
+        return tr3_fc2_block(A.t_fc2, A.t_ptab, pe, tr, b, BITS) + static_cast<size_t>(G * 8 + warp) * 8 * TB;
     };
     const uint8_t* xsrc = A.x2 + static_cast<size_t>(wt) * WT_NM * EB * 4 * REC;       // row block mb, block b at + (mb EB + b) 4 REC
     auto stage = [&](int b) {
@@ -730,9 +730,8 @@ __global__ void __launch_bounds__(WT_NTH, 1) k_pf_fc1t_w4(Expert A)
     const int r0 = w[1], rows = w[2];
     if (threadIdx.x < WT_R) sRow[threadIdx.x] = static_cast<int>(threadIdx.x) < rows ? A.rr_row[r0 + threadIdx.x] : 0;
     __syncthreads();
-    size_t off;
-    const int k = tr3_unit(A.t_kmix, w[0], tr, b * 2 + mat, off);
-    const uint8_t* mw = A.t_fc1 + off;
+    const uint8_t* mw;
+    const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, w[0], tr, b * 2 + mat, mw);
     const __half* v1b = A.t_v1b + ((static_cast<size_t>(tr[2]) + b) * 2 + mat) * (HID / 128);
     if (k == 4) fc1t_w4_nm<CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS);
     else if (k == 3) fc1t_nm<3, true, CB, EB>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS);
@@ -842,8 +841,9 @@ __device__ __forceinline__ void fc2t_w4_body(const Expert& A, const long long* t
     const int prev_lane = (lane + 31) & 31;
     const int srow = (lane >> 2) + ((lane & 1) ? 8 : 0), c = lane & 3, r = lane >> 2;
     const int nb = static_cast<int>(tr[3]);
+    const int pe = static_cast<int>((tr - A.t_tab) / 6);          // the row's index, for the piece table (#151)
     auto wptr = [&](int b) {
-        return A.t_fc2 + tr[1] + static_cast<size_t>(b) * TR4W_MAT + static_cast<size_t>(G * 8 + warp) * TR4W_NT + lane * 16;
+        return tr3_fc2_block(A.t_fc2, A.t_ptab, pe, tr, b, 4) + static_cast<size_t>(G * 8 + warp) * TR4W_NT + lane * 16;
     };
     const uint8_t* xsrc = A.x2 + static_cast<size_t>(wt) * WT_NM * EB * 4 * REC;
     auto stage = [&](int b) {
@@ -1001,8 +1001,9 @@ __device__ __forceinline__ void fc2t_h1_body(const Expert& A, const long long* t
     const int prev_lane = (lane + 31) & 31;
     const int srow = (lane >> 2) + ((lane & 1) ? 8 : 0), c = lane & 3, r = lane >> 2;
     const int nb = static_cast<int>(tr[3]);
+    const int pe = static_cast<int>((tr - A.t_tab) / 6);          // the row's index, for the piece table (#151)
     auto wptr = [&](int b) {
-        return A.t_fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB) + static_cast<size_t>(G * 8 + warp) * 8 * TB;
+        return tr3_fc2_block(A.t_fc2, A.t_ptab, pe, tr, b, BITS) + static_cast<size_t>(G * 8 + warp) * 8 * TB;
     };
     const uint8_t* xsrc = A.x2 + static_cast<size_t>(wt) * WT_NM * EB * 4 * REC;
     auto stage = [&](int b) {

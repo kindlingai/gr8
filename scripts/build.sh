@@ -75,6 +75,8 @@ elif [ -n "$GR_OFF" ]; then echo "request grammars: off ($GR_OFF)"
 else echo "request grammars: off (no XGrammar source; it needs cargo and cmake, or GR8_XGRAMMAR=DIR)"; fi
 G6LOAD_BIN=$REPO/engine/loader-rs/target/release/g6load
 if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
+G6LAYOUT_BIN=$REPO/engine/loader-rs/target/release/g6layout
+if [ -x "$G6LAYOUT_BIN" ]; then cp "$G6LAYOUT_BIN" "$OUT/"; fi
 # the knob table the launcher reads (tools/launch/knobs.py)
 KNOBSO=$REPO/engine/knobs-rs/target/release/libgr8knobs.so
 if [ -f "$KNOBSO" ]; then mkdir -p "$OUT/lib" && cp "$KNOBSO" "$OUT/lib/"; fi
@@ -205,6 +207,23 @@ build() {   # build <bin> <command..>: in the background, at most J at once; a f
 build l2pf_bench $NVCC -O3 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR} -I "$REPO/engine/kernels" \
   -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
   "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas "${KNOBS[@]}"
+# EL3 (#151) piece tables: the routed experts through a per-layer device table (GR8_PTAB) against the pack layout, decode
+# (K1, every row count, graphs with changing table contents) and prefill, byte for byte; + bench. Built at each width
+# with that width's engine flags, except widths whose EB (16 / TP) is above 8, the kmix format's ceiling (TP1); and in
+# the Flash geometry at TP4 (the Flash-only prefill kernels). Build only (needs an idle GPU and ~6 GB):
+# $OUT/ptab_test_tp<N>, $OUT/ptab_test_flash_tp4 (file header)
+for n in $WIDTHS; do
+  [ $(( (16 + n - 1) / n )) -le 8 ] || { echo "ptab_test_tp$n: skipped (EB = $(( (16 + n - 1) / n )) > 8, the kmix format's ceiling)"; continue; }
+  f="-DG6_NR=$n -DDEC_S2"
+  case " ${F12_WIDTHS:-4} " in *" $n "*) f="$f -DPF_F12" ;; esac
+  # shellcheck disable=SC2086
+  build ptab_test_tp$n $NVCC -O2 -std=c++17 $GEN $K1H2_FLAGS $f -I "$REPO/engine/kernels" -o "$OUT/ptab_test_tp$n" \
+    "$REPO/engine/kernels/tests/ptab_test.cu" -lcublas "${KNOBS[@]}"
+done
+# shellcheck disable=SC2086
+build ptab_test_flash_tp4 $NVCC -O2 -std=c++17 $GEN ${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 \
+  -DG6_NR=4 -DDEC_S2 -I "$REPO/engine/kernels" -o "$OUT/ptab_test_flash_tp4" "$REPO/engine/kernels/tests/ptab_test.cu" \
+  -lcublas "${KNOBS[@]}"
 # Steering projection/consume/finalizer fixtures (and S2 batched steering, s2_steer_test): compile in CI even without a
 # GPU. No model or fabric service needed.
 STEERING="s2_steer_test steering_consume_test steering_shared_test steering_boot_cuda_test steering_cuda_test"
@@ -277,7 +296,7 @@ if nvidia-smi -L > /dev/null 2>&1; then
 else
   echo "tr3_e4m3_test and the steering tests ($STEERING): compiled; no GPU visible, not run"
 fi
-echo "dtr_test_tp4, dtr_test_flash_tp4, l2pf_bench, test_flash_cp: built (they need release files or an idle GPU)"
+echo "dtr_test_tp4, dtr_test_flash_tp4, l2pf_bench, test_flash_cp, ptab_test_tp<N>, ptab_test_flash_tp4: built (they need release files or an idle GPU)"
 echo "the DS41 v2 GPU tests ($(for t in $DS41_V2_TESTS; do printf '%s ' "${t##*/}"; done | sed 's/ $//')): built; TEST=ds41_v2 scripts/c1_tests.sh runs the 12 tests (ds41_v2_fc2_profile is a profile, built only)"
 echo "fabric_rs_flat_test: built (a cluster test, not run here)"
 [ -f "$GR8_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$GR8_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$GR8_NVCC_CACHE_LOG") miss"

@@ -318,8 +318,8 @@ pub fn validate(c: &Config, max_sessions: u32, mtp0: bool, pack: bool, park: boo
     )?;
     require(!c.cp_seg || c.cp_step_rows != 0, "cp_seg needs cp_step_rows")?;
     require(
-        c.r2_rows.is_multiple_of(PAGE) && (c.r2_rows == 0 || c.window_pages != 0),
-        "r2_rows must be 0, or a multiple of 64 with window_pages",
+        c.r2_rows.is_multiple_of(PAGE),
+        "r2_rows must be 0 or a multiple of 64",
     )?;
     Ok(())
 }
@@ -338,7 +338,7 @@ fn slot_index(s: &[Slot], k: &Key) -> Result<usize, Err> {
     Ok(i)
 }
 
-fn finish_slot(s: &mut Slot, r: &Completion, revision: &mut u64) -> Result<(), Err> {
+fn finish_slot(c: &Config, s: &mut Slot, r: &Completion, revision: &mut u64) -> Result<(), Err> {
     require(s.key == r.key && r.emitted <= s.req.max_tokens.wrapping_sub(s.emitted), "invalid completion")?;
     s.emitted = s.emitted.wrapping_add(r.emitted);
     require(r.inserted >= s.inserted, "insert count went back")?;
@@ -347,6 +347,11 @@ fn finish_slot(s: &mut Slot, r: &Completion, revision: &mut u64) -> Result<(), E
         s.phase = RETIRING;
         *revision = revision.wrapping_add(1);
     } else {
+        // With dynamic R2 sharding, a session at R1 becomes shrinkable (on_make_room) as soon as it enters DECODE:
+        // bump revision so a queued request waiting on capacity retries immediately instead of stalling until retire.
+        if c.r2_rows != 0 && s.phase == PREFILL && s.req.r_rows == 0 {
+            *revision = revision.wrapping_add(1);
+        }
         s.phase = DECODE;
     }
     Ok(())
@@ -625,7 +630,8 @@ pub fn apply(c: &Config, s: &mut [Slot], st: &mut State, e: &Commit, digest: u64
                 && k.r_rows == c.r2_rows
                 && t.req.r_rows == 0
                 && k.run.table_version == t.run.table_version
-                && k.run.pages == t.run.pages,
+                && k.run.pages >= t.run.pages
+                && (k.run.pages == t.run.pages || grant_pages_ok(c, &t.req, k.run.pages)?),
             "bad shrink",
         )?;
         t.req.r_rows = k.r_rows;
@@ -982,7 +988,7 @@ pub fn complete_tail(c: &Config, s: &mut [Slot], st: &mut State, r: &Completion)
     require(st.busy && st.work.kind == PROMPT_TAIL && st.work.keys[0] == r.key, "not this prompt tail")?;
     let i = slot_index(s, &r.key)?;
     let mut copy = s[i];
-    finish_slot(&mut copy, r, &mut st.revision)?;
+    finish_slot(c, &mut copy, r, &mut st.revision)?;
     copy.pack_tail = false;
     let i = slot_index(s, &r.key)?;
     s[i] = copy;
@@ -1009,7 +1015,7 @@ pub fn complete_tail_pack(c: &Config, s: &mut [Slot], st: &mut State, r: &[Compl
     for x in r {
         // the revision counts as the C++ did: a later refusal keeps the earlier sessions' increments, not their slots
         let t = &mut copy[x.key.slot as usize];
-        finish_slot(t, x, &mut st.revision)?;
+        finish_slot(c, t, x, &mut st.revision)?;
         t.pack_tail = false;
     }
     s.copy_from_slice(&copy);
@@ -1026,7 +1032,7 @@ pub fn complete_decode(c: &Config, s: &mut [Slot], st: &mut State, r: &[Completi
     }
     for x in r {
         let i = slot_index(s, &x.key)?;
-        finish_slot(&mut s[i], x, &mut st.revision)?; // a refusal here leaves the earlier sessions finished, as the C++ did
+        finish_slot(c, &mut s[i], x, &mut st.revision)?; // a refusal here leaves the earlier sessions finished, as the C++ did
     }
     completed(c, s, st);
     Ok(())

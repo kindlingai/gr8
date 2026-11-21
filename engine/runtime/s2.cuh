@@ -609,6 +609,87 @@ inline void s2_copy_rows(Model& m, const std::vector<g6kv_copy>& copies, cudaStr
         i = j;
     }
 }
+// Plain in-RAM dynamic shrink (GR8_CP_R2 without GR8_RT_LOCAL): migrate every live owned logical page [0, live_pages)
+// whose physical page changes from t_old[lp] to t_new[lp]. Runs independent DAG waves through s2_copy_rows (one launch
+// for all layers x all pages in the wave) and breaks any permutation cycle with a temporary 1-page device buffer.
+inline void s2_migrate_pages(Model& m, const std::vector<int>& t_old, const std::vector<int>& t_new, int live_pages, cudaStream_t st)
+{
+    const S2Model& s = *m.s2;
+    struct Move { int src, dst; };
+    std::vector<Move> pending;
+    const int n = std::min<int>(live_pages, (int)std::min(t_old.size(), t_new.size()));
+    for (int lp = 0; lp < n; ++lp)
+    {
+        const int dst = t_new[lp];
+        if (dst < 0 || dst == G6_CP_REMOTE) continue;
+        const int src = t_old[lp];
+        if (src < 0 || src == G6_CP_REMOTE) die("s2_migrate_pages: owned post-shrink page was not local before shrink");
+        if (src >= s.pool_pages || dst >= s.pool_pages) die("s2_migrate_pages: page outside the model's pool");
+        if (src != dst) pending.push_back({src, dst});
+    }
+    if (pending.empty()) return;
+    while (!pending.empty())
+    {
+        std::vector<g6kv_copy> wave;
+        std::vector<Move> rest;
+        rest.reserve(pending.size());
+        for (const Move& mv : pending)
+        {
+            bool blocked = false;
+            for (const Move& other : pending)
+                if (other.src == mv.dst) { blocked = true; break; }
+            if (!blocked) wave.push_back(g6kv_copy{(uint32_t)mv.src, (uint32_t)mv.dst, 64});
+            else rest.push_back(mv);
+        }
+        if (!wave.empty())
+        {
+            s2_copy_rows(m, wave, st);
+            pending.swap(rest);
+            continue;
+        }
+        // Pure cycle fallback (disjoint cycles): break one cycle starting at pending[0] via a 1-page scratch buffer.
+        const size_t kv = 64 * g6kv::ROW, ix = 64 * g6kv::IDX_ROW;
+        char *tmp_kv = nullptr, *tmp_ix = nullptr;
+        G6RT_CK(cudaMalloc(&tmp_kv, kv));
+        G6RT_CK(cudaMalloc(&tmp_ix, ix));
+        std::vector<Move> cyc;
+        std::vector<bool> used(pending.size(), false);
+        int cur = 0;
+        while (cur >= 0 && !used[cur])
+        {
+            used[cur] = true;
+            cyc.push_back(pending[cur]);
+            int next = -1;
+            for (size_t i = 0; i < pending.size(); ++i)
+                if (!used[i] && pending[i].src == pending[cur].dst) { next = (int)i; break; }
+            cur = next;
+        }
+        for (const G6AttnBinding* p : s.pool)
+        {
+            const G6Attn& g = p->args;
+            // Save cyc.back().src -> tmp, shift backwards, then tmp -> cyc.back().dst (= cyc[0].src).
+            G6RT_CK(cudaMemcpyAsync(tmp_kv, (const char*)g.mla_cache + (size_t)cyc.back().src * kv, kv, cudaMemcpyDeviceToDevice, st));
+            if (g.index_cache)
+                G6RT_CK(cudaMemcpyAsync(tmp_ix, (const char*)g.index_cache + (size_t)cyc.back().src * ix, ix, cudaMemcpyDeviceToDevice, st));
+            for (int i = (int)cyc.size() - 2; i >= 0; --i)
+            {
+                G6RT_CK(cudaMemcpyAsync((char*)g.mla_cache + (size_t)cyc[i].dst * kv, (const char*)g.mla_cache + (size_t)cyc[i].src * kv, kv, cudaMemcpyDeviceToDevice, st));
+                if (g.index_cache)
+                    G6RT_CK(cudaMemcpyAsync((char*)g.index_cache + (size_t)cyc[i].dst * ix, (const char*)g.index_cache + (size_t)cyc[i].src * ix, ix, cudaMemcpyDeviceToDevice, st));
+            }
+            G6RT_CK(cudaMemcpyAsync((char*)g.mla_cache + (size_t)cyc.back().dst * kv, tmp_kv, kv, cudaMemcpyDeviceToDevice, st));
+            if (g.index_cache)
+                G6RT_CK(cudaMemcpyAsync((char*)g.index_cache + (size_t)cyc.back().dst * ix, tmp_ix, ix, cudaMemcpyDeviceToDevice, st));
+        }
+        G6RT_CK(cudaStreamSynchronize(st));
+        G6RT_CK(cudaFree(tmp_kv));
+        G6RT_CK(cudaFree(tmp_ix));
+        rest.clear();
+        for (size_t i = 0; i < pending.size(); ++i)
+            if (!used[i]) rest.push_back(pending[i]);
+        pending.swap(rest);
+    }
+}
 // re-base slot q's run, keeping its pages (s2_relocate)
 inline void s2_set_base(Model& m, int q, int base_page)
 {
@@ -814,13 +895,34 @@ inline bool s2_cp_bucket(const Model& m, int bk)
 {
 #if defined(G6_CP) && G6_CP
     const S2Model& s = *m.s2;
-    return s.batch && !s.cbv.empty() && m.cp.on && m.bk[bk] > m.cp.step_R();
+    return s.batch && !s.cbv.empty() && m.cp.on && !m.cp.force_nocp && m.bk[bk] > m.cp.step_R();
 #else
     (void)m; (void)bk;
     return false;
 #endif
 }
 inline bool s2_cp_step(const Model& m) { return s2_cp_bucket(m, s2_bucket(*m.s2)); }
+// Whether a main decode step at bucket `bk` needs the CP attention block and CP fabric collectives.
+// For buckets in (R2, R] (cp_dual_bucket), returns false whenever every active session in the step has all of its
+// live tokens within its replicated prefix (rp * 64), letting unsharded sessions run at full non-CP speed.
+inline bool s2_step_needs_cp(const Model& m, int bk, int solo, const S2In& layout, int solo_ctx)
+{
+#if defined(G6_CP) && G6_CP
+    if (!m.cp.on || m.bk[bk] <= m.cp.step_R()) return false;
+    if (!cp_dual_bucket(m, bk)) return true;
+    const S2Model& s = *m.s2;
+    if (solo >= 0) return s.ex_split[solo] && solo_ctx > s.rp[solo] * 64;
+    for (int j = 0; j < layout.ns; ++j)
+    {
+        const int q = layout.sess[j];
+        if (s.ex_split[q] && layout.ctx[j] > s.rp[q] * 64) return true;
+    }
+    return false;
+#else
+    (void)m; (void)bk; (void)solo; (void)layout; (void)solo_ctx;
+    return false;
+#endif
+}
 // the CP batch view's replay entry of layer i for the current step (s2_prepare made it)
 inline G6AttnReplay* s2_cp_replay(Model& m, int i, int M)
 {

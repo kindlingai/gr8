@@ -228,13 +228,32 @@ not an in-process switch:
    (`FLASH_CACHE=aligned` with a persisted SSD store; not with `GR8_CP=1`). A chat's next turn then reads its run from
    the store instead of prefilling it again. Without such a store the scale works and sessions prefill again. The
    store must be on each box's local disk: the scale moves rank folders within it.
-4. When the head's API answers, the hold ends and the held requests run on the new width. A box that left exits.
+4. When the head's API answers, the hold ends and the held requests run on the new width. A box that left exits. The
+   head logs, and the scale command prints, a timeline of the hold (`timeline: drained +0.1s, stopped +6.2s,
+   handshake +1.4s, started +0.3s, ready +52.0s, serving +0.4s`: each part the seconds since the one before), and a
+   scale's boot relays each rank's store rewrite, weight check, boot capture and load-cache lines to its supervisor log.
+
+A scale also prepares what the new width loads, before the hold: with `GR8_LOAD_COMPACT=DIR` in the cluster's
+`EXTRA_ENV` every box writes its new rank's compact copies into `DIR.tp<N>-<tag>` while the old width serves
+([COMPACT-WEIGHTS.md](COMPACT-WEIGHTS.md)), and GLM-5.3's planned layout is kept as `out/scale/layout-<hash>.json`, so
+a scale back to a layout seen before keeps its `GR8_GEN_CACHE` entries. The scale never turns compact copies on by
+itself (about 75 GB of disk a box); name the knob on the `scale` command (`--extra-env`) to start using them.
 
 If the new width fails to boot (a refused handshake, an engine that exits, `READY_TMO`), every box of the old list
-puts its store back and boots the old list again, and the held requests run there. The hold lasts the drain plus a
-boot (`READY_TMO` + 120 s, at least 900 s), and a rollback sets it again for the old list's boot: clients need a
-request timeout at least that long. A supervisor that dies mid-scale is not resumed: `down` and `up` as after any
-failure; a box that leaves stops after `JOIN_TIMEOUT` + `READY_TMO` without word from the head.
+puts its store back and boots the old list again, and the held requests run there. The new engines never served, so
+they stop at once (SIGTERM, not the orderly quit), and a box of the old list that asks the head during its rollback
+waits for it. The hold lasts the drain plus a boot (`READY_TMO` + 120 s, at least 900 s), and a rollback sets it again
+for the old list's boot: clients need a request timeout at least that long. A supervisor that dies mid-scale is not
+resumed: `down` and `up` as after any failure; a box that leaves stops after `JOIN_TIMEOUT` + `READY_TMO` without word
+from the head.
+
+With `POOL` (every box that may serve, head first, with `TP` the boxes that serve now; `deploy/k8s` sets both with
+`tp`), `scale --tp N` needs no `--peers`: the new member list is the pool's first N. A box of the pool outside the
+member list is a standby: it runs its supervisor only (state `standby`, `health` true), joins the scale that names
+it, and a box that leaves stands by again instead of exiting. The head writes the last scale's options to
+`out/scale.json` and boots that width at its next `up` while `TP` and `POOL` are the ones it was written under; the
+other boxes take the head's member list when theirs differs. While the head's front end holds requests, the head's
+`health` is true too (`the front end holds requests through a scale`), so a readiness probe keeps it in service.
 
 What the scale keeps the same, so the store's blocks stay valid: the running variant (`--variant`), the KV format
 (`--kv-format`, also when a TP default chose it, as int4 at GLM-5.3 TP=4), `SHARE_LIMIT` and `REUSE_GRID` are pinned.

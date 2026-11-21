@@ -488,9 +488,11 @@ class CanonicalTests(unittest.TestCase):
 
     def test_l2pf_reaches_every_rank(self):
         _, text, _ = self.digest()
-        self.assertNotIn('GR8_L2PF', text)
+        self.assertIn(' GR8_L2PF=31', text)
         _, text, _ = self.digest('--l2pf', '15')
         self.assertIn(' GR8_L2PF=15', text)
+        _, text, _ = self.digest('--l2pf', '0')
+        self.assertIn(' GR8_L2PF=0', text)
 
     def test_cp_step_rows_reaches_every_rank(self):
         _, text, d0 = self.digest()
@@ -528,7 +530,9 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotEqual(d0, d1)
         _, text, _ = self.digest(*rows, '--share-limit-busy', '16384', '--share-big', '2')
         self.assertIn(' GR8_CP_R2_BIG=2 ', text)
-        for bad in (('--share-limit-busy', '16384'), (*rows, '--share-limit-busy', '32768'),
+        _, text, _ = self.digest('--share-limit-busy', '16384')
+        self.assertIn(' GR8_CP_R2=16384 ', text)
+        for bad in ((*rows, '--share-limit-busy', '32768'),
                     (*rows, '--share-limit-busy', '16100'), ('--share-big', '2')):
             with self.assertRaises(opt.OptionError):
                 self.digest(*bad)
@@ -653,7 +657,7 @@ class CanonicalTests(unittest.TestCase):
 
     def test_tp4_serve_options_default_on_and_override(self):
         on = ['GR8_ROUTE_OVL=1', 'GR8_DRAFT_HEAD_I4=1', 'GR8_ATTN_SC2=4', 'GR8_ATTN_SC2_TR=2', 'GR8_ATTN_CTX2=4', 'GR8_ATTN_CTX3=2',
-              'GR8_ATTN_SEL2=16', 'GR8_IDX_GRP=16', 'GR8_ATTN_QT=1', 'GR8_ATTN_FRONT=1', 'GR8_IDX_VEC=1', 'GR8_DEC_BK=2048', 'GR8_DEC_BK_MAX=32768',
+              'GR8_ATTN_SEL2=16', 'GR8_IDX_GRP=16', 'GR8_ATTN_QT=1', 'GR8_ATTN_FRONT=1', 'GR8_IDX_VEC=1', 'GR8_DEC_BK=2048', 'GR8_DEC_BK_MAX=2048',
               'GR8_S2_ADAPT=1', 'GR8_S2_DECODE_PF=4096', 'GR8_S2_ADMIT_HOLD=1', 'GR8_PF_SELX_CTX=53248']
         def env(peers, *argv):
             o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
@@ -743,6 +747,68 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(env(PEERS, '--tr3-w2all', '0'), ['GR8_TR3_W2ALL=0'])
         self.assertEqual(env(PEERS, '--extra-env', 'GR8_TR3_W2ALL=0'), ['GR8_TR3_W2ALL=0'])   # EXTRA_ENV keeps its value, no second copy
         self.assertEqual(env('10.0.0.1,10.0.0.2,10.0.0.3'), [])   # TP=3 unchanged
+
+    def test_tp4_exact_knobs_and_union_cap_defaults_and_overrides(self):
+        exact = ['GR8_DEC_DENSE_OPT=1', 'GR8_DTR_EXACT_OPT=1', 'GR8_MOE_RTR_FIN_OPT=1', 'GR8_TR3_WIDE4=1',
+                 'GR8_PF_ATTN_OPT=1', 'GR8_PF_DENSE_OPT=1', 'GR8_PF_ISGRT_CLEAN=1', 'GR8_DFL_DEDUP=1']
+        def env(peers, *argv):
+            o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
+            opt.validate(o)
+            return opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env']
+        e = env(PEERS)
+        for v in exact:
+            self.assertIn(v, e)
+        self.assertIn('GR8_MOE_UNION_CAP=48', e)
+        # DFL_DEDUP must stay off when DFLASH=0 (engine refuses GR8_DFL_DEDUP=1 without --dflash-manifest)
+        e_nodfl = env(PEERS, '--dflash', '0')
+        self.assertFalse(any(a.startswith('GR8_DFL_DEDUP=') for a in e_nodfl))
+        self.assertIn('GR8_DEC_DENSE_OPT=1', e_nodfl)
+        # explicit overrides and rollback to 0
+        e_off = env(PEERS, '--dec-dense-opt', '0', '--moe-union-cap', '0')
+        self.assertIn('GR8_DEC_DENSE_OPT=0', e_off)
+        self.assertFalse(any(a.startswith('GR8_MOE_UNION_CAP=') for a in e_off))
+        # fast concurrency cap and mode pass-through
+        e_fast = env(PEERS, '--moe-union-cap', '32', '--moe-union-mode', '1')
+        self.assertIn('GR8_MOE_UNION_CAP=32', e_fast)
+        self.assertIn('GR8_MOE_UNION_MODE=1', e_fast)
+        # EXTRA_ENV keeps its own value with no second copy
+        e_extra = env(PEERS, '--extra-env', 'GR8_DEC_DENSE_OPT=0 GR8_MOE_UNION_CAP=0')
+        self.assertEqual([a for a in e_extra if a.startswith(('GR8_DEC_DENSE_OPT=', 'GR8_MOE_UNION_CAP='))],
+                         ['GR8_DEC_DENSE_OPT=0', 'GR8_MOE_UNION_CAP=0'])
+        # other TP widths: TP=3 stays untouched; TP=5 and TP=6 share the 7 exact kernels, DEC_BK_MAX=2048,
+        # MOE_UNION_CAP=48, and the MTP/prefill tuning defaults (no DFL_DEDUP without DFlash2)
+        e_tp3 = env('10.0.0.1,10.0.0.2,10.0.0.3')
+        keys = {v.split('=')[0] for v in exact} | {'GR8_MOE_UNION_CAP', 'GR8_MOE_UNION_MODE', 'GR8_L2PF', 'GR8_PF_GEMMF32', 'GR8_DFL_REUSE_MIN'}
+        self.assertFalse(any(a.split('=')[0] in keys for a in e_tp3))
+        tp4_extra = ['GR8_L2PF=31', 'GR8_PF_GEMMF32=1', 'GR8_MTP_L2PF=3', 'GR8_MTP_LASTROW=1', 'GR8_DRAFT_HEAD2=1', 'GR8_DFL_REUSE_MIN=0']
+        for v in tp4_extra:
+            self.assertIn(v, e)
+        self.assertFalse(any(a.startswith('GR8_DFL_REUSE_MIN=') for a in e_nodfl))
+        e_nomtp = env(PEERS, '--mtp', '0', '--dflash', '0')
+        for k in ('GR8_MTP_L2PF=', 'GR8_MTP_LASTROW=', 'GR8_DRAFT_HEAD2='):
+            self.assertFalse(any(a.startswith(k) for a in e_nomtp))
+        tp56_want = ['GR8_DEC_BK_MAX=2048', 'GR8_L2PF=31', 'GR8_PF_GEMMF32=1', 'GR8_MTP_L2PF=3', 'GR8_MTP_LASTROW=1',
+                     'GR8_DRAFT_HEAD2=1', 'GR8_DEC_DENSE_OPT=1', 'GR8_DTR_EXACT_OPT=1', 'GR8_MOE_RTR_FIN_OPT=1',
+                     'GR8_TR3_WIDE4=1', 'GR8_PF_ATTN_OPT=1', 'GR8_PF_DENSE_OPT=1', 'GR8_PF_ISGRT_CLEAN=1',
+                     'GR8_MOE_UNION_CAP=48']
+        for peers in (','.join(f'10.0.0.{i}' for i in range(1, 6)), ','.join(f'10.0.0.{i}' for i in range(1, 7))):
+            e_wide = env(peers)
+            for v in tp56_want:
+                self.assertIn(v, e_wide)
+            self.assertFalse(any(a.startswith('GR8_DFL_DEDUP=') for a in e_wide))
+            self.assertIn('GR8_MOE_UNION_CAP=32', env(peers, '--moe-union-cap', '32'))
+            self.assertFalse(any(a.startswith('GR8_MOE_UNION_CAP=') for a in env(peers, '--moe-union-cap', '0')))
+
+    def test_ptab_off_unless_set(self):
+        # PTAB (EL3 #151): unset = no GR8_PTAB in the engine environment (the pack layout); set = passed through, as a
+        # cluster option (the handshake compares it)
+        def env(*argv):
+            o = opt.parse(['--no-config', '--peers', PEERS, *argv], GLM)
+            opt.validate(o)
+            return [a for a in opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env'] if a.startswith('GR8_PTAB=')]
+        self.assertEqual(env(), [])
+        self.assertEqual(env('--ptab', '2'), ['GR8_PTAB=2'])
+        self.assertEqual(opt.KEYS['PTAB'][0], 'cluster')
 
     def test_tp6_is_s2_without_drafter(self):
         peers = ','.join(f'10.0.0.{i}' for i in range(1, 7))

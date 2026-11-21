@@ -661,6 +661,7 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
         P.T.back().heads = y.ab.args.heads;
         P.T.back().fc1_wide = y.T.fc1_wide;      // decode widened tr3.fc1 in place: prefill must read the same order
         P.T.back().fc2_wide = y.T.fc2_wide;      // ... and tr3.fc2
+        P.T.back().ptab = y.T.ptab;              // ... and through the same piece table (#151)
         P.T.back().fc1_wide4 = y.T.fc1_wide4;    // GR8_TR3_WIDE4: K4 wide order in place
         P.T.back().fc2_wide4 = y.T.fc2_wide4;
         P.T.back().k2 = y.T.k2;                  // 2-bit units: the K2 instantiations (bind::scan_widths)
