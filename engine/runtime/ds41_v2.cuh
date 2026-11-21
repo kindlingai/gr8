@@ -70,7 +70,7 @@ __device__ inline void get16(char* dst,const char* src,size_t i,size_t valid) {
     if (i+16<=valid && ((reinterpret_cast<uintptr_t>(src)|reinterpret_cast<uintptr_t>(dst+i))&15)==0) {
         *reinterpret_cast<uint4*>(dst+i)=__ldcv(reinterpret_cast<const uint4*>(src)); return;
     }
-    for (int b=0;b<16 && i+b<valid;++b) dst[i+b]=src[b];
+    for (int b=0;b<16 && i+b<valid;++b) dst[i+b]=static_cast<char>(__ldcv(reinterpret_cast<const unsigned char*>(src)+b));
 }
 __global__ void pack(g6::FabricDev f,Seq epoch,int c,Geometry g,Segments seg,bool scatter) {
     const size_t first=(size_t(blockIdx.x)*blockDim.x+threadIdx.x)*16;

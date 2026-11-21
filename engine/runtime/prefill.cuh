@@ -1615,8 +1615,11 @@ inline void pf_step(Model& m, Prefill& P, int M, int context, u64 ls0, cudaStrea
     pf_mark(7, st);
     for (int i = 0; i < m.nl; ++i)
     {
-        pf_set_step(P, ls0 + i, st);
+        // cp_pf_pre(i) must finish BEFORE pf_ix(i - 1) appends/scores layer i's index keys in staged pool[i % 2],
+        // and pf_ix(i - 1) must run BEFORE pf_set_step advances P.stepp from ls0 + i - 1 to ls0 + i.
         cp_pf_pre(m, i, context - M, st);
+        if (i > 0) pf_ix(m, P, i - 1, M, context, st);
+        pf_set_step(P, ls0 + i, st);
         pf_attn_block(m, P, i, M, context, st);
         cp_pf_prefetch(m, i, context - M, st);
         cp_pf_post(m, i, context - M, M, 0, 0, st);
@@ -1624,7 +1627,6 @@ inline void pf_step(Model& m, Prefill& P, int M, int context, u64 ls0, cudaStrea
         pf_mlp_block(m, P, i, M, st);
         pf_consume_x(m, P, i, M, st);
         if (P.dfl_tap) P.dfl_tap(m, P, i, M, st);
-        pf_ix(m, P, i, M, context, st);
     }
     pf_finish(P, M, st);
     pf_prof().flush(M);
@@ -1642,8 +1644,11 @@ inline void pf_step2(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA,
     pf_mark(7, st);
     for (int i = 0; i < m.nl; ++i)
     {
-        pf_set_step(A, lsA + i, st);
+        // Wait for layer i's staged KV/index pool before pf_ix(A, i - 1) reads/appends layer i's index keys
+        // (while A.stepp is still lsA + i - 1).
         cp_pf_pre(m, i, ctxA - MA, st);
+        if (i > 0) pf_ix(m, A, i - 1, MA, ctxA, st);
+        pf_set_step(A, lsA + i, st);
         pf_attn_block(m, A, i, MA, ctxA, st);
         cp_pf_prefetch(m, i, ctxA - MA, st);
         if (i > 0) { pf_consume_x(m, B, i - 1, MB, st); if (B.dfl_tap) B.dfl_tap(m, B, i - 1, MB, st); pf_ix(m, B, i - 1, MB, ctxB, st); }
@@ -1656,7 +1661,6 @@ inline void pf_step2(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA,
         pf_mlp_block(m, B, i, MB, st);
         pf_consume_x(m, A, i, MA, st);
         if (A.dfl_tap) A.dfl_tap(m, A, i, MA, st);
-        pf_ix(m, A, i, MA, ctxA, st);
     }
     pf_finish_put(A, MA, st);
     pf_consume_x(m, B, m.nl - 1, MB, st);
@@ -1718,9 +1722,11 @@ inline void pf_step2s(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA
     pf_mark(7, sb);
     for (int i = 0; i < m.nl; ++i)
     {
+        // Wait for layer i's staged KV/index pool before pf_ix(A, i - 1) appends/scores layer i's index keys
+        // (still on layer-step lsA + i - 1); lane B's pf_ix waits on L.ea[i], which is recorded after cp_pf_pre(i).
+        cp_pf_pre(m, i, ctxA - MA, sa);
         if (i > 0) pf_ix(m, A, i - 1, MA, ctxA, sa, L.eb[i - 1]);      // GR8_PF_OWN=2: layer i's IDs (layer-step i - 1)
         pf_set_step(A, lsA + i, sa);
-        cp_pf_pre(m, i, ctxA - MA, sa);
         pf_attn_block(m, A, i, MA, ctxA, sa, false, i > 0 ? L.eb[i - 1] : nullptr, L.ea[i]);
         cp_pf_prefetch(m, i, ctxA - MA, sa);
         pf_consume(A, 0, MA, m.layers[i].mlp_norm, A.x2, sa, pf_steer(m, A, i, true));

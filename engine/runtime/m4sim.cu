@@ -1263,8 +1263,7 @@ int main(int argc, char** argv)
         for (Model& m : R) pf_consume_ag(L[m.rank], c, M, L[m.rank].*out, st);
     };
     // the consume of layer i's MLP partial (c2 / c3 in the RS form; GR8_PF_OWN: c3 carries the owner records)
-    // (GR8_PF_OWN=2: then the owner IDs of full-index layer i + 1 on c4)
-    auto pf_deliver_consume_x = [&](std::vector<Prefill>& L, const Loop& l, int i, int M, int ctx) {
+    auto pf_deliver_consume_x = [&](std::vector<Prefill>& L, const Loop& l, int i, int M) {
         if (!pf_rs)
         {
             for (Model& m : R) pf_consume(L[m.rank], 1, M, norm_after(m, i), L[m.rank].x, st);
@@ -1273,7 +1272,11 @@ int main(int argc, char** argv)
         for (Model& m : R) pf_consume_x_rs(m, L[m.rank], i, M, st);
         deliver_l(l, 3, M, 2, pf_x_row_bytes(R[0], L[0], i));
         for (Model& m : R) pf_consume_x_ag(m, L[m.rank], i, M, st);
-        if (!pf_ix_next(R[0], L[0], i)) return;
+    };
+    // GR8_PF_OWN=2 / 4: owner IDs of full-index layer i + 1 on c4 (must run AFTER cp_gather(i + 1) staged
+    // layer i + 1's index pool and BEFORE pf_set_step advances L[0].stepp to ls + i + 1)
+    auto pf_deliver_ix = [&](std::vector<Prefill>& L, const Loop& l, int i, int M, int ctx) {
+        if (!pf_rs || !pf_ix_next(R[0], L[0], i)) return;
         for (Model& m : R) pf_ix_score(m, L[m.rank], i, M, ctx, st);
         deliver_l(l, 4, M, 2, IX_ROW);
         for (Model& m : R) pf_ix_gather(m, L[m.rank], i, M, st);
@@ -1349,15 +1352,16 @@ int main(int argc, char** argv)
         for (Model& m : R) pf_embed(m, PF[m.rank], M, st);
         for (int i = 0; i < NL; ++i)
         {
-            pf_set_step(PF[0], ls0 + i, st);
             cp_gather(i, context - M);
+            if (i > 0) pf_deliver_ix(PF, loop_pf, i - 1, M, context);
+            pf_set_step(PF[0], ls0 + i, st);
             for (Model& m : R) pf_attn_block(m, PF[m.rank], i, M, context, st);
             cp_back(i, context - M, M);
             pf_deliver_part(loop_pf, 0, M);
             pf_deliver_consume(PF, loop_pf, 0, M, [&](Model& m) { return m.layers[i].mlp_norm; }, &Prefill::x2);
             for (Model& m : R) pf_mlp_block(m, PF[m.rank], i, M, st);
             pf_deliver_part(loop_pf, 1, M);
-            pf_deliver_consume_x(PF, loop_pf, i, M, context);
+            pf_deliver_consume_x(PF, loop_pf, i, M);
         }
         pf_fin_rs(PF, loop_pf, M);
         cp_exit();
@@ -1374,9 +1378,6 @@ int main(int argc, char** argv)
             for (Model& m : R) pf_mlp_block(m, L[m.rank], i, M, st);
             pf_deliver_part(l, 1, M);
         };
-        auto fin = [&](std::vector<Prefill>& L, const Loop& l, int i, int M, int ctx) {
-            pf_deliver_consume_x(L, l, i, M, ctx);
-        };
         sel_ma = MA; sel_mb = MB;
         cp_enter();
         for (Model& m : R) pf_embed(m, PF[m.rank], MA, st);
@@ -1385,16 +1386,17 @@ int main(int argc, char** argv)
         for (int i = 0; i < NL; ++i)
         {
             cp_gather(i, std::min(ctxA - MA, ctxB - MB));
+            if (i > 0) pf_deliver_ix(PF, loop_pf, i - 1, MA, ctxA);
             attn(PF, loop_pf, i, MA, ctxA, lsA + i);
-            if (i > 0) fin(PF2, loop_pf2, i - 1, MB, ctxB);
+            if (i > 0) { pf_deliver_consume_x(PF2, loop_pf2, i - 1, MB); pf_deliver_ix(PF2, loop_pf2, i - 1, MB, ctxB); }
             attn(PF2, loop_pf2, i, MB, ctxB, lsB + i);
             cp_back(i, ctxA - MA, MA);
             cp_back(i, ctxB - MB, MB);
             mlp(PF, loop_pf, i, MA);
             mlp(PF2, loop_pf2, i, MB);
-            fin(PF, loop_pf, i, MA, ctxA);
+            pf_deliver_consume_x(PF, loop_pf, i, MA);
         }
-        fin(PF2, loop_pf2, NL - 1, MB, ctxB);
+        pf_deliver_consume_x(PF2, loop_pf2, NL - 1, MB);
         pf_fin_rs(PF, loop_pf, MA);
         pf_fin_rs(PF2, loop_pf2, MB);
         cp_exit();

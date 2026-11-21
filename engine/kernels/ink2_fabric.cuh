@@ -38,10 +38,11 @@ __device__ __forceinline__ void ar_st_release_sys(unsigned long long* p, unsigne
 }
 
 // n16 cells of 16 bytes
+template <bool Cv = false>
 __global__ void k_ink2_ar_copy(const uint4* __restrict__ src, uint4* __restrict__ dst, size_t n16)
 {
     const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n16) dst[i] = src[i];
+    if (i < n16) dst[i] = Cv ? __ldcv(src + i) : src[i];
 }
 
 struct ArWait
@@ -90,7 +91,7 @@ inline void ar_exchange(const g6::FabricDev& f, unsigned long long step, int c, 
     k_ink2_ar_ring_wait<<<1, 32, 0, st>>>(a);
     for (int p = 0; p < f.nr; ++p)
         if (p != f.rank)
-            k_ink2_ar_copy<<<grid, 256, 0, st>>>(reinterpret_cast<const uint4*>(f.recv + g6::fab_recv_off(f, par, c, p)),
-                                                 reinterpret_cast<uint4*>(parts + static_cast<size_t>(p) * bytes), n16);
+            k_ink2_ar_copy<true><<<grid, 256, 0, st>>>(reinterpret_cast<const uint4*>(f.recv + g6::fab_recv_off(f, par, c, p)),
+                                                       reinterpret_cast<uint4*>(parts + static_cast<size_t>(p) * bytes), n16);
 }
 }   // namespace ink2

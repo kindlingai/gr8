@@ -106,9 +106,9 @@ __global__ void __launch_bounds__(128) k_rs_gather_y_mx(g6::FabricDev f,const u6
     const char* src=glue::peer_slot(f,*stepp,cag,p);
     const size_t nc=(size_t)q*H, ns=nc/32;
     for(size_t i=(size_t)blockIdx.x*128+threadIdx.x;i<nc/16;i+=(size_t)gridDim.x*128)
-        reinterpret_cast<uint4*>(codes+(size_t)p*nc)[i]=reinterpret_cast<const uint4*>(src)[i];
+        reinterpret_cast<uint4*>(codes+(size_t)p*nc)[i]=__ldcv(reinterpret_cast<const uint4*>(src)+i);
     for(size_t i=(size_t)blockIdx.x*128+threadIdx.x;i<ns/16;i+=(size_t)gridDim.x*128)
-        reinterpret_cast<uint4*>(scales+(size_t)p*ns)[i]=reinterpret_cast<const uint4*>(src+nc)[i];
+        reinterpret_cast<uint4*>(scales+(size_t)p*ns)[i]=__ldcv(reinterpret_cast<const uint4*>(src+nc)+i);
 }
 // The BF16 readers intentionally see local dequant, including this rank's own rows.
 __global__ void __launch_bounds__(256) k_rs_dequant_y(const uint8_t* codes,const uint8_t* scales,__nv_bfloat16* y,size_t n) {
@@ -140,7 +140,7 @@ __global__ void __launch_bounds__(128) k_rs_tail_state(g6::FabricDev f,const u64
         else if((j-=n2)<n3) local=reinterpret_cast<char*>(b.post+(size_t)first*4)+j;
         else if((j-=n3)<n4) local=reinterpret_cast<char*>(b.comb+(size_t)first*16)+j;
         else { j-=n4; local=reinterpret_cast<char*>(y+(size_t)first*H)+j; }
-        if constexpr (Import) *reinterpret_cast<uint4*>(local)=*reinterpret_cast<const uint4*>(slot+i);
+        if constexpr (Import) *reinterpret_cast<uint4*>(local)=__ldcv(reinterpret_cast<const uint4*>(slot+i));
         else *reinterpret_cast<uint4*>(const_cast<char*>(slot)+i)=*reinterpret_cast<const uint4*>(local);
     }
 }
