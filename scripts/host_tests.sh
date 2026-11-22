@@ -490,6 +490,12 @@ run_job live_migrate_test '
     "$REPO/engine/runtime/s2/tests/live_migrate_test.cpp" "${KVLIB[@]}" -o "$D/live_migrate_test"
   "$D/live_migrate_test"
 '
+# EL8 (#156) in-process live width switch coordinator (pre-capture, deferred capture, rollbacks) & multi-rank Service SWITCH fence
+run_job live_switch_test '
+  g++ -std=c++17 -O1 -g -Wall -Wextra -pthread -fsanitize=address,undefined -I "$REPO/engine/runtime" \
+    "$REPO/engine/runtime/s2/tests/live_switch_test.cpp" "${KVLIB[@]}" -o "$D/live_switch_test"
+  "$D/live_switch_test" 2>/dev/null
+'
 run_job ds41_geom_dump '
   g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/ds41_geom_dump.cpp" -o "$D/ds41_geom_dump"
   (cd "$REPO/engine/tests" && DS41_GEOM_DUMP="$D/ds41_geom_dump" python3 -m unittest -q test_ds41_geom)

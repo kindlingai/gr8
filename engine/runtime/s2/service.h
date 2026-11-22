@@ -104,9 +104,10 @@ struct NativeHooks {
     // and recalls are Resize events on FLASH_KV_TIER, so they need the resize hook
     std::function<uint32_t()> flash_room;
     FlashLend flash;
-    // optional (#159): export a live session's KV at an event fence, and import canonical KV into a newly bound slot
+    // optional (#159, #156): export/import a live session's KV and cut over to a new width at an event fence
     std::function<void(const Slot&, const Export&)> export_session;
     std::function<void(const Grant&)> import_session;
+    std::function<void(const SwitchOp&)> switch_width;
     DispatchHooks dispatch;
     // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
     int dfl_kv = 7;
@@ -414,6 +415,7 @@ public:
         require(!native_.module.ctx || !(native_.bind || native_.bind_request || native_.grown || native_.retire || native_.fence ||
                                          native_.before_work || native_.drained || native_.resize || native_.shrink ||
                                          native_.flash_room || native_.export_session || native_.import_session ||
+                                         native_.switch_width ||
                                          native_.pool.retain || native_.pool.park || native_.dispatch.launch ||
                                          native_.dispatch.bucket || native_.dispatch.mode || native_.dispatch.prefill ||
                                          native_.dispatch.logprob || native_.dispatch.dfl_ok || native_.dispatch.dfl_start ||
@@ -437,6 +439,7 @@ public:
         if (m.resize) h.resize = [&](const Resize& r) { mod_.resize(r); };
         if (m.export_session) h.export_session = [&](const Slot& s, const Export& ex) { mod_.export_session(s, ex); };
         if (m.import_session) h.import_session = [&](const Grant& g) { mod_.import_session(g); };
+        if (m.switch_width) h.switch_width = [&](const SwitchOp& sw) { mod_.switch_width(sw); };
         h.shrink = [&](const Shrink& k, const Run& was, uint64_t length) {   // a worker's pool changed in the driver first
             require(mod_.o.shrink != nullptr, "a shrink commit without the native shrink hook");
             mod_.shrink(k, was, length);

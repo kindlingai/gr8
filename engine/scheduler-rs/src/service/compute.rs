@@ -84,6 +84,7 @@ fn kind_name(k: u32) -> &'static str {
         wire::CANCEL => "cancel",
         wire::EXPORT => "export",
         wire::IMPORT => "import",
+        wire::SWITCH => "switch",
         _ => "admit",
     }
 }

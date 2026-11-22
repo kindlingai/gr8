@@ -224,13 +224,15 @@ def cmd_status(argv):
 def cmd_scale(argv):
     """Send `scale` to the head, then follow it in the head's status until it is done (0) or failed (1)."""
     sys.stdout.reconfigure(line_buffering=True)   # a pipe (a CI log, a kubectl exec) sees each phase as it happens
-    drain, rest = '300', []
+    drain, live, rest = '300', False, []
     it = iter(argv)
     for a in it:
         if a == '--drain-timeout':
             drain = next(it, '')
         elif a.startswith('--drain-timeout='):
             drain = a.partition('=')[2]
+        elif a == '--live':
+            live = True
         else:
             rest.append(a)
     if not drain.replace('.', '', 1).isdigit():
@@ -251,7 +253,7 @@ def cmd_scale(argv):
         return 1
     head = m[0][0]
     try:
-        r = rpc(m, head, {'t': 'scale', 'argv': words, 'drain_timeout': float(drain)}, timeout=30)
+        r = rpc(m, head, {'t': 'scale', 'argv': words, 'drain_timeout': float(drain), 'live': live}, timeout=30)
     except OSError as e:
         print(f'gr8: the head {head} does not answer ({e})', file=sys.stderr)
         return 1

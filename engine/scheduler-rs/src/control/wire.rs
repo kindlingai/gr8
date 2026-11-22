@@ -9,7 +9,7 @@ use crate::scheduler::{self as sch, Grant, Identity, Key, Run, Shrink, PAGE};
 
 /// The link's version: a frame of another version is refused, and the bootstrap agreement carries it, so ranks of
 /// different builds refuse each other there (scheduler.h CONTROL_VERSION).
-pub const CONTROL_VERSION: u64 = 16;
+pub const CONTROL_VERSION: u64 = 17;
 /// The first word of every frame.
 pub const MAGIC: u64 = 0x473653324530 + CONTROL_VERSION;
 
@@ -38,6 +38,8 @@ pub const RESIZE: u32 = 3;
 pub const EXPORT: u32 = 4;
 /// A session with imported canonical KV is admitted at an event fence (#159).
 pub const IMPORT: u32 = 5;
+/// An in-process live width switch cuts over at an event fence (#156).
+pub const SWITCH: u32 = 6;
 
 /// The steering scopes a decoder accepts (steering.h Scope) and the identity's limits.
 const SCOPE_SHARED: u8 = 1;
@@ -77,7 +79,16 @@ pub struct Export {
     pub rows: u32,
 }
 
-/// scheduler.h Commit whole: the scheduler's part, the hold flag, a Resize event's change, and session Export/Import.
+/// scheduler.h SwitchOp: an in-process live width switch at an event fence (#156).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SwitchOp {
+    pub group_id: u64,
+    pub target_nr: u32,
+    pub flags: u32,
+}
+
+/// scheduler.h Commit whole: the scheduler's part, the hold flag, Resize, Export/Import, and SwitchOp.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Commit {
@@ -88,6 +99,8 @@ pub struct Commit {
     pub has_export: bool,
     pub export: Export,
     pub has_import: bool,
+    pub has_switch: bool,
+    pub switch_op: SwitchOp,
 }
 
 /// steering.h Identity's defaults: off, scope Full.
@@ -137,6 +150,8 @@ impl Commit {
             has_export: false,
             export: Export::default(),
             has_import: false,
+            has_switch: false,
+            switch_op: SwitchOp::default(),
         }
     }
 }
@@ -234,7 +249,7 @@ impl<'a> Dec<'a> {
         n.request = self.u64()?;
         n.payload_hash = self.u64()?;
         let k = self.u64()?;
-        require((1..=5).contains(&k), "unknown event kind")?;
+        require((1..=6).contains(&k), "unknown event kind")?;
         n.kind = k as u32;
         Ok(n)
     }
@@ -314,7 +329,7 @@ pub fn check_match(n: &Notice, x: &Commit) -> R<()> {
     require((n.kind == RESIZE) == x.has_resize, "a resize commit needs a RESIZE notice and back")?;
     if x.has_resize {
         require(
-            !c.has_admit && !c.has_cancel && !x.hold && !c.has_shrink && !x.has_export && !x.has_import,
+            !c.has_admit && !c.has_cancel && !x.hold && !c.has_shrink && !x.has_export && !x.has_import && !x.has_switch,
             "a resize commit changes nothing else",
         )?;
     }
@@ -324,14 +339,30 @@ pub fn check_match(n: &Notice, x: &Commit) -> R<()> {
     require((n.kind == EXPORT) == x.has_export, "an export commit needs an EXPORT notice and back")?;
     if x.has_export {
         require(
-            !c.has_admit && !c.has_cancel && !x.hold && !x.has_resize && !c.has_shrink && !x.has_import,
+            !c.has_admit && !c.has_cancel && !x.hold && !x.has_resize && !c.has_shrink && !x.has_import && !x.has_switch,
             "an export commit changes nothing else",
         )?;
     }
     if x.has_import {
         require(
-            n.kind == IMPORT && c.has_admit && c.admit.reuse != 0 && !x.has_resize && !x.has_export,
+            n.kind == IMPORT && c.has_admit && c.admit.reuse != 0 && !x.has_resize && !x.has_export && !x.has_switch,
             "an import commit needs an IMPORT notice and a grant with imported rows",
+        )?;
+    }
+    require((n.kind == SWITCH) == x.has_switch, "a switch commit needs a SWITCH notice and back")?;
+    if x.has_switch {
+        require(
+            !c.has_admit
+                && !c.has_cancel
+                && !x.hold
+                && !x.has_resize
+                && !c.has_shrink
+                && !x.has_export
+                && !x.has_import
+                && x.switch_op.group_id != 0
+                && x.switch_op.target_nr >= 1
+                && x.switch_op.target_nr <= 8,
+            "a switch commit changes nothing else and names a valid target width",
         )?;
     }
     Ok(())
@@ -405,6 +436,12 @@ pub fn encode_commit(n: &Notice, x: &Commit) -> R<Vec<u8>> {
         e.u64(u64::from(ex.rows));
     }
     e.u64(u64::from(x.has_import));
+    e.u64(u64::from(x.has_switch));
+    if x.has_switch {
+        e.u64(x.switch_op.group_id);
+        e.u64(u64::from(x.switch_op.target_nr));
+        e.u64(u64::from(x.switch_op.flags));
+    }
     Ok(e.b)
 }
 
@@ -532,6 +569,14 @@ pub fn decode_commit(b: &[u8]) -> R<(Notice, Commit)> {
     let has = d.u64()?;
     require(has <= 1, "invalid import flag")?;
     x.has_import = has != 0;
+    let has = d.u64()?;
+    require(has <= 1, "invalid optional switch")?;
+    if has != 0 {
+        x.switch_op.group_id = d.u64()?;
+        x.switch_op.target_nr = d.u32()?;
+        x.switch_op.flags = d.u32()?;
+        x.has_switch = true;
+    }
     check_match(&n, &x)?;
     d.end()?;
     Ok((n, x))

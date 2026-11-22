@@ -461,8 +461,9 @@ struct g6s2_drv_hooks {
     int32_t (*grown)(void* ctx, const g6sch_slot* s, const g6sch_run* r);
     int32_t (*export_session)(void* ctx, const g6sch_slot* s, const struct g6sch_export* ex);
     int32_t (*import_session)(void* ctx, const g6sch_grant* g);
+    int32_t (*switch_width)(void* ctx, const struct g6sch_switch* sw);
     bool has_prefill_pack, has_dfl_ok, has_terminal, has_grow, has_finished, has_resize, has_shrink, has_settle, has_grown;
-    bool has_export_session, has_import_session;
+    bool has_export_session, has_import_session, has_switch_width;
 };
 // the planner's calls, through the C++ s2::Batch (which writes the round log); admit builds the session from the slot's
 // payload; inserted: Stats::inserted
@@ -488,9 +489,10 @@ g6s2_driver* g6s2_driver_new(const g6s2_drv_hooks* h, const g6s2_drv_planner* p,
 void g6s2_driver_free(g6s2_driver* d);
 const char* g6s2_driver_error(const g6s2_driver* d);
 void g6s2_driver_view(const g6s2_driver* d, g6s2_drv_view* out);
-// digest: the scheduler's before the commit; pay: null without an admit; export_op: null without an export; freed: room for n runs
+// digest: the scheduler's before the commit; pay: null without an admit; export_op: null without an export; switch_op: null without a switch; freed: room for n runs
 int32_t g6s2_driver_apply(const g6s2_driver* d, const g6sch_commit* e, uint64_t digest, bool resize,
                           const g6s2_drv_payload* pay, const struct g6sch_export* export_op, bool is_import,
+                          const struct g6sch_switch* switch_op,
                           g6sch_run* freed, size_t* n_freed, bool* admitted);
 int32_t g6s2_driver_step(const g6s2_driver* d, g6sch_quantum* out);
 void g6s2_driver_fail(const g6s2_driver* d);
@@ -537,9 +539,10 @@ struct g6s2_module_ops {
     int32_t (*drained)(void* ctx, bool* out);
     int32_t (*resize)(void* ctx, const g6sch_resize* r);
     int32_t (*flash_room)(void* ctx, uint32_t* out);
-    // session state export/import at an event fence (#159)
+    // session state export/import and in-process live width switch at an event fence (#159, #156)
     int32_t (*export_session)(void* ctx, const g6sch_slot* s, const struct g6sch_export* ex);
     int32_t (*import_session)(void* ctx, const g6sch_grant* g);
+    int32_t (*switch_width)(void* ctx, const struct g6sch_switch* sw);
     // steps (s2/dispatch.h)
     int32_t (*bucket)(void* ctx, bool draft, int32_t context, int32_t* out);
     int32_t (*mode)(void* ctx, int32_t old_solo, int32_t new_solo);
@@ -601,7 +604,8 @@ struct g6s2_pool_ops {
 struct g6ctl_notice { uint64_t epoch, event, boundary, request, payload_hash; uint32_t kind; };
 struct g6ctl_ack { g6ctl_notice notice; uint32_t rank; uint64_t state_hash; uint32_t room; };
 struct g6sch_export { g6sch_key key; uint64_t export_id; uint32_t first_row, rows; };
-struct g6ctl_commit { g6sch_commit c; bool hold; bool has_resize; g6sch_resize resize; bool has_export; g6sch_export export_op; bool has_import; };
+struct g6sch_switch { uint64_t group_id; uint32_t target_nr, flags; };
+struct g6ctl_commit { g6sch_commit c; bool hold; bool has_resize; g6sch_resize resize; bool has_export; g6sch_export export_op; bool has_import; bool has_switch; g6sch_switch switch_op; };
 // any frame: tag picks the fields (notice: NOTICE and COMMIT; ack: ACK; commit: COMMIT; epoch, request and bytes:
 // REQUEST; epoch: QUIT; epoch, rank and seq: SYNC; epoch and seq: GO). A decoded REQUEST's bytes point into the input
 struct g6ctl_frame {
@@ -1149,16 +1153,17 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6s2_drv_view) G6SCH_FIELD(g6s2_drv_view, s) G6SCH_FIELD(g6s2_drv_view, n) G6SCH_FIELD(g6s2_drv_view, st)
     G6SCH_TYPE(g6s2_drv_payload) G6SCH_FIELD(g6s2_drv_payload, prompt_len) G6SCH_FIELD(g6s2_drv_payload, chunk) G6SCH_FIELD(g6s2_drv_payload, decode_prompt) G6SCH_FIELD(g6s2_drv_payload, steering_ok)
     G6SCH_TYPE(g6s2_drv_pool) G6SCH_FIELD(g6s2_drv_pool, grow) G6SCH_FIELD(g6s2_drv_pool, shrink) G6SCH_FIELD(g6s2_drv_pool, release) G6SCH_FIELD(g6s2_drv_pool, head)
-    G6SCH_TYPE(g6s2_drv_hooks) G6SCH_FIELD(g6s2_drv_hooks, ctx) G6SCH_FIELD(g6s2_drv_hooks, bind) G6SCH_FIELD(g6s2_drv_hooks, retire) G6SCH_FIELD(g6s2_drv_hooks, prefill) G6SCH_FIELD(g6s2_drv_hooks, prefill_pack) G6SCH_FIELD(g6s2_drv_hooks, dfl_ok) G6SCH_FIELD(g6s2_drv_hooks, terminal) G6SCH_FIELD(g6s2_drv_hooks, grow) G6SCH_FIELD(g6s2_drv_hooks, finished) G6SCH_FIELD(g6s2_drv_hooks, resize) G6SCH_FIELD(g6s2_drv_hooks, shrink) G6SCH_FIELD(g6s2_drv_hooks, settle) G6SCH_FIELD(g6s2_drv_hooks, payload) G6SCH_FIELD(g6s2_drv_hooks, grown) G6SCH_FIELD(g6s2_drv_hooks, export_session) G6SCH_FIELD(g6s2_drv_hooks, import_session) G6SCH_FIELD(g6s2_drv_hooks, has_prefill_pack) G6SCH_FIELD(g6s2_drv_hooks, has_dfl_ok) G6SCH_FIELD(g6s2_drv_hooks, has_terminal) G6SCH_FIELD(g6s2_drv_hooks, has_grow) G6SCH_FIELD(g6s2_drv_hooks, has_finished) G6SCH_FIELD(g6s2_drv_hooks, has_resize) G6SCH_FIELD(g6s2_drv_hooks, has_shrink) G6SCH_FIELD(g6s2_drv_hooks, has_settle) G6SCH_FIELD(g6s2_drv_hooks, has_grown) G6SCH_FIELD(g6s2_drv_hooks, has_export_session) G6SCH_FIELD(g6s2_drv_hooks, has_import_session)
+    G6SCH_TYPE(g6s2_drv_hooks) G6SCH_FIELD(g6s2_drv_hooks, ctx) G6SCH_FIELD(g6s2_drv_hooks, bind) G6SCH_FIELD(g6s2_drv_hooks, retire) G6SCH_FIELD(g6s2_drv_hooks, prefill) G6SCH_FIELD(g6s2_drv_hooks, prefill_pack) G6SCH_FIELD(g6s2_drv_hooks, dfl_ok) G6SCH_FIELD(g6s2_drv_hooks, terminal) G6SCH_FIELD(g6s2_drv_hooks, grow) G6SCH_FIELD(g6s2_drv_hooks, finished) G6SCH_FIELD(g6s2_drv_hooks, resize) G6SCH_FIELD(g6s2_drv_hooks, shrink) G6SCH_FIELD(g6s2_drv_hooks, settle) G6SCH_FIELD(g6s2_drv_hooks, payload) G6SCH_FIELD(g6s2_drv_hooks, grown) G6SCH_FIELD(g6s2_drv_hooks, export_session) G6SCH_FIELD(g6s2_drv_hooks, import_session) G6SCH_FIELD(g6s2_drv_hooks, switch_width) G6SCH_FIELD(g6s2_drv_hooks, has_prefill_pack) G6SCH_FIELD(g6s2_drv_hooks, has_dfl_ok) G6SCH_FIELD(g6s2_drv_hooks, has_terminal) G6SCH_FIELD(g6s2_drv_hooks, has_grow) G6SCH_FIELD(g6s2_drv_hooks, has_finished) G6SCH_FIELD(g6s2_drv_hooks, has_resize) G6SCH_FIELD(g6s2_drv_hooks, has_shrink) G6SCH_FIELD(g6s2_drv_hooks, has_settle) G6SCH_FIELD(g6s2_drv_hooks, has_grown) G6SCH_FIELD(g6s2_drv_hooks, has_export_session) G6SCH_FIELD(g6s2_drv_hooks, has_import_session) G6SCH_FIELD(g6s2_drv_hooks, has_switch_width)
     G6SCH_TYPE(g6s2_drv_planner) G6SCH_FIELD(g6s2_drv_planner, ctx) G6SCH_FIELD(g6s2_drv_planner, admit) G6SCH_FIELD(g6s2_drv_planner, admit_pack) G6SCH_FIELD(g6s2_drv_planner, round) G6SCH_FIELD(g6s2_drv_planner, demote) G6SCH_FIELD(g6s2_drv_planner, promote) G6SCH_FIELD(g6s2_drv_planner, release) G6SCH_FIELD(g6s2_drv_planner, length) G6SCH_FIELD(g6s2_drv_planner, finished) G6SCH_FIELD(g6s2_drv_planner, active) G6SCH_FIELD(g6s2_drv_planner, inserted)
     G6SCH_TYPE(g6s2_lp_row) G6SCH_FIELD(g6s2_lp_row, lp) G6SCH_FIELD(g6s2_lp_row, rank) G6SCH_FIELD(g6s2_lp_row, n) G6SCH_FIELD(g6s2_lp_row, id) G6SCH_FIELD(g6s2_lp_row, tlp)
-    G6SCH_TYPE(g6s2_module_ops) G6SCH_FIELD(g6s2_module_ops, ctx) G6SCH_FIELD(g6s2_module_ops, bind) G6SCH_FIELD(g6s2_module_ops, bind_request) G6SCH_FIELD(g6s2_module_ops, grown) G6SCH_FIELD(g6s2_module_ops, shrink) G6SCH_FIELD(g6s2_module_ops, retire) G6SCH_FIELD(g6s2_module_ops, retain) G6SCH_FIELD(g6s2_module_ops, park) G6SCH_FIELD(g6s2_module_ops, fence) G6SCH_FIELD(g6s2_module_ops, before_work) G6SCH_FIELD(g6s2_module_ops, drained) G6SCH_FIELD(g6s2_module_ops, resize) G6SCH_FIELD(g6s2_module_ops, flash_room) G6SCH_FIELD(g6s2_module_ops, export_session) G6SCH_FIELD(g6s2_module_ops, import_session) G6SCH_FIELD(g6s2_module_ops, bucket) G6SCH_FIELD(g6s2_module_ops, mode) G6SCH_FIELD(g6s2_module_ops, launch) G6SCH_FIELD(g6s2_module_ops, prefill) G6SCH_FIELD(g6s2_module_ops, prefill_seq) G6SCH_FIELD(g6s2_module_ops, prefill_pack) G6SCH_FIELD(g6s2_module_ops, logprob) G6SCH_FIELD(g6s2_module_ops, draft_lp) G6SCH_FIELD(g6s2_module_ops, dfl_ok) G6SCH_FIELD(g6s2_module_ops, dfl_start) G6SCH_FIELD(g6s2_module_ops, dfl) G6SCH_FIELD(g6s2_module_ops, gm_on) G6SCH_FIELD(g6s2_module_ops, gm_bits) G6SCH_FIELD(g6s2_module_ops, gm_words) G6SCH_FIELD(g6s2_module_ops, pen_rows) G6SCH_FIELD(g6s2_module_ops, pen_sess)
+    G6SCH_TYPE(g6s2_module_ops) G6SCH_FIELD(g6s2_module_ops, ctx) G6SCH_FIELD(g6s2_module_ops, bind) G6SCH_FIELD(g6s2_module_ops, bind_request) G6SCH_FIELD(g6s2_module_ops, grown) G6SCH_FIELD(g6s2_module_ops, shrink) G6SCH_FIELD(g6s2_module_ops, retire) G6SCH_FIELD(g6s2_module_ops, retain) G6SCH_FIELD(g6s2_module_ops, park) G6SCH_FIELD(g6s2_module_ops, fence) G6SCH_FIELD(g6s2_module_ops, before_work) G6SCH_FIELD(g6s2_module_ops, drained) G6SCH_FIELD(g6s2_module_ops, resize) G6SCH_FIELD(g6s2_module_ops, flash_room) G6SCH_FIELD(g6s2_module_ops, export_session) G6SCH_FIELD(g6s2_module_ops, import_session) G6SCH_FIELD(g6s2_module_ops, switch_width) G6SCH_FIELD(g6s2_module_ops, bucket) G6SCH_FIELD(g6s2_module_ops, mode) G6SCH_FIELD(g6s2_module_ops, launch) G6SCH_FIELD(g6s2_module_ops, prefill) G6SCH_FIELD(g6s2_module_ops, prefill_seq) G6SCH_FIELD(g6s2_module_ops, prefill_pack) G6SCH_FIELD(g6s2_module_ops, logprob) G6SCH_FIELD(g6s2_module_ops, draft_lp) G6SCH_FIELD(g6s2_module_ops, dfl_ok) G6SCH_FIELD(g6s2_module_ops, dfl_start) G6SCH_FIELD(g6s2_module_ops, dfl) G6SCH_FIELD(g6s2_module_ops, gm_on) G6SCH_FIELD(g6s2_module_ops, gm_bits) G6SCH_FIELD(g6s2_module_ops, gm_words) G6SCH_FIELD(g6s2_module_ops, pen_rows) G6SCH_FIELD(g6s2_module_ops, pen_sess)
     G6SCH_TYPE(g6s2_pool_hit) G6SCH_FIELD(g6s2_pool_hit, skip) G6SCH_FIELD(g6s2_pool_hit, lcp) G6SCH_FIELD(g6s2_pool_hit, why) G6SCH_FIELD(g6s2_pool_hit, age) G6SCH_FIELD(g6s2_pool_hit, stored) G6SCH_FIELD(g6s2_pool_hit, tier) G6SCH_FIELD(g6s2_pool_hit, slot)
     G6SCH_TYPE(g6s2_pool_ops) G6SCH_FIELD(g6s2_pool_ops, ctx) G6SCH_FIELD(g6s2_pool_ops, match) G6SCH_FIELD(g6s2_pool_ops, take) G6SCH_FIELD(g6s2_pool_ops, digest) G6SCH_FIELD(g6s2_pool_ops, tiers) G6SCH_FIELD(g6s2_pool_ops, refusal) G6SCH_FIELD(g6s2_pool_ops, r_rows) G6SCH_FIELD(g6s2_pool_ops, make_room) G6SCH_FIELD(g6s2_pool_ops, pool) G6SCH_FIELD(g6s2_pool_ops, max_run_pages) G6SCH_FIELD(g6s2_pool_ops, grow) G6SCH_FIELD(g6s2_pool_ops, count) G6SCH_FIELD(g6s2_pool_ops, status)
     G6SCH_TYPE(g6ctl_notice) G6SCH_FIELD(g6ctl_notice, epoch) G6SCH_FIELD(g6ctl_notice, event) G6SCH_FIELD(g6ctl_notice, boundary) G6SCH_FIELD(g6ctl_notice, request) G6SCH_FIELD(g6ctl_notice, payload_hash) G6SCH_FIELD(g6ctl_notice, kind)
     G6SCH_TYPE(g6ctl_ack) G6SCH_FIELD(g6ctl_ack, notice) G6SCH_FIELD(g6ctl_ack, rank) G6SCH_FIELD(g6ctl_ack, state_hash) G6SCH_FIELD(g6ctl_ack, room)
     G6SCH_TYPE(g6sch_export) G6SCH_FIELD(g6sch_export, key) G6SCH_FIELD(g6sch_export, export_id) G6SCH_FIELD(g6sch_export, first_row) G6SCH_FIELD(g6sch_export, rows)
-    G6SCH_TYPE(g6ctl_commit) G6SCH_FIELD(g6ctl_commit, c) G6SCH_FIELD(g6ctl_commit, hold) G6SCH_FIELD(g6ctl_commit, has_resize) G6SCH_FIELD(g6ctl_commit, resize) G6SCH_FIELD(g6ctl_commit, has_export) G6SCH_FIELD(g6ctl_commit, export_op) G6SCH_FIELD(g6ctl_commit, has_import)
+    G6SCH_TYPE(g6sch_switch) G6SCH_FIELD(g6sch_switch, group_id) G6SCH_FIELD(g6sch_switch, target_nr) G6SCH_FIELD(g6sch_switch, flags)
+    G6SCH_TYPE(g6ctl_commit) G6SCH_FIELD(g6ctl_commit, c) G6SCH_FIELD(g6ctl_commit, hold) G6SCH_FIELD(g6ctl_commit, has_resize) G6SCH_FIELD(g6ctl_commit, resize) G6SCH_FIELD(g6ctl_commit, has_export) G6SCH_FIELD(g6ctl_commit, export_op) G6SCH_FIELD(g6ctl_commit, has_import) G6SCH_FIELD(g6ctl_commit, has_switch) G6SCH_FIELD(g6ctl_commit, switch_op)
     G6SCH_TYPE(g6ctl_frame) G6SCH_FIELD(g6ctl_frame, tag) G6SCH_FIELD(g6ctl_frame, notice) G6SCH_FIELD(g6ctl_frame, ack) G6SCH_FIELD(g6ctl_frame, commit) G6SCH_FIELD(g6ctl_frame, epoch) G6SCH_FIELD(g6ctl_frame, request) G6SCH_FIELD(g6ctl_frame, seq) G6SCH_FIELD(g6ctl_frame, rank) G6SCH_FIELD(g6ctl_frame, bytes) G6SCH_FIELD(g6ctl_frame, n)
     G6SCH_TYPE(g6ctl_boot) G6SCH_FIELD(g6ctl_boot, rank) G6SCH_FIELD(g6ctl_boot, ranks) G6SCH_FIELD(g6ctl_boot, timeout) G6SCH_FIELD(g6ctl_boot, port) G6SCH_FIELD(g6ctl_boot, head_ip) G6SCH_FIELD(g6ctl_boot, head_ip_n) G6SCH_FIELD(g6ctl_boot, directory) G6SCH_FIELD(g6ctl_boot, directory_n) G6SCH_FIELD(g6ctl_boot, agreement) G6SCH_FIELD(g6ctl_boot, agreement_n)
     G6SCH_TYPE(g6svc_command) G6SCH_FIELD(g6svc_command, epoch) G6SCH_FIELD(g6svc_command, request) G6SCH_FIELD(g6svc_command, hash) G6SCH_FIELD(g6svc_command, admit) G6SCH_FIELD(g6svc_command, kind)

@@ -434,13 +434,13 @@ uint64_t status_section(uint64_t seed, std::vector<std::string>* lines) {
 int main(int argc, char** argv) {
     struct Section { const char* name; uint64_t seed; uint64_t (*run)(uint64_t, std::vector<std::string>*); uint64_t want; };
     // DS41 takes configs the other shapes refuse (mtp 0, park, c8 packs).
-    // Capability transcript re-recorded for control v16 (Export/Import, #159); files/command/ingress unchanged.
+    // Capability transcript re-recorded for control v17 (Switch, #156); number/command/ingress/files/trace/status unchanged.
     const bool ds41 = g6mod::has(G6_CAP_PARK);
     const Section sections[] = {
         {"number", 1, number_section, 0x33740fd68ae4b673ull},
         {"command", 2, command_section, 0x7830189284d224c3ull},
         {"ingress", 3, ingress_section, 0x16ff191341caef03ull},
-        {"capability", 4, capability_section, ds41 ? 0x91778d8e4ded1e44ull : 0xd0dbc678dc17b08eull},
+        {"capability", 4, capability_section, ds41 ? 0x7cc86b1225daae69ull : 0x7f2e5f1920e8be2full},
         {"files", 5, files_section, ds41 ? 0x36e307a2bdeefe63ull : 0xec6dbed1b2b68bd0ull},
         {"trace", 6, trace_section, 0x8a798dcc6c22b7adull},
         {"status", 7, status_section, 0x25ab880d0fafd229ull},

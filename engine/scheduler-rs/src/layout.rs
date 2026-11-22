@@ -227,6 +227,9 @@ impl Kind for crate::control::wire::Ack {
 impl Kind for crate::control::wire::Export {
     const K: u64 = 6;
 }
+impl Kind for crate::control::wire::SwitchOp {
+    const K: u64 = 6;
+}
 impl Kind for crate::control::wire::Commit {
     const K: u64 = 6;
 }
@@ -328,6 +331,7 @@ fn_kinds!(
     crate::module::LogprobFn,
     crate::module::ModDflFn,
     crate::module::ExportSessionFn,
+    crate::module::SwitchWidthFn,
     crate::pool_ops::MatchFn,
     crate::pool_ops::TakeFn,
     crate::pool_ops::U64OutFn,
@@ -730,6 +734,7 @@ pub fn digest() -> u64 {
             grown,
             export_session,
             import_session,
+            switch_width,
             has_prefill_pack,
             has_dfl_ok,
             has_terminal,
@@ -740,7 +745,8 @@ pub fn digest() -> u64 {
             has_settle,
             has_grown,
             has_export_session,
-            has_import_session
+            has_import_session,
+            has_switch_width
         }
     );
     layout!(
@@ -778,6 +784,7 @@ pub fn digest() -> u64 {
             flash_room,
             export_session,
             import_session,
+            switch_width,
             bucket,
             mode,
             launch,
@@ -818,7 +825,8 @@ pub fn digest() -> u64 {
     layout!(h, crate::control::wire::Notice { epoch, event, boundary, request, payload_hash, kind });
     layout!(h, crate::control::wire::Ack { notice, rank, state_hash, room });
     layout!(h, crate::control::wire::Export { key, export_id, first_row, rows });
-    layout!(h, crate::control::wire::Commit { c, hold, has_resize, resize, has_export, export, has_import });
+    layout!(h, crate::control::wire::SwitchOp { group_id, target_nr, flags });
+    layout!(h, crate::control::wire::Commit { c, hold, has_resize, resize, has_export, export, has_import, has_switch, switch_op });
     layout!(h, crate::control::ffi::Frame { tag, notice, ack, commit, epoch, request, seq, rank, bytes, n });
     layout!(
         h,
