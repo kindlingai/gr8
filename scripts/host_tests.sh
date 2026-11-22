@@ -394,6 +394,15 @@ for f in "" "-DDEC_S2 -DG6_NR=4" "-DDEC_S2 -DG6_NR=3" "-DG6_MODEL_FLASH=1 -DDEC_
   "
   i=$((i + 1))
 done
+# EL6 (#154): fabric_plan_apply_group over loopback FabricPool groups in GLM, Flash and DS41 shapes
+i=0
+for f in "-DDEC_S2 -DG6_NR=4" "-DDEC_S2 -DG6_NR=3" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=2"; do
+  run_job "fabric_plan_group_$i" "
+    g++ -std=c++17 -O2 -Wall -Wextra -pthread $f -I \"\$REPO/engine/runtime\" \"\$REPO/engine/runtime/s2/tests/fabric_plan_group_test.cpp\" -o \"\$D/fabric_plan_group_test\" \"\${KVLIB[@]}\"
+    \"\$D/fabric_plan_group_test\"
+  "
+  i=$((i + 1))
+done
 
 run_job control_wire_test '
   g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_wire_test.cpp" -o "$D/control_wire_test" "${KNOBS[@]}"

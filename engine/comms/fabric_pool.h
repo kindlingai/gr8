@@ -43,12 +43,14 @@
 
 namespace g6 {
 
+constexpr int kGroupPortSpan = 80;     // a group's fabrics use base..base+79 (offsets up to DraftGather +72, plus 4 ports)
+
 struct PoolConfig {
   int index = -1;                     // this box's pool index (position in ips)
   std::vector<std::string> ips;       // rail 0 address of every pool box; ips[0] is the pool head
   std::vector<std::string> ips2;      // rail 1 addresses (empty = single rail; else one per pool box)
-  int port = 18660;                   // pool control port on the head
-  int group_port[2] = {18600, 18700}; // fabric bootstrap base of even / odd group ids (a group's fabrics use base..base+59)
+  int port = 18800;                   // pool control port on the head (outside both group port ranges)
+  int group_port[2] = {18600, 18700}; // fabric bootstrap base of even / odd group ids (each spans base..base+79)
   int s2_port[2] = {7341, 7342};      // S2 control port of even / odd group ids, on the group's rank 0
   unsigned timeout_s = 120;           // boot: how long the head waits for every box, and a box for the head
 };
@@ -82,8 +84,13 @@ inline void put(int fd, const std::string& s) {
   need(s.size() < (1u << 20), "frame too long");
   const uint32_t n = htonl((uint32_t)s.size());
   std::string b((const char*)&n, 4); b += s;
+#ifdef MSG_NOSIGNAL
+  const int flags = MSG_NOSIGNAL;
+#else
+  const int flags = 0;
+#endif
   for (size_t at = 0; at < b.size();) {
-    const ssize_t k = ::send(fd, b.data() + at, b.size() - at, MSG_NOSIGNAL);
+    const ssize_t k = ::send(fd, b.data() + at, b.size() - at, flags);
     if (k < 0 && errno == EINTR) continue;
     need(k > 0, "control link send failed (" + std::string(strerror(errno)) + ")");
     at += (size_t)k;
@@ -115,14 +122,42 @@ inline void keepalive(int fd) {
   int one = 1, idle = 10, intvl = 5, cnt = 4;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
   setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+#ifdef SO_NOSIGPIPE
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+#ifdef TCP_KEEPIDLE
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+#elif defined(TCP_KEEPALIVE)
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof idle);
+#endif
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+}
+inline int tcp_socket(bool nonblock) {
+#if defined(SOCK_CLOEXEC) && defined(SOCK_NONBLOCK)
+  return ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | (nonblock ? SOCK_NONBLOCK : 0), 0);
+#else
+  int s = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (s >= 0) {
+    fcntl(s, F_SETFD, FD_CLOEXEC);
+    if (nonblock) fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+  }
+  return s;
+#endif
+}
+inline int tcp_accept(int ls) {
+#if defined(__linux__) && defined(SOCK_CLOEXEC)
+  return ::accept4(ls, nullptr, nullptr, SOCK_CLOEXEC);
+#else
+  int c = ::accept(ls, nullptr, nullptr);
+  if (c >= 0) fcntl(c, F_SETFD, FD_CLOEXEC);
+  return c;
+#endif
 }
 // connect with a deadline (a filtered port would otherwise block for the kernel's SYN retries); -1 = not yet
 inline int connect_by(const std::string& ip, int port, Clock::time_point end) {
   sockaddr_in a = addr(ip, port);
-  int s = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0); need(s >= 0, "socket");
+  int s = tcp_socket(true); need(s >= 0, "socket");
   int rc = ::connect(s, (sockaddr*)&a, sizeof a), err = 0;
   if (rc != 0 && errno == EINPROGRESS) {
     pollfd q{s, POLLOUT, 0};
@@ -164,12 +199,13 @@ inline std::string group_refusal(const std::vector<int>& members, int pool_size)
 }
 
 // A member's fabric config in group g: base (slot sizes, layout, proxy CPU, ...) with the group's rank, addresses and
-// ports. With every pool box in pool order this is the FabricConfig a fixed fabric of the same boxes gets today, so its
-// collectives are the same bytes (the only differences are the bootstrap ports).
-inline FabricConfig group_fabric(const PoolConfig& pc, const Group& g, const FabricConfig& base) {
+// ports (g.fabric_port + port_off). With every pool box in pool order this is the FabricConfig a fixed fabric of the
+// same boxes gets today, so its collectives are the same bytes (the only differences are the bootstrap ports).
+inline FabricConfig group_fabric(const PoolConfig& pc, const Group& g, const FabricConfig& base, int port_off = 0) {
   using namespace pool_detail;
   need(g.member(), "group_fabric on a box outside the group");
   need(!base.ring, "a ring fabric (--shape ring) cannot regroup: groups are mesh only");
+  need(port_off >= 0 && port_off + 4 <= kGroupPortSpan, "fabric port offset outside the group port range");
   FabricConfig c = base;
   c.rank = g.rank;
   c.ips.clear(); c.ips2.clear();
@@ -177,7 +213,7 @@ inline FabricConfig group_fabric(const PoolConfig& pc, const Group& g, const Fab
     c.ips.push_back(pc.ips[m]);
     if (!pc.ips2.empty()) c.ips2.push_back(pc.ips2[m]);
   }
-  c.port = g.fabric_port;
+  c.port = g.fabric_port + port_off;
   return c;
 }
 
@@ -196,15 +232,15 @@ class FabricPool {
     need(n >= 2 && pc.index >= 0 && pc.index < n, "pool index out of range");
     need(pc.ips2.empty() || pc.ips2.size() == pc.ips.size(), "ips2 must name every pool box");
     for (int k = 0; k < 2; k++)
-      need(pc.group_port[k] > 0 && pc.group_port[k] + 60 < 65536 && pc.s2_port[k] > 0 && pc.s2_port[k] < 65536, "bad group port");
-    need(pc.group_port[0] + 60 <= pc.group_port[1] || pc.group_port[1] + 60 <= pc.group_port[0], "the two group port ranges overlap");
+      need(pc.group_port[k] > 0 && pc.group_port[k] + kGroupPortSpan < 65536 && pc.s2_port[k] > 0 && pc.s2_port[k] < 65536, "bad group port");
+    need(pc.group_port[0] + kGroupPortSpan <= pc.group_port[1] || pc.group_port[1] + kGroupPortSpan <= pc.group_port[0], "the two group port ranges overlap");
     for (int k = 0; k < 2; k++)
-      need(pc.port < pc.group_port[k] || pc.port > pc.group_port[k] + 59, "the pool port is inside a group port range");
+      need(pc.port < pc.group_port[k] || pc.port >= pc.group_port[k] + kGroupPortSpan, "the pool port is inside a group port range");
     pc_ = pc;
     const std::string agree = agreement();
     const auto end = Clock::now() + std::chrono::seconds(pc.timeout_s);
     if (pc.index == 0) {
-      int ls = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0); need(ls >= 0, "socket");
+      int ls = tcp_socket(false); need(ls >= 0, "socket");
       int one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
       sockaddr_in a = addr(pc.ips[0], pc.port);
       if (::bind(ls, (sockaddr*)&a, sizeof a) != 0 || ::listen(ls, 64) != 0) { ::close(ls); fail("cannot listen on the pool port"); }
@@ -215,7 +251,7 @@ class FabricPool {
           const int r = ::poll(&q, 1, left_ms(end));
           if (r < 0 && errno == EINTR) continue;
           need(r > 0, "timed out waiting for every pool box (" + std::to_string(got - 1) + " of " + std::to_string(n - 1) + " connected)");
-          int c = ::accept4(ls, nullptr, nullptr, SOCK_CLOEXEC);
+          int c = tcp_accept(ls);
           if (c < 0) continue;
           keepalive(c);
           std::string hello;

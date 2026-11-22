@@ -17,7 +17,7 @@ static std::atomic<int> fails{0};
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #x); fails++; } } while (0)
 
 static int open_fds() {
-  int n = 0; DIR* d = opendir("/proc/self/fd"); if (!d) return -1;
+  int n = 0; DIR* d = opendir("/proc/self/fd"); if (!d) d = opendir("/dev/fd"); if (!d) return -1;
   while (auto* e = readdir(d)) if (e->d_name[0] != '.') n++;
   closedir(d); return n;
 }
@@ -72,6 +72,14 @@ int main() {
     const FabricConfig c = group_fabric(pc, g, base);
     CHECK(c.rank == today.rank && c.ips == today.ips && c.ips2 == today.ips2 && c.port == today.port);
     CHECK(c.slot_bytes == today.slot_bytes && c.ncoll == today.ncoll && c.proxy_cpu == today.proxy_cpu && c.vcap == today.vcap && c.vdst_k == today.vdst_k);
+    // port_off preserves late fabrics up to DraftGather (+72) inside kGroupPortSpan (80) and refuses out-of-range offsets
+    CHECK(PoolConfig{}.port == 18800 && kGroupPortSpan == 80);
+    for (int off : {0, 32, 48, 64, 72}) CHECK(group_fabric(pc, g, base, off).port == g.fabric_port + off);
+    for (int bad_off : {-1, 77, 80}) {
+      bool bad_threw = false;
+      try { group_fabric(pc, g, base, bad_off); } catch (const std::exception&) { bad_threw = true; }
+      CHECK(bad_threw);
+    }
     Group s; s.members = {3, 2}; s.rank = 1; s.fabric_port = pc.group_port[0];
     const FabricConfig d = group_fabric(pc, s, base);
     CHECK(d.rank == 1 && d.ips.size() == 2 && d.ips2.size() == 2 && d.ips2[0] == pc.ips2[3] && d.ips2[1] == pc.ips2[2] && d.port == pc.group_port[0]);
