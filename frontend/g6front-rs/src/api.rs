@@ -2266,14 +2266,21 @@ mod http_tokenize_chat_tests {
     async fn post_raw(addr: std::net::SocketAddr, path: &str, body: &Value) -> (u16, Vec<u8>) {
         let b = serde_json::to_vec(body).unwrap();
         let mut s = TcpStream::connect(addr).await.unwrap();
-        let head = format!(
+        let mut req = format!(
             "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             b.len()
-        );
-        s.write_all(head.as_bytes()).await.unwrap();
-        s.write_all(&b).await.unwrap();
+        )
+        .into_bytes();
+        req.extend_from_slice(&b);
+        s.write_all(&req).await.unwrap();
         let mut raw = Vec::new();
-        s.read_to_end(&mut raw).await.unwrap();
+        // On BSD/macOS, when the server sends an early error response (e.g. 404) without draining the request body
+        // and closes the socket, the kernel follows the response bytes with a TCP RST (ECONNRESET).
+        match s.read_to_end(&mut raw).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && !raw.is_empty() => {}
+            Err(e) => panic!("read_to_end failed: {e}"),
+        }
         let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
         let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
