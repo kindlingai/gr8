@@ -151,17 +151,17 @@ template <class F> inline LayerTensors layer_tensors(int layer, F find)
 inline void widen_fc1(LayerTensors& T, cudaStream_t st)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc1 = T.t[T_TR3_FC1];
-    if (!tab.p || !fc1.p || T.fc1_wide) return;
+    if (!tab.p || (!fc1.p && !T.ptab) || T.fc1_wide) return;
     launch_tr3_widen(const_cast<void*>(fc1.p), static_cast<const long long*>(tab.p), static_cast<const long long*>(T.t[T_TR3_KMIX].p),
-                     static_cast<int>(tab.shape[0]), g6nr::EB, st);
+                     static_cast<int>(tab.shape[0]), g6nr::EB, st, T.ptab);
     T.fc1_wide = 1;
 }
 // The same for tr3.fc2 (k_tr3_widen2: the 8 k-tiles of an n-tile in three 64-bit loads). Same rules, same results bit for bit.
 inline void widen_fc2(LayerTensors& T, cudaStream_t st)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc2 = T.t[T_TR3_FC2];
-    if (!tab.p || !fc2.p || T.fc2_wide) return;
-    launch_tr3_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st);
+    if (!tab.p || (!fc2.p && !T.ptab) || T.fc2_wide) return;
+    launch_tr3_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st, T.ptab);
     T.fc2_wide = 1;
 }
 // Optional (GR8_TR3_WIDE4=1), once per layer after make_shared_fp8: reorder K4 records of tr3.fc1 / tr3.fc2 in place
@@ -169,16 +169,16 @@ inline void widen_fc2(LayerTensors& T, cudaStream_t st)
 inline void widen_k4_fc1(LayerTensors& T, cudaStream_t st)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc1 = T.t[T_TR3_FC1];
-    if (!tab.p || !fc1.p || T.fc1_wide4) return;
+    if (!tab.p || (!fc1.p && !T.ptab) || T.fc1_wide4) return;
     launch_tr4_widen(const_cast<void*>(fc1.p), static_cast<const long long*>(tab.p), static_cast<const long long*>(T.t[T_TR3_KMIX].p),
-                     static_cast<int>(tab.shape[0]), g6nr::EB, st);
+                     static_cast<int>(tab.shape[0]), g6nr::EB, st, T.ptab);
     T.fc1_wide4 = 1;
 }
 inline void widen_k4_fc2(LayerTensors& T, cudaStream_t st)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc2 = T.t[T_TR3_FC2];
-    if (!tab.p || !fc2.p || T.fc2_wide4) return;
-    launch_tr4_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st);
+    if (!tab.p || (!fc2.p && !T.ptab) || T.fc2_wide4) return;
+    launch_tr4_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st, T.ptab);
     T.fc2_wide4 = 1;
 }
 
@@ -256,7 +256,8 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
 // grid ceil(I * 6144 * 3 / 256), block 256: one thread per weight. CB = the layer's codebook.
 template <int CB>
 __global__ void __launch_bounds__(256) k_shared_fp8(const uint8_t* fc1, const uint8_t* fc2, long long o1, long long o2, int bits, int I,
-                                                    uint8_t* cg, uint8_t* cu, uint8_t* cd)
+                                                    uint8_t* cg, uint8_t* cu, uint8_t* cd,
+                                                    const uint8_t* const* ptab_sh = nullptr)
 {
     const long long i = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x, per = static_cast<long long>(I) * HID;
     if (i >= 3 * per) return;
@@ -272,14 +273,16 @@ __global__ void __launch_bounds__(256) k_shared_fp8(const uint8_t* fc1, const ui
     if (mat < 2)          // gate / up: block b, tile (k16, c) at fc1 + o1 + (2b + mat) MBY + (8 k16 + c) TB
     {
         const int b = static_cast<int>(tile / (KSH * 8)), r = static_cast<int>(tile % (KSH * 8)), k16 = r >> 3, c = r & 7;
-        p = fc1 + o1 + (2 * b + mat) * MBY + static_cast<size_t>(r) * TB;
+        p = ptab_sh ? (ptab_sh[2 * b] + static_cast<size_t>(mat) * MBY + static_cast<size_t>(r) * TB)
+                    : (fc1 + o1 + (2 * b + mat) * MBY + static_cast<size_t>(r) * TB);
         k = k16 * 16 + kk;
         n = b * 128 + c * 16 + nn;
     }
     else                  // down: block b, tile (n-tile nt, k-tile kt) at fc2 + o2 + b MBY + (8 nt + kt) TB
     {
         const int b = static_cast<int>(tile / (KSH * 8)), r = static_cast<int>(tile % (KSH * 8)), nt = r >> 3, kt = r & 7;
-        p = fc2 + o2 + b * MBY + static_cast<size_t>(r) * TB;
+        p = ptab_sh ? (ptab_sh[2 * b + 1] + static_cast<size_t>(r) * TB)
+                    : (fc2 + o2 + b * MBY + static_cast<size_t>(r) * TB);
         k = b * 128 + kt * 16 + kk;
         n = nt * 16 + nn;
     }
@@ -309,10 +312,11 @@ inline const char* make_shared_fp8(LayerTensors& T, cudaStream_t st)
             return "make_shared_fp8: cudaMalloc failed";
         cudaMemsetAsync(F.scales[m], 127, nc / 32, st);
     }
+    const uint8_t* const* ptab_sh = T.ptab ? (T.ptab + static_cast<size_t>(geom::NEXP) * g6nr::EB * 2) : nullptr;
     tr3_cb_dispatch(T.cb, [&](auto CB) {
         k_shared_fp8<decltype(CB)::value><<<static_cast<unsigned>((3 * nc + 255) / 256), 256, 0, st>>>(
             static_cast<const uint8_t*>(T.t[T_TR3_FC1].p), static_cast<const uint8_t*>(T.t[T_TR3_FC2].p), T.sh_tr[0], T.sh_tr[1],
-            static_cast<int>(T.sh_tr[4]), F.I, F.codes[0], F.codes[1], F.codes[2]);
+            static_cast<int>(T.sh_tr[4]), F.I, F.codes[0], F.codes[1], F.codes[2], ptab_sh);
     });
     return cudaStreamSynchronize(st) == cudaSuccess ? nullptr : "make_shared_fp8: decode failed";
 }
@@ -1172,7 +1176,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         const Tensor &tab = T.t[T_TR3_TAB], &v1 = T.t[T_TR3_V1], &v2 = T.t[T_TR3_V2], &v3 = T.t[T_TR3_V3];
         const Tensor &sg = T.t[T_TR3_SG], &v1b = T.t[T_TR3_V1B], &v3b = T.t[T_TR3_V3B];
         const bool bsf = v1b.p != nullptr;           // block-scale hidden-side vectors (exlr8 v2 with the trellis shared expert)
-        if (!T.t[T_TR3_FC1].p || !T.t[T_TR3_FC2].p || !v2.p || (bsf ? !sg.p || !v3b.p : !v1.p || !v3.p))
+        if ((!T.ptab && (!T.t[T_TR3_FC1].p || !T.t[T_TR3_FC2].p)) || !v2.p || (bsf ? !sg.p || !v3b.p : !v1.p || !v3.p))
             return "MoE layer without tr3.fc1/fc2/v2 and v1/v3 (or sg/v1b/v3b)";
         const long long rows = v2.shape[0];
         if (tab.nd != 2 || tab.shape[1] != 6 || v2.nd != 3 || v2.shape[1] != 3 || v2.shape[2] != 128 ||
