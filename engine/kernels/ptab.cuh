@@ -30,6 +30,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include "ptab_pool.h"
+#include "ptab_delta.h"
 #include "tr3.cuh"
 #include "../vmm.h"
 #include "../knobs-rs/gr8_knobs.h"
@@ -347,6 +348,41 @@ inline const char* alloc_direct(Table& t, const std::vector<long long>& h, const
         }
     }
     return upload(t, st);
+}
+
+// EL3 (#151 Stage 3) in-process delta piece-prefetch for one MoE layer: reuses every kept slab from `old_t`
+// (may be nullptr on a joiner rank), allocates ONLY added pieces contiguously per expert in `pool`, populates
+// `dst` (host + device table), and adds ONLY the added pieces' pack ranges into `route`.
+inline const char* stage_delta(const Table* old_t, const std::vector<long long>& new_h, const std::vector<long long>& new_k,
+                               int new_rows, int new_eb, const std::vector<ExpertDelta>& deltas, Pool& pool,
+                               uint64_t fc1_pack_off, uint64_t fc2_pack_off, RouteMap& route,
+                               Table& dst, TableDeltaResult& out, cudaStream_t st)
+{
+    static const std::vector<const uint8_t*> empty_host;
+    static const std::vector<size_t> empty_bytes;
+    constexpr size_t MB = static_cast<size_t>(KSH) * 8 * 32;
+    const char* err = plan_table_delta(
+        old_t ? old_t->host : empty_host, old_t ? old_t->bytes : empty_bytes,
+        old_t ? old_t->rows : 0, old_t ? old_t->eb : 0,
+        new_h, new_k, new_rows, new_eb, deltas, pool, fc1_pack_off, fc2_pack_off, MB, route, out);
+    if (err) return err;
+    dst.rows = out.rows;
+    dst.eb = out.eb;
+    dst.mode = CONTIG;
+    dst.host = out.host;
+    dst.bytes = out.bytes;
+    dst.slab_bytes = out.slab_bytes;
+    if (!dst.dev && cudaMalloc(&dst.dev, dst.n() * sizeof(void*)) != cudaSuccess)
+    {
+        rollback_delta_slabs(pool, out.added_slabs);
+        return "ptab::stage_delta: cudaMalloc of target table failed";
+    }
+    if (const char* ue = upload(dst, st))
+    {
+        rollback_delta_slabs(pool, out.added_slabs);
+        return ue;
+    }
+    return nullptr;
 }
 
 // The slabs that held a piece before a set(): hand them to Pool::give (SCATTER slabs) once nothing reads them.

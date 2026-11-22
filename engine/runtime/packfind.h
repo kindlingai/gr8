@@ -265,6 +265,206 @@ void rs_fill_direct_ptab(const g6::Pack& pack, g6::DevImage& img, DirectPtab& di
             stats.image_bytes / 1e9 / std::max(stats.seconds, 1e-6));
 }
 
+// EL3 (#151 Stage 3) staged target weights for an in-process width switch: shares `direct.pool` with the active width,
+// keeps all resident expert slabs untouched, holds only the newly-prefetched slabs (`added_slabs`) + compact repacked
+// dense/attn/vocab image (`dense_img`), and tracks `dropped_slabs` to free via Pool::give + reclaim_empty after cutover.
+struct StagedDeltaPtab
+{
+    DirectPtab direct;
+    g6::DevImage dense_img;
+    std::vector<ptab::SlabRef> added_slabs;
+    std::vector<ptab::SlabRef> dropped_slabs;
+    size_t kept_pieces = 0, added_pieces = 0, dropped_pieces = 0;
+    size_t kept_bytes = 0, added_bytes = 0, dropped_bytes = 0;
+
+    size_t rollback(size_t* chunks_freed = nullptr)
+    {
+        direct.tables.clear();
+        dense_img = g6::DevImage{};
+        dropped_slabs.clear();
+        return direct.pool ? ptab::rollback_delta_slabs(*direct.pool, added_slabs, chunks_freed) : 0;
+    }
+    size_t retire_dropped(size_t* chunks_freed = nullptr)
+    {
+        added_slabs.clear();
+        return direct.pool ? ptab::retire_dropped_slabs(*direct.pool, dropped_slabs, chunks_freed) : 0;
+    }
+};
+
+// Prefetches only dense/attn/vocab tensors + missing routed-expert pieces for a target layout (`plan_handle` + `delta`)
+// into `staged`, reusing all resident slabs in `current` (may be empty on a joiner rank) without touching them.
+// Returns true on success; on failure rolls back newly allocated slabs and sets `err_out`.
+inline bool rs_prefetch_delta_ptab(const g6::Pack& target_pack, void* plan_handle, const void* delta_handle,
+                                   const DirectPtab& current, int target_eb, int rank, StagedDeltaPtab& staged,
+                                   std::string& err_out)
+{
+    staged = StagedDeltaPtab{};
+    staged.direct.pool = current.pool ? current.pool : std::make_shared<ptab::Pool>();
+    static const long vmm = (long)knob::img_vmm();
+    staged.direct.pool->vmm = vmm > 0;
+
+    struct LayerSpec { const g6::Entry *fc1 = nullptr, *fc2 = nullptr, *tab = nullptr, *kmix = nullptr; };
+    std::map<int, LayerSpec> moe_layers;
+    for (const g6::Entry& e : target_pack.entries())
+    {
+        int lyr = -1; bool is_fc2 = false;
+        if (ptab::parse_tr3_layer_name(e.name, lyr, is_fc2))
+        {
+            LayerSpec& sp = moe_layers[lyr];
+            if (is_fc2) sp.fc2 = &e; else sp.fc1 = &e;
+        }
+    }
+    for (auto it = moe_layers.begin(); it != moe_layers.end(); )
+    {
+        char nm[64];
+        snprintf(nm, sizeof nm, "L%03d.tr3.table", it->first);
+        it->second.tab = target_pack.find(nm);
+        snprintf(nm, sizeof nm, "L%03d.tr3.kmix", it->first);
+        it->second.kmix = target_pack.find(nm);
+        if (!it->second.fc1 || !it->second.fc2 || !it->second.tab || it->second.tab->shape.size() != 2 || it->second.tab->shape[1] != 6)
+            it = moe_layers.erase(it);
+        else ++it;
+    }
+
+    uint64_t dense_bytes = 0;
+    for (const g6::Entry& e : target_pack.entries())
+    {
+        int lyr = -1; bool is_fc2 = false;
+        if (ptab::parse_tr3_layer_name(e.name, lyr, is_fc2) && moe_layers.count(lyr)) continue;
+        dense_bytes = (dense_bytes + 255ull) & ~255ull;
+        staged.direct.dense_off[e.name] = dense_bytes;
+        dense_bytes += e.nbytes;
+    }
+    dense_bytes = std::max<uint64_t>((dense_bytes + 255ull) & ~255ull, 256ull);
+    staged.direct.dense_bytes = dense_bytes;
+
+    void* dev = nullptr;
+    void (*release)(void*) = nullptr;
+    if (vmm > 0)
+    {
+        std::string why;
+        const size_t chunk = vmm > 1 ? (size_t)vmm << 20 : 0;
+        if ((dev = g6vmm::alloc(dense_bytes, chunk, why))) release = [](void* p) { g6vmm::release(p); };
+    }
+    if (!dev && cudaMalloc(&dev, dense_bytes) != cudaSuccess)
+    {
+        err_out = "delta prefetch: cudaMalloc of target dense image failed";
+        return false;
+    }
+    staged.dense_img.adopt(target_pack, static_cast<uint8_t*>(dev), dense_bytes, release);
+
+    ptab::RouteMap route;
+    for (const g6::Entry& e : target_pack.entries())
+    {
+        auto it = staged.direct.dense_off.find(e.name);
+        if (it != staged.direct.dense_off.end()) route.add(e.offset, e.nbytes, static_cast<uint8_t*>(dev) + it->second);
+    }
+
+    cudaStream_t st = nullptr;
+    if (cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess)
+    {
+        staged.rollback();
+        err_out = "delta prefetch: cudaStreamCreateWithFlags failed";
+        return false;
+    }
+
+    char rerr_buf[512] = "";
+    for (const auto& [lyr, sp] : moe_layers)
+    {
+        const int rows = static_cast<int>(sp.tab->shape[0]);
+        std::vector<long long> h(static_cast<size_t>(rows) * 6, 0);
+        std::vector<long long> k;
+        if (g6l_plan_read(plan_handle, sp.tab->offset, sp.tab->nbytes, h.data(), rerr_buf, sizeof rerr_buf))
+        {
+            cudaStreamDestroy(st);
+            staged.rollback();
+            err_out = std::string("delta prefetch read tr3.table: ") + rerr_buf;
+            return false;
+        }
+        if (sp.kmix && sp.kmix->nbytes)
+        {
+            k.assign(static_cast<size_t>(rows), 0);
+            if (g6l_plan_read(plan_handle, sp.kmix->offset, sp.kmix->nbytes, k.data(), rerr_buf, sizeof rerr_buf))
+            {
+                cudaStreamDestroy(st);
+                staged.rollback();
+                err_out = std::string("delta prefetch read tr3.kmix: ") + rerr_buf;
+                return false;
+            }
+        }
+        std::vector<ptab::ExpertDelta> deltas(static_cast<size_t>(rows));
+        for (int e = 0; e < rows; ++e)
+        {
+            uint8_t ko[16], kn[16], ad[16], dr[16];
+            uint32_t nk = 0, na = 0, nd = 0;
+            if (g6l_delta_halves(delta_handle, static_cast<uint32_t>(lyr), static_cast<uint32_t>(e),
+                                 ko, kn, &nk, ad, &na, dr, &nd, rerr_buf, sizeof rerr_buf))
+            {
+                cudaStreamDestroy(st);
+                staged.rollback();
+                err_out = std::string("delta prefetch halves: ") + rerr_buf;
+                return false;
+            }
+            ptab::ExpertDelta& d = deltas[static_cast<size_t>(e)];
+            d.row = e;
+            for (uint32_t i = 0; i < nk; ++i) d.kept.push_back({ko[i], kn[i]});
+            for (uint32_t i = 0; i < na; ++i) d.added.push_back(ad[i]);
+            for (uint32_t i = 0; i < nd; ++i) d.dropped.push_back(dr[i]);
+        }
+        const auto oit = current.tables.find(lyr);
+        const ptab::Table* old_t = oit != current.tables.end() ? oit->second.get() : nullptr;
+        auto dst_t = std::make_shared<ptab::Table>();
+        ptab::TableDeltaResult res;
+        if (const char* pe = ptab::stage_delta(old_t, h, k, rows, target_eb, deltas, *staged.direct.pool,
+                                               sp.fc1->offset, sp.fc2->offset, route, *dst_t, res, st))
+        {
+            cudaStreamDestroy(st);
+            staged.rollback();
+            err_out = std::string("delta prefetch stage layer ") + std::to_string(lyr) + ": " + pe;
+            return false;
+        }
+        staged.direct.expert_bytes += dst_t->slab_bytes;
+        staged.direct.tables[lyr] = std::move(dst_t);
+        staged.added_slabs.insert(staged.added_slabs.end(), res.added_slabs.begin(), res.added_slabs.end());
+        staged.dropped_slabs.insert(staged.dropped_slabs.end(), res.dropped_slabs.begin(), res.dropped_slabs.end());
+        staged.kept_pieces += res.kept_pieces;
+        staged.added_pieces += res.added_pieces;
+        staged.dropped_pieces += res.dropped_pieces;
+        staged.kept_bytes += res.kept_bytes;
+        staged.added_bytes += res.added_bytes;
+        staged.dropped_bytes += res.dropped_bytes;
+    }
+    cudaStreamDestroy(st);
+
+    if (!route.finalize(err_out))
+    {
+        staged.rollback();
+        return false;
+    }
+    const auto exts_p = ptab::route_extents(route);
+    std::vector<g6l_extent> keep;
+    keep.reserve(exts_p.size());
+    for (const auto& [off, nb] : exts_p) keep.push_back(g6l_extent{off, nb});
+
+    RoutedRsSink sink;
+    sink.route = &route;
+    const g6l_sink s{&sink, &RoutedRsSink::alloc, &RoutedRsSink::release, &RoutedRsSink::copy};
+    g6l_stats stats{};
+    if (g6l_plan_load_ranges(plan_handle, keep.data(), keep.size(), &s, &stats, rerr_buf, sizeof rerr_buf))
+    {
+        for (cudaStream_t x : sink.streams) cudaStreamDestroy(x);
+        staged.rollback();
+        err_out = std::string("delta prefetch load: ") + rerr_buf;
+        return false;
+    }
+    for (cudaStream_t x : sink.streams) cudaStreamDestroy(x);
+    fprintf(stderr, "# rank %d: EL3 delta prefetch: kept %zu pieces (%.2f GB), added %zu pieces (%.2f GB), "
+            "dropped %zu pieces (%.2f GB), dense %.2f GB, read %.2f GB in %.2f s\n",
+            rank, staged.kept_pieces, staged.kept_bytes / 1e9, staged.added_pieces, staged.added_bytes / 1e9,
+            staged.dropped_pieces, staged.dropped_bytes / 1e9, dense_bytes / 1e9, stats.read_bytes / 1e9, stats.seconds);
+    return true;
+}
+
 // The Rust loader's sink: pinned staging buffers and one stream per worker into the device image. Each chunk is summed
 // in staging for the weight check (weight_check.cuh).
 struct RsSink

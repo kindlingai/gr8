@@ -397,6 +397,99 @@ pub fn moves(model: &Model, old: &Layout, new: &Layout) -> Result<Moves, String>
     Ok(m)
 }
 
+/// Per-expert piece delta between an old layout/rank and a target layout/rank (EL3 #151 Stage 3).
+/// Block indices refer to the ascending-half positions (`0..held.len()`) in each rank's `tr3.table` row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HalvesDelta {
+    /// `(old_block, new_block)` pairs already resident in `ptab::Pool` on this rank (0 bytes fetched).
+    pub kept: Vec<(u8, u8)>,
+    /// `new_block` indices missing on this rank that must be fetched into contiguous `take_run` slabs.
+    pub added: Vec<u8>,
+    /// `old_block` indices dropped by this rank that may be returned via `Pool::give` after cutover.
+    pub dropped: Vec<u8>,
+}
+
+/// Reusable layout-to-layout piece-delta resolver (parsed once per switch; queried per `(layer, expert)`).
+/// When `old_nr == 0` (a joiner box not in the previous group), every target piece is `added` and none are `kept`.
+/// When a layout file path is omitted, the rank's formula ownership (`Group::formula_with`) is used.
+pub struct DeltaPlan {
+    old: Option<Layout>,
+    old_nr: usize,
+    old_rank: usize,
+    new: Option<Layout>,
+    new_nr: usize,
+    new_rank: usize,
+}
+
+impl DeltaPlan {
+    pub fn new(old_path: Option<&str>, old_nr: usize, old_rank: usize, new_path: Option<&str>, new_nr: usize,
+               new_rank: usize) -> Result<DeltaPlan, String> {
+        let old = old_path.map(Layout::read).transpose()?;
+        let new = new_path.map(Layout::read).transpose()?;
+        let eff_old_nr = old.as_ref().map_or(old_nr, Layout::nr);
+        let eff_new_nr = new.as_ref().map_or(new_nr, Layout::nr);
+        if eff_old_nr > 0 {
+            check_nr(eff_old_nr)?;
+            if old_rank >= eff_old_nr {
+                return Err(format!("delta old_rank {old_rank} >= old_nr {eff_old_nr}"));
+            }
+        }
+        check_nr(eff_new_nr)?;
+        if new_rank >= eff_new_nr {
+            return Err(format!("delta new_rank {new_rank} >= new_nr {eff_new_nr}"));
+        }
+        Ok(DeltaPlan { old, old_nr: eff_old_nr, old_rank, new, new_nr: eff_new_nr, new_rank })
+    }
+
+    pub fn from_layouts(old: Option<Layout>, old_rank: usize, new: Layout, new_rank: usize) -> Result<DeltaPlan, String> {
+        let old_nr = old.as_ref().map_or(0, Layout::nr);
+        let new_nr = new.nr();
+        if old_nr > 0 && old_rank >= old_nr {
+            return Err(format!("delta old_rank {old_rank} >= old_nr {old_nr}"));
+        }
+        if new_rank >= new_nr {
+            return Err(format!("delta new_rank {new_rank} >= new_nr {new_nr}"));
+        }
+        Ok(DeltaPlan { old, old_nr, old_rank, new: Some(new), new_nr, new_rank })
+    }
+
+    pub fn halves(&self, layer: usize, expert: usize) -> Result<HalvesDelta, String> {
+        let g = Group::Halves(layer, expert);
+        let geom = self.new.as_ref().or(self.old.as_ref())
+            .and_then(|l| l.owner.get(&g))
+            .filter(|o| o.len() == ModelGeom::QW38.nh)
+            .map_or(&ModelGeom::GLM, |_| &ModelGeom::QW38);
+        let old_held: Vec<usize> = if self.old_nr == 0 {
+            Vec::new()
+        } else if let Some(l) = &self.old {
+            l.held(g, self.old_rank)?
+        } else {
+            let o = g.formula_with(self.old_nr, geom);
+            (0..o.len()).filter(|&i| o[i] as usize == self.old_rank).collect()
+        };
+        let new_held: Vec<usize> = if let Some(l) = &self.new {
+            l.held(g, self.new_rank)?
+        } else {
+            let o = g.formula_with(self.new_nr, geom);
+            (0..o.len()).filter(|&i| o[i] as usize == self.new_rank).collect()
+        };
+        let mut d = HalvesDelta::default();
+        for (nb, &h) in new_held.iter().enumerate() {
+            if let Some(ob) = old_held.iter().position(|&x| x == h) {
+                d.kept.push((ob as u8, nb as u8));
+            } else {
+                d.added.push(nb as u8);
+            }
+        }
+        for (ob, &h) in old_held.iter().enumerate() {
+            if !new_held.contains(&h) {
+                d.dropped.push(ob as u8);
+            }
+        }
+        Ok(d)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +733,61 @@ mod tests {
         let t4 = plan(&m, &t2, names("a,b,c,d")).unwrap();
         t4.check(&m).unwrap();
         assert!(Layout::formula(&m, names("a,b,c,d,e")).is_err());
+    }
+
+    #[test]
+    fn halves_delta_four_to_three_and_three_to_four() {
+        let m = model();
+        let t4 = Layout::formula(&m, names("a,b,c,d")).unwrap();
+        let p3 = plan(&m, &t4, names("a,b,c")).unwrap();
+        // 4 -> 3 on each staying rank: every existing half (4/expert) is kept, 0 dropped, and ~1/12th of total model
+        // halves are added per staying rank (1/3 of the departing rank's 1/4 = 1/12th).
+        for r in 0..3 {
+            let dp = DeltaPlan::from_layouts(Some(t4.clone()), r, p3.clone(), r).unwrap();
+            let (mut kept, mut added, mut dropped) = (0usize, 0usize, 0usize);
+            for l in 3..=78 {
+                for e in 0..=256 {
+                    let d = dp.halves(l, e).unwrap();
+                    kept += d.kept.len();
+                    added += d.added.len();
+                    dropped += d.dropped.len();
+                    assert_eq!(d.kept.len(), 4, "4->3 must keep all 4 halves on staying rank {r}");
+                    assert!(d.dropped.is_empty());
+                    assert!(d.added.len() == 1 || d.added.len() == 2);
+                }
+            }
+            let total_model_halves = 76 * 257 * NH;
+            let frac = added as f64 / total_model_halves as f64;
+            assert!((frac - 1.0 / 12.0).abs() < 0.001, "rank {r}: added frac {frac}");
+            assert_eq!(kept, 76 * 257 * 4);
+            assert_eq!(dropped, 0);
+        }
+        // 3 -> 4 planned from p3: staying ranks add 0 halves and drop only what goes to the joiner; joiner adds 1/4.
+        let p4 = plan(&m, &p3, names("a,b,c,d")).unwrap();
+        for r in 0..3 {
+            let dp = DeltaPlan::from_layouts(Some(p3.clone()), r, p4.clone(), r).unwrap();
+            let (mut added, mut dropped) = (0usize, 0usize);
+            for l in 3..=78 {
+                for e in 0..=256 {
+                    let d = dp.halves(l, e).unwrap();
+                    added += d.added.len();
+                    dropped += d.dropped.len();
+                }
+            }
+            assert_eq!(added, 0, "3->4 staying rank {r} must fetch 0 expert pieces");
+            assert!(dropped > 0);
+        }
+        // Joiner rank 3 (old_nr == 0): 0 kept, 0 dropped, 4 added per expert (1/4 of model).
+        let join = DeltaPlan::from_layouts(None, 0, p4.clone(), 3).unwrap();
+        let mut join_added = 0usize;
+        for l in 3..=78 {
+            for e in 0..=256 {
+                let d = join.halves(l, e).unwrap();
+                assert!(d.kept.is_empty() && d.dropped.is_empty());
+                assert_eq!(d.added.len(), 4);
+                join_added += d.added.len();
+            }
+        }
+        assert_eq!(join_added * 4, 76 * 257 * NH);
     }
 }

@@ -334,12 +334,12 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&
         0 => None,
         kb => Some(kb as u64 * 1024),
     };
-    run_cfg(plan, pack_bytes, sink, t0, cache, mode, threads, chunk, merge)
+    run_cfg(plan, pack_bytes, sink, t0, cache, mode, threads, chunk, merge, false)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_cfg(mut plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&gencache::GenCache>, mode: Mode,
-           threads: usize, chunk: u64, merge: Option<u64>) -> Result<G6lStats, String> {
+           threads: usize, chunk: u64, merge: Option<u64>, skip_empty: bool) -> Result<G6lStats, String> {
     let merge = merge.filter(|_| mode == Mode::Read);
     if let Some(dir) = gr8knobs::LOAD_COMPACT.get() {
         sys::raise_nofile();
@@ -393,6 +393,9 @@ fn run_cfg(mut plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: 
                     }
                     let a = c * chunk;
                     let n = chunk.min(pack_bytes - a) as usize;
+                    if skip_empty && !l.plan.has_work(a, a + n as u64) {
+                        continue;
+                    }
                     let buf = unsafe { std::slice::from_raw_parts_mut(p, n) };
                     let r = l.fill(a, buf, &mut bufs).and_then(|read| {
                         read_total.fetch_add(read, Ordering::Relaxed);
@@ -596,6 +599,104 @@ pub unsafe extern "C" fn g6l_plan_load(h: *mut c_void, sink: *const G6lSink, sta
     }
 }
 
+/// Loads only image bytes intersecting `keep[0..nkeep)` from a planned image through `sink` (EL3 #151 Stage 3 delta
+/// piece-prefetch). Chunks and source ranges outside `keep` are skipped without reading from storage or invoking `sink`.
+///
+/// # Safety
+/// `h` must come from g6l_v2_plan or g6l_release_plan and be loaded once; `keep` must point to `nkeep` extents.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_plan_load_ranges(h: *mut c_void, keep: *const G6lExtent, nkeep: usize,
+                                              sink: *const G6lSink, stats: *mut G6lStats,
+                                              err: *mut c_char, errlen: usize) -> i32 {
+    let (img, t0) = &mut *(h as *mut (v2plan::V2Image, Instant));
+    let ext = if nkeep == 0 { &[][..] } else { std::slice::from_raw_parts(keep, nkeep) };
+    let mut plan = std::mem::replace(&mut img.plan, Plan::empty());
+    if let Err(e) = plan.restrict(ext) {
+        return write_err(err, errlen, &e);
+    }
+    let cache = img.cache.as_ref();
+    let mode = if gr8knobs::LOAD_MODE.get() == "mmap" { Mode::Mmap } else { Mode::Read };
+    let threads = gr8knobs::LOAD_THREADS.get() as usize;
+    let chunk = (gr8knobs::LOAD_CHUNK_MB.get() as u64) << 20;
+    let merge = match gr8knobs::LOAD_MERGE_KB.get() {
+        0 => None,
+        kb => Some(kb as u64 * 1024),
+    };
+    match run_cfg(plan, img.bytes, &*sink, *t0, cache, mode, threads, chunk, merge, true) {
+        Ok(s) => {
+            *stats = s;
+            0
+        }
+        Err(e) => write_err(err, errlen, &e),
+    }
+}
+
+/// Creates a layout-to-layout piece-delta resolver (EL3 #151 Stage 3).
+///
+/// # Safety
+/// Paths are NUL-terminated or NULL; `err` holds `errlen` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_delta_new(old_layout: *const c_char, old_nr: u32, old_rank: u32,
+                                       new_layout: *const c_char, new_nr: u32, new_rank: u32,
+                                       err: *mut c_char, errlen: usize) -> *mut c_void {
+    let op = cstr(old_layout);
+    let np = cstr(new_layout);
+    match layout::DeltaPlan::new(op.as_deref(), old_nr as usize, old_rank as usize,
+                                 np.as_deref(), new_nr as usize, new_rank as usize) {
+        Ok(d) => Box::into_raw(Box::new(d)) as *mut c_void,
+        Err(e) => {
+            write_err(err, errlen, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Queries the piece delta for MoE `(layer, expert)` on this rank.
+///
+/// # Safety
+/// `delta` must come from `g6l_delta_new`; output buffers must hold at least 16 entries each.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_delta_halves(delta: *const c_void, layer: u32, expert: u32,
+                                          kept_old: *mut u8, kept_new: *mut u8, n_kept: *mut u32,
+                                          added: *mut u8, n_added: *mut u32,
+                                          dropped: *mut u8, n_dropped: *mut u32,
+                                          err: *mut c_char, errlen: usize) -> i32 {
+    if delta.is_null() {
+        return write_err(err, errlen, "g6l_delta_halves: null delta handle");
+    }
+    let dp = &*(delta as *const layout::DeltaPlan);
+    match dp.halves(layer as usize, expert as usize) {
+        Ok(d) => {
+            for (i, &(ob, nb)) in d.kept.iter().enumerate() {
+                if !kept_old.is_null() { *kept_old.add(i) = ob; }
+                if !kept_new.is_null() { *kept_new.add(i) = nb; }
+            }
+            if !n_kept.is_null() { *n_kept = d.kept.len() as u32; }
+            for (i, &nb) in d.added.iter().enumerate() {
+                if !added.is_null() { *added.add(i) = nb; }
+            }
+            if !n_added.is_null() { *n_added = d.added.len() as u32; }
+            for (i, &ob) in d.dropped.iter().enumerate() {
+                if !dropped.is_null() { *dropped.add(i) = ob; }
+            }
+            if !n_dropped.is_null() { *n_dropped = d.dropped.len() as u32; }
+            0
+        }
+        Err(e) => write_err(err, errlen, &e),
+    }
+}
+
+/// Frees a `g6l_delta_new` handle.
+///
+/// # Safety
+/// `delta` must come from `g6l_delta_new` and not be used again.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_delta_free(delta: *mut c_void) {
+    if !delta.is_null() {
+        drop(Box::from_raw(delta as *mut layout::DeltaPlan));
+    }
+}
+
 /// Image bytes `a..a + buf.len()` of a segment plan (g6l_v2_plan, g6l_release_plan), one range at a time: files opened
 /// per call, computed ranges computed and dropped.
 pub fn read_range(plan: &Plan, a: u64, buf: &mut [u8]) -> Result<(), String> {
@@ -743,7 +844,7 @@ mod tests {
             let img = Img { bytes: Mutex::new(vec![0xAA; bytes as usize]), staging: chunk as usize };
             let sink = G6lSink { ctx: &img as *const Img as *mut c_void, alloc_staging: alloc, free_staging: free, copy };
             let st = run_cfg(plan_of(&files, &segs, bytes), bytes, &sink, Instant::now(), None, Mode::Read, threads,
-                             chunk, merge).unwrap();
+                             chunk, merge, false).unwrap();
             let got = img.bytes.into_inner().unwrap();
             assert!(got == want, "merge {merge:?} threads {threads} chunk {chunk}: image differs");
             let need: u64 = segs.iter().map(|s| s.1).sum();
@@ -791,7 +892,7 @@ mod tests {
             assert!(left > 0);
             let img = Img { bytes: Mutex::new(vec![0xAA; bytes as usize]), staging: 65536 };
             let sink = G6lSink { ctx: &img as *const Img as *mut c_void, alloc_staging: alloc, free_staging: free, copy };
-            run_cfg(p, bytes, &sink, Instant::now(), None, mode, 3, 65536, merge).unwrap();
+            run_cfg(p, bytes, &sink, Instant::now(), None, mode, 3, 65536, merge, false).unwrap();
             assert!(img.bytes.into_inner().unwrap() == want, "merge {merge:?}: image differs");
         }
         // Every run is checked, not just the last: overflow, source bounds, copy bounds and overlap.
@@ -848,8 +949,47 @@ mod tests {
         let p = Plan::from_segs(files, segs, Vec::new(), Vec::new(), 300).unwrap();
         let img = Img { bytes: Mutex::new(vec![0xAA; 300]), staging: 4096 };
         let sink = G6lSink { ctx: &img as *const Img as *mut c_void, alloc_staging: alloc, free_staging: free, copy };
-        run_cfg(p, 300, &sink, Instant::now(), None, Mode::Read, 1, 4096, None).unwrap();
+        run_cfg(p, 300, &sink, Instant::now(), None, Mode::Read, 1, 4096, None, false).unwrap();
         assert_eq!(img.bytes.into_inner().unwrap(), vec![if compact.is_some() { 42 } else { 0 }; 300]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plan_load_ranges_skips_unrequested_bytes() {
+        let dir = std::env::temp_dir().join(format!("g6load-ranges-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (files, segs, bytes) = fixture(&dir);
+        let mut want = vec![0u8; bytes as usize];
+        read_range(&plan_of(&files, &segs, bytes), 0, &mut want).unwrap();
+        // Request only two non-adjacent segments from the fixture; all other bytes & chunks must stay untouched.
+        let kept_ext = [
+            G6lExtent { offset: segs[0].0, nbytes: segs[0].1 },
+            G6lExtent { offset: segs[segs.len() - 1].0, nbytes: segs[segs.len() - 1].1 },
+        ];
+        let mut p = plan_of(&files, &segs, bytes);
+        p.restrict(&kept_ext).unwrap();
+        let img = Img { bytes: Mutex::new(vec![0xCC; bytes as usize]), staging: 65536 };
+        let sink = G6lSink { ctx: &img as *const Img as *mut c_void, alloc_staging: alloc, free_staging: free, copy };
+        let st = run_cfg(p, bytes, &sink, Instant::now(), None, Mode::Read, 2, 65536, None, true).unwrap();
+        let got = img.bytes.into_inner().unwrap();
+        let kept_bytes = kept_ext[0].nbytes + kept_ext[1].nbytes;
+        assert_eq!(st.read_bytes, kept_bytes, "read {} for kept {}", st.read_bytes, kept_bytes);
+        let total_segs: u64 = segs.iter().map(|s| s.1).sum();
+        assert!(st.read_bytes < total_segs, "delta range load must read strictly less than full image");
+        for e in &kept_ext {
+            let a = e.offset as usize;
+            let b = (e.offset + e.nbytes) as usize;
+            assert_eq!(&got[a..b], &want[a..b], "kept range {a}..{b} mismatch");
+        }
+        // Empty keep list reads 0 bytes and touches nothing.
+        let mut empty_p = plan_of(&files, &segs, bytes);
+        empty_p.restrict(&[]).unwrap();
+        let img2 = Img { bytes: Mutex::new(vec![0x77; bytes as usize]), staging: 4096 };
+        let sink2 = G6lSink { ctx: &img2 as *const Img as *mut c_void, alloc_staging: alloc, free_staging: free, copy };
+        let st2 = run_cfg(empty_p, bytes, &sink2, Instant::now(), None, Mode::Read, 2, 4096, None, true).unwrap();
+        assert_eq!(st2.read_bytes, 0);
+        assert!(img2.bytes.into_inner().unwrap().iter().all(|&x| x == 0x77));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

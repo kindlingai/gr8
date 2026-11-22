@@ -260,6 +260,84 @@ impl Plan {
     pub fn max_item128(&self) -> u64 {
         self.segs.iter().filter(|s| matches!(s.op, Op::Item128 { .. })).map(|s| s.nbytes).max().unwrap_or(0)
     }
+
+    /// True if image range `a..b` has any pack-file data or source segments to materialize.
+    pub fn has_work(&self, a: u64, b: u64) -> bool {
+        !self.pack_data(a, b).is_empty() || !self.sources(a, b).is_empty()
+    }
+
+    /// Restricts this plan to bytes overlapping `keep` (for EL3 #151 delta piece-prefetch: skips all resident expert
+    /// slabs so only dense/attn/vocab staging and newly added expert pieces are read from storage).
+    /// `Op::Copy` segments and pack-file extents are clipped tightly to `keep`; `Op::Item128`, `Op::Mem`, and `Op::Gen`
+    /// segments are kept whole if they intersect `keep` and dropped completely otherwise.
+    pub fn restrict(&mut self, keep: &[G6lExtent]) -> Result<(), String> {
+        let mut want: Vec<(u64, u64)> = Vec::with_capacity(keep.len());
+        for e in keep.iter().filter(|e| e.nbytes > 0) {
+            let hi = e.offset.checked_add(e.nbytes).ok_or("g6l_plan_load_ranges: extent overflow")?;
+            want.push((e.offset, hi));
+        }
+        want.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(want.len());
+        for (lo, hi) in want {
+            if let Some(last) = merged.last_mut() {
+                if lo <= last.1 {
+                    last.1 = last.1.max(hi);
+                    continue;
+                }
+            }
+            merged.push((lo, hi));
+        }
+        if merged.is_empty() {
+            self.data.clear();
+            self.segs.clear();
+            return Ok(());
+        }
+        let mut new_data = Vec::new();
+        for &(a, b) in &self.data {
+            let mut i = merged.partition_point(|w| w.1 <= a);
+            while i < merged.len() && merged[i].0 < b {
+                let lo = a.max(merged[i].0);
+                let hi = b.min(merged[i].1);
+                if lo < hi {
+                    new_data.push((lo, hi));
+                }
+                i += 1;
+            }
+        }
+        let mut new_segs = Vec::new();
+        for s in self.segs.drain(..) {
+            let a = s.pack_off;
+            let b = a + s.nbytes;
+            let mut i = merged.partition_point(|w| w.1 <= a);
+            if i >= merged.len() || merged[i].0 >= b {
+                continue;
+            }
+            match s.op {
+                Op::Copy => {
+                    while i < merged.len() && merged[i].0 < b {
+                        let lo = a.max(merged[i].0);
+                        let hi = b.min(merged[i].1);
+                        if lo < hi {
+                            new_segs.push(Seg {
+                                pack_off: lo,
+                                nbytes: hi - lo,
+                                op: Op::Copy,
+                                file_off: s.file_off + (lo - a),
+                                file: s.file,
+                            });
+                        }
+                        i += 1;
+                    }
+                }
+                Op::Item128 { .. } | Op::Mem | Op::Gen => {
+                    new_segs.push(s);
+                }
+            }
+        }
+        self.data = new_data;
+        self.segs = new_segs;
+        Ok(())
+    }
 }
 
 fn parse_sources(path: &str, root: Option<&str>, pack_bytes: u64, files: &mut Vec<String>) -> Result<Vec<Seg>, String> {
