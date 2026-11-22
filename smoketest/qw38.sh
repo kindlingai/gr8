@@ -107,12 +107,4 @@ t_tool_call_parsed() {
   ok
 }
 
-run_case t_health
-run_case t_models_lists_served_name
-run_case t_smoke_42
-run_case t_greedy_sampled_greedy
-run_case t_thinking_on
-run_case t_thinking_off
-run_case t_stream
-run_case t_tool_call_parsed
-summary
+run_all
