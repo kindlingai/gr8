@@ -16,10 +16,13 @@
 //! must hold its prompt's token. The ranks of a cluster must queue the same copies and agree on the pool digest after
 //! every call. One line of JSON per head poll (the timeline), and a summary at the end.
 
+mod glm53;
+
 use g6kvman::remote::{coldest_ages, Config, GroupOpts, Node, Opts, RemoteStore, Share, Want};
 use g6kvman::stash::{Io, Keep, Policy};
-use g6kvman::tier::{page_slot, BlockStore, MLA_ROW, MLA_ROW_KV4};
+use g6kvman::tier::BlockStore;
 use g6kvman::{Finished, Pool, Rules, Run, PAGE};
+use glm53::{page_slot, MLA_ROW, MLA_ROW_KV4};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
