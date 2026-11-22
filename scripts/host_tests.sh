@@ -17,6 +17,7 @@ HL=$REPO/engine/target/release/libg6host.a
 KN=$REPO/engine/knobs-rs/target/release/libgr8knobs.a
 GL=$REPO/engine/loader-rs/target/release/libg6load.a
 if command -v cargo > /dev/null 2>&1; then
+  rustc -V > /dev/null; cargo -V > /dev/null
   cargo build --release --quiet --manifest-path "$REPO/engine/Cargo.toml" & P1=$!
   cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml" & P2=$!
   cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml" & P3=$!

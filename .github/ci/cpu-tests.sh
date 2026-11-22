@@ -19,11 +19,12 @@ step() { echo; echo "== $*"; }
 step "bash -n"
 git ls-files -z '*.sh' | xargs -0 -n1 bash -n
 
-if [ "$PART" != frontend ]; then
-  step "Rust compiler"
-  rustc -V
-  cargo -V
+# Print compiler versions up front (serially) so rustup never races auto-installing the pinned toolchain in parallel cargo jobs.
+step "Rust compiler"
+rustc -V
+cargo -V
 
+if [ "$PART" != frontend ]; then
   step "scripts/host_tests.sh"
   scripts/host_tests.sh
 
