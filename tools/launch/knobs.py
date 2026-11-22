@@ -40,7 +40,13 @@ def library():
         r = subprocess.run(['cargo', 'rustc', '--release', '--quiet', '--features', 'capi', '--lib', '--crate-type',
                             'cdylib', '--manifest-path', os.path.join(CRATE, 'Cargo.toml')], capture_output=True, text=True)
         if not r.returncode:
-            return os.path.join(CRATE, 'target', 'release', LIB)
+            out = os.path.join(CRATE, 'target', 'release', LIB)
+            try:
+                # Cargo skips rewriting an unchanged cdylib, leaving a cached binary older than a fresh checkout's YAML.
+                os.utime(out, None)
+            except OSError:
+                pass
+            return out
         err = f': cargo rustc failed:\n{r.stderr.strip()}'
     if found:
         print(f'gr8: warning: {found[0]} is older than knobs/ and could not be rebuilt{err}', file=sys.stderr)

@@ -89,13 +89,17 @@ class FakeDaemon:
 
             def log_message(self, *_):
                 pass
+        class _HttpSrv(http.server.ThreadingHTTPServer):
+            def server_bind(self):
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address[:2]
         for _ in range(20):
             with socket.socket() as s:
                 s.bind((host, 0))
                 port = s.getsockname()[1]
             try:
                 self.ctl = socketserver.ThreadingTCPServer((host, port), Ctl)
-                self.http = http.server.ThreadingHTTPServer((host, port + 1), Http)
+                self.http = _HttpSrv((host, port + 1), Http)
                 break
             except OSError:
                 continue

@@ -358,7 +358,11 @@ class RealModelLoaderTests(unittest.TestCase):
                 self.wfile.write(data)
                 return None
 
-        srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(H, directory=rel))
+        class _Srv(http.server.ThreadingHTTPServer):
+            def server_bind(self):
+                http.server.socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address[:2]
+        srv = _Srv(('127.0.0.1', 0), functools.partial(H, directory=rel))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(lambda: (srv.shutdown(), srv.server_close()) if srv.socket.fileno() >= 0 else None)
         store = os.path.join(t, 'store')
