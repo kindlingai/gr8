@@ -22,12 +22,17 @@
 //
 // No CUDA and no verbs here: the host tests run it over loopback (scripts/host_tests.sh, tests/fabric_pool_test.cpp).
 #pragma once
+// g6m4 defines a global namespace `bind` (kernels/bind.cuh), so POSIX bind() may not be declared in its TU:
+// include socket headers with bind renamed and invoke bind via SYS_bind (same pattern as runtime/s2/posix_socket.h).
+#define bind g6_posix_bind_undeclared
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+#undef bind
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <poll.h>
-#include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -243,7 +248,15 @@ class FabricPool {
       int ls = tcp_socket(false); need(ls >= 0, "socket");
       int one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
       sockaddr_in a = addr(pc.ips[0], pc.port);
-      if (::bind(ls, (sockaddr*)&a, sizeof a) != 0 || ::listen(ls, 64) != 0) { ::close(ls); fail("cannot listen on the pool port"); }
+#ifdef __APPLE__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+      const int brc = (int)::syscall(SYS_bind, ls, (const sockaddr*)&a, (socklen_t)sizeof a);
+#ifdef __APPLE__
+#pragma clang diagnostic pop
+#endif
+      if (brc != 0 || ::listen(ls, 64) != 0) { ::close(ls); fail("cannot listen on the pool port"); }
       links_.assign(n, -1);
       try {
         for (int got = 1; got < n;) {
