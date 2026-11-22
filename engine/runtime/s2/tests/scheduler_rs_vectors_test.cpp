@@ -12,6 +12,7 @@
 #include "../scheduler.h"
 #include "../kv_share.h"
 #include "../sessions.h"
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -20,6 +21,8 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace vec {
 namespace impl {
@@ -75,10 +78,29 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "no section %s\n", argv[2]);
         return 2;
     }
+    constexpr size_t N = sizeof(sections) / sizeof(sections[0]);
+    std::vector<uint64_t> got(N, 0);
+    std::atomic<size_t> next{0};
+    unsigned nw = std::thread::hardware_concurrency();
+    if (nw == 0) nw = 4;
+    if (nw > N) nw = unsigned(N);
+    std::vector<std::thread> workers;
+    workers.reserve(nw);
+    for (unsigned w = 0; w < nw; ++w)
+        workers.emplace_back([&]() {
+            for (;;)
+            {
+                size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= N) break;
+                got[i] = sections[i].run(sections[i].seed, nullptr);
+            }
+        });
+    for (auto& th : workers) th.join();
     int fails = 0;
-    for (const auto& s : sections)
+    for (size_t i = 0; i < N; ++i)
     {
-        const uint64_t h = s.run(s.seed, nullptr);
+        const auto& s = sections[i];
+        const uint64_t h = got[i];
         if (h == s.want) continue;
         ++fails;
         std::printf("FAIL %s: transcript %016llx, recorded %016llx%s\n", s.name, (unsigned long long)h, (unsigned long long)s.want,

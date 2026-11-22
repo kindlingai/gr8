@@ -104,17 +104,24 @@ def bare_reads(paths, table):
 
 
 def unread(paths, table):
-    text = ''
+    cpp_used = set()
+    rs_used = set()
+    id_used = set()
+    cpp_re = re.compile(r'\bknob::([a-z0-9_]+)\s*\(')
+    rs_re = re.compile(r'\b([A-Za-z0-9_]+)\.(?:get|var)\(')
+    id_re = re.compile(r'\b(?:knob_ids|kid)::([A-Za-z0-9_]+)\b')
     for f in paths:
         if f.startswith(CRATE) or not (f.endswith('.rs') or C_EXT.search(f)):
             continue
-        text += code(open(os.path.join(REPO, f), errors='replace').read())[0]
+        body = code(open(os.path.join(REPO, f), errors='replace').read())[0]
+        cpp_used.update(cpp_re.findall(body))
+        rs_used.update(rs_re.findall(body))
+        id_used.update(id_re.findall(body))
     errs = []
     for name, scope, _kind, _family in table:
         if scope == 'Outside':
             continue
-        if not re.search(r'\bknob::' + name.lower() + r'\s*\(', text) and not re.search(r'\b' + name + r'\.(?:get|var)\(', text) \
-                and not re.search(r'\b(?:knob_ids|kid)::' + name + r'\b', text):
+        if name.lower() not in cpp_used and name not in rs_used and name not in id_used:
             errs.append(f'{name}: scope {scope.lower()}, but nothing reads knob::{name.lower()}() or {name}.get(): '
                         'remove it from the table, or mark it outside')
     return errs
@@ -141,10 +148,14 @@ def main():
         sys.exit(f'env_lint: knobs list failed:\n{err}')
     table = [tuple(line.split()) + ('',) * (4 - len(line.split())) for line in listing.splitlines()]
     errs = bare_reads(paths, table) + unread(paths, table)
-    for f, a in assignments(paths):
-        code_, _, err = knobs('validate', a)
+    assigns = assignments(paths)
+    if assigns:
+        code_, _, _ = knobs('validate', *(a for _, a in assigns))
         if code_:
-            errs.append(f'{f}: {a}: {err.strip()}')
+            for f, a in assigns:
+                code_, _, err = knobs('validate', a)
+                if code_:
+                    errs.append(f'{f}: {a}: {err.strip()}')
     code_, _, err = knobs('check')
     if code_:
         errs.append(err.strip())

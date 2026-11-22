@@ -93,7 +93,12 @@ class Ds41SmokeTests(unittest.TestCase):
     def run_script(self, *lie):
         handler = type('H', (Fake,), {'lie': lie, 'seen': [], 'missing': []})
         self.handler = handler
-        srv = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        class _Srv(ThreadingHTTPServer):
+            def server_bind(self):
+                import socketserver
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address[:2]
+        srv = _Srv(('127.0.0.1', 0), handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)

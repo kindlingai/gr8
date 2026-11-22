@@ -302,11 +302,17 @@ mod tests {
         }
     }
 
-    // RssAnon of this process, bytes
-    fn rss_anon() -> u64 {
-        let s = std::fs::read_to_string("/proc/self/status").unwrap();
-        let l = s.lines().find(|l| l.starts_with("RssAnon:")).unwrap();
-        l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 1024
+    /// Resident bytes of `[ptr, ptr + len)` via mincore(2). Unlike /proc/self/status RssAnon,
+    /// this measures only this mapping and cannot race with concurrent test threads freeing memory.
+    fn resident_bytes(ptr: *mut u8, len: usize) -> u64 {
+        extern "C" {
+            fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> c_int;
+        }
+        let ps = page_size();
+        let mut vec = vec![0u8; len.div_ceil(ps)];
+        let rc = unsafe { mincore(ptr as *mut c_void, len, vec.as_mut_ptr()) };
+        assert_eq!(rc, 0, "mincore failed: {}", io::Error::last_os_error());
+        vec.iter().filter(|&&b| b & 1 != 0).count() as u64 * ps as u64
     }
 
     #[test]
@@ -315,19 +321,21 @@ mod tests {
         let lock = !memlock_limit().is_some_and(|l| l < part as u64) || is_root();
         let a = Arena::with(len, lock, true).unwrap();
         assert!(!a.locked && a.held() == 0);
-        let r0 = rss_anon();
+        let slice_ptr = unsafe { a.base().add(part) };
+        let r0 = resident_bytes(slice_ptr, part);
+        assert_eq!(r0, 0, "nothing backed before take");
         a.take(part, part).unwrap();
         assert_eq!(a.held(), part);
-        assert!(rss_anon() >= r0 + part as u64 * 9 / 10, "the range is backed");
+        assert!(resident_bytes(slice_ptr, part) >= part as u64 * 9 / 10, "the range is backed");
         unsafe {
-            std::ptr::write_bytes(a.base().add(part), 7, part);
+            std::ptr::write_bytes(slice_ptr, 7, part);
         }
-        let r1 = rss_anon();
+        let r1 = resident_bytes(slice_ptr, part);
         a.give(part, part);
         assert_eq!(a.held(), 0);
-        assert!(rss_anon() + part as u64 * 9 / 10 <= r1, "the range went back");
+        assert!(resident_bytes(slice_ptr, part) + part as u64 * 9 / 10 <= r1, "the range went back");
         a.take(part, part).unwrap();
-        let z = unsafe { std::slice::from_raw_parts(a.base().add(part), part) };
+        let z = unsafe { std::slice::from_raw_parts(slice_ptr, part) };
         assert!(z.iter().all(|&b| b == 0), "taken again, it reads as zeros");
         a.give(part, part);
     }

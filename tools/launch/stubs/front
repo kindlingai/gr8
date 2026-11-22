@@ -134,4 +134,10 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
 
-http.server.ThreadingHTTPServer(('127.0.0.1', a.port), H).serve_forever()
+class _Server(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        http.server.socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+_Server(('127.0.0.1', a.port), H).serve_forever()

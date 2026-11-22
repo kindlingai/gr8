@@ -54,8 +54,15 @@ class Scale(unittest.TestCase):
             self.env.pop(k, None)
 
     def tearDown(self):
+        procs = []
         for i in range(4):
-            self.gr8(i, 'down', timeout=60)
+            out = os.path.join(self.homes[i], 'out')
+            if os.path.exists(os.path.join(out, 'supervisor.lock')) or os.path.exists(os.path.join(out, 'supervisor.pid')):
+                procs.append(subprocess.Popen([sys.executable, os.path.join(HERE, 'launch.py'), 'down',
+                                               '--work-dir', self.homes[i]], env=self.env,
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        for p in procs:
+            p.wait(timeout=60)
         shutil.rmtree(self.t, ignore_errors=True)
 
     extra = ()

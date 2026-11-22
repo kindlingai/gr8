@@ -263,17 +263,17 @@ build tr3_e4m3_test $NVCC -O2 -std=c++17 $GEN -o "$OUT/tr3_e4m3_test" "$REPO/eng
 build gpuprobe $NVCC -O2 -std=c++17 $GEN -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
 # the prefetch queues (GR8_L2PF targets, GR8_MTP_L2PF's draft eh_proj / head targets): order and capacity, CPU
 # shellcheck disable=SC2086
-build l2pf_queue_test nvcc -O2 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR} -I "$REPO/engine/kernels" \
+build l2pf_queue_test $NVCC -O2 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR} -I "$REPO/engine/kernels" \
   -o "$OUT/l2pf_queue_test" "$REPO/engine/kernels/tests/l2pf_queue_test.cu"
 # K1 split choice (GR8_K1_SPLIT table vs triple, the fused remap's KS1 x WG >= 2 guard): host only, runs everywhere
 # shellcheck disable=SC2086
-build k1_split_test nvcc -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_split_test" \
+build k1_split_test $NVCC -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_split_test" \
   "$REPO/engine/kernels/tests/k1_split_test.cu" "${KNOBS[@]}"
 # the sampler's uniform draw (u01_top24: 0 < u < 1, a finite Gumbel noise, the old value below 1): host only, runs everywhere
-build sampler_u01_test nvcc -O2 -std=c++17 $GEN -I "$REPO/engine/kernels" -o "$OUT/sampler_u01_test" \
+build sampler_u01_test $NVCC -O2 -std=c++17 $GEN -I "$REPO/engine/kernels" -o "$OUT/sampler_u01_test" \
   "$REPO/engine/kernels/tests/sampler_u01_test.cu"
 # the DFlash2 selector's top-16 ids (dfl_topk.h: a row with no orderable logit sends no id outside the vocabulary): host only
-build dfl_topk_test nvcc -O2 -std=c++17 $GEN -o "$OUT/dfl_topk_test" "$REPO/engine/runtime/tests/dfl_topk_test.cu"
+build dfl_topk_test $NVCC -O2 -std=c++17 $GEN -o "$OUT/dfl_topk_test" "$REPO/engine/runtime/tests/dfl_topk_test.cu"
 # flat reduce-scatter slices (Fabric::Rs::flat) over real verbs, mesh or ring: built here, run on the cluster (see its header)
 build fabric_rs_flat_test $NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_rs_flat_test" \
   "$REPO/engine/comms/tests/fabric_rs_flat_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs "${KNOBS[@]}"

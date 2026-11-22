@@ -210,7 +210,11 @@ class FakeHub:
                         table[path] -= 1
                         body = bytes([body[0] ^ 1]) + body[1:]
                 return self.send(206 if rng else 200, body, head=head)
-        self.srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+        class _Srv(http.server.ThreadingHTTPServer):
+            def server_bind(self):
+                http.server.socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address[:2]
+        self.srv = _Srv(('127.0.0.1', 0), H)
         self.srv.daemon_threads = True
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
@@ -638,7 +642,11 @@ class KeepAliveTests(unittest.TestCase):
                 if t.close_next[0]:
                     t.close_next[0], self.close_connection = False, True
 
-        self.srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+        class _Srv(http.server.ThreadingHTTPServer):
+            def server_bind(self):
+                http.server.socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address[:2]
+        self.srv = _Srv(('127.0.0.1', 0), H)
         self.srv.daemon_threads = True
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
