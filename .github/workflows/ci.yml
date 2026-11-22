@@ -264,10 +264,8 @@ jobs:
           target: rust-dist
           platforms: linux/arm64
           outputs: type=local,dest=rust-dist
-          # Read from GHCR cache package first, falling back to legacy GHA cache during migration; write only to GHCR on main.
-          cache-from: |
-            type=registry,ref=${{ steps.cache.outputs.repo }}:rust
-            type=gha,scope=rust
+          # Read BuildKit layer cache from the GHCR cache package; write only on main.
+          cache-from: type=registry,ref=${{ steps.cache.outputs.repo }}:rust
           cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && format('type=registry,ref={0}:rust,mode=max', steps.cache.outputs.repo) || '' }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
@@ -357,10 +355,6 @@ jobs:
             echo "type=registry,ref=${repo}:gr8"
             if [ "${{ matrix.scope }}" != "gr8" ]; then
               echo "type=registry,ref=${repo}:${{ matrix.scope }}"
-            fi
-            echo "type=gha,scope=gr8"
-            if [ "${{ matrix.scope }}" != "gr8" ]; then
-              echo "type=gha,scope=${{ matrix.scope }}"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
@@ -571,9 +565,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           load: true
-          cache-from: |
-            type=registry,ref=${{ steps.head.outputs.cache_repo }}:runtime
-            type=gha,scope=runtime
+          cache-from: type=registry,ref=${{ steps.head.outputs.cache_repo }}:runtime
           cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && format('type=registry,ref={0}:runtime,mode=max', steps.head.outputs.cache_repo) || '' }}
       - name: Smoke test (no GPU)
         env:
