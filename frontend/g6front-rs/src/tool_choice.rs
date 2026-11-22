@@ -141,6 +141,16 @@ impl ToolChoice {
         self.forced_ids_for(text, tok, think_close)
     }
 
+    /// Qwen3.8 XML forced reply: `<tool_call>\n<function=NAME>\n` (`dialect::qwen_forced_text`), behind `think_close`.
+    pub fn forced_ids_qwen(&self, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {
+        let text = match self {
+            ToolChoice::Required => Some(crate::dialect::qwen_forced_text(None)),
+            ToolChoice::Named(name) => Some(crate::dialect::qwen_forced_text(Some(name))),
+            ToolChoice::None | ToolChoice::Auto => None,
+        };
+        self.forced_ids_for(text, tok, think_close)
+    }
+
     /// Inkling's forced reply: the start of a JSON tool-call block (`dialect::ink_forced_text`), behind `think_close`.
     /// `tools` is the request's normalized list: `required` with one declared tool names it.
     pub fn forced_ids_ink(&self, tools: Option<&Value>, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {

@@ -425,7 +425,7 @@ async fn serve(args: Args) -> Result<(), String> {
             let d = thinking::Defaults { effort: None, budget: args.default_budget, allow_off: true };
             (None, d, effort)
         }
-        dialect::Dialect::Hf => {
+        dialect::Dialect::Hf | dialect::Dialect::Qwen => {
             let template = template::ChatTemplate::load(
                 &PathBuf::from(&args.model_dir),
                 tok.eos_token.clone(),
@@ -436,8 +436,9 @@ async fn serve(args: Args) -> Result<(), String> {
             tok.think_close = tok.encode("</think>", false)?;
             let effort = args.default_effort.as_deref().map(thinking::parse_default_effort).transpose()?;
             log::info!(
-                "dialect hf: tokenizer + template loaded in {:.0} ms (vocab {}, eos {:?}); reasoning efforts the \
+                "dialect {}: tokenizer + template loaded in {:.0} ms (vocab {}, eos {:?}); reasoning efforts the \
                  template names: {:?}; default effort {:?}, default thinking budget {}, thinking off allowed",
+                dialect.name(),
                 t0.elapsed().as_secs_f64() * 1e3,
                 tok.vocab_size,
                 tok.eos_ids,
@@ -486,6 +487,7 @@ async fn serve(args: Args) -> Result<(), String> {
         dialect::Dialect::Glm => vec!["glm-5.3".into(), "glm53".into()],
         dialect::Dialect::Ds41 => vec!["deepseek-v4.1-flash".into()],
         dialect::Dialect::Hf => vec![dialect::hf_served_name(std::path::Path::new(&args.model_dir))],
+        dialect::Dialect::Qwen => dialect::qwen_served_names(std::path::Path::new(&args.model_dir)),
         dialect::Dialect::Inkling => dialect::inkling_served_names(std::path::Path::new(&args.model_dir)),
     });
     if !args.emit_undeclared {

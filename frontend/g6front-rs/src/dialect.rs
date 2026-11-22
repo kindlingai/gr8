@@ -31,6 +31,7 @@ pub enum Dialect {
     Ds41,
     Hf,
     Inkling,
+    Qwen,
 }
 
 impl Dialect {
@@ -40,25 +41,27 @@ impl Dialect {
             Dialect::Ds41 => "ds41",
             Dialect::Hf => "hf",
             Dialect::Inkling => "inkling",
+            Dialect::Qwen => "qwen",
         }
     }
 
-    /// `--dialect`: `glm`, `ds41`, `hf`, `inkling`, or `auto` (None: look at the model directory).
+    /// `--dialect`: `glm`, `ds41`, `hf`, `inkling`, `qwen`, or `auto` (None: look at the model directory).
     pub fn parse_flag(s: &str) -> Result<Option<Dialect>, String> {
         match s {
             "glm" => Ok(Some(Dialect::Glm)),
             "ds41" => Ok(Some(Dialect::Ds41)),
             "hf" => Ok(Some(Dialect::Hf)),
             "inkling" => Ok(Some(Dialect::Inkling)),
+            "qwen" => Ok(Some(Dialect::Qwen)),
             "auto" => Ok(None),
-            other => Err(format!("--dialect {other}: want glm, ds41, hf, inkling or auto")),
+            other => Err(format!("--dialect {other}: want glm, ds41, hf, inkling, qwen or auto")),
         }
     }
 
     /// Auto-detect the dialect from `config.json` and the tokenizer:
-    /// - `DeepseekV4` in `architectures[0]` or the `｜DSML｜` token -> `Ds41` (the 1017 release's `config.json` is the
-    ///   inference layout and names no architecture);
+    /// - `DeepseekV4` in `architectures[0]` or the `｜DSML｜` token -> `Ds41`;
     /// - an `architectures[0]` that starts with `Inkling` (any case) or `"model_type": "inkling2"` -> `Inkling`;
+    /// - `Qwen4Exp` in `architectures[0]` or `"model_type": "qwen4_exp"` -> `Qwen`;
     /// - missing `config.json`, missing/empty `architectures[0]`, or a `Glm` / `ChatGLM` prefix -> `Glm`;
     /// - any other non-empty `architectures[0]` (e.g. `Qwen3ForCausalLM`, `LlamaForCausalLM`) -> `Hf`.
     pub fn detect(dir: &Path, tokenizer_has_dsml: bool) -> Dialect {
@@ -72,6 +75,11 @@ impl Dialect {
             || arch.as_deref().is_some_and(|a| a.to_ascii_lowercase().starts_with("inkling"))
         {
             return Dialect::Inkling;
+        }
+        if model_type.is_some_and(|m| m.starts_with("qwen4_exp"))
+            || arch.as_deref().is_some_and(|a| a.starts_with("Qwen4Exp"))
+        {
+            return Dialect::Qwen;
         }
         match arch.as_deref() {
             Some(a) if !a.is_empty() && !is_glm_arch(a) => Dialect::Hf,
@@ -118,6 +126,7 @@ impl AnyParser {
             Dialect::Ds41 => AnyParser::Ds(DsParser::new(tools, tool_choice, include_reasoning)),
             Dialect::Hf => AnyParser::Hf(HfParser::new(tools, tool_choice, include_reasoning)),
             Dialect::Inkling => AnyParser::Ink(InkParser::new(tools, tool_choice, include_reasoning)),
+            Dialect::Qwen => AnyParser::Hf(HfParser::new(tools, tool_choice, include_reasoning).with_xml_tools()),
         }
     }
 
@@ -501,6 +510,25 @@ pub fn hf_forced_text(name: Option<&str>) -> String {
     }
 }
 
+/// What a forced `tool_choice` puts at the start of the reply on `--dialect qwen`: a Qwen3.8 XML `<tool_call>` block.
+pub fn qwen_forced_text(name: Option<&str>) -> String {
+    match name {
+        Some(n) => format!("<tool_call>\n<function={n}>\n"),
+        None => "<tool_call>\n<function=".to_string(),
+    }
+}
+
+/// Default `--served-model-name` for `--dialect qwen`.
+pub fn qwen_served_names(dir: &Path) -> Vec<String> {
+    let mut names = vec!["qwen3.8-flash-next".to_string(), "qw38".to_string()];
+    if let Some(base) = dir.file_name().and_then(|n| n.to_str()).filter(|n| !n.is_empty()) {
+        if !names.iter().any(|n| n == base) {
+            names.push(base.to_string());
+        }
+    }
+    names
+}
+
 // ---- Inkling thinking, effort and forced calls -----------------------------------------------------------------------
 
 const INK_EFFORT_ERROR: &str =
@@ -839,11 +867,12 @@ mod tests {
         assert_eq!(Dialect::parse_flag("ds41"), Ok(Some(Dialect::Ds41)));
         assert_eq!(Dialect::parse_flag("glm"), Ok(Some(Dialect::Glm)));
         assert_eq!(Dialect::parse_flag("hf"), Ok(Some(Dialect::Hf)));
+        assert_eq!(Dialect::parse_flag("qwen"), Ok(Some(Dialect::Qwen)));
         assert_eq!(Dialect::parse_flag("auto"), Ok(None));
-        assert!(Dialect::parse_flag("qwen").is_err());
+        assert!(Dialect::parse_flag("bogus").is_err());
         assert_eq!(Dialect::parse_flag("inkling"), Ok(Some(Dialect::Inkling)));
-        assert_eq!(Dialect::parse_flag("qwen").unwrap_err(), "--dialect qwen: want glm, ds41, hf, inkling or auto");
-        assert_eq!((Dialect::Glm.name(), Dialect::Ds41.name(), Dialect::Hf.name()), ("glm", "ds41", "hf"));
+        assert_eq!(Dialect::parse_flag("bogus").unwrap_err(), "--dialect bogus: want glm, ds41, hf, inkling, qwen or auto");
+        assert_eq!((Dialect::Glm.name(), Dialect::Ds41.name(), Dialect::Hf.name(), Dialect::Qwen.name()), ("glm", "ds41", "hf", "qwen"));
         assert_eq!(Dialect::Inkling.name(), "inkling");
     }
 
