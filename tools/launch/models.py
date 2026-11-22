@@ -137,7 +137,7 @@ QW38 = Model('qw38', 'Qwen3.8-Flash-Next', 'https://huggingface.co/kindlingai/qw
              max_positions=262144, per_slot_pool=True, stage_relay=True,
              engine_profile='qw38', simulator='m4sim_qw38', smoke_script='smoketest/qw38.sh',
              serve_options=('MTP', 'CHUNK', 'EAGER'), engine_prefixes=('GR8_QW38_',),
-             min_free_gib=8, checkpoint_cache=True,
+             min_free_gib=8, checkpoint_cache=True, engine_prefixes=('GR8_QW38_',),
              build_widths=('1', '2', '3', '4'), build_define='G6_MODEL_QW38', build_fc2gl=4, build_what_env='QW38_WHAT',
              scalable=True)
 # The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on
