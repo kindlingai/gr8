@@ -153,9 +153,9 @@ inst() {   # inst <bin> <width>: $O/<bin>.w<width>.i.o, the width's instance of 
   local attn="$O/attn.w$2.o $O/attn_bind.w$2.o $O/attn_ops.w$2.o"
   [ "$INK2" = 1 ] || [ "$QW38" = 1 ] && attn=""
   ld -r --force-group-allocation -o $b.r.o $b.o $attn
-  objcopy --redefine-sym main=g6w$2_main $b.r.o
+  objcopy --redefine-sym main=g6w$2_main --redefine-sym g6_width_create=g6w$2_create $b.r.o
   nm --defined-only -g $b.r.o | awk 'NF == 3 { print $3 }' | sort -u | comm -12 - $O/shared.syms > $b.weak
-  { echo g6w$2_main; cat $b.weak; } > $b.keep
+  { echo g6w$2_main; nm --defined-only -g $b.r.o | awk '$3 == "g6w'"$2"'_create" { print $3 }'; cat $b.weak; } > $b.keep
   objcopy --keep-global-symbols=$b.keep --weaken-symbols=$b.weak $b.r.o $b.i.o
 }
 if [ "$WHAT" != g6 ]; then

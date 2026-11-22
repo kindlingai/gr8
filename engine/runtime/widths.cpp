@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include "width_module.h"
 #ifdef M4SIM
 #include <sys/stat.h>
 #include <vector>
@@ -18,6 +19,31 @@ int g6w4_main(int, char**) __attribute__((weak));
 int g6w5_main(int, char**) __attribute__((weak));
 int g6w6_main(int, char**) __attribute__((weak));
 int g6w8_main(int, char**) __attribute__((weak));
+
+int g6w1_create(const G6HostRuntime*, const G6WidthSpec*, G6WidthModule*, char*, size_t) __attribute__((weak));
+int g6w2_create(const G6HostRuntime*, const G6WidthSpec*, G6WidthModule*, char*, size_t) __attribute__((weak));
+int g6w3_create(const G6HostRuntime*, const G6WidthSpec*, G6WidthModule*, char*, size_t) __attribute__((weak));
+int g6w4_create(const G6HostRuntime*, const G6WidthSpec*, G6WidthModule*, char*, size_t) __attribute__((weak));
+int g6w5_create(const G6HostRuntime*, const G6WidthSpec*, G6WidthModule*, char*, size_t) __attribute__((weak));
+int g6w6_create(const G6HostRuntime*, const G6WidthSpec*, G6WidthModule*, char*, size_t) __attribute__((weak));
+int g6w8_create(const G6HostRuntime*, const G6WidthSpec*, G6WidthModule*, char*, size_t) __attribute__((weak));
+}
+
+// Process-wide registry of all compiled width factories linked into this binary (EL7 #155).
+const g6rt::WidthRegistry& g6_width_registry()
+{
+    static const g6rt::WidthRegistry reg = [] {
+        g6rt::WidthRegistry r;
+        r.add(1, g6w1_create);
+        r.add(2, g6w2_create);
+        r.add(3, g6w3_create);
+        r.add(4, g6w4_create);
+        r.add(5, g6w5_create);
+        r.add(6, g6w6_create);
+        r.add(8, g6w8_create);
+        return r;
+    }();
+    return reg;
 }
 
 using Main = int (*)(int, char**);
