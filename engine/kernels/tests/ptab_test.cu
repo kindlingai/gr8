@@ -55,6 +55,7 @@
 #include "../l2pf.cuh"
 #ifndef PTAB_MAIN
 #include "../ptab.cuh"
+#include "../ptab_compact.cuh"
 #endif
 #ifndef PTAB_NO_PREFILL
 #include "../bind_prefill.cuh"
@@ -639,6 +640,54 @@ int main(int argc, char** argv)
             }
             replay(g2, M, got);
             cmp_bytes("graph M=1: replay after the table was restored == before", ref, got, ob);
+            // 4. EL3b (#164): online per-step compaction on a live captured graph (ptab::CudaCompactor):
+            //    re-points Ls[l].sct at Ls[l].sct2 (leaving saved[l] untouched), compacts those scattered slabs into
+            //    contiguous per-expert runs with event-fenced Pool::give + reclaim_empty and bind::refresh_shared_pieces
+            //    while replaying the SAME captured graph mid-compaction and after, then restores saved[l].
+            if (nb > 1)
+            {
+                ptab::Pool cpool;
+                std::vector<bind::LayerTensors> cT(nlay);
+                std::vector<bind::Layer> cL(nlay);
+                std::vector<ptab::CudaCompactLayer> cls;
+                for (int l = 0; l < nlay; ++l)
+                {
+                    Ls[l].sct.host = Ls[l].sct2.host;
+                    if (const char* e = ptab::upload(Ls[l].sct, st)) { printf("%s\n", e); return 2; }
+                    cT[l] = tens(l, 2);
+                    cls.push_back({l, NEXP, &Ls[l].sct, &cT[l], &cL[l]});
+                }
+                ptab::CompactConfig ccfg;
+                ccfg.active_experts_per_step = 8;
+                ccfg.idle_experts_per_step = 64;
+                ptab::CudaCompactor comp(ccfg);
+                comp.set_layers(std::move(cls));
+                const char* ce = comp.step(cpool, /*idle=*/false, st);
+                check("EL3b compaction: active step succeeds on scattered tables", ce == nullptr && comp.stats().experts_moved == 8);
+                replay(g2, M, got);
+                cmp_bytes("EL3b compaction: captured graph replay mid-compaction == before", ref, got, ob);
+                for (int it = 0; it < 32 && !comp.done(); ++it)
+                {
+                    ce = comp.step(cpool, /*idle=*/true, st);
+                    if (ce) { printf("FAIL EL3b compaction step: %s\n", ce); ++g_fail; break; }
+                    if (it % 4 == 0) CK(cudaStreamSynchronize(st));
+                }
+                ce = comp.drain(cpool, st);
+                check("EL3b compaction: completes with 0 split experts and refreshes shared row",
+                      ce == nullptr && comp.stats().split_remaining == 0 && comp.stats().shared_refreshes >= static_cast<size_t>(nlay));
+                replay(g2, M, got);
+                cmp_bytes("EL3b compaction: captured graph replay after full compaction == before", ref, got, ob);
+                for (int l = 0; l < nlay; ++l) bind::warm_mlp(cL[l], st);
+                CK(cudaStreamSynchronize(st));
+                CK(cudaGetLastError());
+                // Restore original scattered table for the remaining scattered-mode checks & bench.
+                for (int l = 0; l < nlay; ++l)
+                {
+                    Ls[l].sct.host = saved[l];
+                    if (const char* e = ptab::upload(Ls[l].sct, st)) { printf("%s\n", e); return 2; }
+                }
+                cpool.release();
+            }
             CK(cudaGraphExecDestroy(g2));
         }
     }

@@ -680,6 +680,11 @@ run_job ptab_delta_test '
     -lpthread -ldl -lm -o "$D/ptab_delta_test"
   "$D/ptab_delta_test"
 '
+# EL3b (#164) online per-step weight defragmentation: fenced retirement, shared-expert refresh, KV headroom borrow
+run_job ptab_compact_test '
+  g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined "$REPO/engine/kernels/tests/ptab_compact_test.cpp" -o "$D/ptab_compact_test"
+  "$D/ptab_compact_test"
+'
 
 wait
 for name in "${ORDER[@]}"; do
