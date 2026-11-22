@@ -2,7 +2,8 @@
 // walk_step, the loop fabric.cpp runs). The GPU is modelled by a thread that publishes collectives in PROGRAM order: it
 // rings doorbell[c] = coll_seq(step, c, ncoll), then blocks until the proxy has sent c (a real step uses the reduced
 // result of c before it publishes the next one). The proxy thread runs walk_step with a fake doorbell array; its timeout
-// and the device's spin timeout are 1 s (fabric.cpp uses 30 s, G6_SPIN_TIMEOUT_CYC the device side).
+// is 1 s and the device's spin timeout 2 s, so a stall ends in the proxy's timeout even when a busy runner delays one
+// of the two threads (fabric.cpp uses 30 s, G6_SPIN_TIMEOUT_CYC the device side).
 //   g++ -std=c++17 -O2 -Wall -Wextra -pthread -I engine/comms engine/comms/tests/fabric_order_test.cpp -o fabric_order_test
 // The DS41 + Engram plan (83 collectives: 2 NL + 1 = 81 plus the Engram reduces c = 81, 82) publishes c = 81 between c = 1
 // and c = 2 and c = 82 between c = 27 and c = 28, so numeric order deadlocks; the same plan with the execution order must pass.
@@ -55,7 +56,7 @@ static Run run_plan(int ncoll, size_t nsizes, const std::vector<int>& program, c
                 while (done[c].load(std::memory_order_acquire) != seq)
                 {
                     if (halt.load()) { r.device_c = c; return; }   // the proxy gave up while the device waited for c
-                    if (now_s() - w0 > timeout_s) { r.device_c = c; halt = true; return; }
+                    if (now_s() - w0 > 2 * timeout_s) { r.device_c = c; halt = true; return; }
                     std::this_thread::yield();
                 }
             }
