@@ -102,7 +102,6 @@
 #include <algorithm>
 #include <chrono>
 #include "engine_options.h"
-#include "fabric_plan.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include "packfind.h"
 #include "weight_check.cuh"
@@ -117,6 +116,7 @@
 #endif
 #include "../comms/fabric.h"
 #include "../comms/progress_cpus.h"
+#include "fabric_plan.h"
 #include "s2/native.cuh"
 #include "s2/flash_native.cuh"
 #include "s2/flash_ckpt_rewidth.h"   // GR8_KV_REWIDTH: a scale's carry of the Flash checkpoint store
