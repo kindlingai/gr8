@@ -363,6 +363,11 @@ def build_index_slices(out_dir, widths, tps=(1, 2, 3, 4), force=False):
 
 
 def write_manifests(out_dir, widths):
+    import hashlib
+    man_dir = os.path.join(out_dir, "manifests")
+    os.makedirs(man_dir, exist_ok=True)
+    # Deterministic weight-set ID for launcher release_set() / modelset.py
+    set_id = hashlib.sha256(f"qw38-exlr8-v2:{H}:{NHALF}:{NE}:{','.join(map(str, widths))}".encode()).hexdigest()
     for K in widths:
         name = f"bit{K}00"
         layers_str = []
@@ -378,6 +383,7 @@ def write_manifests(out_dir, widths):
             "format": "exlr8-v2-manifest",
             "model": "qw38",
             "name": name,
+            "set_id": set_id,
             "hidden_size": H,
             "nh": NHALF,
             "num_experts": NE,
@@ -385,11 +391,12 @@ def write_manifests(out_dir, widths):
         }
         text = "{\n" + "".join(f"{json.dumps(k)}: {json.dumps(v)},\n" for k, v in head.items())
         text += '"layers": {\n' + ",\n".join(layers_str) + "\n}}\n"
-        path = os.path.join(out_dir, f"exlr8-manifest-{name}.json")
-        with open(path + ".tmp", "w") as f:
-            f.write(text)
-        os.replace(path + ".tmp", path)
-        log(f"manifest: wrote {os.path.basename(path)}")
+        for dst_dir in (man_dir, out_dir):
+            path = os.path.join(dst_dir, f"exlr8-manifest-{name}.json")
+            with open(path + ".tmp", "w") as f:
+                f.write(text)
+            os.replace(path + ".tmp", path)
+        log(f"manifest: wrote manifests/exlr8-manifest-{name}.json (set_id={set_id[:16]})")
 
 
 def build_non_expert_and_ple(bf16_dir, out_dir, skip_ple=False, force=False):

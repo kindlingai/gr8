@@ -53,6 +53,55 @@ pub struct ChatTemplate {
 /// Keyword args the renderer owns; a request cannot override them through chat_template_kwargs.
 const RESERVED: [&str; 5] = ["messages", "tools", "documents", "chat_template", "tokenize"];
 
+/// Rewrite HuggingFace's training-only `{% generation %}` / `{% endgeneration %}` tags into no-op
+/// `{% if true %}` / `{% endif %}` blocks, preserving `-`/`+` whitespace-control markers verbatim.
+fn rewrite_hf_generation_tags(source: String) -> String {
+    if !source.contains("generation") {
+        return source;
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source.as_str();
+    while let Some(a) = rest.find("{%") {
+        out.push_str(&rest[..a]);
+        let after = &rest[a + 2..];
+        let Some(b) = after.find("%}") else {
+            out.push_str(&rest[a..]);
+            return out;
+        };
+        let inner = &after[..b];
+        let (lmark, body) = match inner.as_bytes().first() {
+            Some(b'-') => ("-", &inner[1..]),
+            Some(b'+') => ("+", &inner[1..]),
+            _ => ("", inner),
+        };
+        let (rmark, body) = match body.as_bytes().last() {
+            Some(b'-') => ("-", &body[..body.len() - 1]),
+            Some(b'+') => ("+", &body[..body.len() - 1]),
+            _ => ("", body),
+        };
+        match body.trim() {
+            "generation" => {
+                out.push_str("{%");
+                out.push_str(lmark);
+                out.push_str(" if true ");
+                out.push_str(rmark);
+                out.push_str("%}");
+            }
+            "endgeneration" => {
+                out.push_str("{%");
+                out.push_str(lmark);
+                out.push_str(" endif ");
+                out.push_str(rmark);
+                out.push_str("%}");
+            }
+            _ => out.push_str(&rest[a..a + 2 + b + 2]),
+        }
+        rest = &after[b + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn normalize_special_token(v: Value) -> Value {
     match &v {
         Value::Object(_) => crate::tok::token_text(&v).map_or(Value::Null, Value::from),
@@ -134,6 +183,7 @@ impl ChatTemplate {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
         env.add_function("strftime_now", |fmt: String| -> Result<String, Error> { Ok(strftime_now(&fmt)) });
+        let source = rewrite_hf_generation_tags(source);
         env.add_template_owned("chat", source).map_err(|e| format!("chat_template.jinja: {e:#}"))?;
         Ok(ChatTemplate {
             env,

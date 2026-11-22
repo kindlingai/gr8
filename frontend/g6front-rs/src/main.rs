@@ -122,7 +122,7 @@ struct Args {
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
-                  [--dialect glm|ds41|hf|inkling|auto] [--served-model-name NAME ...] [--max-model-len N]
+                  [--dialect glm|ds41|hf|inkling|qwen|auto] [--served-model-name NAME ...] [--max-model-len N]
                   [--reasoning-fields both|reasoning|reasoning_content]
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
