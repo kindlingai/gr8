@@ -1006,6 +1006,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         at_kvb("kv_b.uk", y.ap.uk, y.ap.uks);
         at_kvb("kv_b.uv", y.ap.uv, y.ap.uvs);
         if (!y.ap.uks.data != !y.ap.uvs.data) die("layer " + std::to_string(y.l) + ": kv_b.uk and kv_b.uv differ in form");
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41 && !G6_MODEL_INK2
         const bool vmm_kv = knob::kv_chunks();
         if (vmm_kv)
         {
@@ -1042,6 +1043,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
                                             mla, idx));
         }
         else
+#endif
 #if defined(G6_CP) && G6_CP
         if (m.cp.on)
         {
