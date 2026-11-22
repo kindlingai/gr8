@@ -1,0 +1,424 @@
+{
+  "schema_version": 1,
+  "version": "1.1.1",
+  "tag": "v1.1.1",
+  "previous_tag": "v1.1.0",
+  "date": "2026-11-21",
+  "commit": "a3f44a075854fc9af0ed56c6d43f7739705bc871",
+  "release_url": "https://github.com/kindlingai/gr8/releases/tag/v1.1.1",
+  "validation_gate": "Full CI build across all seven engine legs and CPU test suite plus live 4x GB10 (TP=4, 200G switch) GLM-5.3 multi-session long-context regression gate (KV_STORE=ssd, MOE_UNION_CAP=48, GR8_KV_SHARE_PAGES=1, GR8_CP_PF_VERIFY=1, MTP=2, 4 concurrent multi-turn sessions at 185K-195K): 12/12 clean greedy (temp=0.0) and 12/12 clean sampled (temp=0.7) = 24/24 clean, 0 empty replies, 0 corruption hits, 0 CP verify mismatches.",
+  "container": {
+    "image": "ghcr.io/kindlingai/gr8:v1.1.1",
+    "digest": "sha256:fa5c9f66fbfa55d162782578b3262893b782e6365a76562bcab951b54acc6d96",
+    "pinned": "ghcr.io/kindlingai/gr8:v1.1.1@sha256:fa5c9f66fbfa55d162782578b3262893b782e6365a76562bcab951b54acc6d96",
+    "platforms": [
+      "linux/arm64"
+    ],
+    "target_arch": "sm_121a"
+  },
+  "toolchain": {
+    "cuda": "13.0.1",
+    "base_os": "ubuntu24.04",
+    "rust": "1.94.1",
+    "runtime_apt": [
+      "libibverbs1",
+      "ibverbs-providers",
+      "ibverbs-utils",
+      "python3",
+      "python3-yaml",
+      "curl",
+      "jq"
+    ]
+  },
+  "binaries": [
+    "bin/g6m4",
+    "bin/g6m4-int4",
+    "bin/g6m4_flash",
+    "bin/g6m4_flash-int4",
+    "bin/g6m4_ds41",
+    "bin/g6m4_ink2",
+    "bin/m4sim",
+    "bin/m4sim_flash",
+    "bin/m4sim_ds41",
+    "bin/m4sim_ink2",
+    "bin/g6front-rs",
+    "bin/g6load",
+    "bin/g6layout",
+    "bin/kvman-remote",
+    "bin/kvman-peer",
+    "bin/gpuprobe",
+    "bin/tr3_e4m3_test",
+    "bin/lib/libgr8knobs.so"
+  ],
+  "api": {
+    "protocol": "openai",
+    "http_port": 8100,
+    "control_port": 7340,
+    "s2_port": 7341,
+    "endpoints": [
+      "POST /v1/chat/completions",
+      "POST /v1/completions",
+      "POST /tokenize",
+      "POST /detokenize",
+      "GET /v1/models",
+      "GET /health",
+      "GET /health?deep",
+      "GET /metrics"
+    ]
+  },
+  "models": [
+    {
+      "id": "glm53",
+      "title": "GLM-5.3",
+      "architecture": "GlmMoeDsaForCausalLM",
+      "served_names": [
+        "glm-5.3",
+        "glm53"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4",
+      "drafter": "https://huggingface.co/incoai/GLM-5.3-DFlash2",
+      "engine_binaries": [
+        "bin/g6m4",
+        "bin/g6m4-int4"
+      ],
+      "tp_supported": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "variants": [
+        "bit200",
+        "bit225",
+        "bit239",
+        "bit260",
+        "bit273",
+        "bit300",
+        "bit325",
+        "bit332",
+        "bit390",
+        "bit400"
+      ],
+      "default_variant_by_tp": {
+        "3": "bit260",
+        "4": "bit325",
+        "5": "bit325",
+        "6": "bit325"
+      },
+      "int4_kv": true,
+      "defaults_by_tp": {
+        "3": {
+          "kv_format": "fp8",
+          "cap": 307136,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "4": {
+          "kv_format": "int4",
+          "cap": 513536,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 1,
+          "share_limit": 32768,
+          "dec_bk": 2048,
+          "dec_bk_max": 2048,
+          "reuse_grid": 64,
+          "moe_union_cap": 48,
+          "exact_kernel_opts": [
+            "DEC_DENSE_OPT",
+            "DTR_EXACT_OPT",
+            "MOE_RTR_FIN_OPT",
+            "TR3_WIDE4",
+            "PF_ATTN_OPT",
+            "PF_DENSE_OPT",
+            "PF_ISGRT_CLEAN",
+            "DFL_DEDUP"
+          ],
+          "l2pf": 31,
+          "pf_gemmf32": 1,
+          "mtp_l2pf": 3,
+          "mtp_lastrow": 1,
+          "draft_head2": 1,
+          "dfl_reuse_min": 0
+        },
+        "5": {
+          "kv_format": "fp8",
+          "cap": 502848,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 32768,
+          "dec_bk_max": 2048,
+          "l2pf": 31,
+          "pf_gemmf32": 1,
+          "mtp_l2pf": 3,
+          "mtp_lastrow": 1,
+          "draft_head2": 1,
+          "moe_union_cap": 48,
+          "exact_kernel_opts": [
+            "DEC_DENSE_OPT",
+            "DTR_EXACT_OPT",
+            "MOE_RTR_FIN_OPT",
+            "TR3_WIDE4",
+            "PF_ATTN_OPT",
+            "PF_DENSE_OPT",
+            "PF_ISGRT_CLEAN"
+          ]
+        },
+        "6": {
+          "kv_format": "fp8",
+          "cap": 614400,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 131072,
+          "dec_bk_max": 2048,
+          "l2pf": 31,
+          "pf_gemmf32": 1,
+          "mtp_l2pf": 3,
+          "mtp_lastrow": 1,
+          "draft_head2": 1,
+          "moe_union_cap": 48,
+          "exact_kernel_opts": [
+            "DEC_DENSE_OPT",
+            "DTR_EXACT_OPT",
+            "MOE_RTR_FIN_OPT",
+            "TR3_WIDE4",
+            "PF_ATTN_OPT",
+            "PF_DENSE_OPT",
+            "PF_ISGRT_CLEAN"
+          ]
+        }
+      }
+    },
+    {
+      "id": "glm53f",
+      "title": "GLM-5.3-Flash",
+      "architecture": "Glm5NextForConditionalGeneration",
+      "served_names": [
+        "glm-5.3-flash",
+        "glm53f"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4",
+      "drafter": "https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2",
+      "engine_binaries": [
+        "bin/g6m4_flash",
+        "bin/g6m4_flash-int4"
+      ],
+      "tp_supported": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "variants": [
+        "k2",
+        "k3",
+        "k4"
+      ],
+      "default_variant_by_tp": {
+        "1": "k2",
+        "2": "k4",
+        "3": "k4",
+        "4": "k4"
+      },
+      "int4_kv": true,
+      "defaults_by_tp": {
+        "1": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 1,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768
+        },
+        "2": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 1,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768,
+          "int4_override_defaults": {
+            "sess": 4,
+            "mtp": 3,
+            "s2_shared_waterfill": 1,
+            "s2_shared_wf_margin": 0.02
+          }
+        },
+        "3": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 4,
+          "mtp": 1,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 8,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768
+        }
+      }
+    },
+    {
+      "id": "ds41",
+      "title": "DeepSeek-V4.1-Flash",
+      "architecture": "DeepseekV41ForCausalLM",
+      "served_names": [
+        "deepseek-v4.1-flash"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native",
+      "drafter": null,
+      "engine_binaries": [
+        "bin/g6m4_ds41"
+      ],
+      "tp_supported": [
+        4
+      ],
+      "variants": [],
+      "default_variant_by_tp": {},
+      "int4_kv": false,
+      "defaults_by_tp": {
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 5,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "exact": 0,
+          "ds_pf_v2": 1,
+          "ds_prefill_w": 12288,
+          "default_max_tokens": 32768,
+          "default_reasoning_effort": "low"
+        }
+      }
+    },
+    {
+      "id": "ink2",
+      "title": "Inkling-2-Small",
+      "architecture": "Inkling2ForConditionalGeneration",
+      "served_names": [
+        "inkling-2-small",
+        "ink2"
+      ],
+      "checkpoint": "https://huggingface.co/thinkingmachines/Inkling-2-Small",
+      "drafter": null,
+      "engine_binaries": [
+        "bin/g6m4_ink2"
+      ],
+      "tp_supported": [
+        4,
+        6
+      ],
+      "variants": [],
+      "default_variant_by_tp": {},
+      "int4_kv": false,
+      "defaults_by_tp": {
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 4,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "chunk": 8
+        },
+        "6": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 4,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "chunk": 8
+        }
+      }
+    }
+  ],
+  "breaking": false,
+  "breaking_changes": [],
+  "default_or_cache_changes": [
+    {
+      "scope": "glm53 TP=4/5/6",
+      "change": "TP=5 and TP=6 now default the v1.1.0 bit-exact tuned kernels, DEC_BK_MAX=2048, L2PF=31, PF_GEMMF32=1, MTP prefetch/lastrow/head2 tuning, and MOE_UNION_CAP=48; TP=4 also defaults L2PF=31, PF_GEMMF32=1, MTP prefetch/lastrow/head2 tuning, and DFL_REUSE_MIN=0 when DFLASH=1 (#554).",
+      "rollback": "Set MOE_UNION_CAP=0 (--moe-union-cap 0) for strict uncapped exact routing (KL=0.00000); set MOE_UNION_CAP=32 for fast mode."
+    },
+    {
+      "scope": "KV_STORE=ssd:...",
+      "change": "Persistent session index resets once on binary upgrade while preserving the preallocated SSD block file.",
+      "rollback": "None required; active sessions prefill once on first boot."
+    }
+  ],
+  "toolchain_changes": [
+    "Dockerfile adds bin/g6layout (#553) to dist; CUDA (13.0.1), base OS (ubuntu24.04), Rust (1.94.1), and runtime apt packages are unchanged."
+  ],
+  "operational_notes": [
+    "Recommended upgrade for all GLM-5.3 TP=4 deployments: fixes the 150K+ multi-session CP staged index ordering bug (#557) that caused intermittent empty replies or reasoning loops on short follow-up chunks.",
+    "Quality-first recipes (such as K4 bit387) continue to explicitly set MOE_UNION_CAP=0 to opt out of default MOE_UNION_CAP=48.",
+    "New --pool (POOL) mode enables standby boxes and zero-restart Helm scaling with ./gr8 <model> scale --tp N (#547)."
+  ],
+  "prs": [
+    {
+      "number": 552,
+      "commit": "c7d38a64",
+      "summary": "Record gr8 v1.1.0 release (CHANGELOG, releases/v1.1.0.json, README, 4x card)"
+    },
+    {
+      "number": 553,
+      "commit": "6947afca",
+      "summary": "Ship bin/g6layout in container image, build.sh, and release zip"
+    },
+    {
+      "number": 554,
+      "commit": "9fa56951",
+      "summary": "Launcher: default TP=4/5/6 v1.1.0 tuned kernels, L2PF/MTP/PF_GEMMF32, and MOE_UNION_CAP=48"
+    },
+    {
+      "number": 555,
+      "commit": "b2c96ca2",
+      "summary": "Dynamic capacity-scaled CP sharding in RAM (solo unsharded fast path + live R1->R2 shrink)"
+    },
+    {
+      "number": 545,
+      "commit": "97089b3f",
+      "summary": "scale: the new width's compact copies and layout file are ready before the hold"
+    },
+    {
+      "number": 547,
+      "commit": "e4e80702",
+      "summary": "scale: POOL, a pool of boxes with standbys; the Helm chart's tp runs the group as one"
+    },
+    {
+      "number": 556,
+      "commit": "b6b65d24",
+      "summary": "docs: explain how mixed-precision int4 KV preserves quality and capacity"
+    },
+    {
+      "number": 546,
+      "commit": "fe835de9",
+      "summary": "engine/runtime/tests: img_handoff_test, Phase B probe P0 (weights that outlive the process)"
+    },
+    {
+      "number": 557,
+      "commit": "a3f44a07",
+      "summary": "fix(prefill): wait for CP staged index pool before pf_ix and use __ldcv on RDMA recv slots"
+    }
+  ],
+  "benchmarks": [
+    {
+      "model": "glm53",
+      "tp": 4,
+      "config": "bit325 v0.6, int4 KV, KV_STORE=ssd, MOE_UNION_CAP=48, GR8_KV_SHARE_PAGES=1, GR8_CP_PF_VERIFY=1, MTP=2, 4 concurrent multi-turn sessions at 185K-195K, 200G switch",
+      "long_context_multi_turn_greedy_t0": "12/12 clean (0 empty replies, 0 corruption hits, 0 CP verify mismatches)",
+      "long_context_multi_turn_sampled_t07": "12/12 clean (0 empty replies, 0 corruption hits, 0 CP verify mismatches)",
+      "total_calls_clean": "24/24"
+    }
+  ]
+}

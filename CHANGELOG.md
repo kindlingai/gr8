@@ -8,19 +8,65 @@ Format and release rules live in [`RELEASING.md`](RELEASING.md).
 
 ## [Unreleased]
 
-Changes merged on `main` since `v1.1.0` that are not yet cut in a numbered `v*` release tag.
+Changes merged on `main` since `v1.1.1` that are not yet cut in a numbered `v*` release tag.
 
-- `scale` prepares the new width's load files before the hold: with `GR8_LOAD_COMPACT=DIR` in `EXTRA_ENV`, each box
-  writes its new rank's compact copies into `DIR.tp<N>-<tag>` while the old width serves (older widths' copies go once
-  a later scale is done), and the planned layout file is named by its content, so a repeated transition keeps its
-  `GR8_GEN_CACHE` entries. The config lines `scale` prints now come from the finished scale.
-- **`POOL`** (`--pool`): every box that may serve, head first; with `--tp N` the first N serve and the others stand by.
-  `scale --tp M` then needs no `--peers` and no new `up`, a box that leaves stands by instead of exiting, and the head
-  boots the last scaled width at its next `up` (`out/scale.json`, while `TP` and `POOL` are unchanged). `health` is
-  true on a standby, and on the head while its front end holds requests. The Helm chart's new `tp` value runs the group
-  as such a pool, so `kubectl exec <release>-0 -- /opt/gr8/gr8 <model> scale --tp N` changes the width without a pod
-  restarting; unset, the chart renders as before.
 - **Breaking changes:** None.
+
+---
+
+## [v1.1.1] — 2026-11-21
+
+- **Tag / commit:** [`v1.1.1`](https://github.com/kindlingai/gr8/releases/tag/v1.1.1) · `a3f44a075854fc9af0ed56c6d43f7739705bc871`
+- **Container image:** `ghcr.io/kindlingai/gr8:v1.1.1@sha256:fa5c9f66fbfa55d162782578b3262893b782e6365a76562bcab951b54acc6d96`
+- **Version spec:** [`releases/v1.1.1.json`](releases/v1.1.1.json)
+- **Validation gate:** Full CI build across all seven engine legs and CPU test suite plus live `4x GB10` (`TP=4`, 200G switch)
+  long-context multi-session regression gate (`KV_STORE=ssd`, `MOE_UNION_CAP=48`, `GR8_KV_SHARE_PAGES=1`, `GR8_CP_PF_VERIFY=1`,
+  `MTP=2`, 4 concurrent multi-turn sessions at 185K–195K across greedy `temp=0.0` and sampled `temp=0.7` runs).
+
+### Highlights and measured numbers
+
+- **Fix TP=4 150K+ multi-session corruption and empty-reply loops (`#557`):**
+  - Orders `cp_pf_pre(i)` / `cp_gather(i)` ahead of `pf_ix(i - 1)` in `pf_step`, `pf_step2`, `pf_step2s`, and `m4sim`
+    (`enqueue_pf` / `enqueue_pf2`) so staged peer index keys finish arriving over RDMA before `pf_ix` appends and scores
+    layer `i` (while keeping `pf_ix` before `pf_set_step` so collective `c4` remains on layer-step `i - 1`). Adds CI
+    regression gate `engine/tests/test_cp_pf_ix_order.py` and hardens direct RDMA receive-slot loads with `__ldcv`.
+  - **Live `4x GB10` (`TP=4`, 200G switch, `bit325` v0.6, `int4` KV, full production defaults, 2026-11-21):**
+    - Greedy (`temp=0.0`, exact seed that failed 8/12 on `v1.1.0`): **12/12 CLEAN** (0 empty replies, 0 corruption hits,
+      0 `GR8_CP_PF_VERIFY` mismatches across all 4 ranks).
+    - Sampled (`temp=0.7`, independent seed): **12/12 CLEAN** (**24/24 CLEAN** total, no prefill throughput regression).
+- **TP=4/5/6 tuned launcher defaults (`#554`):** Extends the `v1.1.0` bit-exact tuned kernels, `DEC_BK_MAX=2048`,
+  `L2PF=31`, `PF_GEMMF32=1`, MTP prefetch/lastrow/head2 tuning, `DFL_REUSE_MIN=0` (when `DFLASH=1`), and
+  `MOE_UNION_CAP=48` to `TP=5` and `TP=6` alongside `TP=4`.
+- **Dynamic capacity-scaled CP sharding in RAM (`#555`):** Adds a solo unsharded fast path and live `R1 -> R2` shrink
+  as KV pool utilization increases.
+- **Cluster scaling and standby pools (`#545`, `#547`, `#553`):**
+  - `scale` prepares the new width's compact copies (`GR8_LOAD_COMPACT=DIR`) and content-addressed layout file before
+    the hold (`#545`), keeping `GR8_GEN_CACHE` hits across repeated transitions.
+  - Adds **`POOL`** (`--pool`) standby pool mode and Helm chart `tp` support (`#547`) so `gr8 <model> scale --tp N`
+    changes serving width without pod restarts.
+  - Ships `bin/g6layout` in the container image, `scripts/build.sh`, and release zip (`#553`).
+- **Docs and runtime tests (`#546`, `#556`):** Documents how mixed-precision `int4` KV preserves quality and capacity
+  (`#556`) and adds `img_handoff_test` (`#546`).
+
+### Breaking changes
+
+None. `./gr8` CLI commands and flags, port `8100` HTTP endpoints and payloads, Hugging Face `exlr8` weight and steering
+profile schemas, and 128 GB GB10 runtime memory and numerical contracts remain backward-compatible with `v1.1.0`.
+
+### Default or cache-key changes
+
+- **GLM-5.3 TP=5 and TP=6 launcher defaults (`#554`):** Now enable the same bit-exact tuned kernels, `DEC_BK_MAX=2048`,
+  `L2PF=31`, `PF_GEMMF32=1`, MTP prefetch/lastrow/head2 tuning, and `MOE_UNION_CAP=48` as TP=4 (and `DFL_REUSE_MIN=0`
+  on TP=4 when `DFLASH=1`). Roll back MoE union capping with `MOE_UNION_CAP=0` (`--moe-union-cap 0`) or opt in to fast
+  mode with `MOE_UNION_CAP=32`.
+- **Persistent `KV_STORE`:** As on any engine binary upgrade, the persistent session index resets once on first boot of
+  `v1.1.1` while preserving the preallocated SSD block file.
+
+### Toolchain / Dockerfile sync
+
+Base CUDA (`13.0.1`), OS (`ubuntu24.04`), Rust (`1.94.1`), and runtime `apt` packages are unchanged from `v1.1.0`.
+`Dockerfile` adds `bin/g6layout` (`#553`) to `dist`. Downstream GLM-5.3, Flash, and DeepSeek recipe Dockerfiles need no
+toolchain changes.
 
 ---
 
