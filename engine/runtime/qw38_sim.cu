@@ -123,7 +123,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "# m4sim_qw38 TP=%d P=%d gen=%d sess=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s/sess)\n",
                  G6_NR, P, gen, sessions, pf_ms, (P * sessions) / (pf_ms / 1e3 + 1e-9),
                  dec_ms, gen > 1 ? ((gen - 1) / (dec_ms / 1e3 + 1e-9)) : 0.0);
-    if (o.profile) e.prof.print(0);
+    if (e.o.profile) e.prof.print(0);
 
     for (int s = 0; s < sessions; ++s) {
         std::printf("session %d:", s);

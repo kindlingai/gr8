@@ -258,7 +258,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "# g6m4_qw38 TP=%d P=%d gen=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s)\n",
                      G6_NR, P, gen, pf_ms, P / (pf_ms / 1e3 + 1e-9), dec_ms,
                      gen > 1 ? ((gen - 1) / (dec_ms / 1e3 + 1e-9)) : 0.0);
-        if (o.profile) e.prof.print(rank);
+        if (e.o.profile) e.prof.print(rank);
         std::printf("session 0:");
         for (int t : said) std::printf(" %d", t);
         std::printf("\n");
