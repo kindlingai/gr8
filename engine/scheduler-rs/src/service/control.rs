@@ -15,7 +15,7 @@
 //! then `take` or `reserve`.
 
 use super::admit;
-use super::files::{atomic_file, exists, Command, Ingress};
+use super::files::{self, atomic_file, exists, Command, Ingress};
 use super::status::{self, Growth, RunUse, Status};
 use super::trace::{Trace, CONTROL};
 use crate::admission::{Queue, Status as Fit, STALL_CAPACITY, STALL_NONE, STALL_SLOTS};
@@ -76,6 +76,8 @@ pub const CALL_COUNT: u32 = 3;
 
 /// check(id, bytes, n, *checked)
 pub type CheckFn = unsafe extern "C" fn(*mut c_void, u64, *const u8, usize, *mut Checked) -> i32;
+/// check_import(id, *ok, *rows): validates import.<id>.canon and returns its canonical row count (#159)
+pub type CheckImportFn = unsafe extern "C" fn(*mut c_void, u64, *mut bool, *mut u32) -> i32;
 /// retire_run(slot)
 pub type RetireRunFn = crate::driver::SlotFn;
 /// share(idle, *has, *resize)
@@ -124,6 +126,8 @@ pub type CountersFn = unsafe extern "C" fn(*mut c_void, *const Key, u32) -> i32;
 pub struct Host {
     pub ctx: *mut c_void,
     pub check: Option<CheckFn>,
+    pub check_import: Option<CheckImportFn>,
+    pub export_meta: Option<crate::module::ExportSessionFn>,
     pub retire_run: Option<RetireRunFn>,
     pub share: Option<ShareFn>,
     pub refusal: Option<ReasonFn>,
@@ -243,6 +247,8 @@ struct Inner {
     // prefix reuse: queued requests' prompts (none for prompt logprobs) and system spans
     prompts: BTreeMap<u64, Vec<i32>>,
     spans: BTreeMap<u64, i64>,
+    // IMPORT commands: queued request id -> canonical KV row count to restore (#159)
+    imports: BTreeMap<u64, u32>,
     attempted_head: u64,
     attempted_revision: u64,
     event: u64,
@@ -346,6 +352,7 @@ impl Control {
                 payloads: BTreeMap::new(),
                 prompts: BTreeMap::new(),
                 spans: BTreeMap::new(),
+                imports: BTreeMap::new(),
                 attempted_head: u64::MAX,
                 attempted_revision: u64::MAX,
                 event: 1,
@@ -622,6 +629,13 @@ impl Control {
         hook(unsafe { f(self.host.ctx, id, bytes.as_ptr(), bytes.len(), &mut ck) })?;
         Ok(ck.ok.then_some(ck))
     }
+    fn check_import(&self, id: u64) -> R<Option<u32>> {
+        let Some(f) = self.host.check_import else { return Ok(None) };
+        let (mut ok, mut rows) = (false, 0u32);
+        // SAFETY: as check
+        hook(unsafe { f(self.host.ctx, id, &mut ok, &mut rows) })?;
+        Ok(ok.then_some(rows))
+    }
     fn retire_run(&self, s: &Slot) -> R<()> {
         let f = self.host.retire_run.ok_or_else(|| refused("bad_function_call"))?;
         // SAFETY: as check
@@ -731,13 +745,18 @@ impl Control {
             while let Some(command) = self.ingress().next()? {
                 changed = true;
                 let id = command.request;
-                if command.admit {
-                    self.intake(inn, &command)?;
+                if command.kind == files::CMD_ADMIT {
+                    self.intake(inn, &command, false)?;
+                } else if command.kind == files::CMD_IMPORT {
+                    self.intake(inn, &command, true)?;
+                } else if command.kind == files::CMD_EXPORT {
+                    self.event(inn, &Cmd { c: command, resize: None }, None)?;
                 } else if self.queue_cancel(id) {
                     inn.commands.remove(&id);
                     inn.prompts.remove(&id);
                     inn.spans.remove(&id);
                     inn.payloads.remove(&id);
+                    inn.imports.remove(&id);
                     atomic_file(&self.path(&format!("resp.{id}")), b"end abort -1 0\n")?;
                 } else {
                     // a resident or retiring session: found only at the commit
@@ -764,10 +783,19 @@ impl Control {
         Ok(())
     }
 
-    // an ADMIT command into the FIFO, its request file read and checked; a refused request is answered and not queued
-    fn intake(&self, inn: &mut Inner, command: &Command) -> R<()> {
+    // an ADMIT or IMPORT command into the FIFO, its request file read and checked; a refused request is answered and not queued
+    fn intake(&self, inn: &mut Inner, command: &Command, is_import: bool) -> R<()> {
         let bytes = self.ingress().request(command)?;
         let Some(ck) = self.check(command.request, &bytes)? else { return Ok(()) };
+        let mut import_rows = 0u32;
+        if is_import {
+            let Some(rows) = self.check_import(command.request)? else { return Ok(()) };
+            if rows == 0 || (rows as usize) >= ck.n {
+                atomic_file(&self.path(&format!("resp.{}", command.request)), b"end error -1 0\n")?;
+                return Ok(());
+            }
+            import_rows = rows;
+        }
         let mut queued = request(command.request, ck.n, ck.n_gen, ck.steering);
         queued.ckpt_at = ck.ckpt_at;
         // the busy guard's arrival bound (GR8_BUSY_QUEUE_MAX): a request that would wait behind the bound past the free
@@ -782,7 +810,7 @@ impl Control {
         // instead of being refused at grant time after its queue wait. The same rule as the grant path, which keeps
         // its check as the backstop (the pool can change between intake and grant). A view that cannot be computed
         // (a hook error) keeps the old behaviour: the request queues.
-        if self.busy_on() {
+        if self.busy_on() && !is_import {
             match self.busy_intake(&queued, &ck) {
                 Ok(true) => {
                     self.busy_answer(inn, command.request, queued.id, "intake")?;
@@ -807,7 +835,10 @@ impl Control {
         self.queue_push(queued)?;
         inn.commands.entry(command.request).or_insert(*command);
         inn.payloads.entry(command.request).or_insert_with(|| Arc::new(bytes));
-        if self.reuse() && ck.plp < 0 {
+        if is_import {
+            inn.imports.insert(command.request, import_rows);
+        }
+        if !is_import && self.reuse() && ck.plp < 0 {
             inn.spans.entry(command.request).or_insert(ck.sys);
             // SAFETY: the host's prompt stays valid until the next host call
             let prompt =
@@ -829,6 +860,7 @@ impl Control {
         inn.prompts.remove(&req_id);
         inn.spans.remove(&req_id);
         inn.payloads.remove(&req_id);
+        inn.imports.remove(&req_id);
         if let Some(t) = self.trace() {
             if admit::busy_line(inn.busied, req_id) {
                 inn.busied = req_id;
@@ -874,7 +906,7 @@ impl Control {
                 return Ok(());
             }
             self.ingress().next()?;
-            self.intake(inn, &command)?;
+            self.intake(inn, &command, false)?;
         }
         Ok(())
     }
@@ -892,6 +924,10 @@ impl Control {
         let target = admit::notice_target(boundary, horizon, held, self.c.notice_max);
         let (kind, wkind) = if cmd.resize.is_some() {
             ("resize", wire::RESIZE)
+        } else if cmd.c.kind == files::CMD_EXPORT {
+            ("export", wire::EXPORT)
+        } else if cmd.c.kind == files::CMD_IMPORT {
+            ("import", wire::IMPORT)
         } else if cmd.c.admit {
             ("admit", wire::ADMIT)
         } else {
@@ -930,7 +966,7 @@ impl Control {
         };
         // the channel sends these bytes before make_commit, and the commit erases the request's entry: this reference
         // keeps them alive for the whole event
-        let payload = if cmd.c.admit {
+        let payload = if cmd.c.admit || cmd.c.kind == files::CMD_IMPORT {
             Some(inn.payloads.get(&cmd.c.request).cloned().ok_or_else(|| refused("map::at"))?)
         } else {
             None
@@ -976,7 +1012,25 @@ impl Control {
             cm.has_resize = true;
             cm.resize = r;
         }
-        if !cmd.c.admit && cmd.resize.is_none() {
+        if cmd.c.kind == files::CMD_EXPORT && cmd.resize.is_none() {
+            cm.has_export = true;
+            cm.export.export_id = cmd.c.hash;
+            if let Some(k) = sch::find(s, cmd.c.request) {
+                let sl = &s[k.slot as usize];
+                if sl.phase == sch::PREFILL || sl.phase == sch::DECODE {
+                    let rows = if sl.phase == sch::DECODE {
+                        sl.req.prompt_tokens.saturating_add(sl.emitted).saturating_sub(1)
+                    } else {
+                        sl.prefilled
+                    };
+                    cm.export.key = sl.key;
+                    cm.export.first_row = 0;
+                    cm.export.rows = rows;
+                }
+            }
+            return Ok(cm);
+        }
+        if cmd.c.kind == files::CMD_CANCEL && cmd.resize.is_none() {
             if let Some(k) = sch::find(s, cmd.c.request) {
                 cm.c.has_cancel = true;
                 cm.c.cancel = k;
@@ -989,7 +1043,7 @@ impl Control {
                 self.retire_run(sl)?;
             }
         }
-        if cmd.c.admit {
+        if cmd.c.admit || cmd.c.kind == files::CMD_IMPORT {
             self.admission(inn, s, st, cmd, &mut cm, hold)?;
         }
         Ok(cm)
@@ -1036,11 +1090,17 @@ impl Control {
         let worst = sch::reserve_rows(&self.c, &req).map_err(refused)?;
         let rows = self.admit_rows(&req)?;
         let ns = cache_namespace(&req.steering);
+        let is_import = cmd.c.kind == files::CMD_IMPORT;
+        let import_rows = if is_import {
+            *inn.imports.get(&id).ok_or_else(|| refused("import without metadata"))?
+        } else {
+            0
+        };
         let obs = self.observer();
         {
             let Inner { prompts, spans, waited, refused: refused_for, recall, recall_t0, recall_for, lend, .. } =
                 &mut *inn;
-            let prompt: Option<&[i32]> = if self.reuse() { prompts.get(&id).map(Vec::as_slice) } else { None };
+            let prompt: Option<&[i32]> = if !is_import && self.reuse() { prompts.get(&id).map(Vec::as_slice) } else { None };
             let (mut r, mut pre, mut fits) = self.try_fit(&mut req, rows, worst, prompt, &ns, obs)?;
             // no room: a decoding session may take the smaller R, and this request then tries the room it gave up
             if admit::shrink(fits, self.ops.make_room.is_some(), live, limit) {
@@ -1191,7 +1251,15 @@ impl Control {
                     let park = (parked >= 0).then_some(parked as u32);
                     let key = sch::next_key(&self.c, s, None, park).map_err(refused)?;
                     cm.c.has_admit = true;
-                    cm.c.admit = Grant { key, req, run, reuse: skip, restored, counted };
+                    cm.c.admit = Grant {
+                        key,
+                        req,
+                        run,
+                        reuse: if is_import { import_rows } else { skip },
+                        restored,
+                        counted,
+                    };
+                    cm.has_import = is_import;
                 }
             }
         }
@@ -1219,6 +1287,7 @@ impl Control {
             inn.prompts.remove(&cmd.c.request);
             inn.spans.remove(&cmd.c.request);
             inn.payloads.remove(&cmd.c.request);
+            inn.imports.remove(&cmd.c.request);
             // another request queued and a slot left after this one: keep the ranks at this boundary for it. First
             // queue the ADMIT files that landed while this thread was inside the event chain (each event waits for
             // every rank's ACK, ~8 ms); the loop reads cmd files only between events, so without this a burst written

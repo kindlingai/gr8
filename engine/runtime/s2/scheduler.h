@@ -32,7 +32,8 @@ constexpr unsigned PACK_MAX_MEMBERS = unsigned(g6mod::INFO.pack_members);
 // 10 adds the steering profile slot. 11 adds Request::r_rows. 12 adds Commit::shrink. 13 adds 32 session slots and the
 // DS41 prefill packs. 14 adds the image digest to a request's identity (DS41 image input).
 // 15 adds an optional exact prefill checkpoint boundary (zero leaves scheduling unchanged).
-constexpr unsigned CONTROL_VERSION = 15;
+// 16 adds session Export and Import events at an event fence (#159).
+constexpr unsigned CONTROL_VERSION = 16;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
@@ -172,6 +173,13 @@ struct Shrink {
     Key key; uint32_t r_rows = 0; Run run;
     bool operator==(const Shrink& b) const { return key == b.key && r_rows == b.r_rows && run == b.run; }
 };
+// a live session's KV exported at an event fence (#159): key of the session, export_id, row range [first_row, first_row + rows)
+struct Export {
+    Key key; uint64_t export_id = 0; uint32_t first_row = 0, rows = 0;
+    bool operator==(const Export& b) const {
+        return key == b.key && export_id == b.export_id && first_row == b.first_row && rows == b.rows;
+    }
+};
 struct Commit {
     uint64_t epoch = 0, event = 0, boundary = 0, before_hash = 0;
     std::optional<Key> cancel;
@@ -185,6 +193,10 @@ struct Commit {
     // an admission's room: a decoding session takes the smaller R (Config::r2_rows) before the grant, which may then
     // use the pages it gave up (Driver::apply: DriverHooks::shrink before bind)
     std::optional<Shrink> shrink;
+    // an Export event's change (#159): Driver::apply passes it to DriverHooks::export_session; leaves slots untouched
+    std::optional<Export> export_op = std::nullopt;
+    // an Import event (#159): admit carries imported rows in Grant::reuse; Driver::apply calls import_session after bind
+    bool import_session = false;
 };
 struct Changes {
     std::vector<Run> freed;

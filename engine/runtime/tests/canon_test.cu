@@ -402,18 +402,42 @@ static void run(uint64_t seed, int T, int B, int M)
         const StepOut a = step(src, A, rng, M, T + M, heads, seed * 31 + 2);
         const StepOut b = step(dst, A, rng, M, T + M, heads, seed * 31 + 2);
         report(caches_same && same(a, b), std::string("CP -> replicated: the caches and the decode step match, ") + nm);
-        // replicated -> CP: each rank's import equals that rank's own caches
+        // replicated -> CP: each rank's import equals that rank's own caches, and decoding on the imported CP bindings
+        // matches the reference CP bindings bit for bit on every rank (#159 gate)
         const std::vector<uint8_t>& as_cp = from_rep;
-        bool all_same = true;
+        bool all_same = true, cp_dec_same = true;
+        G6AttnBinding cp_dst[NRK][NL] = {};
         for (int r = 0; r < NRK; ++r) {
-            std::vector<HostCache> z = cc[r];
-            for (auto& c : z) { std::fill(c.mla.begin(), c.mla.end(), 0); std::fill(c.idx.begin(), c.idx.end(), 0); }
+            for (int l = 0; l < NL; ++l)
+                CKI(g6_attn_bind_create_cp(&cp_dst[r][l], &pk[r][l].p, r, LAYER[l], cap, MXR, 32, R, NRK, ST, scr, sb));
+            CK(cudaStreamSynchronize(ST));
+            std::vector<HostCache> z{down(cp_dst[r][0]), down(cp_dst[r][1])};
             import_rows(as_cp, z, FLAGS_CP, NRK, R, run_list, r);
             all_same = all_same && z[0].mla == cc[r][0].mla && z[0].idx == cc[r][0].idx && z[1].mla == cc[r][1].mla;
+            for (int l = 0; l < NL; ++l) up(cp_dst[r][l], z[l]);
+            const int rheads[NL] = {pk[r][0].h, pk[r][1].h};
+            const StepOut ref_cp = step(cp[r], A, rng, M, T + M, rheads, seed * 31 + 3 + r);
+            const StepOut got_cp = step(cp_dst[r], A, rng, M, T + M, rheads, seed * 31 + 3 + r);
+            cp_dec_same = cp_dec_same && same(ref_cp, got_cp);
         }
+        // After the CP decode step appended rows T..T+M-1 on all ranks, exporting both sets must yield identical blobs
+        std::vector<std::vector<HostCache>> cc_after(NRK), cd_after(NRK);
+        for (int r = 0; r < NRK; ++r) {
+            cc_after[r] = {down(cp[r][0]), down(cp[r][1])};
+            cd_after[r] = {down(cp_dst[r][0]), down(cp_dst[r][1])};
+        }
+        const int Tq = (T + M + 63) / 64;
+        std::vector<uint32_t> qlist(ident.begin(), ident.begin() + Tq);
+        const bool cp_rows_same = export_rows(cc_after, FLAGS_CP, NRK, R, qlist, 0, T + M) ==
+                                  export_rows(cd_after, FLAGS_CP, NRK, R, qlist, 0, T + M);
         report(all_same, std::string("replicated -> CP: every rank's caches equal its own, ") + nm);
+        report(cp_dec_same && cp_rows_same,
+               std::string("replicated -> CP: decode step on CP bindings matches reference on all ranks, ") + nm);
         for (int r = 0; r < NRK; ++r)
-            for (int l = 0; l < NL; ++l) CKI(g6_attn_bind_release(&cp[r][l]));
+            for (int l = 0; l < NL; ++l) {
+                CKI(g6_attn_bind_release(&cp_dst[r][l]));
+                CKI(g6_attn_bind_release(&cp[r][l]));
+            }
         for (int l = 0; l < NL; ++l) CKI(g6_attn_bind_release(&dst[l]));
     }
 #endif

@@ -11,7 +11,7 @@
 
 use super::gate::{lock, Agreement, Gate};
 use super::io::Io;
-use super::wire::{self, Ack, Commit, Notice, ADMIT};
+use super::wire::{self, Ack, Commit, Notice, ADMIT, IMPORT};
 use super::{refused, require, R};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -296,7 +296,7 @@ impl Endpoint {
     }
     fn event_inner(&self, n: &Notice, make_commit: impl FnOnce(u64) -> R<Commit>, payload: Option<&[u8]>) -> R<()> {
         let peers = self.peers()?;
-        require((n.kind == ADMIT) == payload.is_some(), "an ADMIT notice carries its request bytes")?;
+        require((n.kind == ADMIT || n.kind == IMPORT) == payload.is_some(), "an ADMIT notice carries its request bytes")?;
         self.install(n)?;
         if let Some(p) = payload {
             self.send_all(&wire::encode_request(n.epoch, n.request, p))?;

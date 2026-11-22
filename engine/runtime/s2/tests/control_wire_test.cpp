@@ -186,8 +186,8 @@ int main() {
     for (auto& t : taps) t.join();
     ::close(relay);
 
-    // Per rank: worker to head, head to worker; re-recorded for control v15 (Request::ckpt_at).
-    const uint64_t want[2][2] = {{0x6f4e78a561bbb9deull, 0xa654ed846488ea11ull}, {0x4f0d0f32b6627405ull, 0xa654ed846488ea11ull}};
+    // Per rank: worker to head, head to worker; re-recorded for control v16 (Export/Import commits, #159).
+    const uint64_t want[2][2] = {{0xd0304c4dd1eabb17ull, 0x73d44a504685dc46ull}, {0xac2ba23cd7707de8ull, 0x73d44a504685dc46ull}};
     for (const auto& t : taps) {
         const unsigned r = rank_of(t);
         CHECK(r == 1 || r == 2);

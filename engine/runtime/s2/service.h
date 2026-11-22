@@ -2,6 +2,7 @@
 // the real TP4 pool and fc2 CUDA APIs; test pools never enable native readiness.
 #pragma once
 #include "bootstrap.h"
+#include "canon_mover.h"
 #include "control_channel.h"
 #include "dispatch.h"
 #include "flash_lend.h"
@@ -103,6 +104,9 @@ struct NativeHooks {
     // and recalls are Resize events on FLASH_KV_TIER, so they need the resize hook
     std::function<uint32_t()> flash_room;
     FlashLend flash;
+    // optional (#159): export a live session's KV at an event fence, and import canonical KV into a newly bound slot
+    std::function<void(const Slot&, const Export&)> export_session;
+    std::function<void(const Grant&)> import_session;
     DispatchHooks dispatch;
     // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
     int dfl_kv = 7;
@@ -180,6 +184,50 @@ class Service {
                 out->prompt = h.prompt.data(); out->n = h.prompt.size();
                 out->sys = request.sys; out->plp = request.plp; out->n_gen = request.n_gen;
                 std::memcpy(&out->steering, &request.steering, sizeof out->steering);
+            });
+        }
+        static int32_t check_import(void* x, uint64_t id, bool* ok, uint32_t* rows) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                *ok = false; *rows = 0;
+                if (!h.s.mod_.o.import_session) {
+                    fprintf(stderr, "# s2: request %llu import refused: module has no import_session hook\n", (unsigned long long)id);
+                    atomic_file(h.s.c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
+                    return;
+                }
+                CanonBlobInfo info;
+                std::string err;
+                const std::string path = h.s.c_.directory + "/import." + std::to_string(id) + ".canon";
+                if (!canon_inspect_file(path, info, err) || info.first != 0 || info.rows == 0 || info.rows > UINT32_MAX) {
+                    fprintf(stderr, "# s2: request %llu import refused (%s): %s\n", (unsigned long long)id, path.c_str(),
+                            err.empty() ? "invalid row range" : err.c_str());
+                    atomic_file(h.s.c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
+                    return;
+                }
+                *ok = true;
+                *rows = uint32_t(info.rows);
+            });
+        }
+        static int32_t export_meta(void* x, const g6sch_slot* sl, const g6sch_export* ex) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                if (ex->rows == 0) return;
+                const Slot& s = *mod::as<const Slot>(sl);
+                CanonSessionMeta m;
+                m.request_id = s.req.id;
+                m.export_id = ex->export_id;
+                m.prompt_tokens = s.req.prompt_tokens;
+                m.emitted_tokens = s.emitted;
+                m.committed_rows = ex->rows;
+                m.remaining_max_tokens = s.req.max_tokens > s.emitted ? s.req.max_tokens - s.emitted : 0;
+                {
+                    std::ifstream rf(h.s.c_.directory + "/req." + std::to_string(s.req.id));
+                    if (rf) std::getline(rf, m.req_header);
+                }
+                const auto& pr = h.s.driver_->prompt(s.key.slot);
+                const auto em = h.s.driver_->emitted(s.key.slot);
+                m.tokens.reserve(pr.size() + em.size());
+                m.tokens.insert(m.tokens.end(), pr.begin(), pr.end());
+                m.tokens.insert(m.tokens.end(), em.begin(), em.end());
+                canon_meta_write(h.s.c_.directory + "/export." + std::to_string(ex->export_id) + ".meta", m);
             });
         }
         static int32_t retire_run(void* x, const g6sch_slot* sl) noexcept {
@@ -365,7 +413,8 @@ public:
         require(native_.pool.pool, "the service needs the rank's pool");
         require(!native_.module.ctx || !(native_.bind || native_.bind_request || native_.grown || native_.retire || native_.fence ||
                                          native_.before_work || native_.drained || native_.resize || native_.shrink ||
-                                         native_.flash_room || native_.pool.retain || native_.pool.park || native_.dispatch.launch ||
+                                         native_.flash_room || native_.export_session || native_.import_session ||
+                                         native_.pool.retain || native_.pool.park || native_.dispatch.launch ||
                                          native_.dispatch.bucket || native_.dispatch.mode || native_.dispatch.prefill ||
                                          native_.dispatch.logprob || native_.dispatch.dfl_ok || native_.dispatch.dfl_start ||
                                          native_.dispatch.dfl || native_.dispatch.draft_lp || native_.dispatch.prefill_seq ||
@@ -386,6 +435,8 @@ public:
         // the hooks whose logic is the service's are Rust (compute.rs); the rest forward to Dispatch and Sessions
         DriverHooks h;
         if (m.resize) h.resize = [&](const Resize& r) { mod_.resize(r); };
+        if (m.export_session) h.export_session = [&](const Slot& s, const Export& ex) { mod_.export_session(s, ex); };
+        if (m.import_session) h.import_session = [&](const Grant& g) { mod_.import_session(g); };
         h.shrink = [&](const Shrink& k, const Run& was, uint64_t length) {   // a worker's pool changed in the driver first
             require(mod_.o.shrink != nullptr, "a shrink commit without the native shrink hook");
             mod_.shrink(k, was, length);
@@ -462,7 +513,7 @@ public:
         cc.slots = driver_->state().slot_data(); cc.n_slots = MAX_SESSIONS; cc.state = driver_->state().counters();
         cc.pool = pol_.o;
         cc.host.ctx = static_cast<ModuleCtx*>(&host_);
-        cc.host.check = Host::check; cc.host.retire_run = Host::retire_run;
+        cc.host.check = Host::check; cc.host.check_import = Host::check_import; cc.host.retire_run = Host::retire_run;
         if (native_.share) cc.host.share = Host::share;
         if (pol_.o.refusal) cc.host.refusal = Host::refusal;
         if (pol_.o.tiers) cc.host.tiers = Host::tiers_of;
@@ -486,6 +537,7 @@ public:
         pc.module = mod_.o;
         g6svc_host& ct = pc.host;
         ct.ctx = static_cast<ModuleCtx*>(&chost_);
+        ct.export_meta = Host::export_meta;
         ct.retire_run = Host::retire_run; ct.idle_boundary = Host::idle_boundary; ct.stage = Host::stage; ct.unstage = Host::unstage;
         ct.digest = Host::digest; ct.abort = Host::abort; ct.apply = Host::apply; ct.mode = Host::mode; ct.step = Host::step;
         ct.counters = Host::counters; ct.begin = Host::begin; ct.bound = Host::bound; ct.release = Host::release;

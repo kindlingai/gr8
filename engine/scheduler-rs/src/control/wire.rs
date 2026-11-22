@@ -9,7 +9,7 @@ use crate::scheduler::{self as sch, Grant, Identity, Key, Run, Shrink, PAGE};
 
 /// The link's version: a frame of another version is refused, and the bootstrap agreement carries it, so ranks of
 /// different builds refuse each other there (scheduler.h CONTROL_VERSION).
-pub const CONTROL_VERSION: u64 = 15;
+pub const CONTROL_VERSION: u64 = 16;
 /// The first word of every frame.
 pub const MAGIC: u64 = 0x473653324530 + CONTROL_VERSION;
 
@@ -34,6 +34,10 @@ pub const ADMIT: u32 = 1;
 pub const CANCEL: u32 = 2;
 /// A tier changes size.
 pub const RESIZE: u32 = 3;
+/// A live session's KV is exported at an event fence (#159).
+pub const EXPORT: u32 = 4;
+/// A session with imported canonical KV is admitted at an event fence (#159).
+pub const IMPORT: u32 = 5;
 
 /// The steering scopes a decoder accepts (steering.h Scope) and the identity's limits.
 const SCOPE_SHARED: u8 = 1;
@@ -63,7 +67,17 @@ pub struct Ack {
     pub room: u32,
 }
 
-/// scheduler.h Commit whole: the scheduler's part, the hold flag and a Resize event's change.
+/// scheduler.h Export: a live session's KV exported at an event fence (#159).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Export {
+    pub key: Key,
+    pub export_id: u64,
+    pub first_row: u32,
+    pub rows: u32,
+}
+
+/// scheduler.h Commit whole: the scheduler's part, the hold flag, a Resize event's change, and session Export/Import.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Commit {
@@ -71,6 +85,9 @@ pub struct Commit {
     pub hold: bool,
     pub has_resize: bool,
     pub resize: Resize,
+    pub has_export: bool,
+    pub export: Export,
+    pub has_import: bool,
 }
 
 /// steering.h Identity's defaults: off, scope Full.
@@ -117,6 +134,9 @@ impl Commit {
             hold: false,
             has_resize: false,
             resize: Resize::default(),
+            has_export: false,
+            export: Export::default(),
+            has_import: false,
         }
     }
 }
@@ -214,7 +234,7 @@ impl<'a> Dec<'a> {
         n.request = self.u64()?;
         n.payload_hash = self.u64()?;
         let k = self.u64()?;
-        require((1..=3).contains(&k), "unknown event kind")?;
+        require((1..=5).contains(&k), "unknown event kind")?;
         n.kind = k as u32;
         Ok(n)
     }
@@ -278,21 +298,41 @@ impl<'a> Dec<'a> {
     }
 }
 
-/// A commit agrees with its notice: same event, a grant only for its ADMIT, hold only with a grant, a resize exactly
-/// for a RESIZE notice and alone, a shrink only with an admission.
+/// A commit agrees with its notice: same event, a grant only for its ADMIT/IMPORT, hold only with a grant, a resize
+/// exactly for a RESIZE notice and alone, a shrink only with an admission, an export exactly for an EXPORT notice and
+/// alone, and an import flag only with an IMPORT grant carrying imported rows.
 pub fn check_match(n: &Notice, x: &Commit) -> R<()> {
     let c = &x.c;
     require(n.epoch == c.epoch && n.event == c.event && n.boundary == c.boundary, "commit/notice mismatch")?;
     if c.has_admit {
-        require(n.kind == ADMIT && c.admit.req.id == n.request, "grant does not match announced request")?;
+        require(
+            (n.kind == ADMIT || n.kind == IMPORT) && c.admit.req.id == n.request,
+            "grant does not match announced request",
+        )?;
     }
     require(!x.hold || c.has_admit, "a held boundary needs a grant")?;
     require((n.kind == RESIZE) == x.has_resize, "a resize commit needs a RESIZE notice and back")?;
     if x.has_resize {
-        require(!c.has_admit && !c.has_cancel && !x.hold && !c.has_shrink, "a resize commit changes nothing else")?;
+        require(
+            !c.has_admit && !c.has_cancel && !x.hold && !c.has_shrink && !x.has_export && !x.has_import,
+            "a resize commit changes nothing else",
+        )?;
     }
     if c.has_shrink {
-        require(n.kind == ADMIT, "a shrink comes with an admission")?;
+        require(n.kind == ADMIT || n.kind == IMPORT, "a shrink comes with an admission")?;
+    }
+    require((n.kind == EXPORT) == x.has_export, "an export commit needs an EXPORT notice and back")?;
+    if x.has_export {
+        require(
+            !c.has_admit && !c.has_cancel && !x.hold && !x.has_resize && !c.has_shrink && !x.has_import,
+            "an export commit changes nothing else",
+        )?;
+    }
+    if x.has_import {
+        require(
+            n.kind == IMPORT && c.has_admit && c.admit.reuse != 0 && !x.has_resize && !x.has_export,
+            "an import commit needs an IMPORT notice and a grant with imported rows",
+        )?;
     }
     Ok(())
 }
@@ -356,6 +396,15 @@ pub fn encode_commit(n: &Notice, x: &Commit) -> R<Vec<u8>> {
         e.u64(u64::from(k.r_rows));
         e.run(&k.run);
     }
+    e.u64(u64::from(x.has_export));
+    if x.has_export {
+        let ex = &x.export;
+        e.key(&ex.key);
+        e.u64(ex.export_id);
+        e.u64(u64::from(ex.first_row));
+        e.u64(u64::from(ex.rows));
+    }
+    e.u64(u64::from(x.has_import));
     Ok(e.b)
 }
 
@@ -470,6 +519,19 @@ pub fn decode_commit(b: &[u8]) -> R<(Notice, Commit)> {
         require(k.r_rows != 0 && k.r_rows.is_multiple_of(PAGE), "invalid shrink R")?;
         x.c.has_shrink = true;
     }
+    let has = d.u64()?;
+    require(has <= 1, "invalid optional export")?;
+    if has != 0 {
+        let ex = &mut x.export;
+        ex.key = d.key()?;
+        ex.export_id = d.u64()?;
+        ex.first_row = d.u32()?;
+        ex.rows = d.u32()?;
+        x.has_export = true;
+    }
+    let has = d.u64()?;
+    require(has <= 1, "invalid import flag")?;
+    x.has_import = has != 0;
     check_match(&n, &x)?;
     d.end()?;
     Ok((n, x))

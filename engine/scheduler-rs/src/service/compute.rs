@@ -9,7 +9,7 @@
 //! module_calls_test's transcripts depend on it.
 
 use super::control::{eline, hook, targ, Control, Host, Staged};
-use super::files::{payload_hash, Command, Ingress};
+use super::files::{self, payload_hash, Command, Ingress};
 use super::trace::{self, Trace, STEPS};
 use crate::control::channel::{wall_us, Endpoint};
 use crate::control::wire::{self, Commit, Notice};
@@ -66,8 +66,9 @@ pub struct Compute {
     elog: bool,
     dfl_reuse: bool,
     ngram: bool,
-    // the ADMIT's request, parsed before the event ACK and checked against the notice's hash
+    // the ADMIT/IMPORT's request, parsed before the event ACK and checked against the notice's hash
     staged: Cell<Option<Staged>>,
+    staged_import: Cell<bool>,
     step: RefCell<Span>,
     first: RefCell<BTreeSet<u64>>, // requests whose first token the trace has
     sync: Cell<u64>,               // barriers passed (the module's drained)
@@ -81,6 +82,8 @@ fn kind_name(k: u32) -> &'static str {
     match k {
         wire::RESIZE => "resize",
         wire::CANCEL => "cancel",
+        wire::EXPORT => "export",
+        wire::IMPORT => "import",
         _ => "admit",
     }
 }
@@ -131,6 +134,7 @@ impl Compute {
             dfl_reuse: c.dfl_reuse,
             ngram: c.ngram,
             staged: Cell::new(None),
+            staged_import: Cell::new(false),
             step: RefCell::new(Span { open: false, kind: "", t0: 0, args: String::new() }),
             first: RefCell::new(BTreeSet::new()),
             sync: Cell::new(0),
@@ -179,6 +183,7 @@ impl Compute {
     }
     fn unstage(&self) -> R<()> {
         self.staged.set(None);
+        self.staged_import.set(false);
         // SAFETY: as idle_boundary
         hook(unsafe { self.host.unstage.unwrap_unchecked()(self.host.ctx) })
     }
@@ -271,10 +276,17 @@ impl Compute {
                 let n = self.endpoint().wait_notice()?;
                 noticed = n;
                 self.unstage()?;
-                if n.kind == wire::ADMIT {
+                if n.kind == wire::ADMIT || n.kind == wire::IMPORT {
                     // the head reads its own req.<id>; a worker has the bytes from the head
+                    let is_import = n.kind == wire::IMPORT;
                     let bytes = if self.head() {
-                        let c = Command { epoch: n.epoch, request: n.request, hash: n.payload_hash, admit: true };
+                        let c = Command {
+                            epoch: n.epoch,
+                            request: n.request,
+                            hash: n.payload_hash,
+                            admit: !is_import,
+                            kind: if is_import { files::CMD_IMPORT } else { files::CMD_ADMIT },
+                        };
                         // SAFETY: the head's ingress outlives the Compute; it allows the control thread's reads too
                         unsafe { (*self.ingress).request(&c)? }
                     } else {
@@ -282,6 +294,7 @@ impl Compute {
                     };
                     require(payload_hash(&bytes) == n.payload_hash, "request bytes do not match the ADMIT notice")?;
                     self.stage(&bytes)?;
+                    self.staged_import.set(is_import);
                 }
                 let d = self.digest()?;
                 Ok((d, self.room()?))
@@ -361,6 +374,18 @@ impl Compute {
             require(self.staged.get().is_some(), "commit without verified request")?;
         }
         self.apply(cm)?;
+        if cm.has_export && self.head() {
+            if let Some(f) = self.host.export_meta {
+                let s = self.view().0;
+                let sl = if cm.export.rows > 0 && (cm.export.key.slot as usize) < s.len() {
+                    &s[cm.export.key.slot as usize]
+                } else {
+                    &s[0]
+                };
+                // SAFETY: as idle_boundary
+                hook(unsafe { f(self.host.ctx, sl, &cm.export) })?;
+            }
+        }
         if let Some(t) = self.trace() {
             let args = format!(
                 "{},\"kind\":\"{}\",{}",
@@ -404,8 +429,9 @@ impl Compute {
     /// run; then Dispatch::begin, the module's bind_request and bind, and Sessions::bind.
     pub fn bind(&self, g: &Grant) -> R<()> {
         let st = self.staged.get().ok_or_else(|| refused("binding without verified payload"))?;
+        let is_import = self.staged_import.get();
         let ctl = self.ctl();
-        require(g.reuse == 0 || ctl.reuse(), "reused rows without prefix reuse")?;
+        require(g.reuse == 0 || is_import || ctl.reuse(), "reused rows without prefix reuse")?;
         if !self.head() {
             // the head's calls, on the same pool state
             let worst = sch::reserve_rows(self.c(), &g.req).map_err(refused)?;
@@ -414,12 +440,12 @@ impl Compute {
             let obs = ctl.observer();
             // SAFETY: the staged prompt stays valid until the next stage or unstage, which run makes only after apply
             let prompt = if st.n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(st.prompt, st.n) } };
-            if ctl.counts() && ctl.reuse() && st.plp < 0 {
+            if !is_import && ctl.counts() && ctl.reuse() && st.plp < 0 {
                 require(ctl.count(prompt, st.sys, &ns, obs) == g.counted, "worker prefix counts differ from the head")?;
             } else {
                 require(g.counted == 0, "a counted grant without counting")?;
             }
-            let mine = if g.reuse != 0 {
+            let mine = if !is_import && g.reuse != 0 {
                 let h = ctl.pool_match(prompt, rows, worst, g.req.prompt_tokens as i32 - 1, &ns, g.req.r_rows)?;
                 let restored = if h.stored { h.tier + 1 } else { 0 };
                 require(

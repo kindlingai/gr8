@@ -224,6 +224,9 @@ impl Kind for crate::control::wire::Notice {
 impl Kind for crate::control::wire::Ack {
     const K: u64 = 6;
 }
+impl Kind for crate::control::wire::Export {
+    const K: u64 = 6;
+}
 impl Kind for crate::control::wire::Commit {
     const K: u64 = 6;
 }
@@ -324,6 +327,7 @@ fn_kinds!(
     crate::module::PackSeqFn,
     crate::module::LogprobFn,
     crate::module::ModDflFn,
+    crate::module::ExportSessionFn,
     crate::pool_ops::MatchFn,
     crate::pool_ops::TakeFn,
     crate::pool_ops::U64OutFn,
@@ -332,6 +336,7 @@ fn_kinds!(
     crate::pool_ops::RRowsFn,
     crate::pool_ops::MakeRoomFn,
     crate::service::control::CheckFn,
+    crate::service::control::CheckImportFn,
     crate::service::control::ShareFn,
     crate::service::control::ReasonFn,
     crate::service::control::TotalsFn,
@@ -723,6 +728,8 @@ pub fn digest() -> u64 {
             settle,
             payload,
             grown,
+            export_session,
+            import_session,
             has_prefill_pack,
             has_dfl_ok,
             has_terminal,
@@ -731,7 +738,9 @@ pub fn digest() -> u64 {
             has_resize,
             has_shrink,
             has_settle,
-            has_grown
+            has_grown,
+            has_export_session,
+            has_import_session
         }
     );
     layout!(
@@ -767,6 +776,8 @@ pub fn digest() -> u64 {
             drained,
             resize,
             flash_room,
+            export_session,
+            import_session,
             bucket,
             mode,
             launch,
@@ -806,7 +817,8 @@ pub fn digest() -> u64 {
     );
     layout!(h, crate::control::wire::Notice { epoch, event, boundary, request, payload_hash, kind });
     layout!(h, crate::control::wire::Ack { notice, rank, state_hash, room });
-    layout!(h, crate::control::wire::Commit { c, hold, has_resize, resize });
+    layout!(h, crate::control::wire::Export { key, export_id, first_row, rows });
+    layout!(h, crate::control::wire::Commit { c, hold, has_resize, resize, has_export, export, has_import });
     layout!(h, crate::control::ffi::Frame { tag, notice, ack, commit, epoch, request, seq, rank, bytes, n });
     layout!(
         h,
@@ -823,7 +835,7 @@ pub fn digest() -> u64 {
             agreement_n
         }
     );
-    layout!(h, crate::service::files::Command { epoch, request, hash, admit });
+    layout!(h, crate::service::files::Command { epoch, request, hash, admit, kind });
     layout!(h, crate::service::status::RunUse { table_version, held, worst });
     layout!(h, crate::service::ffi::CProfile { name, name_n, digest, active_layers });
     layout!(h, crate::service::ffi::CSteering { profiles, n, scope, forced_scale_bits, loaded, forced });
@@ -879,6 +891,8 @@ pub fn digest() -> u64 {
         crate::service::control::Host {
             ctx,
             check,
+            check_import,
+            export_meta,
             retire_run,
             share,
             refusal,

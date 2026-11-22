@@ -40,13 +40,13 @@ static bool boot(uint16_t port, const std::string& dir, unsigned version, std::s
 }
 
 int main() {
-    CHECK(CONTROL_VERSION == 15);
+    CHECK(CONTROL_VERSION == 16);
     BootstrapConfig c; c.runtime_signature = "x";
-    CHECK(c.agreement().find(" ctl 15\n") != std::string::npos);
+    CHECK(c.agreement().find(" ctl 16\n") != std::string::npos);
     // a smaller R per grant joins the agreement only when set
     CHECK(c.agreement().find(" r2 ") == std::string::npos);
     BootstrapConfig r2 = c; r2.scheduler.window_pages = 40; r2.scheduler.r2_rows = 16384;
-    CHECK(r2.agreement().find(" r2 16384 ctl 15\n") != std::string::npos);
+    CHECK(r2.agreement().find(" r2 16384 ctl 16\n") != std::string::npos);
     CHECK(agreement_difference(1, "a b\nenv G6_X=1", "a b\nenv G6_X=1").empty());
     CHECK(agreement_difference(1, "a b\nenv G6_X=1", "a b\nenv G6_X=2") == "rank 1 has 'G6_X=2', the head has 'G6_X=1'");
     CHECK(agreement_difference(3, "a b", "a b c") == "rank 3 has 'c', the head has ''");
@@ -57,7 +57,7 @@ int main() {
     CHECK(boot(port, dir + "/same", CONTROL_VERSION, why));
     const bool mixed = boot(uint16_t(port + 1), dir + "/mixed", 6, why);
     CHECK(!mixed);
-    CHECK(why.find("bootstrap config mismatch: rank 2 has '6', the head has '15'") != std::string::npos);
+    CHECK(why.find("bootstrap config mismatch: rank 2 has '6', the head has '16'") != std::string::npos);
     std::printf("control_version_test: mixed boot refused: %s\n", why.c_str());
 
     // a frame with the previous numeric magic is refused before any field is read
@@ -83,6 +83,26 @@ int main() {
     try { (void)decode_commit(encode(e)); }
     catch (const std::exception& ex) { threw = std::strstr(ex.what(), "invalid checkpoint boundary") != nullptr; }
     CHECK(threw);
+
+    // Export and Import commits round-trip over the v16 control link (#159).
+    {
+        EventCommit ex;
+        ex.notice = Notice{9, 2, 10, 11, 777, EventKind::Export};
+        ex.commit.epoch = 9; ex.commit.event = 2; ex.commit.boundary = 10;
+        ex.commit.export_op = Export{Key{9, 1, 2}, 777, 0, 192};
+        const auto back = decode_commit(encode(ex));
+        CHECK(back.notice.kind == EventKind::Export && back.commit.export_op && *back.commit.export_op == *ex.commit.export_op);
+    }
+    {
+        EventCommit im;
+        im.notice = Notice{9, 3, 12, 22, 12345, EventKind::Import};
+        im.commit.epoch = 9; im.commit.event = 3; im.commit.boundary = 12;
+        Grant ig; ig.key = Key{9, 2, 1}; ig.req = Request{22, 193, 32}; ig.run = Run{4, 6, 3, 99}; ig.reuse = 192;
+        im.commit.admit = ig; im.commit.import_session = true;
+        const auto back = decode_commit(encode(im));
+        CHECK(back.notice.kind == EventKind::Import && back.commit.import_session && back.commit.admit &&
+              back.commit.admit->reuse == 192);
+    }
 
     if (!fails) std::printf("control_version_test: PASS\n");
     return fails ? 1 : 0;

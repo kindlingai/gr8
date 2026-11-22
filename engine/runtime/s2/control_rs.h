@@ -29,6 +29,11 @@ inline g6ctl_commit to_ctl(const Commit& e) {
     x.c = sch::to_rs(e);
     x.hold = e.hold;
     if ((x.has_resize = bool(e.resize))) x.resize = {e.resize->tier, e.resize->segs, e.resize->slots, e.resize->txn};
+    if ((x.has_export = bool(e.export_op))) {
+        x.export_op = {{e.export_op->key.epoch, e.export_op->key.slot, e.export_op->key.generation},
+                       e.export_op->export_id, e.export_op->first_row, e.export_op->rows};
+    }
+    x.has_import = e.import_session;
     return x;
 }
 inline Commit from_ctl(const g6ctl_commit& x) {
@@ -39,6 +44,11 @@ inline Commit from_ctl(const g6ctl_commit& x) {
     c.hold = x.hold;
     if (x.has_resize) c.resize = Resize{x.resize.tier, x.resize.segs, x.resize.slots, x.resize.txn};
     if (x.c.has_shrink) { Shrink k; std::memcpy(static_cast<void*>(&k), &x.c.shrink, sizeof k); c.shrink = k; }
+    if (x.has_export) {
+        c.export_op = Export{Key{x.export_op.key.epoch, x.export_op.key.slot, x.export_op.key.generation},
+                             x.export_op.export_id, x.export_op.first_row, x.export_op.rows};
+    }
+    c.import_session = x.has_import;
     return c;
 }
 } // namespace g6s2::ctl

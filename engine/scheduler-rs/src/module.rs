@@ -86,6 +86,8 @@ pub type PackSeqFn = unsafe extern "C" fn(*mut c_void, *const Parts, u64) -> i32
 pub type LogprobFn = unsafe extern "C" fn(*mut c_void, i32, bool, i32, *mut LpRow) -> i32;
 /// dfl(request, sampling, *drafts)
 pub type ModDflFn = unsafe extern "C" fn(*mut c_void, *const DflReq, *const Sampling, *mut DflDrafts) -> i32;
+/// export_session(slot, export) (#159)
+pub type ExportSessionFn = unsafe extern "C" fn(*mut c_void, *const Slot, *const crate::control::wire::Export) -> i32;
 
 /// g6s2_module_ops: one module's calls. Calls on one module never overlap.
 #[repr(C)]
@@ -104,6 +106,8 @@ pub struct ModuleOps {
     pub drained: Option<BoolOutFn>,
     pub resize: Option<ResizeFn>,
     pub flash_room: Option<U32OutFn>,
+    pub export_session: Option<ExportSessionFn>,
+    pub import_session: Option<crate::driver::BindFn>,
     pub bucket: Option<BucketFn>,
     pub mode: Option<ModeFn>,
     pub launch: Option<LaunchFn>,

@@ -11,7 +11,7 @@
 #include <mutex>
 
 namespace g6s2 {
-enum class EventKind : uint32_t { Admit = 1, Cancel = 2, Resize = 3 };
+enum class EventKind : uint32_t { Admit = 1, Cancel = 2, Resize = 3, Export = 4, Import = 5 };
 struct Notice {
     uint64_t epoch = 0, event = 0, boundary = 0, request = 0, payload_hash = 0;
     EventKind kind = EventKind::Admit;

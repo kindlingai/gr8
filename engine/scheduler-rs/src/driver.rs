@@ -101,6 +101,8 @@ pub struct CHooks {
     pub settle: Option<VoidFn>,
     pub payload: Option<PayloadFn>,
     pub grown: Option<GrownFn>,
+    pub export_session: Option<crate::module::ExportSessionFn>,
+    pub import_session: Option<BindFn>,
     pub has_prefill_pack: bool,
     pub has_dfl_ok: bool,
     pub has_terminal: bool,
@@ -110,6 +112,8 @@ pub struct CHooks {
     pub has_shrink: bool,
     pub has_settle: bool,
     pub has_grown: bool,
+    pub has_export_session: bool,
+    pub has_import_session: bool,
 }
 
 /// admit(slot, first, n_gen, dfl)
@@ -362,7 +366,15 @@ impl Driver {
     /// Driver::apply: validate the payload, apply the commit to the scheduler, then the hooks it implies. `digest` is
     /// the scheduler's digest before it. Refusals before the scheduler changes leave it as it was; a failure after it
     /// fails the scheduler.
-    pub fn apply(&self, e: &Commit, digest: u64, resize: bool, pay: Option<&CPayload>) -> Res<sch::Changes> {
+    pub fn apply(
+        &self,
+        e: &Commit,
+        digest: u64,
+        resize: bool,
+        pay: Option<&CPayload>,
+        export_op: Option<&crate::control::wire::Export>,
+        is_import: bool,
+    ) -> Res<sch::Changes> {
         let _b = self.enter()?;
         let s = &self.s();
         if e.has_admit {
@@ -376,14 +388,24 @@ impl Driver {
         let mut before = [s.slot(0); QMAX];
         before[..s.n].copy_from_slice(s.slots());
         let changes = s.with(|c, sl, st| sch::apply(c, sl, st, e, digest)).map_err(sch_err)?;
-        if let Err(r) = self.apply_hooks(s, e, resize, pay, &before[..s.n]) {
+        if let Err(r) = self.apply_hooks(s, e, resize, pay, export_op, is_import, &before[..s.n]) {
             s.fail();
             return Err(r);
         }
         Ok(changes)
     }
 
-    fn apply_hooks(&self, s: &S, e: &Commit, resize: bool, pay: Option<&CPayload>, before: &[Slot]) -> Res<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn apply_hooks(
+        &self,
+        s: &S,
+        e: &Commit,
+        resize: bool,
+        pay: Option<&CPayload>,
+        export_op: Option<&crate::control::wire::Export>,
+        is_import: bool,
+        before: &[Slot],
+    ) -> Res<()> {
         for old in before {
             let i = old.key.slot as usize;
             let now = s.slot(i);
@@ -435,6 +457,11 @@ impl Driver {
             self.reused[i].set(g.reuse);
             // SAFETY: as retire
             ok(unsafe { self.h.bind.ok_or_else(missing)?(self.h.ctx, g) })?;
+            if is_import {
+                require(self.h.has_import_session, "an import commit without the import_session hook")?;
+                // SAFETY: as retire
+                ok(unsafe { self.h.import_session.ok_or_else(missing)?(self.h.ctx, g) })?;
+            }
             if p.decode_prompt {
                 s.with(|_, sl, st| sch::skip_prefill_from(sl, st, &g.key, g.reuse)).map_err(sch_err)?;
             }
@@ -443,6 +470,16 @@ impl Driver {
             require(self.h.has_resize, "a resize commit without the resize hook")?;
             // SAFETY: as retire
             ok(unsafe { self.h.resize.ok_or_else(missing)?(self.h.ctx) })?;
+        }
+        if let Some(ex) = export_op {
+            if ex.rows > 0 {
+                require(self.h.has_export_session, "an export commit without the export_session hook")?;
+                require((ex.key.slot as usize) < s.n, "export slot out of range")?;
+                let sl = s.slot(ex.key.slot as usize);
+                require(sl.key == ex.key && (sl.phase == PREFILL || sl.phase == DECODE), "export slot mismatch")?;
+                // SAFETY: as retire
+                ok(unsafe { self.h.export_session.ok_or_else(missing)?(self.h.ctx, &sl, ex) })?;
+            }
         }
         Ok(())
     }
@@ -780,7 +817,7 @@ pub unsafe extern "C" fn g6s2_driver_view(d: *const Driver, out: *mut CView) {
     *out = CView { s: s.s, n: s.n, st: s.st };
 }
 
-/// Driver::apply. pay: null without an admit. freed: room for the driver's slot count
+/// Driver::apply. pay: null without an admit. export_op: null without an export. freed: room for the driver's slot count
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_driver_apply(
     d: *const Driver,
@@ -788,13 +825,15 @@ pub unsafe extern "C" fn g6s2_driver_apply(
     digest: u64,
     resize: bool,
     pay: *const CPayload,
+    export_op: *const crate::control::wire::Export,
+    is_import: bool,
     freed: *mut Run,
     n_freed: *mut usize,
     admitted: *mut bool,
 ) -> i32 {
     let d = &*d;
     let n_slots = d.s().n;
-    let r = d.apply(&*e, digest, resize, pay.as_ref()).map(|c| {
+    let r = d.apply(&*e, digest, resize, pay.as_ref(), export_op.as_ref(), is_import).map(|c| {
         let n = c.freed.len().min(n_slots);
         std::slice::from_raw_parts_mut(freed, n).copy_from_slice(&c.freed[..n]);
         *n_freed = n;
@@ -1225,7 +1264,7 @@ mod tests {
             let mut e = commit(&d);
             e.has_shrink = true;
             e.shrink = Shrink { key: d.s().slot(2).key, r_rows: c.r2_rows, run };
-            d.apply(&e, 0, false, None).map(|_| (d.s().slot(2).run, pool.lock().digest()))
+            d.apply(&e, 0, false, None, None, false).map(|_| (d.s().slot(2).run, pool.lock().digest()))
         };
         let shrink = |pool: &Handle, u: CPool, run: Run| shrink_own(pool, u, run, true);
         // the head's change, made when it built the commit, on a pool seated alike
@@ -1260,7 +1299,7 @@ mod tests {
             let x = d.s().slot(0);
             let mut e = commit(&d);
             (e.has_cancel, e.cancel) = (true, x.key);
-            d.apply(&e, 0, false, None).unwrap();
+            d.apply(&e, 0, false, None, None, false).unwrap();
             assert_eq!(live(&pool), if head { 3 } else { 2 });
             if head {
                 pool.lock().release(&kv(&x.run)).unwrap();
