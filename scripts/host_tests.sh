@@ -627,7 +627,8 @@ fi
 python3 "$REPO/scripts/check_options_coverage.py" "$REPO/engine/scheduler-rs/src/options.rs" "$T"/options_*.txt
 
 # the bare environment reads the knob table replaced, and the table against the tree
-# CI sets GR8_SKIP_ENV_LINT=1 because the dedicated env-lint job runs tools/env_lint.py on every push/PR.
-if [ "${GR8_SKIP_ENV_LINT:-0}" != 1 ]; then
+# CI sets HOST_TESTS_SKIP_ENV_LINT=1 (non-GR8_ prefix so engine/knobs-rs does not reject it as an unknown engine knob)
+# because the dedicated env-lint job runs tools/env_lint.py on every push/PR.
+if [ "${HOST_TESTS_SKIP_ENV_LINT:-0}" != 1 ]; then
   python3 "$REPO/tools/env_lint.py"
 fi

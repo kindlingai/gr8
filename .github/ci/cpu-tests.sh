@@ -108,15 +108,20 @@ python3 -m unittest discover -s tools/switch/tests -v
 wait "$C1"; wait "$C2"
 (cd frontend && STEERING_TRANSPORT_CHECK="$T/steering_transport_test" python3 -m unittest tests.test_s2shim tests.test_steering)
 # the launch: options, model sets, the handshake, mentat, and four supervisors end to end on 127.0.0.1-4.
-# Run each test_*.py module in parallel across CPU cores (longest e2e/scale modules first); each uses mkdtemp + free_port.
+# Modules that spawn g6m4/g6pseudo or run `launch.py up` scan /proc for running engines, so run that group serially
+# on one dedicated lane while the remaining independent launch modules run in parallel beside it.
 STEERING_BOOT_CHECK="$T/steering_boot_check" python3 - <<'PY'
 import concurrent.futures, glob, os, subprocess, sys, time
 
-mods = sorted(os.path.basename(p)[:-3] for p in glob.glob('tools/launch/test_*.py'))
-# Schedule heaviest end-to-end modules first (LPT) so they overlap with the lighter modules.
-priority = ['test_scale', 'test_e2e', 'test_supervisor', 'test_options', 'test_hf', 'test_mentat']
-mods.sort(key=lambda m: (priority.index(m) if m in priority else len(priority), m))
-workers = max(1, min(4, os.cpu_count() or 1))
+all_mods = sorted(os.path.basename(p)[:-3] for p in glob.glob('tools/launch/test_*.py'))
+# Serial lane: modules that start live engine/supervisor processes (running_engines() scans /proc).
+serial_order = ['test_scale', 'test_e2e', 'test_pseudo_e2e', 'test_kvnode']
+serial_mods = [m for m in serial_order if m in all_mods]
+parallel_mods = [m for m in all_mods if m not in serial_mods]
+# Schedule heaviest parallel modules first (LPT).
+priority = ['test_hf', 'test_options', 'test_supervisor', 'test_handshake', 'test_models', 'test_mentat']
+parallel_mods.sort(key=lambda m: (priority.index(m) if m in priority else len(priority), m))
+workers = max(2, min(4, os.cpu_count() or 1))
 
 def run_mod(mod):
     t0 = time.monotonic()
@@ -124,15 +129,25 @@ def run_mod(mod):
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     return mod, r.returncode, time.monotonic() - t0, r.stdout
 
+def run_serial(mods):
+    return [run_mod(m) for m in mods]
+
 t_all = time.monotonic()
-failed = []
+results = []
 with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-    for mod, rc, dt, out in ex.map(run_mod, mods):
-        summary = next((l for l in reversed(out.splitlines()) if l.strip()), '')
-        print(f'tools/launch/{mod}.py ({dt:.1f}s): {summary}', flush=True)
-        if rc != 0:
-            failed.append((mod, out))
-print(f'tools/launch: {len(mods)} modules in {time.monotonic() - t_all:.1f}s ({workers} workers)', flush=True)
+    serial_fut = ex.submit(run_serial, serial_mods)
+    par_futs = [ex.submit(run_mod, m) for m in parallel_mods]
+    for fut in par_futs:
+        results.append(fut.result())
+    results.extend(serial_fut.result())
+
+failed = []
+for mod, rc, dt, out in results:
+    summary = next((l for l in reversed(out.splitlines()) if l.strip()), '')
+    print(f'tools/launch/{mod}.py ({dt:.1f}s): {summary}', flush=True)
+    if rc != 0:
+        failed.append((mod, out))
+print(f'tools/launch: {len(all_mods)} modules in {time.monotonic() - t_all:.1f}s ({workers} workers, {len(serial_mods)} serial)', flush=True)
 if failed:
     for mod, out in failed:
         print(f'\n=== FAILED: tools/launch/{mod}.py ===\n{out}', file=sys.stderr)

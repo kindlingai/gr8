@@ -160,7 +160,7 @@ jobs:
       CARGO_PROFILE_RELEASE_LTO: "off"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
       CARGO_PROFILE_RELEASE_OPT_LEVEL: "2"
-      GR8_SKIP_ENV_LINT: "1"
+      HOST_TESTS_SKIP_ENV_LINT: "1"
     strategy:
       fail-fast: false
       matrix:
