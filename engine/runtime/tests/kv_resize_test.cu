@@ -126,18 +126,25 @@ static Pack make_pack(Arena& A, Rng& r, int layer)
 }
 
 // one session on one set of caches: a binding per layer whose MLA (and index) cache is the shared region, and whose
-// block table is the session's page list
+// block table is the session's page list. When `vmm` is non-null, binds directly through g6_attn_bind_create_vmm
+// (GR8_KV_CHUNKS=1, EL5 #153) without allocating private cache storage in `storage`.
 struct Sess {
     G6AttnBinding b[NL] = {};
 };
-static void bind(Sess& s, Pack* pk, void* scr, size_t sb, void* const* mla, void* idx, const std::vector<uint32_t>& list)
+static void bind(Sess& s, Pack* pk, void* scr, size_t sb, void* const* mla, void* idx, const std::vector<uint32_t>& list,
+                 G6KvChunks* const* vmm = nullptr)
 {
     std::vector<int> t(PAGES, (int)list[0]);
     for (size_t i = 0; i < list.size(); ++i) t[i] = (int)list[i];
     for (int l = 0; l < NL; ++l) {
-        CKI(g6_attn_bind_create_ext(&s.b[l], &pk[l].p, 0, LAYER[l], PAGES * 64, MXR, 32, ST, scr, sb));
-        s.b[l].args.mla_cache = mla[l];
-        if (l == 0) s.b[l].args.index_cache = idx;
+        if (vmm) {
+            CKI(g6_attn_bind_create_vmm(&s.b[l], &pk[l].p, 0, LAYER[l], PAGES * 64, 0, MXR, 32, 0, 0, 0, ST, scr, sb,
+                                        vmm[l], l == 0 ? vmm[2] : nullptr));
+        } else {
+            CKI(g6_attn_bind_create_ext(&s.b[l], &pk[l].p, 0, LAYER[l], PAGES * 64, MXR, 32, ST, scr, sb));
+            s.b[l].args.mla_cache = mla[l];
+            if (l == 0) s.b[l].args.index_cache = idx;
+        }
         CK(cudaMemcpy(const_cast<int*>(s.b[l].args.block_table), t.data(), t.size() * 4, cudaMemcpyHostToDevice));
     }
 }
@@ -294,11 +301,14 @@ static void run(uint64_t seed)
     snprintf(nm, sizeof nm, "seed %llu, a pages %u..%u, b pages %u..%u, retained %u..%u, %s row", (unsigned long long)seed,
              la.front(), la.back(), lb.front(), lb.back(), lk.front(), lk.back(), g6kv::NAME);
 
-    Sess va, vb, wa, wb;   // v: resizing caches, w: reference
-    bind(va, pk, scr, sb, vmla, vidx, la);
-    bind(vb, pk, scr, sb, vmla, vidx, lb);
+    Sess va, vb, wa, wb;   // v: resizing caches (bound directly through g6_attn_bind_create_vmm), w: reference
+    bind(va, pk, scr, sb, vmla, vidx, la, vm);
+    bind(vb, pk, scr, sb, vmla, vidx, lb, vm);
     bind(wa, pk, scr, sb, rmla, ridx, la);
     bind(wb, pk, scr, sb, rmla, ridx, lb);
+    report(wa.b[0].storage_bytes > va.b[0].storage_bytes + (size_t)PAGES * (MLA_PAGE + IDX_PAGE) - 1024 &&
+               wa.b[1].storage_bytes > va.b[1].storage_bytes + (size_t)PAGES * MLA_PAGE - 1024,
+           std::string("g6_attn_bind_create_vmm omits cache bytes from binding storage, ") + nm);
     {
         Rng pa(seed * 3 + 1), pb(seed * 3 + 2);
         prefill(va, A, pa, TA);

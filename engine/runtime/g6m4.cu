@@ -147,6 +147,7 @@ namespace g6rt {
 #include "s2/cp_rows.h"
 #include "s2/signature.h"
 #include "s2/pool.h"
+#include "s2/kv_chunks_plan.h"
 #include "s2/kv_tier.cuh"
 #include "rt_rows.cuh"
 #include "s2/kv_share.h"
@@ -1693,8 +1694,39 @@ int main(int argc, char** argv)
                                     "lendable\n", R, m.fkv.chunks - h.flash.keep, m.fkv.chunks, lend_ms,
                             (unsigned long long)lendable);
                 }
-                ext.resize = [&](const g6s2::Resize& r) {
+                ext.resize = [&](const g6s2::Resize& r, g6s2::RunPool& fpool) {
                     if (r.tier != g6s2::FLASH_KV_TIER) return false;
+                    if (fpool.chunk_count())
+                    {
+                        // Multi-session Flash (EL5 #153): RunPool tracks online chunks so runs never touch offline pages.
+                        auto sync_models = [&](const std::vector<uint8_t>& mask, uint32_t n, size_t* mapped, size_t* released) {
+                            uint64_t mp = 0, rl = 0;
+                            for (g6rt::Model* x : {&m, &D.d})
+                            {
+                                if (!x->fkv.pages) continue;
+                                uint64_t a = 0, b = 0;
+                                if (int e = x->fkv.resize_mask(mask, n, st, &a, &b))
+                                {
+                                    fprintf(stderr, "# rank %d: flash kv (multi): to %u chunks failed (%d): %s; %u online\n", R,
+                                            n, e, x->fkv.err.c_str(), x->fkv.online);
+                                    return e;
+                                }
+                                mp += a; rl += b;
+                            }
+                            if (mapped) *mapped = (size_t)mp;
+                            if (released) *released = (size_t)rl;
+                            return 0;
+                        };
+                        const g6s2::KvResizeResult res = g6s2::kv_pool_resize_to(fpool, (uint32_t)r.segs, nullptr, sync_models);
+                        if (res.status == g6s2::KvResizeStatus::Busy)
+                            fprintf(stderr, "# rank %d: flash kv (multi): to %llu chunks busy (live sessions hold pages); %u online\n", R,
+                                    (unsigned long long)r.segs, res.after_online);
+                        else if (res.status == g6s2::KvResizeStatus::Ok || res.status == g6s2::KvResizeStatus::Noop)
+                            fprintf(stderr, "# rank %d: flash kv (multi): %u of %u chunks online (%llu tokens) at %lld ms\n", R,
+                                    m.fkv.online, m.fkv.chunks, (unsigned long long)m.fkv.tokens(),
+                                    (long long)g6s2::s2_wall_ms());
+                        return true;
+                    }
                     for (g6rt::Model* x : {&m, &D.d})
                     {
                         if (!x->fkv.pages) continue;
@@ -2421,6 +2453,17 @@ int main(int argc, char** argv)
         }
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
         g6s2::RunPool pool((uint32_t)pool_pages, (uint32_t)place, (uint32_t)s2_below);
+        uint32_t kv_chunk_pages = 0;
+        if (m.kv_chunks.active())
+        {
+            kv_chunk_pages = g6s2::kv_chunk_pages_default((uint32_t)place, (uint32_t)knob::kv_chunk_pages());
+            if (!kv_chunk_pages) die("GR8_KV_CHUNKS=1: place is 0");
+            pool.chunks(kv_chunk_pages);
+            fprintf(stderr, "# rank %d: GR8_KV_CHUNKS=1: %u chunks of %u pages below place %d, %.1f MiB backed (main %.1f + draft %.1f MiB)\n",
+                    R, pool.chunk_count(), kv_chunk_pages, place,
+                    (m.kv_chunks.backed() + D.d.kv_chunks.backed()) / (1024.0 * 1024.0),
+                    m.kv_chunks.backed() / (1024.0 * 1024.0), D.d.kv_chunks.backed() / (1024.0 * 1024.0));
+        }
         if (total_place >= 0)
         {
             // the record ids and the pool must see the same place, and the drafter must hold the whole pool
@@ -2853,7 +2896,7 @@ int main(int argc, char** argv)
 #define GLM_CAPTURES(X) X(R) X(m) X(D) X(DF) X(st) X(st_par) X(exec_f) X(fabf) X(in_f) X(out_f) X(plan) X(dfl_reuse) \
     X(rtt) X(pool) X(kvt) X(kv_drained) X(kv_drain) X(bind_delay_rank) X(bind_delay_ms) X(dfl_owner) X(dfl_from) \
     X(slot_prompt) X(slot_whole) X(s2_dstep) X(dfl_par_st) X(dfl_tl) X(dfl_t0) X(rt_told) X(rt_log) X(rt_layers) \
-    X(rt_gen) X(nd)
+    X(rt_gen) X(nd) X(place) X(kv_chunk_pages)
             GLM_CAPTURES(G6S2_CAPTURE_TYPE)
             uint32_t big = 0;   // GR8_CP_R2_BIG, with GR8_CP_R2
 #define GLM_POOL_ONLY(X) X(cap) X(rt_runs) X(cp_R2) X(big)
@@ -3151,6 +3194,41 @@ int main(int argc, char** argv)
                 void on_fence() { nd.synchronize(); }
                 bool on_drained() { return kv_drained.exchange(false); }
                 void on_resize(const g6s2::Resize& r) {
+                    if (r.tier == g6s2::GLM_KV_TIER)
+                    {
+                        if (!m.kv_chunks.active()) return;
+                        auto sync_glm = [&](const std::vector<uint8_t>& mask, uint32_t, size_t* mapped, size_t* released) {
+                            size_t mp = 0, rl = 0;
+                            for (Model* x : {&m, &D.d})
+                            {
+                                if (!x->kv_chunks.active()) continue;
+                                size_t a = 0, b = 0;
+                                if (int e = x->kv_chunks.sync(kv_chunk_pages, (uint32_t)place, mask, st, &a, &b))
+                                {
+                                    fprintf(stderr, "# rank %d: glm kv chunks sync failed (%d): %s\n", R, e, x->kv_chunks.err.c_str());
+                                    return e;
+                                }
+                                mp += a; rl += b;
+                            }
+                            if (mapped) *mapped = mp;
+                            if (released) *released = rl;
+                            return 0;
+                        };
+                        const g6s2::KvResizeResult res = g6s2::kv_pool_resize_to(pool, (uint32_t)r.segs, kv_drain, sync_glm);
+                        if (res.status == g6s2::KvResizeStatus::Busy)
+                            fprintf(stderr, "# rank %d: glm kv chunks: to %llu chunks busy (live sessions hold pages); %u online\n", R,
+                                    (unsigned long long)r.segs, res.after_online);
+                        else if (res.status == g6s2::KvResizeStatus::Ok || res.status == g6s2::KvResizeStatus::Noop)
+                            fprintf(stderr, "# rank %d: glm kv chunks: %u of %u chunks online (%.1f MiB backed, mapped %.1f MiB, released %.1f MiB) at %lld ms\n",
+                                    R, res.after_online, pool.chunk_count(),
+                                    (m.kv_chunks.backed() + D.d.kv_chunks.backed()) / (1024.0 * 1024.0),
+                                    res.mapped_bytes / (1024.0 * 1024.0), res.released_bytes / (1024.0 * 1024.0),
+                                    (long long)g6s2::s2_wall_ms());
+                        else
+                            fprintf(stderr, "# rank %d: glm kv chunks: to %llu chunks failed (status %d rc %d); %u online\n", R,
+                                    (unsigned long long)r.segs, (int)res.status, res.sync_rc, res.after_online);
+                        return;
+                    }
                     if (!g6s2::share_apply(pool, kvt->store(r.tier), r, kv_drain))
                         fprintf(stderr, "# rank %d: s2 share: tier %u to %llu blocks refused (transaction %llu), the lease keeps its size: %s\n", R,
                                 r.tier, (unsigned long long)r.slots, (unsigned long long)r.txn, g6kv_tier_error());
@@ -3242,9 +3320,9 @@ int main(int argc, char** argv)
             for (size_t i = 0; kvt && i < kvt->size(); ++i) if (kvt->group(i)) kv_groups.push_back((uint32_t)i);
             std::vector<g6kv_tier_totals> kv_seen(kv_groups.size(), g6kv_tier_totals{});
             size_t kv_next_group = 0;
+            if (!kv_groups.empty() || m.kv_chunks.active()) o.resize = g6s2::mod::resize<G, &G::on_resize>;
             if (!kv_groups.empty())
             {
-                o.resize = g6s2::mod::resize<G, &G::on_resize>;
                 // GR8_KV_SHARE_WHEN=idle (default): the head offers its blocks to other groups only while the engine is
                 // idle, so a give's compaction never pauses a turn; always: whenever the node asks
                 const bool share_always = knob::kv_share_when() == "always";

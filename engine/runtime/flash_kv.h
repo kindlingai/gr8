@@ -37,6 +37,7 @@ struct Map {
     uint32_t chunk_pages = 0, pages = 0, chunks = 0, online = 0;
     size_t gran = 0;
     int device = 0;
+    std::vector<uint8_t> cur_mask;       // current per-chunk online mask [0..chunks) (prefix for S=1, pool mask for S>1)
     std::vector<G6KvChunks*> mla, idx;   // one each per binding
     std::string ledger;                  // the host ledger's path, or empty: no ledger
     int wait_ms = 10000;                 // grow: how long the node may take to release
@@ -55,6 +56,7 @@ struct Map {
         pages = pages_;
         chunks = (pages + chunk_pages - 1) / chunk_pages;
         online = std::min(online_, chunks);
+        cur_mask = mask(online);
         return 0;
     }
     std::vector<uint8_t> mask(uint32_t n) const
@@ -66,7 +68,7 @@ struct Map {
     // the two regions of one binding, backed for the chunks online now
     int add(G6KvChunks** m, G6KvChunks** i)
     {
-        const std::vector<uint8_t> on = mask(online);
+        const std::vector<uint8_t> on = cur_mask.size() == chunks ? cur_mask : mask(online);
         *m = *i = nullptr;
         int e = g6_kvc_create_masked(m, pages * MLA_PAGE, device, MLA_PAGE, chunk_pages, pages, on.data(), chunks);
         if (!e) e = g6_kvc_create_masked(i, pages * IDX_PAGE, device, IDX_PAGE, chunk_pages, pages, on.data(), chunks);
@@ -76,23 +78,34 @@ struct Map {
         return 0;
     }
     uint64_t tokens() const { return (uint64_t)std::min(online * chunk_pages, pages) * g6kv::PAGE; }
-    // bytes every region backs with n chunks online
-    uint64_t bytes_at(uint32_t n) const
+    // bytes every region backs for an arbitrary chunk mask (each full chunk is whole granules for both MLA and index)
+    uint64_t bytes_at_mask(const std::vector<uint8_t>& m) const
     {
-        const uint64_t p = std::min(std::min(n, chunks) * chunk_pages, pages);
-        auto up = [&](uint64_t b) { return (b + gran - 1) / gran * gran; };
-        return (uint64_t)mla.size() * (up(p * MLA_PAGE) + up(p * IDX_PAGE));
+        auto up = [&](uint64_t b) { return gran ? (b + gran - 1) / gran * gran : b; };
+        uint64_t per_binding = 0;
+        for (uint32_t k = 0; k < chunks && k < (uint32_t)m.size(); ++k)
+        {
+            if (!m[k]) continue;
+            const uint64_t lo = (uint64_t)k * chunk_pages;
+            const uint64_t hi = std::min<uint64_t>(lo + chunk_pages, pages);
+            if (hi <= lo) continue;
+            const uint64_t cp = hi - lo;
+            per_binding += up(cp * MLA_PAGE) + up(cp * IDX_PAGE);
+        }
+        return (uint64_t)mla.size() * per_binding;
     }
+    // bytes every region backs with n prefix chunks online
+    uint64_t bytes_at(uint32_t n) const { return bytes_at_mask(mask(n)); }
     uint64_t backed() const
     {
         uint64_t b = 0;
         for (size_t k = 0; k < mla.size(); ++k) b += g6_kvc_backed(mla[k]) + g6_kvc_backed(idx[k]);
         return b;
     }
-    // every region to n chunks online, no ledger. *mapped / *released: granule bytes changed, all regions
-    int sync(uint32_t n, void* stream, uint64_t* mapped = nullptr, uint64_t* released = nullptr)
+    // every region to `on` chunk mask, no ledger. *mapped / *released: granule bytes changed, all regions
+    int sync_mask(const std::vector<uint8_t>& on, void* stream, uint64_t* mapped = nullptr, uint64_t* released = nullptr)
     {
-        const std::vector<uint8_t> on = mask(n);
+        if (on.size() != chunks) return fail(1, "mask size mismatch");
         uint64_t mp = 0, rl = 0;
         int e = 0;
         for (size_t k = 0; !e && k < mla.size(); ++k)
@@ -108,19 +121,38 @@ struct Map {
         if (released) *released = rl;
         return e ? fail(e, "g6_kvc_sync") : 0;
     }
-    // n chunks online; with a ledger, the bytes move GPU <-> node as one transfer (the header). 0, or an error with err
+    // every region to n prefix chunks online, no ledger. *mapped / *released: granule bytes changed, all regions
+    int sync(uint32_t n, void* stream, uint64_t* mapped = nullptr, uint64_t* released = nullptr)
+    {
+        return sync_mask(mask(n), stream, mapped, released);
+    }
+    // resize to an arbitrary chunk mask `on` (with `n` chunks online); supports multi-session RunPool chunk maps
+    // as well as single-session prefix maps, with the same host-ledger protocol.
+    int resize_mask(const std::vector<uint8_t>& on, uint32_t n, void* stream,
+                    uint64_t* mapped = nullptr, uint64_t* released = nullptr)
+    {
+        if (on.size() != chunks) return fail(1, "mask size mismatch");
+        n = std::min(n, chunks);
+        if (cur_mask == on && n == online)
+        {
+            if (mapped) *mapped = 0;
+            if (released) *released = 0;
+            return 0;
+        }
+        if (ledger.empty())
+        {
+            const int e = sync_mask(on, stream, mapped, released);
+            // a failed shrink may leave some regions backed past n: none of those pages is handed out again
+            if (!e || n < online) { online = n; cur_mask = on; }
+            return e;
+        }
+        return n < online ? shrink_mask(on, n, stream, released) : grow_mask(on, n, stream, mapped);
+    }
+    // n prefix chunks online; with a ledger, the bytes move GPU <-> node as one transfer (the header). 0, or an error with err
     int resize(uint32_t n, void* stream)
     {
         n = std::min(n, chunks);
-        if (n == online) return 0;
-        if (ledger.empty())
-        {
-            const int e = sync(n, stream);
-            // a failed shrink may leave some regions backed past n: none of those pages is handed out again
-            if (!e || n < online) online = n;
-            return e;
-        }
-        return n < online ? shrink(n, stream) : grow(n, stream);
+        return resize_mask(mask(n), n, stream);
     }
     void release()
     {
@@ -145,23 +177,28 @@ private:
         err = std::string("the host ledger: ") + what + ": " + g6kv_tier_error();
         return -1;
     }
-    int shrink(uint32_t n, void* stream)
+    int shrink_mask(const std::vector<uint8_t>& on, uint32_t n, void* stream, uint64_t* released_out = nullptr)
     {
-        const uint64_t want = bytes_at(online) - bytes_at(n);
+        const uint64_t b_now = bytes_at_mask(cur_mask), b_next = bytes_at_mask(on);
+        const uint64_t want = b_now > b_next ? b_now - b_next : 0;
         uint64_t gen = 0, released = 0;
         if (g6kv_ledger_begin(ledger.c_str(), 0, 1, want, &gen)) return ledger_fail("begin gpu -> node");
         crash_at("begun");
-        const int e = sync(n, stream, nullptr, &released);
+        const int e = sync_mask(on, stream, nullptr, &released);
+        if (released_out) *released_out = released;
         online = n;   // as resize: even a failed shrink hands out no page past n
+        cur_mask = on;
         crash_at("synced");
         if (g6kv_ledger_released(ledger.c_str(), gen, released)) return ledger_fail("released");
         crash_at("released");
         if (g6kv_ledger_commit(ledger.c_str(), gen, released)) return ledger_fail("commit");
         return e;
     }
-    int grow(uint32_t n, void* stream)
+    int grow_mask(const std::vector<uint8_t>& on, uint32_t n, void* stream, uint64_t* mapped_out = nullptr)
     {
-        const uint64_t want = bytes_at(n) - bytes_at(online), before = backed();
+        const uint64_t b_now = bytes_at_mask(cur_mask), b_next = bytes_at_mask(on);
+        const uint64_t want = b_next > b_now ? b_next - b_now : 0;
+        const uint64_t before = backed();
         uint64_t gen = 0, book[9] = {};
         if (g6kv_ledger_begin(ledger.c_str(), 1, 0, want, &gen)) return ledger_fail("begin node -> gpu");
         crash_at("begun");
@@ -182,17 +219,19 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         uint64_t mapped = 0;
-        const int e = sync(n, stream, &mapped, nullptr);
+        const int e = sync_mask(on, stream, &mapped, nullptr);
+        if (mapped_out) *mapped_out = mapped;
         crash_at("synced");
         if (e)
         {
             // back to what was online; what the GPU still holds of the transfer is committed, the rest goes to free
-            sync(online, stream);
+            sync_mask(cur_mask, stream);
             const uint64_t now = backed(), kept = now > before ? now - before : 0;
             if (g6kv_ledger_commit(ledger.c_str(), gen, std::min(kept, book[8]))) return ledger_fail("commit");
             return e;
         }
         online = n;
+        cur_mask = on;
         if (g6kv_ledger_commit(ledger.c_str(), gen, std::min(mapped, book[8]))) return ledger_fail("commit");
         return 0;
     }

@@ -210,7 +210,7 @@ build() {   # build <bin> <command..>: in the background, at most J at once; a f
 # shellcheck disable=SC2086
 build l2pf_bench $NVCC -O3 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR} -I "$REPO/engine/kernels" \
   -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
-  "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas "${KNOBS[@]}"
+  "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" -lcublas "${KNOBS[@]}"
 # EL3 (#151) piece tables: the routed experts through a per-layer device table (GR8_PTAB) against the pack layout, decode
 # (K1, every row count, graphs with changing table contents) and prefill, byte for byte; + bench. Built at each width
 # with that width's engine flags, except widths whose EB (16 / TP) is above 8, the kmix format's ceiling (TP1); and in

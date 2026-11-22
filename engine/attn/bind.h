@@ -49,9 +49,11 @@ struct G6AttnBinding {
     void *storage, *scratch;
     size_t storage_bytes, scratch_bytes;
     int rank, layer, head_begin, capacity, max_rows, full_index;
-    // Flash, GR8_GLM53F_KV_CHUNKS: the MLA and index caches' regions (G6KvChunks*, kvchunks.h; caller-owned), else null
+    // GR8_GLM53F_KV_CHUNKS / GR8_KV_CHUNKS: the MLA and index caches' regions (G6KvChunks*, kvchunks.h; caller-owned), else null
     void* kv_chunks[2];
 };
+
+struct G6KvChunks;
 
 // Binding must initially be zero-initialized and must NOT be copied after create.
 // Returned statuses are CUDA error codes. Pack pointer lifetime >= binding lifetime.
@@ -63,8 +65,14 @@ extern "C" int g6a_bind_create(G6AttnBinding*, const G6AttnPack*, int rank,
 // instead of a slice of storage. Bindings may share one ext_scratch only if their runs never overlap (one stream).
 extern "C" int g6a_bind_create_ext(G6AttnBinding*, const G6AttnPack*, int rank,
     int layer, int capacity, int max_rows, int query_tile, void* stream, void* ext_scratch, size_t ext_bytes);
+// GLM (GR8_KV_CHUNKS, EL5 #153): same as create_ext / create_pages / create_cp_phys, with the MLA cache (and index
+// cache on full-index layers) backed by caller-owned G6KvChunks VMM regions instead of slices of storage.
+// cp_nr > 0 builds a CP binding (pages must be 0); cp_nr == 0 && pages > 0 builds a non-CP binding with `pages`
+// physical pages; cp_nr == 0 && pages == 0 uses ceil(capacity / 64). Reset zeroes only backed granules.
+extern "C" int g6a_bind_create_vmm(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity, int pages,
+    int max_rows, int query_tile, int cp_R, int cp_nr, int cp_phys, void* stream, void* ext_scratch, size_t ext_bytes,
+    G6KvChunks* mla, G6KvChunks* idx);
 #if G6_MODEL_FLASH
-struct G6KvChunks;
 // Flash (GR8_GLM53F_KV_CHUNKS): the MLA and index caches are the two regions (kvchunks.h, each at least the capacity's
 // pages; the caller frees them after release), the rest is storage as g6_attn_bind_create. Kernels see the same
 // pointers; no step may reach a page whose chunk is offline. Reset zeroes only what the regions back.
