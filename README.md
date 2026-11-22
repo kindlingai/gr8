@@ -129,7 +129,7 @@ the engine only.
 
 ## Building on gr8
 
-Current release: **[`v1.1.0`](https://github.com/kindlingai/gr8/releases/tag/v1.1.0)** ·
+Current release: **[`v1.1.1`](https://github.com/kindlingai/gr8/releases/tag/v1.1.1)** ·
 [Changelog](CHANGELOG.md) · [Version specs](releases/) ·
 [All releases](https://github.com/kindlingai/gr8/releases) · [Release and pinning rules](RELEASING.md)
 
@@ -141,10 +141,10 @@ an exact merged `main` / `stable` commit when tuning ahead of the next tag) — 
 # compose.yaml
 services:
   gr8:
-    image: ${GR8_IMAGE:-ghcr.io/kindlingai/gr8:v1.1.0@sha256:b22eedbd7902f65dbf2090897d75f5d92276cbf78a16bcde1f958aa56a306cf7}
+    image: ${GR8_IMAGE:-ghcr.io/kindlingai/gr8:v1.1.1@sha256:fa5c9f66fbfa55d162782578b3262893b782e6365a76562bcab951b54acc6d96}
 ```
 
-Use the same `v1.1.0@sha256:...` reference in `FROM` for a thin wrapper `Dockerfile`, or `git -C gr8 checkout v1.1.0` when
+Use the same `v1.1.1@sha256:...` reference in `FROM` for a thin wrapper `Dockerfile`, or `git -C gr8 checkout v1.1.1` when
 pinning gr8 as a submodule.
 
 If you are an agent (or developer) building on gr8, start from the matching entry point:
