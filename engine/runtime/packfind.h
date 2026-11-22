@@ -277,10 +277,19 @@ struct StagedDeltaPtab
     size_t kept_pieces = 0, added_pieces = 0, dropped_pieces = 0;
     size_t kept_bytes = 0, added_bytes = 0, dropped_bytes = 0;
 
+    void clear()
+    {
+        direct = DirectPtab{};
+        dense_img.reset();
+        added_slabs.clear();
+        dropped_slabs.clear();
+        kept_pieces = added_pieces = dropped_pieces = 0;
+        kept_bytes = added_bytes = dropped_bytes = 0;
+    }
     size_t rollback(size_t* chunks_freed = nullptr)
     {
         direct.tables.clear();
-        dense_img = g6::DevImage{};
+        dense_img.reset();
         dropped_slabs.clear();
         return direct.pool ? ptab::rollback_delta_slabs(*direct.pool, added_slabs, chunks_freed) : 0;
     }
@@ -298,7 +307,7 @@ inline bool rs_prefetch_delta_ptab(const g6::Pack& target_pack, void* plan_handl
                                    const DirectPtab& current, int target_eb, int rank, StagedDeltaPtab& staged,
                                    std::string& err_out)
 {
-    staged = StagedDeltaPtab{};
+    staged.clear();
     staged.direct.pool = current.pool ? current.pool : std::make_shared<ptab::Pool>();
     static const long vmm = (long)knob::img_vmm();
     staged.direct.pool->vmm = vmm > 0;
