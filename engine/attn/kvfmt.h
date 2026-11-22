@@ -38,6 +38,15 @@ constexpr const char* NAME = "ds41-fp4";
 #endif
 constexpr int ROW = 2 * geom::nh_kv(G6_NR, 0) * geom::HEAD_DIM * 2, IDX_ROW = 0, PAGE = geom::KV_PAGE;
 constexpr const char* NAME = "bf16gqa";
+#elif G6_MODEL_QW38
+// Qwen3.8-Flash-Next (model_geom_qw38.h): a full-attention layer's row on one rank holds K then V for the rank's
+// KV heads (BF16, head_dim = 256): 2 x nh_kv_max x 256 x 2 B = 2048 B at TP1/TP3, 1024 B at TP2/TP4.
+// QSA indexer compressed keys: 16 blocks of 4 tokens per 64-token page x 128 BF16 = 4096 B/page (IDX_ROW = 64 B/tok).
+#ifndef G6_NR
+#define G6_NR 2
+#endif
+constexpr int ROW = 2 * geom::nh_kv_max(G6_NR) * geom::HEAD_DIM * 2, IDX_ROW = (geom::IDX_DIM * 2) / geom::IDX_COMPRESS, PAGE = geom::KV_PAGE;
+constexpr const char* NAME = "bf16gqa256";
 #elif G6_MODEL_FLASH
 // GLM 5.3 Flash (attn/flash_attn.cu): NoPE MLA, the 512-d latent only (kv_a_layernorm applied), selected by G6_KV4
 // (the int4 engine, `--kv-format int4`) and otherwise by G6_FLASH_KV_FP8 (default 0):
@@ -87,7 +96,7 @@ constexpr const char* NAME = "int4g32h";
 constexpr int ROW = 528 + 2 * geom::QK_ROPE, SCALE_OFF = 512, ROPE_OFF = 528;
 constexpr const char* NAME = "fp8";
 #endif
-#if !G6_MODEL_FLASH && !G6_MODEL_DS41 && !G6_MODEL_INK2
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41 && !G6_MODEL_INK2 && !G6_MODEL_QW38
 constexpr int IDX_ROW = 132;
 #endif
 // both latent rows by name, whatever the build's row is, for code that converts one to the other (the remote rows

@@ -54,6 +54,10 @@ void* g6l_release_plan(const char* dense_dir, const char* v2_dir, const char* sl
 // Plans rank `rank` of `nr` of an Inkling-2-Small checkpoint directory (config.json + its safetensors shards) as a
 // g6pack-v1 image and writes that image's manifest to out_manifest. NULL with a message in err when the plan fails.
 void* g6l_ink2_plan(const char* model_dir, uint32_t nr, uint32_t rank, const char* out_manifest, char* err, size_t errlen);
+// Plans rank `rank` of `nr` of a Qwen3.8-Flash-Next exlr8 v2 release directory (dense/exlr8-{dense,vocab,mtp},
+// experts/, index-slices/, width manifest `widths`, optional `layout`). Writes the g6pack-v1 manifest to out_manifest.
+void* g6l_qw38_plan(const char* release_dir, const char* widths, uint32_t nr, uint32_t rank, int with_mtp,
+                    const char* layout, const char* out_manifest, char* err, size_t errlen);
 // Fills dst with image bytes off .. off + n of a planned image, without a sink (one tensor at a time, for m4sim).
 // Returns 0, or 1 with a message in err.
 int g6l_plan_read(void* plan, uint64_t off, uint64_t n, void* dst, char* err, size_t errlen);

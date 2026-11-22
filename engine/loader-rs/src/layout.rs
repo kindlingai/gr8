@@ -26,26 +26,45 @@ const HEADS: usize = 64;
 const DENSE: usize = 96;
 const VTILES: usize = 1210;
 
+/// Per-model group sizes for layout planning. Default is GLM-5.3 / GLM-5.3-Flash; Qwen3.8-Flash-Next sets
+/// `nh = 5, heads = 24, dense = 0, vtiles = 1940`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelGeom {
+    pub nh: usize,
+    pub heads: usize,
+    pub dense: usize,
+    pub vtiles: usize,
+}
+
+impl ModelGeom {
+    pub const GLM: ModelGeom = ModelGeom { nh: NH, heads: HEADS, dense: DENSE, vtiles: VTILES };
+    pub const QW38: ModelGeom = ModelGeom { nh: 5, heads: 24, dense: 0, vtiles: 1940 };
+}
+
 /// A set of interchangeable pieces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
-    /// the 16 halves of expert e (256: the shared expert) in layer l
+    /// the `nh` halves of expert e (n_routed: the shared expert) in layer l
     Halves(usize, usize),
-    /// the 64 attention heads of layer l
+    /// the attention heads of layer l
     Heads(usize),
-    /// the 96 128-channel blocks of layer l's dense MLP
+    /// the 128-channel blocks of layer l's dense MLP
     Dense(usize),
-    /// the 1210 128-row tiles of lm_head
+    /// the 128-row tiles of lm_head
     Vocab,
 }
 
 impl Group {
     pub fn len(self) -> usize {
+        self.len_with(&ModelGeom::GLM)
+    }
+
+    pub fn len_with(self, g: &ModelGeom) -> usize {
         match self {
-            Group::Halves(..) => NH,
-            Group::Heads(_) => HEADS,
-            Group::Dense(_) => DENSE,
-            Group::Vocab => VTILES,
+            Group::Halves(..) => g.nh,
+            Group::Heads(_) => g.heads,
+            Group::Dense(_) => g.dense,
+            Group::Vocab => g.vtiles,
         }
     }
 
@@ -81,16 +100,16 @@ impl Group {
     }
 
     /// Today's owner of each piece at TP nr.
-    fn formula(self, nr: usize) -> Vec<u8> {
+    fn formula_with(self, nr: usize, g: &ModelGeom) -> Vec<u8> {
         // chunk j of widths(n, nr), the larger first, goes to rank (j + off) % nr (plan.py _chunks)
         let chunks = |n: usize, off: usize| -> Vec<u8> {
             (0..nr).flat_map(|j| std::iter::repeat_n(((j + off) % nr) as u8, n / nr + usize::from(j < n % nr))).collect()
         };
         match self {
-            Group::Halves(l, e) => (0..NH).map(|h| ((16 * e + h + l) % nr) as u8).collect(),
-            Group::Heads(l) => chunks(HEADS, l),
-            Group::Dense(l) => chunks(DENSE, l),
-            Group::Vocab => chunks(VTILES, 0),
+            Group::Halves(l, e) => (0..g.nh).map(|h| ((g.nh * e + h + l) % nr) as u8).collect(),
+            Group::Heads(l) => chunks(g.heads, if g.heads == 24 { 0 } else { l }),
+            Group::Dense(l) => chunks(g.dense, l),
+            Group::Vocab => chunks(g.vtiles, 0),
         }
     }
 }
@@ -110,14 +129,14 @@ impl fmt::Display for Group {
 /// the width files. Heads, dense blocks and vocab tiles come from the dense and vocabulary files, which every box
 /// holds whole, so they count 0.
 pub struct Model {
+    pub geom: ModelGeom,
     pub groups: Vec<(Group, Vec<u64>)>,
 }
 
 impl Model {
-    /// A release's pieces at the widths of its width manifest: layers 0 to the last it lists (the MTP layer), dense
-    /// MLPs in layers 0-2, and in every MoE layer the routed experts and the shared one (expert n_routed). The layer
-    /// and expert counts and the hidden size come from the manifest. Both models gr8 serves, GLM 5.3 and
-    /// GLM-5.3-Flash, have 64 heads, 12,288 dense channels and 154,880 vocab rows.
+    /// A release's pieces at the widths of its width manifest. Supports GLM-5.3 / GLM-5.3-Flash (16 halves, 64 heads,
+    /// dense layers 0-2, 1210 vocab tiles) and Qwen3.8-Flash-Next (hidden_size 2560 or nh 5: 5 halves across all MoE
+    /// layers, 24 full-attention heads on l % 4 == 3, no dense layers, 1940 vocab tiles).
     pub fn release(man: &Json) -> Result<Model, String> {
         let layers = man.get("layers").and_then(Json::obj).ok_or("the width manifest lists no layers")?;
         let last = layers.keys().filter_map(|k| k.parse::<usize>().ok()).max().ok_or("the width manifest lists no layers")?;
@@ -126,16 +145,24 @@ impl Model {
             Some(Json::Str(v)) => v.parse::<u64>().map_err(|_| format!("hidden_size {v}"))?,
             Some(v) => v.int().ok_or("bad hidden_size")? as u64,
         };
-        let mut groups = vec![(Group::Vocab, vec![0; VTILES])];
+        let is_qw38 = hidden == 2560
+            || man.get("model").and_then(Json::str) == Some("qw38")
+            || man.get("nh").and_then(Json::int) == Some(5);
+        let geom = if is_qw38 { ModelGeom::QW38 } else { ModelGeom::GLM };
+        let mut groups = vec![(Group::Vocab, vec![0; geom.vtiles])];
         for l in 0..=last {
-            groups.push((Group::Heads(l), vec![0; HEADS]));
-            if l < 3 {
-                groups.push((Group::Dense(l), vec![0; DENSE]));
+            if !is_qw38 || l % 4 == 3 {
+                groups.push((Group::Heads(l), vec![0; geom.heads]));
+            }
+            if !is_qw38 && l < 3 {
+                groups.push((Group::Dense(l), vec![0; geom.dense]));
                 continue;
             }
-            let w = v2plan::widths(man, l)?.ok_or(format!("the width manifest has no widths for MoE layer {l}"))?;
+            let Some(w) = v2plan::widths_nh(man, l, geom.nh)? else {
+                return Err(format!("the width manifest has no widths for MoE layer {l}"));
+            };
             let half = |g: &[u8; v2plan::NH_MAX], u: &[u8; v2plan::NH_MAX], d: u8| -> Vec<u64> {
-                (0..NH).map(|h| hidden * 16 * (g[h] as u64 + u[h] as u64 + d as u64)).collect()
+                (0..geom.nh).map(|h| hidden * 16 * (g[h] as u64 + u[h] as u64 + d as u64)).collect()
             };
             for e in 0..w.down.len() {
                 groups.push((Group::Halves(l, e), half(&w.gate[e], &w.up[e], w.down[e])));
@@ -144,17 +171,26 @@ impl Model {
                 groups.push((Group::Halves(l, w.down.len()), half(&w.sgate, &w.sup, w.sdown)));
             }
         }
-        Ok(Model { groups })
+        Ok(Model { geom, groups })
     }
 }
 
-/// gr8 builds TP 3, 5, 6 or a divisor of 64. A rank's dense slice is whole 128-channel blocks at every one of them
-/// (TP 5: 20 or 19).
+/// gr8 builds TP 3, 5, 6 or a divisor of 64.
 pub fn check_nr(nr: usize) -> Result<(), String> {
     if !(nr == 3 || nr == 5 || nr == 6 || (nr > 0 && 64 % nr == 0)) {
         return Err(format!("TP {nr}: gr8 builds TP 3, 5, 6 or a divisor of 64"));
     }
     Ok(())
+}
+
+fn check_nr_model(nr: usize, geom: &ModelGeom) -> Result<(), String> {
+    if geom.nh == 5 {
+        if !(1..=4).contains(&nr) {
+            return Err(format!("TP {nr}: qw38 builds TP 1, 2, 3 or 4"));
+        }
+        return Ok(());
+    }
+    check_nr(nr)
 }
 
 fn counts(o: &[u8], nr: usize) -> Vec<usize> {
@@ -179,8 +215,8 @@ impl Layout {
 
     /// Today's layout of `model` over `members`.
     pub fn formula(model: &Model, members: Vec<String>) -> Result<Layout, String> {
-        check_nr(members.len())?;
-        let owner = model.groups.iter().map(|(g, _)| (*g, g.formula(members.len()))).collect();
+        check_nr_model(members.len(), &model.geom)?;
+        let owner = model.groups.iter().map(|(g, _)| (*g, g.formula_with(members.len(), &model.geom))).collect();
         Ok(Layout { members, owner })
     }
 
@@ -190,8 +226,8 @@ impl Layout {
         Ok((0..o.len()).filter(|&i| o[i] as usize == rank).collect())
     }
 
-    fn check_members(&self) -> Result<(), String> {
-        check_nr(self.nr())?;
+    fn check_members_for(&self, geom: &ModelGeom) -> Result<(), String> {
+        check_nr_model(self.nr(), geom)?;
         match self.members.iter().find(|m| self.members.iter().filter(|x| x == m).count() > 1) {
             Some(m) => Err(format!("member {m} is listed twice")),
             None => Ok(()),
@@ -200,24 +236,26 @@ impl Layout {
 
     /// Every piece of `model` has one owner, and each rank holds the counts this build's engine reads (module doc).
     pub fn check(&self, model: &Model) -> Result<(), String> {
-        self.check_members()?;
+        self.check_members_for(&model.geom)?;
         let nr = self.nr();
+        let nh = model.geom.nh;
         for (g, _) in &model.groups {
             let o = self.owner.get(g).ok_or(format!("the layout has no {g}"))?;
-            if o.len() != g.len() {
-                return Err(format!("{g}: {} owners, {} pieces", o.len(), g.len()));
+            let glen = g.len_with(&model.geom);
+            if o.len() != glen {
+                return Err(format!("{g}: {} owners, {} pieces", o.len(), glen));
             }
-            let want = g.formula(nr);
+            let want = g.formula_with(nr, &model.geom);
             let c = counts(o, nr);
             let ok = match g {
                 Group::Vocab => *o == want,
-                Group::Halves(..) => c.iter().all(|&n| n >= NH / nr && n <= NH.div_ceil(nr)),
+                Group::Halves(..) => c.iter().all(|&n| n >= nh / nr && n <= nh.div_ceil(nr)),
                 _ => c == counts(&want, nr),
             };
             if !ok {
                 return Err(format!("{g}: rank counts {c:?} at TP {nr}, the engine reads {}", match g {
                     Group::Vocab => "the formula's tiles".to_string(),
-                    Group::Halves(..) => format!("{} or {} halves a rank", NH / nr, NH.div_ceil(nr)),
+                    Group::Halves(..) => format!("{} or {} halves a rank", nh / nr, nh.div_ceil(nr)),
                     _ => format!("{:?}", counts(&want, nr)),
                 }));
             }
@@ -271,13 +309,14 @@ impl Layout {
 pub fn plan(model: &Model, old: &Layout, members: Vec<String>) -> Result<Layout, String> {
     let nr = members.len();
     let new = Layout { members, owner: BTreeMap::new() };
-    new.check_members()?;
+    new.check_members_for(&model.geom)?;
     let to_new: Vec<Option<usize>> = old.members.iter().map(|m| new.members.iter().position(|x| x == m)).collect();
     let mut bytes = vec![0u64; nr];
     let mut halves = vec![0usize; nr];
     let mut owner = BTreeMap::new();
     for (g, size) in &model.groups {
-        let want = g.formula(nr);
+        let want = g.formula_with(nr, &model.geom);
+        let glen = g.len_with(&model.geom);
         if *g == Group::Vocab {
             owner.insert(*g, want);
             continue;
@@ -291,10 +330,10 @@ pub fn plan(model: &Model, old: &Layout, members: Vec<String>) -> Result<Layout,
         }
         let mut count = counts(&want, nr);
         if let Group::Halves(..) = g {
-            count = order(&held, count, &halves);
+            count = order(&held, count, &halves, model.geom.nh);
             halves.iter_mut().zip(&count).for_each(|(h, c)| *h += c);
         }
-        let mut o = vec![u8::MAX; g.len()];
+        let mut o = vec![u8::MAX; glen];
         let mut have = vec![0usize; nr];
         for r in 0..nr {
             for &i in held[r].iter().take(count[r]) {
@@ -303,7 +342,7 @@ pub fn plan(model: &Model, old: &Layout, members: Vec<String>) -> Result<Layout,
                 bytes[r] += size[i];
             }
         }
-        let mut free: Vec<usize> = (0..g.len()).filter(|&i| o[i] == u8::MAX).collect();
+        let mut free: Vec<usize> = (0..glen).filter(|&i| o[i] == u8::MAX).collect();
         free.sort_by_key(|&i| Reverse(size[i]));
         for i in free {
             let r = (0..nr).filter(|&r| have[r] < count[r]).min_by_key(|&r| bytes[r]).ok_or(format!("{g}: no room"))?;
@@ -316,18 +355,10 @@ pub fn plan(model: &Model, old: &Layout, members: Vec<String>) -> Result<Layout,
     Ok(Layout { owner, ..new })
 }
 
-/// A rank may run this many halves ahead of the others to keep a half it holds.
-const SLACK: usize = NH;
-
-/// An expert's counts (16 / nr rounded down or up) in the rank order that balances the halves over the model and
-/// keeps the most in place within that: the larger counts go to the ranks with the fewest halves so far, a rank that
-/// holds more than the smaller count (it keeps the extra half) counting SLACK halves fewer. The formula's order breaks
-/// ties. Putting the larger counts where most is held alone would load the members that stay: going 4 -> 6, the four
-/// would take the larger count of every expert, and the two new members two thirds of their halves.
-fn order(held: &[Vec<usize>], count: Vec<usize>, sofar: &[usize]) -> Vec<usize> {
+fn order(held: &[Vec<usize>], count: Vec<usize>, sofar: &[usize], slack: usize) -> Vec<usize> {
     let small = *count.iter().min().unwrap();
     let mut by: Vec<usize> = (0..held.len()).collect();
-    by.sort_by_key(|&r| (sofar[r] + SLACK * usize::from(held[r].len() <= small), Reverse(count[r])));
+    by.sort_by_key(|&r| (sofar[r] + slack * usize::from(held[r].len() <= small), Reverse(count[r])));
     let mut sorted = count.clone();
     sorted.sort_unstable_by_key(|&c| Reverse(c));
     let mut out = vec![0; held.len()];
@@ -349,7 +380,7 @@ pub fn moves(model: &Model, old: &Layout, new: &Layout) -> Result<Moves, String>
     let mut m = Moves { gained: vec![0; new.nr()], holds: vec![0; new.nr()], ..Moves::default() };
     for (g, size) in &model.groups {
         let (a, b) = (old.owner.get(g).ok_or(format!("the old layout has no {g}"))?, new.owner.get(g).ok_or(format!("the new layout has no {g}"))?);
-        for i in 0..g.len() {
+        for i in 0..g.len_with(&model.geom) {
             let r = b[i] as usize;
             m.holds[r] += size[i];
             if old.members[a[i] as usize] != new.members[r] {
@@ -391,7 +422,7 @@ mod tests {
                 groups.push((Group::Halves(l, e), (0..NH).map(|_| 98304 * (k() + k() + d)).collect()));
             }
         }
-        Model { groups }
+        Model { geom: ModelGeom::GLM, groups }
     }
 
     fn range(l: &Layout, g: Group, r: usize) -> (usize, usize) {
@@ -575,5 +606,34 @@ mod tests {
         assert_eq!(p, q);
         assert!(Layout::parse(&p.to_json().replace("\"halves 3 0\": [", "\"halves 3 0\": [7, ")).is_err());
         assert!(Layout::parse(&p.to_json().replace(FORMAT, "x")).is_err());
+    }
+
+    #[test]
+    fn qw38_layout_scales_tp1_to_tp4() {
+        let mut groups = vec![(Group::Vocab, vec![0; ModelGeom::QW38.vtiles])];
+        for l in 0..48 {
+            if l % 4 == 3 {
+                groups.push((Group::Heads(l), vec![0; ModelGeom::QW38.heads]));
+            }
+            for e in 0..512 {
+                groups.push((Group::Halves(l, e), vec![2560 * 16 * 9; 5]));
+            }
+        }
+        let m = Model { geom: ModelGeom::QW38, groups };
+        let t1 = Layout::formula(&m, names("a")).unwrap();
+        t1.check(&m).unwrap();
+        let t2 = plan(&m, &t1, names("a,b")).unwrap();
+        t2.check(&m).unwrap();
+        let mv12 = moves(&m, &t1, &t2).unwrap();
+        assert_eq!(mv12.gained[0], 0);
+        let tot: u64 = mv12.holds.iter().sum();
+        assert!((mv12.holds[0] as f64 / tot as f64 - 0.5).abs() < 0.001, "holds {:?}", mv12.holds);
+        let back1 = plan(&m, &t2, names("a")).unwrap();
+        back1.check(&m).unwrap();
+        let t3 = plan(&m, &t2, names("a,b,c")).unwrap();
+        t3.check(&m).unwrap();
+        let t4 = plan(&m, &t2, names("a,b,c,d")).unwrap();
+        t4.check(&m).unwrap();
+        assert!(Layout::formula(&m, names("a,b,c,d,e")).is_err());
     }
 }
