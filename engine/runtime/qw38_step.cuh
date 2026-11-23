@@ -25,6 +25,7 @@
 #include "../loader/g6pack.h"
 #include "../loader-rs/g6load.h"
 #include "../knobs-rs/gr8_knobs.h"
+#include "qw38_vision.cuh"
 
 #include <algorithm>
 #include <chrono>
@@ -62,6 +63,55 @@ template <class T> T* dalloc(size_t n) {
     QW38_CK(cudaMalloc(&p, (n ? n : 1) * sizeof(T)));
     QW38_CK(cudaMemset(p, 0, (n ? n : 1) * sizeof(T)));
     return static_cast<T*>(p);
+}
+
+// Compute post-image isotropic 3D MRoPE offset (sum over images of max(llm_h, llm_w) - span).
+// Matches transformers Qwen4ExpModel.get_rope_index verbatim; 0 when there are no images.
+inline int qw38_mrope_delta(const std::vector<g6rt::ImageIn>& images) {
+    int delta = 0;
+    for (const auto& im : images) {
+        const int lh = im.vit_h / qw38v::MERGE;
+        const int lw = im.vit_w / qw38v::MERGE;
+        delta += std::max(lh, lw) - im.span;
+    }
+    return delta;
+}
+
+// Compute exact 3D MRoPE (t, h, w) coordinates for prompt rows [first, first + n).
+inline void qw38_build_mrope(const std::vector<g6rt::ImageIn>& images,
+                             int first, int n, int3* out_thw) {
+    int img_idx = 0;
+    const int n_img = static_cast<int>(images.size());
+    int delta = 0;
+    while (img_idx < n_img && images[size_t(img_idx)].pos + images[size_t(img_idx)].span <= first) {
+        const auto& im = images[size_t(img_idx)];
+        const int lh = im.vit_h / qw38v::MERGE;
+        const int lw = im.vit_w / qw38v::MERGE;
+        delta += std::max(lh, lw) - im.span;
+        ++img_idx;
+    }
+    for (int i = 0; i < n; ++i) {
+        const int p = first + i;
+        while (img_idx < n_img && images[size_t(img_idx)].pos + images[size_t(img_idx)].span <= p) {
+            const auto& im = images[size_t(img_idx)];
+            const int lh = im.vit_h / qw38v::MERGE;
+            const int lw = im.vit_w / qw38v::MERGE;
+            delta += std::max(lh, lw) - im.span;
+            ++img_idx;
+        }
+        if (img_idx < n_img && p >= images[size_t(img_idx)].pos) {
+            const auto& im = images[size_t(img_idx)];
+            const int lw = im.vit_w / qw38v::MERGE;
+            const int rel = p - im.pos;
+            const int r = rel / lw;
+            const int c = rel % lw;
+            const int base = im.pos + delta;
+            out_thw[i] = make_int3(base, base + r, base + c);
+        } else {
+            const int cp = p + delta;
+            out_thw[i] = make_int3(cp, cp, cp);
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ head / sampling
@@ -351,9 +401,30 @@ struct Engine {
     uint8_t* head_dev_pkt = nullptr;      // [max_rows * head_row_bytes(nc)]
     uint8_t* head_host_parts = nullptr;   // [nr * max_rows * head_row_bytes(nc)] pinned host staging (graph-safe D2H!)
     int* h_meta_pinned = nullptr;         // [3 * max_rows] pinned host staging for tok/slot/pos
+    int3* h_rope_pinned = nullptr;        // [max_rows] pinned host staging for 3D MRoPE (t, h, w)
     int* d_tok = nullptr;                 // [max_rows]
     int* d_slot = nullptr;                // [max_rows]
     int* d_pos = nullptr;                 // [max_rows]
+    int3* d_rope = nullptr;               // [max_rows]
+    std::vector<int> slot_mrope_delta;    // [slots] post-image isotropic MRoPE shift (0 for text-only)
+
+    // Optional vision tower (loaded when GR8_QW38_VISION=1 and dense/vision-bf16.safetensors exists)
+    Qw38Vision vision;
+    void load_vision(const std::string& path) { vision.load(path, o.max_rows); }
+    bool vision_ready() const { return vision.ready(); }
+    const std::string& vision_id() const { return vision.id(); }
+    size_t vision_device_bytes() const { return vision.device_bytes(); }
+    void set_slot_mrope_delta(int slot, int delta) {
+        if (slot >= 0 && slot < o.slots) slot_mrope_delta[size_t(slot)] = delta;
+    }
+    void set_slot_idx_raw_thw(int slot, int3 thw) {
+        if (slot < 0 || slot >= o.slots) return;
+        for (auto& y : L) {
+            if (!y.is_full) continue;
+            for (int i = 0; i < o.nloc; ++i)
+                QW38_CK(cudaMemcpyAsync(y.rk[size_t(i)].kv.idx_raw_thw + slot, &thw, sizeof(int3), cudaMemcpyHostToDevice, stream));
+        }
+    }
 
     // Optional Layer-48 MTP drafter state (loaded when o.mtp > 0)
     bool has_mtp = false;
@@ -419,6 +490,7 @@ struct Engine {
         if (ple_pinned) cudaFreeHost(ple_pinned);
         if (head_host_parts) cudaFreeHost(head_host_parts);
         if (h_meta_pinned) cudaFreeHost(h_meta_pinned);
+        if (h_rope_pinned) cudaFreeHost(h_rope_pinned);
         if (blas) cublasDestroy(blas);
         if (ev0) cudaEventDestroy(ev0);
         if (ev1) cudaEventDestroy(ev1);
@@ -603,7 +675,11 @@ struct Engine {
                     rl.kv.kv_pages = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(max_pps) * 2 * geom::KV_PAGE * size_t(nh_kv) * geom::HEAD_DIM);
                     rl.kv.idx_pages = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(max_pps) * 16 * geom::IDX_DIM);
                     rl.kv.idx_raw = dalloc<__nv_bfloat16>(size_t(o.slots) * 4 * geom::IDX_DIM);
-                    if (o.mtp > 0) rl.kv.idx_raw_snap = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(o.mtp) * 4 * geom::IDX_DIM);
+                    rl.kv.idx_raw_thw = dalloc<int3>(size_t(o.slots));
+                    if (o.mtp > 0) {
+                        rl.kv.idx_raw_snap = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(o.mtp) * 4 * geom::IDX_DIM);
+                        rl.kv.idx_raw_thw_snap = dalloc<int3>(size_t(o.slots) * size_t(o.mtp));
+                    }
                     rl.kv.kv_staging = dalloc<__nv_bfloat16>(size_t(o.slots) * 2 * geom::KV_PAGE * size_t(nh_kv) * geom::HEAD_DIM);
                     rl.kv.idx_staging = dalloc<__nv_bfloat16>(size_t(o.slots) * 16 * geom::IDX_DIM);
                 } else {
@@ -723,6 +799,7 @@ struct Engine {
                 kv.kv_pages = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(max_pps) * 2 * geom::KV_PAGE * size_t(nh_kv) * geom::HEAD_DIM);
                 kv.idx_pages = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(max_pps) * 16 * geom::IDX_DIM);
                 kv.idx_raw = dalloc<__nv_bfloat16>(size_t(o.slots) * 4 * geom::IDX_DIM);
+                kv.idx_raw_thw = dalloc<int3>(size_t(o.slots));
 
                 auto& mw = mtp_w.moe[size_t(i)];
                 mw.is_tr3 = false;
@@ -888,22 +965,28 @@ struct Engine {
         QW38_CK(cudaHostAlloc(&head_host_parts, size_t(o.nr) * M * hrb, cudaHostAllocDefault));
         std::memset(head_host_parts, 0, size_t(o.nr) * M * hrb);
         QW38_CK(cudaHostAlloc(&h_meta_pinned, 3 * M * sizeof(int), cudaHostAllocDefault));
+        QW38_CK(cudaHostAlloc(&h_rope_pinned, M * sizeof(int3), cudaHostAllocDefault));
 
         d_tok = dalloc<int>(M);
         d_slot = dalloc<int>(M);
         d_pos = dalloc<int>(M);
+        d_rope = dalloc<int3>(M);
+        slot_mrope_delta.assign(size_t(o.slots), 0);
     }
 
     void reset_slot(int slot) {
         if (slot < 0 || slot >= o.slots) return;
         ple_ctx[size_t(slot)] = {geom::TOK_EOS, geom::TOK_EOS};
+        slot_mrope_delta[size_t(slot)] = 0;
         if (has_ple) {
             const size_t pb = size_t(geom::PLE_NHIST) * geom::HC_D * 2;
             QW38_CK(cudaMemsetAsync(ple_st.conv_hist + size_t(slot) * geom::PLE_NHIST * geom::HC_D, 0, pb, stream));
         }
         if (has_mtp) {
-            for (int i = 0; i < o.nloc; ++i)
+            for (int i = 0; i < o.nloc; ++i) {
                 QW38_CK(cudaMemsetAsync(mtp_w.kv[size_t(i)].idx_raw + size_t(slot) * 4 * geom::IDX_DIM, 0, 4 * geom::IDX_DIM * 2, stream));
+                QW38_CK(cudaMemsetAsync(mtp_w.kv[size_t(i)].idx_raw_thw + size_t(slot), 0, sizeof(int3), stream));
+            }
         }
         for (auto& y : L) {
             for (int i = 0; i < o.nloc; ++i) {
@@ -911,6 +994,7 @@ struct Engine {
                 auto& rl = y.rk[size_t(i)];
                 if (y.is_full) {
                     QW38_CK(cudaMemsetAsync(rl.kv.idx_raw + size_t(slot) * 4 * geom::IDX_DIM, 0, 4 * geom::IDX_DIM * 2, stream));
+                    QW38_CK(cudaMemsetAsync(rl.kv.idx_raw_thw + size_t(slot), 0, sizeof(int3), stream));
                 } else {
                     const size_t sb = size_t(geom::gdn_vh(o.nr)) * 128 * 128 * 4;
                     const size_t cb = size_t(geom::GDN_NHIST) * size_t(geom::gdn_qkv_local(o.nr, r)) * 2;
@@ -923,8 +1007,11 @@ struct Engine {
 
     // Forward one step over `segs` (`M` total rows), optionally skipping lm_head (prefill chunks).
     // When `snap_k > 0` (MTP verify step), saves post-token-t recurrent/conv/idx_raw snapshots for t in 0..snap_k-1!
+    // When `vis_n > 0` (multimodal prefill), splices staged vision embeddings into HC streams and masks image tokens in PLE.
+    // When `rope_thw != nullptr`, uses per-row 3D MRoPE (t, h, w) coords; else uses isotropic (pos + slot_mrope_delta[slot]).
     void forward(const std::vector<qw38::StepSeg>& segs, const int* toks, const RowSample* samples,
-                 std::vector<RowOut>& out, bool skip_head = false, int snap_k = 0) {
+                 std::vector<RowOut>& out, bool skip_head = false, int snap_k = 0,
+                 int vis_n = 0, const int3* rope_thw = nullptr) {
         int M = 0;
         int max_pos = 0;
         bool all_len1 = true;
@@ -945,17 +1032,33 @@ struct Engine {
         int* h_pos_p = h_meta_pinned + 2 * o.max_rows;
         std::memcpy(h_tok_p, toks, size_t(M) * sizeof(int));
         for (const auto& g : segs) {
+            const int dlt = slot_mrope_delta[size_t(g.slot)];
             for (int t = 0; t < g.len; ++t) {
                 h_slot_p[g.row0 + t] = g.slot;
                 h_pos_p[g.row0 + t] = g.pos0 + t;
+                if (!rope_thw) {
+                    const int rp = g.pos0 + t + dlt;
+                    h_rope_pinned[g.row0 + t] = make_int3(rp, rp, rp);
+                }
             }
         }
+        if (rope_thw) std::memcpy(h_rope_pinned, rope_thw, size_t(M) * sizeof(int3));
         QW38_CK(cudaMemcpyAsync(d_tok, h_tok_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
         QW38_CK(cudaMemcpyAsync(d_slot, h_slot_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
         QW38_CK(cudaMemcpyAsync(d_pos, h_pos_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
+        QW38_CK(cudaMemcpyAsync(d_rope, h_rope_pinned, size_t(M) * sizeof(int3), cudaMemcpyHostToDevice, stream));
 
         // 0a. Notify multi-collective fabric step start (single enqueue_step for all 2*L+1 collectives on TP>=2)
         if (step_begin) step_begin(M, skip_head, -1);
+
+        // Mask <|image_pad|> -> TOK_EOS for Layer-1 PLE n-gram hashing (matches Qwen4ExpTextModel conv_mask).
+        std::vector<int> ple_tok_buf;
+        const int* ple_toks = toks;
+        if (has_ple && vis_n > 0) {
+            ple_tok_buf.assign(toks, toks + M);
+            for (int& tk : ple_tok_buf) if (tk == qw38v::TOK_IMAGE) tk = geom::TOK_EOS;
+            ple_toks = ple_tok_buf.data();
+        }
 
         // 0b. Kick off async PLE NVMe fetch BEFORE Layer 0 GPU compute so it overlaps completely behind Layer 0!
         bool ple_in_flight = false;
@@ -964,7 +1067,7 @@ struct Engine {
             for (const auto& g : segs) {
                 if (g.len <= 0) continue;
                 if (g.pos0 == 0) ple_ctx[size_t(g.slot)] = {geom::TOK_EOS, geom::TOK_EOS};
-                ple_store.compute_ids(toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
+                ple_store.compute_ids(ple_toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
                                       ple_job_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
             }
             {
@@ -988,7 +1091,7 @@ struct Engine {
                 for (const auto& g : segs) {
                     if (g.len <= 0) continue;
                     if (g.pos0 == 0) ple_ctx[size_t(g.slot)] = {geom::TOK_EOS, geom::TOK_EOS};
-                    ple_store.compute_ids(toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
+                    ple_store.compute_ids(ple_toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
                                           all_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
                 }
                 if (!ple_store.fetch_rows(all_ids.data(), all_ids.size(), reinterpret_cast<uint8_t*>(ple_pinned)))
@@ -1012,7 +1115,7 @@ struct Engine {
                 if (y.is_full) {
                     qw38::full_attn_forward(blas, rl.attn_w, rl.kv, attn_sc, mixed, p_dst,
                                             d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r,
-                                            max_pps, max_blocks, stream, snap_k);
+                                            max_pps, max_blocks, stream, snap_k, d_rope);
                 } else {
                     qw38::gdn_forward(blas, rl.gdn_w, rl.gdn_st, gdn_sc, mixed, p_dst,
                                       segs.data(), int(segs.size()), M, o.nr, r, true, stream, d_slot, d_pos, snap_k);
@@ -1067,7 +1170,7 @@ struct Engine {
         }
         const bool fp8_ready = !fp8_lm_head.empty() && fp8_lm_head[0].q != nullptr;
         const bool verify_graph_ok = all_verify && (M <= 8 || (M <= 20 && fp8_ready));
-        const bool graph_ok = o.use_graph && !o.profile && !skip_head &&
+        const bool graph_ok = o.use_graph && !o.profile && !skip_head && vis_n == 0 && !rope_thw &&
                               ((snap_k == 0 && M <= 8 && all_len1) || verify_graph_ok) &&
                               (o.nr == 1 || o.nloc == o.nr || static_cast<bool>(step_parity));
         if (graph_ok) {
@@ -1155,7 +1258,11 @@ struct Engine {
         }
 
         // Eager / profiled / prefill path
-        qw38::k_embed_hc4<<<M, 256, 0, stream>>>(d_tok, embed, hyper, M);
+        if (vis_n > 0) {
+            qw38::k_embed_hc4_vis<<<M, 256, 0, stream>>>(d_tok, embed, vision.row_map(), vision.pool(), hyper, M);
+        } else {
+            qw38::k_embed_hc4<<<M, 256, 0, stream>>>(d_tok, embed, hyper, M);
+        }
 
         auto t_start = [&]() { if (o.profile) cudaEventRecord(ev0, stream); };
         auto t_end = [&](double& acc) {
@@ -1190,7 +1297,7 @@ struct Engine {
                 if (y.is_full) {
                     qw38::full_attn_forward(blas, rl.attn_w, rl.kv, attn_sc, mixed, p_dst,
                                             d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r,
-                                            max_pps, max_blocks, stream, snap_k);
+                                            max_pps, max_blocks, stream, snap_k, d_rope);
                 } else {
                     qw38::gdn_forward(blas, rl.gdn_w, rl.gdn_st, gdn_sc, mixed, p_dst,
                                       segs.data(), int(segs.size()), M, o.nr, r, true, stream, d_slot, d_pos, snap_k);
@@ -1274,14 +1381,18 @@ struct Engine {
         int* h_tok_p = h_meta_pinned;
         int* h_slot_p = h_meta_pinned + o.max_rows;
         int* h_pos_p = h_meta_pinned + 2 * o.max_rows;
+        const int dlt = slot_mrope_delta[size_t(slot)];
         for (int t = 0; t < len; ++t) {
             h_tok_p[t] = next_toks[t];
             h_slot_p[t] = slot;
             h_pos_p[t] = pos0 + t;
+            const int rp = pos0 + t + dlt;
+            h_rope_pinned[t] = make_int3(rp, rp, rp);
         }
         QW38_CK(cudaMemcpyAsync(d_tok, h_tok_p, size_t(len) * 4, cudaMemcpyHostToDevice, stream));
         QW38_CK(cudaMemcpyAsync(d_slot, h_slot_p, size_t(len) * 4, cudaMemcpyHostToDevice, stream));
         QW38_CK(cudaMemcpyAsync(d_pos, h_pos_p, size_t(len) * 4, cudaMemcpyHostToDevice, stream));
+        QW38_CK(cudaMemcpyAsync(d_rope, h_rope_pinned, size_t(len) * sizeof(int3), cudaMemcpyHostToDevice, stream));
 
         const __nv_bfloat16* h_src = hyper + size_t(row0) * geom::HC_D;
         qw38::k_gather_embed<<<len, 256, 0, stream>>>(d_tok, embed, mtp_sc.emb_raw, len);
@@ -1319,9 +1430,10 @@ struct Engine {
                 qw38::gemm_bf16_nt(blas, len, nh_kv * geom::HEAD_DIM, geom::HID, mixed, aw.v_proj, attn_sc.v);
                 qw38::gemm_bf16_nt(blas, len, geom::IDX_PROJ_OUT, geom::HID, mixed, aw.idx_qk_proj, attn_sc.idx_qk);
             }
-            qw38::k_qw38_kv_write<<<len * nh_kv, 256, 0, stream>>>(attn_sc.k, attn_sc.v, aw.k_norm, d_slot, d_pos, kv.kv_pages, len, nh_kv, max_pps, geom::RMS_EPS);
+            qw38::k_qw38_kv_write<<<len * nh_kv, 256, 0, stream>>>(attn_sc.k, attn_sc.v, aw.k_norm, d_slot, d_pos, kv.kv_pages, len, nh_kv, max_pps, geom::RMS_EPS, d_rope);
             qw38::k_qsa_k_update_seg<<<1, 128, 0, stream>>>(attn_sc.idx_qk, aw.idx_k_norm, kv.idx_raw, nullptr, kv.idx_pages,
-                                                            max_pps, seg.slot, seg.row0, seg.pos0, seg.len, 0, geom::RMS_EPS);
+                                                            max_pps, seg.slot, seg.row0, seg.pos0, seg.len, 0, geom::RMS_EPS,
+                                                            kv.idx_raw_thw, nullptr, d_rope);
         }
     }
 
@@ -1341,12 +1453,15 @@ struct Engine {
             h_tok_p[s] = toks[s];
             h_slot_p[s] = slots[size_t(s)];
             h_pos_p[s] = pos_mtp[s];
+            const int rp = pos_mtp[s] + slot_mrope_delta[size_t(slots[size_t(s)])];
+            h_rope_pinned[s] = make_int3(rp, rp, rp);
             if (pos_mtp[s] > max_pos) max_pos = pos_mtp[s];
             segs[size_t(s)] = {slots[size_t(s)], s, pos_mtp[s], 1};
         }
         QW38_CK(cudaMemcpyAsync(d_tok, h_tok_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
         QW38_CK(cudaMemcpyAsync(d_slot, h_slot_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
         QW38_CK(cudaMemcpyAsync(d_pos, h_pos_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
+        QW38_CK(cudaMemcpyAsync(d_rope, h_rope_pinned, size_t(M) * sizeof(int3), cudaMemcpyHostToDevice, stream));
 
         // Arm 3-collective fabric step (1 layer = 2 dev AR + 1 head AR)
         if (step_begin) step_begin(M, false, 1);
@@ -1382,7 +1497,7 @@ struct Engine {
                 const int r = o.rank0 + i;
                 __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
                 qw38::full_attn_forward(blas, mtp_w.attn[size_t(i)], mtp_w.kv[size_t(i)], attn_sc, mixed, p_dst,
-                                        d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r, max_pps, max_blocks, stream, 0);
+                                        d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r, max_pps, max_blocks, stream, 0, d_rope);
             }
             if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
             else ++coll;
@@ -1487,6 +1602,12 @@ struct Engine {
                             rl.kv.idx_raw + size_t(slot) * 4 * geom::IDX_DIM,
                             rl.kv.idx_raw_snap + (size_t(slot) * size_t(o.mtp) + size_t(snap_idx)) * 4 * geom::IDX_DIM,
                             ib, cudaMemcpyDeviceToDevice, stream));
+                    }
+                    if (rl.kv.idx_raw_thw_snap && rl.kv.idx_raw_thw) {
+                        QW38_CK(cudaMemcpyAsync(
+                            rl.kv.idx_raw_thw + size_t(slot),
+                            rl.kv.idx_raw_thw_snap + size_t(slot) * size_t(o.mtp) + size_t(snap_idx),
+                            sizeof(int3), cudaMemcpyDeviceToDevice, stream));
                     }
                 } else {
                     const size_t nh_v = size_t(geom::gdn_vh(o.nr));
