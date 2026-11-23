@@ -3,6 +3,7 @@
 // Uses device-driven collectives (ink2::ar_exchange, dual-rail striped when --ips2 is given) so multi-box TP=2..4
 // has minimal collective latency and stays byte-identical to m4sim_qw38.
 #include "qw38_step.cuh"
+#include "vision_id.h"
 #include "../comms/fabric.h"
 #include "../kernels/ink2_fabric.cuh"
 #include "s2/qw38_native.cuh"
@@ -431,6 +432,26 @@ int main(int argc, char** argv) {
 
     Engine e;
     e.init(dir, o);
+    if (!s2dir.empty() && knob::qw38_vision()) {
+        const std::string vp = dir + "/dense/vision-bf16.safetensors";
+        if (std::filesystem::exists(vp)) {
+            e.load_vision(vp);
+            e.vision.log = true;
+            g6rt::vision_flag() = true;
+            std::fprintf(stderr, "# rank %d: qw38 vision: %.1f MiB, id %s\n",
+                         rank, e.vision_device_bytes() / (1024.0 * 1024.0), e.vision_id().c_str());
+            if (rank == 0) {
+                if (FILE* fv = std::fopen((s2dir + "/vision.s2").c_str(), "w")) {
+                    std::fputs("qw38\n", fv);
+                    std::fclose(fv);
+                }
+            }
+        } else {
+            std::fprintf(stderr, "# rank %d: qw38 vision off: %s not found\n", rank, vp.c_str());
+        }
+    }
+    if (!s2dir.empty() && rank == 0 && !e.vision_ready())
+        std::remove((s2dir + "/vision.s2").c_str());
 
     Wire wire;
     if (G6_NR > 1) {
@@ -491,7 +512,8 @@ int main(int argc, char** argv) {
                                "|sess" + std::to_string(s2sess) + "|layers " + layers +
                                "|chunk" + std::to_string(chunk) + "|pf" + std::to_string(prefill) +
                                "|reuse" + std::to_string(reuse ? 1 : 0) + "|nc" + std::to_string(o.nc) +
-                               "|set " + set_id + "|" + knob::signature();
+                               "|set " + set_id + "|" + knob::signature() +
+                               g6vis::signature(e.vision_ready(), e.vision_id());
 
         g6s2::Qw38Context ctx{e, rank, reuse, kv_tiers, kv_keep, kv_sys_after, kv_wlim, set_id};
         g6s2::serve_qw38(ctx, bc, chunk);

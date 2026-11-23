@@ -188,9 +188,25 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(g6s2shim.image_span(160, 160, 'ink2'), 6400)
         self.assertEqual(g6s2shim.image_span(108, 192, 'ink2'), 5184)
         self.assertIsNone(g6s2shim.image_span(2, 12802, 'ink2'))
+        # Qwen3.8-Flash-Next geometry (vision.s2 says qw38): <|image_pad|> rows, one per 2 x 2 patches of 16 px, 64..16384
+        Q = g6s2shim.QW38_IMAGE_TOKEN
+        self.assertEqual(Q, 248056)
+        self.assertIsNone(g6s2shim.set_model('qwen3.8-flash-next', 248320, (248044, 248046)))
+        bq = bytes(16 * 16 * 16 * 16 * 3)                                           # 256 x 256 px = 64 tokens (min)
+        hq = hashlib.sha256(bq).hexdigest()[:16]
+        q64 = {'pos': 2, 'vit_h': 16, 'vit_w': 16, 'key': hq, 'rgb': base64.b64encode(bq).decode()}
+        qp = [5, 248053] + [Q] * 64 + [248054, 6]
+        body, err = g6s2shim.build_request({'prompt': qp, 'max_tokens': 4, 'images': [q64]}, 0, None, 'qw38')
+        self.assertIsNone(err)
+        self.assertTrue(body.split(b'\n')[0].endswith(f' img 2:16:16:{hq}:'.encode() + q64['rgb'].encode()))
+        for b in ({**q64, 'vit_h': 15}, {**q64, 'vit_h': 0}, {**q64, 'vit_h': 258, 'vit_w': 256}, {**q64, 'pos': 1}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': qp, 'max_tokens': 4, 'images': [b]}, 0, None, 'qw38')[1], b)
+        self.assertEqual(g6s2shim.image_span(2, 2, 'qw38'), 1)
+        self.assertEqual(g6s2shim.image_span(32, 32, 'qw38'), 256)
+        self.assertIsNone(g6s2shim.image_span(258, 256, 'qw38'))
         import tempfile
         with tempfile.TemporaryDirectory() as d:
-            for text, want in (('glm5v\n', 'glm5v'), ('1\n', 'ds41'), ('ink2\n', 'ink2')):
+            for text, want in (('glm5v\n', 'glm5v'), ('1\n', 'ds41'), ('ink2\n', 'ink2'), ('qw38\n', 'qw38')):
                 with open(f'{d}/vision.s2', 'w') as fh:
                     fh.write(text)
                 self.assertEqual(g6s2shim.vision_model(f'{d}/vision.s2'), want)
