@@ -287,7 +287,7 @@ static void test_store_roundtrip(const fs::path& dir) {
         std::vector<uint16_t> got_svh(ids.size(), 0xBEEF);
         qw38::PleStats st{};
         CHECK(store.fetch_trellis_rows(ids.data(), ids.size(), got_codes.data(), got_svh.data(), &st));
-        if (!tc.resident) CHECK(st.reads == 7); // 7 unique in-range IDs!
+        if (!tc.resident) CHECK(st.reads >= 1 && st.reads <= 7); // 7 unique in-range IDs (coalesced into <= 7 I/O spans)
 
         // Fetch again -> 100% cache hits!
         qw38::PleStats st2{};
@@ -416,7 +416,7 @@ static void test_raw_bin_and_resolve(const fs::path& dir) {
     std::vector<uint8_t> out(4 * qw38::PLE_ROW_BYTES);
     qw38::PleStats st{};
     CHECK(s.fetch_rows(ids, 4, out.data(), &st));
-    CHECK(st.reads == 3);
+    CHECK(st.reads >= 1 && st.reads <= 3);
     for (int i = 0; i < 4; ++i) {
         const size_t base = size_t(ids[i]) * qw38::PLE_ROW_BYTES;
         for (size_t b = 0; b < qw38::PLE_ROW_BYTES; ++b) {

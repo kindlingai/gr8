@@ -102,7 +102,6 @@
 #include <algorithm>
 #include <chrono>
 #include "engine_options.h"
-#include "fabric_plan.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include "packfind.h"
 #include "weight_check.cuh"
@@ -117,6 +116,7 @@
 #endif
 #include "../comms/fabric.h"
 #include "../comms/progress_cpus.h"
+#include "fabric_plan.h"
 #include "s2/native.cuh"
 #include "s2/flash_native.cuh"
 #include "s2/flash_ckpt_rewidth.h"   // GR8_KV_REWIDTH: a scale's carry of the Flash checkpoint store
@@ -450,9 +450,36 @@ int main(int argc, char** argv)
 #endif
     fpi.gather = qs_mode || iq_split;
     fpi.draft_gather = mtp_split;
-    const FabricPlan fplan = fabric_plan(eo, fpi);
+    FabricPlan fplan = fabric_plan(eo, fpi);
     for (const std::string& l : fplan.log) fputs(l.c_str(), stderr);
     if (!fplan.refusal.empty()) die(fplan.refusal);
+    // EL6 (#154): opt-in FabricPool (GR8_FABRIC_POOL=1 default port 18800, or explicit port 1024..65535).
+    // Default 0 leaves the direct Fabric::init path untouched.
+    g6::FabricPool fpool;
+    g6::PoolConfig fpool_cfg;
+    g6::Group fgroup;
+    const int fpool_knob = (int)knob::fabric_pool();
+    if (fpool_knob && !fabric_dump)
+    {
+        if (fpool_knob != 1 && fpool_knob < 1024) die("GR8_FABRIC_POOL must be 0, 1 (default port 18800), or 1024..65535");
+        if (cfg.ring) die("GR8_FABRIC_POOL: mesh only (--shape ring cannot regroup)");
+        if (cfg.ips.size() < 2) die("GR8_FABRIC_POOL needs at least 2 ranks");
+        fpool_cfg.index = cfg.rank;
+        fpool_cfg.ips = cfg.ips;
+        fpool_cfg.ips2 = cfg.ips2;
+        fpool_cfg.port = fpool_knob == 1 ? 18800 : fpool_knob;
+        fpool_cfg.group_port[1] = cfg.port;
+        fpool_cfg.group_port[0] = cfg.port + 100;
+        fpool_cfg.s2_port[1] = s2port;
+        fpool_cfg.s2_port[0] = s2port + 1;
+        fpool.init(fpool_cfg);
+        std::vector<int> members(cfg.ips.size());
+        for (size_t i = 0; i < cfg.ips.size(); ++i) members[i] = (int)i;
+        fgroup = fpool.head() ? fpool.announce(members) : fpool.follow();
+        fabric_plan_apply_group(fplan, fpool_cfg, fgroup);
+        fprintf(stderr, "# rank %d: GR8_FABRIC_POOL: pool port %d, group %llu (%d members, fabric port %d, s2 port %d)\n",
+                cfg.rank, fpool_cfg.port, (unsigned long long)fgroup.id, fgroup.size(), fgroup.fabric_port, fgroup.s2_port);
+    }
 #if G6_MODEL_DS41
     if (fplan.v2_fallback && !s2mode)   // the serve logs its own line after the weights bind (ds41 serve, pf_v2)
         fprintf(stderr, "# rank %d DS41 prefill: GR8_DS_PF_V2=1 not used: %s; the old range-A path runs\n", cfg.rank, fplan.v2_fallback);
@@ -1445,8 +1472,8 @@ int main(int argc, char** argv)
         sc.notice_max = (uint32_t)knob::s2_notice_max();
         if (R == 0) fprintf(stderr, "# flash s2 interleave: decode_pf %u rows, decode_rounds %u, tail_first %d, notice_max %u\n",
                             sc.decode_prefill_rows, sc.decode_rounds, sc.tail_first ? 1 : 0, sc.notice_max);
-        bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
-        bc.directory = s2dir; bc.port = s2port;
+        bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = fpool.up() ? fgroup.s2_head_ip : cfg.ips[0];
+        bc.directory = s2dir; bc.port = fpool.up() ? fgroup.s2_port : s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
         g6s2::SigInputs sig;               // s2/signature.h
         sig.model = g6s2::SigModel::Flash;
@@ -1767,8 +1794,8 @@ int main(int argc, char** argv)
         sc.decode_rounds = (uint32_t)knob::s2_decode_rounds();
         fprintf(stderr, "# rank %d ds41 s2 interleave: decode_pf %u rows, decode_rounds %u\n",
                 R, sc.decode_prefill_rows, sc.decode_rounds);
-        bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
-        bc.directory = s2dir; bc.port = s2port;
+        bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = fpool.up() ? fgroup.s2_head_ip : cfg.ips[0];
+        bc.directory = s2dir; bc.port = fpool.up() ? fgroup.s2_port : s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
         g6s2::SigInputs sig;               // s2/signature.h
         sig.model = g6s2::SigModel::Ds41;
@@ -3340,9 +3367,9 @@ int main(int argc, char** argv)
             bc.rank = (unsigned)R;
             bc.ranks = (unsigned)cfg.ips.size();
             bc.timeout = (unsigned)knob::s2_timeout();
-            bc.head_ip = cfg.ips[0];
+            bc.head_ip = fpool.up() ? fgroup.s2_head_ip : cfg.ips[0];
             bc.directory = s2dir;
-            bc.port = (uint16_t)s2port;
+            bc.port = (uint16_t)(fpool.up() ? fgroup.s2_port : s2port);
             if (g6_attn_ctx_sp() || g6_attn_posidx())   // round 10 E1 attention flags (attn.cu), read once before the bindings
                 fprintf(stderr, "# rank %d: decode attention E1: GR8_ATTN_CTX3_SP %d GR8_ATTN_POSIDX %d\n", R, g6_attn_ctx_sp(), g6_attn_posidx());
             g6s2::SigInputs sig;           // s2/signature.h
@@ -3361,7 +3388,7 @@ int main(int argc, char** argv)
             sig.knobs = knob::signature();
             bc.runtime_signature = g6s2::runtime_signature(sig);
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
-                    s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+                    s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), (int)bc.port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
             if (kv_index)   // every rank keeps the stored prefixes all of them loaded, in the head's order
             {
@@ -4022,11 +4049,19 @@ int main(int argc, char** argv)
     if (rdump) G6RT_CK(cudaFree(rdump));
     if (rlf) fclose(rlf);
     if (knob::dec_prof()) { char tag[32]; snprintf(tag, sizeof tag, "rank %d", R); dp_print(tag, "synchronized", dec_prof().t, dec_prof().steps); }
-    if (fabdg_on) { fabdg.wait_proxy_idle(); fabdg.stop_proxy(); }
-    if (fabg_on) { fabg.wait_proxy_idle(); fabg.stop_proxy(); }
-    fab.wait_proxy_idle();
-    fab.barrier();
-    fab.stop_proxy();
+    if (fpool.up())
+    {
+        fabric_close_group(fabrics);
+        fpool.close();
+    }
+    else
+    {
+        if (fabdg_on) { fabdg.wait_proxy_idle(); fabdg.stop_proxy(); }
+        if (fabg_on) { fabg.wait_proxy_idle(); fabg.stop_proxy(); }
+        fab.wait_proxy_idle();
+        fab.barrier();
+        fab.stop_proxy();
+    }
 #if G6_MODEL_DS41
     // C2 dispatch trace: one stop-time line per rank. The counter is host-side in
     // attn/ds41_attn.cuh and stays 0 unless GR8_DS_C2_TRACE=1 is in the env.

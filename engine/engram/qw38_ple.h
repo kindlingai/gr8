@@ -435,6 +435,11 @@ public:
         return fetch_rows_impl(ids, n_ids, dst, nullptr, st_out);
     }
 
+    // Warm `PleRowCache` in RAM for `n_ids` rows without copying to a destination buffer. Thread-safe.
+    bool prefetch_rows(const uint64_t* ids, size_t n_ids, PleStats* st_out = nullptr) {
+        return fetch_rows_impl(ids, n_ids, nullptr, nullptr, st_out);
+    }
+
     // Fetch `n_ids` compressed row-trellis rows into `dst_codes` (`n_ids * row_bytes_`) and their FP16 row scales into
     // `dst_svh` (`n_ids` uint16_t). Thread-safe.
     bool fetch_trellis_rows(const uint64_t* ids, size_t n_ids, uint8_t* dst_codes, uint16_t* dst_svh,
@@ -444,8 +449,10 @@ public:
     }
 
 private:
+    static constexpr size_t PLE_SPAN_MAX = 65536;
     struct Miss { uint64_t id; size_t dst_idx; };
-    struct UniqMiss { uint64_t id; size_t first_miss; uint32_t count; };
+    struct UniqMiss { uint64_t id; size_t first; size_t count; };
+    struct IoSpan { uint64_t off; size_t len; uint64_t need_end; size_t first_u; size_t count_u; };
 
     static bool has_ci_substr(const std::string& hay, const std::string& needle) {
         auto to_low = [](std::string s) {
@@ -504,7 +511,7 @@ private:
                     iobuf_slots_ = opts.io_uring;
                 }
             }
-            if (!uring_) start_pool(8);
+            if (!uring_) start_pool(64);
         }
         return true;
     }
@@ -815,16 +822,20 @@ private:
 
         // Fast path: RAM-resident mmap for row-trellis tables that fit in cache_bytes
         if (resident_ && rows_ptr_) {
-            for (size_t i = 0; i < n_ids; ++i) {
-                const uint64_t id = ids[i];
-                if (id >= total_rows_) {
-                    std::memset(dst + i * rb, 0, rb);
-                    if (dst_svh) dst_svh[i] = 0;
-                    continue;
+            if (dst || dst_svh) {
+                for (size_t i = 0; i < n_ids; ++i) {
+                    const uint64_t id = ids[i];
+                    if (id >= total_rows_) {
+                        if (dst) std::memset(dst + i * rb, 0, rb);
+                        if (dst_svh) dst_svh[i] = 0;
+                        continue;
+                    }
+                    if (dst) std::memcpy(dst + i * rb, rows_ptr_ + id * rb, rb);
+                    if (dst_svh) dst_svh[i] = svh_ptr_[id];
+                    ++s.hits;
                 }
-                std::memcpy(dst + i * rb, rows_ptr_ + id * rb, rb);
-                if (dst_svh) dst_svh[i] = svh_ptr_[id];
-                ++s.hits;
+            } else {
+                s.hits = n_ids;
             }
             const auto t1 = std::chrono::steady_clock::now();
             s.total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
@@ -832,45 +843,71 @@ private:
             return true;
         }
 
-        std::vector<Miss> misses;
-        misses.reserve(n_ids);
+        misses_.clear();
+        if (misses_.capacity() < n_ids) misses_.reserve(n_ids);
 
         for (size_t i = 0; i < n_ids; ++i) {
             const uint64_t id = ids[i];
             if (id >= total_rows_) {
-                std::memset(dst + i * rb, 0, rb);
+                if (dst) std::memset(dst + i * rb, 0, rb);
                 if (dst_svh) dst_svh[i] = 0;
                 continue;
             }
             if (dst_svh) dst_svh[i] = svh_ptr_[id];
             if (const uint8_t* hit = cache_.find(id)) {
-                std::memcpy(dst + i * rb, hit, rb);
+                if (dst) std::memcpy(dst + i * rb, hit, rb);
                 ++s.hits;
             } else {
-                misses.push_back({id, i});
+                misses_.push_back({id, i});
             }
         }
-        s.misses = misses.size();
+        s.misses = misses_.size();
 
         const auto tio0 = std::chrono::steady_clock::now();
-        if (!misses.empty()) {
-            // Sort by row_id (= ascending LBA) and deduplicate repeated row IDs within the batch!
-            std::sort(misses.begin(), misses.end(), [](const Miss& a, const Miss& b) { return a.id < b.id; });
-            std::vector<UniqMiss> uniq;
-            uniq.reserve(misses.size());
-            for (size_t i = 0; i < misses.size();) {
+        if (!misses_.empty()) {
+            // 1. Sort misses by ascending row_id -> exact intra-chunk deduplication + LBA locality
+            std::sort(misses_.begin(), misses_.end(), [](const Miss& a, const Miss& b) {
+                return a.id < b.id;
+            });
+            uniq_.clear();
+            uniq_.reserve(misses_.size());
+            for (size_t i = 0; i < misses_.size();) {
                 size_t j = i + 1;
-                while (j < misses.size() && misses[j].id == misses[i].id) ++j;
-                uniq.push_back({misses[i].id, i, uint32_t(j - i)});
+                while (j < misses_.size() && misses_[j].id == misses_[i].id) ++j;
+                uniq_.push_back({misses_[i].id, i, j - i});
                 i = j;
+            }
+
+            // 2. Coalesce overlapping / adjacent 4K-aligned page spans
+            const size_t io_slot_max = std::max<size_t>(8192, ((rb + 2 * align_ - 1) / align_) * align_);
+            const size_t max_span = uring_ ? io_slot_max : std::max<size_t>(PLE_SPAN_MAX, io_slot_max);
+            spans_.clear();
+            spans_.reserve(uniq_.size());
+            for (size_t ui = 0; ui < uniq_.size(); ++ui) {
+                const uint64_t boff = rows_base_off_ + uniq_[ui].id * rb;
+                const uint64_t bend = boff + rb;
+                const uint64_t rlo = direct_ ? (boff & ~(uint64_t(align_) - 1)) : boff;
+                const uint64_t rhi = direct_ ? ((bend + align_ - 1) & ~(uint64_t(align_) - 1)) : bend;
+                if (!spans_.empty()) {
+                    IoSpan& prev = spans_.back();
+                    const uint64_t cur_end = prev.off + prev.len;
+                    const uint64_t new_end = std::max(cur_end, rhi);
+                    const uint64_t gap_ok = direct_ ? 0 : uint64_t(align_);
+                    if (rlo <= cur_end + gap_ok && new_end - prev.off <= max_span) {
+                        prev.len = size_t(new_end - prev.off);
+                        if (bend > prev.need_end) prev.need_end = bend;
+                        ++prev.count_u;
+                        continue;
+                    }
+                }
+                spans_.push_back({rlo, size_t(rhi - rlo), bend, ui, 1});
             }
 
             if (uring_) {
                 int first_err = 0;
-                const size_t max_io = std::max<size_t>(8192, ((rb + 2 * align_ - 1) / align_) * align_);
                 // Pad O_DIRECT io_uring submissions to a multiple of 8 (dummy 4 KiB read at offset 0)
                 // to avoid the ~200 us NVMe IRQ-coalescing cliff on small / non-mod-8 batches.
-                const size_t n_real = uniq.size();
+                const size_t n_real = spans_.size();
                 const bool pad8 = direct_ && file_bytes_ >= align_ && iobuf_slots_ >= 8 && (n_real & 7u) != 0;
                 const size_t n_sub = pad8 ? ((n_real + 7u) & ~size_t(7u)) : n_real;
                 const int rc = uring_->run(
@@ -882,66 +919,73 @@ private:
                             sqe.len = unsigned(align_);
                             return;
                         }
-                        const uint64_t byte_off = rows_base_off_ + uniq[idx].id * rb;
-                        const uint64_t aligned_off = byte_off & ~(uint64_t(align_) - 1);
-                        const uint64_t end_off = (byte_off + rb + align_ - 1) & ~(uint64_t(align_) - 1);
+                        const IoSpan& sp = spans_[idx];
                         sqe.fd = fd_;
-                        sqe.off = aligned_off;
-                        sqe.len = unsigned(std::min<uint64_t>(end_off - aligned_off, max_io));
+                        sqe.off = sp.off;
+                        sqe.len = unsigned(sp.len);
                     },
                     [&](size_t idx, const uint8_t* buf, int res) {
                         if (idx >= n_real) return;
-                        const uint64_t byte_off = rows_base_off_ + uniq[idx].id * rb;
-                        const size_t in_buf = size_t(byte_off & (uint64_t(align_) - 1));
-                        if (res < int(in_buf + rb)) {
+                        const IoSpan& sp = spans_[idx];
+                        const int need = int(sp.need_end - sp.off);
+                        if (res < need) {
                             if (!first_err) first_err = res < 0 ? -res : EIO;
                             return;
                         }
-                        const uint8_t* row = buf + in_buf;
-                        const UniqMiss& u = uniq[idx];
-                        for (uint32_t k = 0; k < u.count; ++k) {
-                            std::memcpy(dst + misses[u.first_miss + k].dst_idx * rb, row, rb);
+                        for (size_t k = 0; k < sp.count_u; ++k) {
+                            const UniqMiss& u = uniq_[sp.first_u + k];
+                            const uint8_t* row = buf + (rows_base_off_ + u.id * rb - sp.off);
+                            if (dst) {
+                                for (size_t d = 0; d < u.count; ++d) {
+                                    std::memcpy(dst + misses_[u.first + d].dst_idx * rb, row, rb);
+                                }
+                            }
+                            cache_.insert(u.id, row);
                         }
-                        cache_.insert(u.id, row);
                         ++s.reads;
                     });
                 if (rc != 0 || first_err != 0) {
                     std::fprintf(stderr, "# qw38 PLE io_uring error rc=%d err=%d\n", rc, first_err);
                     return false;
                 }
-            } else if (!pool_.empty() && uniq.size() >= 4) {
-                if (!run_pool_pread(uniq.data(), uniq.size(), misses.data(), dst)) return false;
-                for (const UniqMiss& u : uniq) {
-                    const uint8_t* row = dst + misses[u.first_miss].dst_idx * rb;
-                    for (uint32_t k = 1; k < u.count; ++k) {
-                        std::memcpy(dst + misses[u.first_miss + k].dst_idx * rb, row, rb);
-                    }
-                    cache_.insert(u.id, row);
-                    ++s.reads;
+            } else if (!pool_.empty() && spans_.size() >= 2) {
+                uint8_t* pf_dst = nullptr;
+                if (!dst) {
+                    pf_buf_.resize(uniq_.size() * rb);
+                    pf_dst = pf_buf_.data();
                 }
+                if (!run_pool_pread(spans_.data(), spans_.size(), uniq_.data(), misses_.data(), dst, pf_dst)) {
+                    return false;
+                }
+                for (size_t ui = 0; ui < uniq_.size(); ++ui) {
+                    const uint8_t* row = dst
+                        ? (dst + misses_[uniq_[ui].first].dst_idx * rb)
+                        : (pf_dst + ui * rb);
+                    cache_.insert(uniq_[ui].id, row);
+                }
+                s.reads += spans_.size();
             } else {
-                const size_t tmp_sz = std::max<size_t>(8192, ((rb + 2 * align_ - 1) / align_) * align_);
-                void* tmp_raw = nullptr;
-                if (::posix_memalign(&tmp_raw, align_, tmp_sz) != 0) return false;
-                uint8_t* tmp = static_cast<uint8_t*>(tmp_raw);
+                const size_t tmp_sz = std::max<size_t>(PLE_SPAN_MAX, ((rb + 2 * align_ - 1) / align_) * align_);
+                void* raw = nullptr;
+                if (::posix_memalign(&raw, align_, tmp_sz) != 0) return false;
+                uint8_t* tmp = static_cast<uint8_t*>(raw);
                 bool ok = true;
-                for (const UniqMiss& u : uniq) {
-                    const uint64_t byte_off = rows_base_off_ + u.id * rb;
-                    const uint64_t aligned_off = direct_ ? (byte_off & ~(uint64_t(align_) - 1)) : byte_off;
-                    const size_t len = direct_
-                        ? size_t(((byte_off + rb + align_ - 1) & ~(uint64_t(align_) - 1)) - aligned_off)
-                        : rb;
-                    const ssize_t got = ::pread(fd_, tmp, len, off_t(aligned_off));
-                    const size_t in_buf = size_t(byte_off - aligned_off);
-                    if (got < ssize_t(in_buf + rb)) { ok = false; break; }
-                    const uint8_t* row = tmp + in_buf;
-                    for (uint32_t k = 0; k < u.count; ++k) {
-                        std::memcpy(dst + misses[u.first_miss + k].dst_idx * rb, row, rb);
+                for (const IoSpan& sp : spans_) {
+                    const ssize_t got = ::pread(fd_, tmp, sp.len, off_t(sp.off));
+                    if (got < ssize_t(sp.need_end - sp.off)) { ok = false; break; }
+                    for (size_t k = 0; k < sp.count_u; ++k) {
+                        const UniqMiss& u = uniq_[sp.first_u + k];
+                        const uint8_t* row = tmp + (rows_base_off_ + u.id * rb - sp.off);
+                        if (dst) {
+                            for (size_t d = 0; d < u.count; ++d) {
+                                std::memcpy(dst + misses_[u.first + d].dst_idx * rb, row, rb);
+                            }
+                        }
+                        cache_.insert(u.id, row);
                     }
-                    cache_.insert(u.id, row);
                     ++s.reads;
                 }
-                ::free(tmp_raw);
+                ::free(raw);
                 if (!ok) return false;
             }
         }
@@ -974,10 +1018,10 @@ private:
     }
 
     void pool_worker() {
-        const size_t tmp_sz = std::max<size_t>(8192, ((row_bytes_ + 2 * align_ - 1) / align_) * align_);
-        void* tmp_raw = nullptr;
-        if (::posix_memalign(&tmp_raw, align_, tmp_sz) != 0) return;
-        uint8_t* tmp = static_cast<uint8_t*>(tmp_raw);
+        const size_t tmp_sz = std::max<size_t>(PLE_SPAN_MAX, ((row_bytes_ + 2 * align_ - 1) / align_) * align_);
+        void* raw = nullptr;
+        if (::posix_memalign(&raw, align_, tmp_sz) != 0) raw = nullptr;
+        uint8_t* tmp = static_cast<uint8_t*>(raw);
         uint64_t seen = 0;
         for (;;) {
             {
@@ -986,26 +1030,34 @@ private:
                 seen = pool_gen_;
                 if (pool_stop_) break;
             }
+            const IoSpan* spans = pool_spans_;
+            const size_t n = pool_n_;
             const UniqMiss* uniq = pool_uniq_;
             const Miss* misses = pool_misses_;
-            const size_t n = pool_n_;
             uint8_t* dst = pool_dst_;
+            uint8_t* pf_dst = pool_pf_dst_;
             const size_t rb = row_bytes_;
             for (;;) {
                 const size_t idx = pool_next_.fetch_add(1, std::memory_order_relaxed);
                 if (idx >= n) break;
-                const UniqMiss& u = uniq[idx];
-                const uint64_t byte_off = rows_base_off_ + u.id * rb;
-                const uint64_t aligned_off = direct_ ? (byte_off & ~(uint64_t(align_) - 1)) : byte_off;
-                const size_t len = direct_
-                    ? size_t(((byte_off + rb + align_ - 1) & ~(uint64_t(align_) - 1)) - aligned_off)
-                    : rb;
-                const ssize_t got = ::pread(fd_, tmp, len, off_t(aligned_off));
-                const size_t in_buf = size_t(byte_off - aligned_off);
-                if (got < ssize_t(in_buf + rb)) {
+                if (!tmp) { pool_err_.store(1, std::memory_order_relaxed); continue; }
+                const IoSpan& sp = spans[idx];
+                const ssize_t got = ::pread(fd_, tmp, sp.len, off_t(sp.off));
+                if (got < ssize_t(sp.need_end - sp.off)) {
                     pool_err_.store(1, std::memory_order_relaxed);
                 } else {
-                    std::memcpy(dst + misses[u.first_miss].dst_idx * rb, tmp + in_buf, rb);
+                    for (size_t k = 0; k < sp.count_u; ++k) {
+                        const size_t ui = sp.first_u + k;
+                        const UniqMiss& u = uniq[ui];
+                        const uint8_t* row = tmp + (rows_base_off_ + u.id * rb - sp.off);
+                        if (dst) {
+                            for (size_t d = 0; d < u.count; ++d) {
+                                std::memcpy(dst + misses[u.first + d].dst_idx * rb, row, rb);
+                            }
+                        } else if (pf_dst) {
+                            std::memcpy(pf_dst + ui * rb, row, rb);
+                        }
+                    }
                 }
             }
             if (pool_rem_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -1014,14 +1066,17 @@ private:
                 pool_done_cv_.notify_one();
             }
         }
-        ::free(tmp_raw);
+        if (raw) ::free(raw);
     }
 
-    bool run_pool_pread(const UniqMiss* uniq, size_t n, const Miss* misses, uint8_t* dst) {
+    bool run_pool_pread(const IoSpan* spans, size_t n, const UniqMiss* uniq, const Miss* misses,
+                        uint8_t* dst, uint8_t* pf_dst) {
+        pool_spans_ = spans;
+        pool_n_ = n;
         pool_uniq_ = uniq;
         pool_misses_ = misses;
-        pool_n_ = n;
         pool_dst_ = dst;
+        pool_pf_dst_ = pf_dst;
         pool_next_.store(0, std::memory_order_relaxed);
         pool_err_.store(0, std::memory_order_relaxed);
         pool_rem_.store(int(pool_.size()), std::memory_order_relaxed);
@@ -1066,16 +1121,23 @@ private:
     int64_t vsizes_[16] = {};
     int32_t eos_tok_ = geom::TOK_EOS;
     std::mutex mu_;
+    // Reusable scratch for dedup + 4K coalescing (guarded by mu_)
+    std::vector<Miss> misses_;
+    std::vector<UniqMiss> uniq_;
+    std::vector<IoSpan> spans_;
+    std::vector<uint8_t> pf_buf_;
     // Persistent pread worker pool (used when io_uring is unavailable)
     std::vector<std::thread> pool_;
     std::mutex pool_mu_;
     std::condition_variable pool_cv_, pool_done_cv_;
     uint64_t pool_gen_ = 0;
     bool pool_stop_ = false, pool_done_ = true;
+    const IoSpan* pool_spans_ = nullptr;
     const UniqMiss* pool_uniq_ = nullptr;
     const Miss* pool_misses_ = nullptr;
     size_t pool_n_ = 0;
     uint8_t* pool_dst_ = nullptr;
+    uint8_t* pool_pf_dst_ = nullptr;
     std::atomic<size_t> pool_next_{0};
     std::atomic<int> pool_rem_{0};
     std::atomic<int> pool_err_{0};
