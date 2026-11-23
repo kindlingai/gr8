@@ -289,7 +289,7 @@ int main(int argc, char** argv) {
         auto& sc = bc.scheduler;
         sc.epoch = static_cast<uint64_t>(s2epoch);
         sc.pool_rows = static_cast<uint32_t>(s2sess) * static_cast<uint32_t>(e.max_pages_per_slot()) * geom::KV_PAGE;
-        sc.max_rows = static_cast<uint32_t>(std::max(prefill, std::max(chunk, s2sess)));
+        sc.max_rows = static_cast<uint32_t>(o.max_rows);
         sc.max_sessions = static_cast<uint32_t>(s2sess);
         sc.prefill_rows = static_cast<uint32_t>(prefill);
         sc.mtp = static_cast<uint32_t>(mtp);
@@ -315,9 +315,18 @@ int main(int argc, char** argv) {
     // Standalone cluster smoke / benchmark run (supports --sessions 1..8)
     std::vector<int> prompt;
     if (!tokens.empty()) {
-        std::stringstream ss(tokens);
-        std::string item;
-        while (std::getline(ss, item, ',')) prompt.push_back(std::atoi(item.c_str()));
+        std::string raw_toks;
+        if (tokens[0] == '@') {
+            std::ifstream tf(tokens.substr(1));
+            if (!tf) die("cannot open --tokens file: " + tokens.substr(1));
+            raw_toks.assign((std::istreambuf_iterator<char>(tf)), std::istreambuf_iterator<char>());
+        } else {
+            raw_toks = tokens;
+        }
+        for (char& ch : raw_toks) if (ch == ',' || ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+        std::stringstream ss(raw_toks);
+        int tid = 0;
+        while (ss >> tid) prompt.push_back(tid);
     }
     if (prompt.empty()) prompt.push_back(geom::TOK_BOS);
     const int P = static_cast<int>(prompt.size());

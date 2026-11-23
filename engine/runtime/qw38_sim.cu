@@ -64,9 +64,18 @@ int main(int argc, char** argv) {
 
     std::vector<int> prompt;
     if (!tokens.empty()) {
-        std::stringstream ss(tokens);
-        std::string item;
-        while (std::getline(ss, item, ',')) prompt.push_back(std::atoi(item.c_str()));
+        std::string raw_toks;
+        if (tokens[0] == '@') {
+            std::ifstream tf(tokens.substr(1));
+            if (!tf) die("cannot open --tokens file: " + tokens.substr(1));
+            raw_toks.assign((std::istreambuf_iterator<char>(tf)), std::istreambuf_iterator<char>());
+        } else {
+            raw_toks = tokens;
+        }
+        for (char& ch : raw_toks) if (ch == ',' || ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+        std::stringstream ss(raw_toks);
+        int tid = 0;
+        while (ss >> tid) prompt.push_back(tid);
     }
     if (prompt.empty()) prompt.push_back(geom::TOK_BOS);
     for (int t : prompt)
