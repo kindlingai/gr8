@@ -364,9 +364,10 @@ The head serves the OpenAI API on port 8100. [frontend/README.md](frontend/READM
 |---|---|---|
 | 8100 | the OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`) | head |
 | 7340 | the supervisors: the handshake before boot, then status, logs and down | every box |
-| 7341 | the multi-session control channel between the ranks | head |
+| 7341–7342 | the multi-session S2 control channel between the ranks (alternating ports under `GR8_FABRIC_POOL`) | head |
 | 7343 | during `scale` with a persisted KV store: each box serves its store to the new ranks (`bin/kvman-peer`, `CONTROL_PORT + 3`) | every box |
-| 18600-18659 | fabric bootstrap and the per-collective regions | head |
+| 18600–18679 | fabric bootstrap and per-collective regions (group range 1; `18700–18779` for alternating group range 2 under `GR8_FABRIC_POOL`) | head |
+| 18800 | fabric pool control link when `GR8_FABRIC_POOL` is enabled | pool head |
 
 ## Layout
 
