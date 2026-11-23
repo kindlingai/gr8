@@ -632,31 +632,36 @@ __device__ __forceinline__ void hc_mma_bf16_m16n8k16(float (&d)[4], uint32_t a0,
 }
 
 // Fused Tensor-Core HC Up + Sigmoid + Mix for prefill (never materializes [M, 10240] up tensor!).
-// Grid: ((M + 31) / 32) * (2560 / 64), Block: 256 (8 warps = 2 M-tiles x 4 N-tiles, 16x16 per warp).
-__global__ void __launch_bounds__(256, 3) k_hc_up_mix_tc(const __nv_bfloat16* __restrict__ hn,
+// BM=64 x BN=64, Block=256 (8 warps = 4 M-warps x 2 N-warps, 16x32 per warp, 4x A-register reuse).
+// CTA scheduling: mb inner, nb outer -> 164 KB w_up slice stays L2-resident across all M-tiles.
+// Coalesced 128-bit uint4 hn loads and mixed stores via bank-conflict-free sm.tile[32][72] (47.1 KB smem).
+__global__ void __launch_bounds__(256, 2) k_hc_up_mix_tc(const __nv_bfloat16* __restrict__ hn,
                                                          const __nv_bfloat16* __restrict__ down,
                                                          const __nv_bfloat16* __restrict__ w_up,
                                                          __nv_bfloat16* __restrict__ mixed,
                                                          int M) {
-    constexpr int BM = 32;
+    constexpr int BM = 64;
     constexpr int BN = 64;
-    constexpr int N_TILES = geom::HID / BN;
-    const int nb = blockIdx.x % N_TILES;
-    const int mb = blockIdx.x / N_TILES;
+    const int M_TILES = (M + BM - 1) / BM;
+    const int mb = blockIdx.x % M_TILES;
+    const int nb = blockIdx.x / M_TILES;
     const int m0 = mb * BM;
     const int d0 = nb * BN;
-    if (m0 >= M) return;
+    if (d0 >= geom::HID || m0 >= M) return;
 
     const int tid = threadIdx.x;
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int wm = warp >> 2;
-    const int wn = warp & 3;
-    const int row0 = lane >> 2;
-    const int col = lane & 3;
+    const int warp = tid >> 5;   // 0..7
+    const int lane = tid & 31;   // 0..31
+    const int wm = warp >> 1;    // 0..3 (4 M-warps x 16 rows = 64)
+    const int wn = warp & 1;     // 0..1 (2 N-warps x 32 cols = 64)
+    const int row0 = lane >> 2;  // 0..7
+    const int col = lane & 3;    // 0..3
 
-    __shared__ __align__(16) uint16_t s_down[BM][328];
-    __shared__ __align__(16) uint16_t s_w[BN][40];
+    __shared__ __align__(16) uint16_t s_down[BM][328]; // 41,984 B
+    __shared__ union {
+        __align__(16) uint16_t w[BN][40];      // 5,120 B
+        __align__(16) uint16_t tile[32][72];   // 4,608 B (stride 144 B = 36 banks -> 0 bank conflicts!)
+    } sm; // total smem = 47,104 B (< 48 KB -> 2 CTAs/SM)
 
     #pragma unroll
     for (int i = tid; i < BM * 40; i += 256) {
@@ -669,80 +674,104 @@ __global__ void __launch_bounds__(256, 3) k_hc_up_mix_tc(const __nv_bfloat16* __
     }
     __syncthreads();
 
-    float mix_acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+    float mix_acc[4][4] = {
+        {0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f},
+        {0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}
+    };
+
+    const int mr0 = wm * 16 + row0;
+    const int mr1 = mr0 + 8;
+    const int lr0 = (wm & 1) * 16 + row0;
+    const int lr1 = lr0 + 8;
+    const int t_r = tid >> 3;        // 0..31
+    const int t_c8 = (tid & 7) << 3; // 0, 8, ..., 56 (128 B full cache line per 8 lanes)
 
     #pragma unroll
     for (int s = 0; s < geom::HC; ++s) {
-        float u_acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+        float u_acc[4][4] = {
+            {0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f},
+            {0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}
+        };
         const __nv_bfloat16* ws_base = w_up + static_cast<size_t>(s * geom::HID + d0) * geom::HC_RANK;
 
         for (int k0 = 0; k0 < geom::HC_RANK; k0 += 32) {
             const int rn = tid >> 2;
             const int ck = tid & 3;
             const uint4 wv = __ldg(reinterpret_cast<const uint4*>(ws_base + static_cast<size_t>(rn) * geom::HC_RANK + k0) + ck);
-            *reinterpret_cast<uint4*>(s_w[rn] + ck * 8) = wv;
+            *reinterpret_cast<uint4*>(sm.w[rn] + ck * 8) = wv;
             __syncthreads();
 
             #pragma unroll
             for (int kp = 0; kp < 2; ++kp) {
                 const int k_off = k0 + kp * 16;
-                const int mr0 = wm * 16 + row0;
-                const int mr1 = mr0 + 8;
                 const uint32_t a0 = *reinterpret_cast<const uint32_t*>(s_down[mr0] + k_off + 2 * col);
                 const uint32_t a1 = *reinterpret_cast<const uint32_t*>(s_down[mr1] + k_off + 2 * col);
                 const uint32_t a2 = *reinterpret_cast<const uint32_t*>(s_down[mr0] + k_off + 8 + 2 * col);
                 const uint32_t a3 = *reinterpret_cast<const uint32_t*>(s_down[mr1] + k_off + 8 + 2 * col);
 
                 #pragma unroll
-                for (int nt = 0; nt < 2; ++nt) {
-                    const int nr = wn * 16 + nt * 8 + row0;
-                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(s_w[nr] + kp * 16 + 2 * col);
-                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(s_w[nr] + kp * 16 + 8 + 2 * col);
+                for (int nt = 0; nt < 4; ++nt) {
+                    const int nr = wn * 32 + nt * 8 + row0;
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(sm.w[nr] + kp * 16 + 2 * col);
+                    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(sm.w[nr] + kp * 16 + 8 + 2 * col);
                     hc_mma_bf16_m16n8k16(u_acc[nt], a0, a1, a2, a3, b0, b1);
                 }
             }
             __syncthreads();
         }
 
-        const int gm0 = m0 + wm * 16 + row0;
-        const int gm1 = gm0 + 8;
+        // Coalesced hn load in 2 halves of 32 rows via sm.tile[32][72]
         #pragma unroll
-        for (int nt = 0; nt < 2; ++nt) {
-            const int gd = d0 + wn * 16 + nt * 8 + 2 * col;
-            if (gm0 < M) {
-                const __nv_bfloat162 hv = *reinterpret_cast<const __nv_bfloat162*>(
-                    hn + static_cast<size_t>(gm0) * geom::HC_D + s * geom::HID + gd);
-                const float2 fh = __bfloat1622float2(hv);
-                const float m0v = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[nt][0])))));
-                const float m1v = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[nt][1])))));
-                mix_acc[nt][0] += m0v * fh.x;
-                mix_acc[nt][1] += m1v * fh.y;
+        for (int half = 0; half < 2; ++half) {
+            const int gm = m0 + half * 32 + t_r;
+            uint4 hv = {0, 0, 0, 0};
+            if (gm < M) {
+                hv = *reinterpret_cast<const uint4*>(
+                    hn + static_cast<size_t>(gm) * geom::HC_D + s * geom::HID + d0 + t_c8);
             }
-            if (gm1 < M) {
-                const __nv_bfloat162 hv = *reinterpret_cast<const __nv_bfloat162*>(
-                    hn + static_cast<size_t>(gm1) * geom::HC_D + s * geom::HID + gd);
-                const float2 fh = __bfloat1622float2(hv);
-                const float m2v = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[nt][2])))));
-                const float m3v = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[nt][3])))));
-                mix_acc[nt][2] += m2v * fh.x;
-                mix_acc[nt][3] += m3v * fh.y;
+            *reinterpret_cast<uint4*>(sm.tile[t_r] + t_c8) = hv;
+            __syncthreads();
+
+            if ((wm >> 1) == half) {
+                #pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    const int lc = wn * 32 + nt * 8 + 2 * col;
+                    const float2 fh0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(sm.tile[lr0] + lc));
+                    const float2 fh1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(sm.tile[lr1] + lc));
+                    const float m0v = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[nt][0])))));
+                    const float m1v = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[nt][1])))));
+                    const float m2v = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[nt][2])))));
+                    const float m3v = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[nt][3])))));
+                    mix_acc[nt][0] += m0v * fh0.x;
+                    mix_acc[nt][1] += m1v * fh0.y;
+                    mix_acc[nt][2] += m2v * fh1.x;
+                    mix_acc[nt][3] += m3v * fh1.y;
+                }
             }
+            __syncthreads();
         }
     }
 
-    const int gm0 = m0 + wm * 16 + row0;
-    const int gm1 = gm0 + 8;
+    // Coalesced mixed store in 2 halves of 32 rows via sm.tile[32][72]
     #pragma unroll
-    for (int nt = 0; nt < 2; ++nt) {
-        const int gd = d0 + wn * 16 + nt * 8 + 2 * col;
-        if (gm0 < M) {
-            *reinterpret_cast<__nv_bfloat162*>(mixed + static_cast<size_t>(gm0) * geom::HID + gd) =
-                __floats2bfloat162_rn(mix_acc[nt][0] * 0.25f, mix_acc[nt][1] * 0.25f);
+    for (int half = 0; half < 2; ++half) {
+        if ((wm >> 1) == half) {
+            #pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const int lc = wn * 32 + nt * 8 + 2 * col;
+                *reinterpret_cast<__nv_bfloat162*>(sm.tile[lr0] + lc) =
+                    __floats2bfloat162_rn(mix_acc[nt][0] * 0.25f, mix_acc[nt][1] * 0.25f);
+                *reinterpret_cast<__nv_bfloat162*>(sm.tile[lr1] + lc) =
+                    __floats2bfloat162_rn(mix_acc[nt][2] * 0.25f, mix_acc[nt][3] * 0.25f);
+            }
         }
-        if (gm1 < M) {
-            *reinterpret_cast<__nv_bfloat162*>(mixed + static_cast<size_t>(gm1) * geom::HID + gd) =
-                __floats2bfloat162_rn(mix_acc[nt][2] * 0.25f, mix_acc[nt][3] * 0.25f);
+        __syncthreads();
+        const int gm = m0 + half * 32 + t_r;
+        if (gm < M) {
+            *reinterpret_cast<uint4*>(mixed + static_cast<size_t>(gm) * geom::HID + d0 + t_c8) =
+                *reinterpret_cast<const uint4*>(sm.tile[t_r] + t_c8);
         }
+        __syncthreads();
     }
 }
 
@@ -996,7 +1025,7 @@ inline void hc_prepare_from_hn(cublasHandle_t blas, const HcWeights& w, __nv_bfl
         const int n8 = (M * geom::HC_RANK) >> 3;
         k_div4_silu_bf16_vec<<<(n8 + 255) / 256, 256, 0, st>>>(sc.down, n8);
     }
-    const int up_grid = ((M + 31) / 32) * (geom::HID / 64);
+    const int up_grid = ((M + 63) / 64) * (geom::HID / 64);
     k_hc_up_mix_tc<<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.up, mixed, M);
 }
 
@@ -1049,7 +1078,7 @@ inline void hc_prepare(cublasHandle_t blas, const HcWeights& w, const __nv_bfloa
         const int n8 = (M * geom::HC_RANK) >> 3;
         k_div4_silu_bf16_vec<<<(n8 + 255) / 256, 256, 0, st>>>(sc.down, n8);
     }
-    const int up_grid = ((M + 31) / 32) * (geom::HID / 64);
+    const int up_grid = ((M + 63) / 64) * (geom::HID / 64);
     k_hc_up_mix_tc<<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.up, mixed, M);
 }
 

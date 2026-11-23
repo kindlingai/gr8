@@ -366,11 +366,12 @@ struct Engine {
     std::function<void(int M, bool skip_head, int n_layers_override)> step_begin;
     std::function<void(int c, __nv_bfloat16* parts, size_t bytes)> gather_dev;
     std::function<void(int c, uint8_t* host_parts, size_t bytes)> gather_host;
-    // Optional zero-copy direct-fabric AR callbacks (g6m4_qw38 fast AR): write directly into f.send,
-    // wait on ring/tail, and inject directly from f.send + __ldcv(f.recv) without staging copies.
+    // Optional zero-copy direct-fabric AR callbacks (g6m4_qw38 fast AR): write directly into f.send (M > 8),
+    // or write to GPU HBM `parts` + coalesced copy to f.send (M <= 8 decode) and inject directly from own + __ldcv(f.recv).
     std::function<__nv_bfloat16*(int c)> direct_send_dst;
     std::function<void(int c, size_t bytes)> direct_ar_wait;
-    std::function<void(int c, __nv_bfloat16* hyper, const float* inj, int M)> direct_hc_inject;
+    std::function<void(int c, const __nv_bfloat16* own_part, size_t bytes)> direct_copy_ring_wait;
+    std::function<void(int c, __nv_bfloat16* hyper, const float* inj, int M, const __nv_bfloat16* own_override)> direct_hc_inject;
     std::function<void(int c, __nv_bfloat16* hyper, const __nv_bfloat16* w_norm, const __nv_bfloat16* w_inj,
                        __nv_bfloat16* hn_out, float* inj_io, int M)> direct_hc_inject_norm;
     // Optional sequence-parallel HC callbacks (multi-rank prefill): RS(M/nr) -> local HC(M/nr) -> AG(M/nr).
@@ -969,6 +970,7 @@ struct Engine {
         QW38_CK(cudaMemcpyAsync(d_pos, h_pos_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
 
         const bool use_direct_ar = (o.nr > 1 && o.nloc == 1 && direct_send_dst && direct_ar_wait && direct_hc_inject);
+        const bool use_direct_send = (use_direct_ar && (M > 8 || !direct_copy_ring_wait));
         const bool use_sp_hc = (use_direct_ar && skip_head && !has_mtp && M >= 64 && L.size() >= 2 &&
                                 step_begin_sp && direct_hc_rs_inject_norm && direct_ag_assemble);
         const int sp_slice = use_sp_hc ? ((M + o.nr - 1) / o.nr) : M;
@@ -1030,7 +1032,7 @@ struct Engine {
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
                 RankLayer& rl = y.rk[size_t(i)];
-                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
+                __nv_bfloat16* p_dst = use_direct_send ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 if (y.is_full) {
                     qw38::full_attn_forward(blas, rl.attn_w, rl.kv, attn_sc, mixed, p_dst,
                                             d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r,
@@ -1041,8 +1043,10 @@ struct Engine {
                 }
             }
             if (use_direct_ar) {
-                direct_ar_wait(coll, part_stride * 2);
-                direct_hc_inject(coll, hyper, hc_sc.inj, M);
+                const __nv_bfloat16* own_p = use_direct_send ? nullptr : (parts + size_t(o.rank0) * part_stride);
+                if (use_direct_send) direct_ar_wait(coll, part_stride * 2);
+                else direct_copy_ring_wait(coll, own_p, part_stride * 2);
+                direct_hc_inject(coll, hyper, hc_sc.inj, M, own_p);
                 ++coll;
             } else {
                 if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
@@ -1054,12 +1058,14 @@ struct Engine {
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
                 RankLayer& rl = y.rk[size_t(i)];
-                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
+                __nv_bfloat16* p_dst = use_direct_send ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 qw38::moe_forward(blas, rl.moe_w, moe_sc, mixed, p_dst, M, stream);
             }
             if (use_direct_ar) {
-                direct_ar_wait(coll, part_stride * 2);
-                direct_hc_inject(coll, hyper, hc_sc.inj, M);
+                const __nv_bfloat16* own_p = use_direct_send ? nullptr : (parts + size_t(o.rank0) * part_stride);
+                if (use_direct_send) direct_ar_wait(coll, part_stride * 2);
+                else direct_copy_ring_wait(coll, own_p, part_stride * 2);
+                direct_hc_inject(coll, hyper, hc_sc.inj, M, own_p);
                 ++coll;
             } else {
                 if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
@@ -1245,7 +1251,7 @@ struct Engine {
                     ++coll;
                     qw38::hc_prepare_from_hn(blas, y.mlp_hc, mixed, hc_sc, M, stream);
                 } else {
-                    direct_hc_inject(coll++, hyper, hc_sc.inj, M);
+                    direct_hc_inject(coll++, hyper, hc_sc.inj, M, nullptr);
                     qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
                 }
                 t_end(prof.hc_ms);
@@ -1255,7 +1261,7 @@ struct Engine {
                 t_end(prof.moe_ms);
 
                 t_start(); direct_ar_wait(coll, part_stride * 2); t_end(prof.ar_ms);
-                t_start(); direct_hc_inject(coll++, hyper, hc_sc.inj, M); t_end(prof.hc_ms);
+                t_start(); direct_hc_inject(coll++, hyper, hc_sc.inj, M, nullptr); t_end(prof.hc_ms);
             }
 
             // --- Layer 1 PLE (on full replicated hyper) + Enter SP-HC ---
@@ -1341,8 +1347,12 @@ struct Engine {
                 }
                 return true;
             }
-            if (use_direct_ar) direct_hc_inject(c, hyper, hc_sc.inj, M);
-            else qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (use_direct_ar) {
+                const __nv_bfloat16* own_p = use_direct_send ? nullptr : (parts + size_t(o.rank0) * part_stride);
+                direct_hc_inject(c, hyper, hc_sc.inj, M, own_p);
+            } else {
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
             return false;
         };
 
@@ -1368,7 +1378,7 @@ struct Engine {
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
                 RankLayer& rl = y.rk[size_t(i)];
-                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
+                __nv_bfloat16* p_dst = use_direct_send ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 if (y.is_full) {
                     qw38::full_attn_forward(blas, rl.attn_w, rl.kv, attn_sc, mixed, p_dst,
                                             d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r,
@@ -1381,8 +1391,10 @@ struct Engine {
             t_end(y.is_full ? prof.attn_ms : prof.gdn_ms);
 
             t_start();
-            if (use_direct_ar) direct_ar_wait(coll, part_stride * 2);
-            else if (o.nr > 1 && gather_dev) gather_dev(coll, parts, part_stride * 2);
+            if (use_direct_ar) {
+                if (use_direct_send) direct_ar_wait(coll, part_stride * 2);
+                else direct_copy_ring_wait(coll, parts + size_t(o.rank0) * part_stride, part_stride * 2);
+            } else if (o.nr > 1 && gather_dev) gather_dev(coll, parts, part_stride * 2);
             t_end(prof.ar_ms);
 
             t_start();
@@ -1399,14 +1411,16 @@ struct Engine {
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
                 RankLayer& rl = y.rk[size_t(i)];
-                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
+                __nv_bfloat16* p_dst = use_direct_send ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 qw38::moe_forward(blas, rl.moe_w, moe_sc, mixed, p_dst, M, stream);
             }
             t_end(prof.moe_ms);
 
             t_start();
-            if (use_direct_ar) direct_ar_wait(coll, part_stride * 2);
-            else if (o.nr > 1 && gather_dev) gather_dev(coll, parts, part_stride * 2);
+            if (use_direct_ar) {
+                if (use_direct_send) direct_ar_wait(coll, part_stride * 2);
+                else direct_copy_ring_wait(coll, parts + size_t(o.rank0) * part_stride, part_stride * 2);
+            } else if (o.nr > 1 && gather_dev) gather_dev(coll, parts, part_stride * 2);
             t_end(prof.ar_ms);
 
             const qw38::HcWeights* next_hc = nullptr;
@@ -1566,19 +1580,22 @@ struct Engine {
             qw38::k_mtp_fuse_stream4<<<M, 256, 0, stream>>>(mtp_sc.hid_proj, mtp_sc.emb_proj, mtp_sc.mtp_hyper, M);
 
             const bool use_direct_ar = (o.nr > 1 && o.nloc == 1 && direct_send_dst && direct_ar_wait && direct_hc_inject);
+        const bool use_direct_send = (use_direct_ar && (M > 8 || !direct_copy_ring_wait));
             int coll = 0;
 
             // L048 Full Attention + AR + Inject
             qw38::hc_prepare(blas, mtp_w.attn_hc, mtp_sc.mtp_hyper, mixed, hc_sc, M, stream);
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
-                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
+                __nv_bfloat16* p_dst = use_direct_send ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 qw38::full_attn_forward(blas, mtp_w.attn[size_t(i)], mtp_w.kv[size_t(i)], attn_sc, mixed, p_dst,
                                         d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r, max_pps, max_blocks, stream, 0);
             }
             if (use_direct_ar) {
-                direct_ar_wait(coll, part_stride * 2);
-                direct_hc_inject(coll, mtp_sc.mtp_hyper, hc_sc.inj, M);
+                const __nv_bfloat16* own_p = use_direct_send ? nullptr : (parts + size_t(o.rank0) * part_stride);
+                if (use_direct_send) direct_ar_wait(coll, part_stride * 2);
+                else direct_copy_ring_wait(coll, own_p, part_stride * 2);
+                direct_hc_inject(coll, mtp_sc.mtp_hyper, hc_sc.inj, M, own_p);
                 ++coll;
             } else {
                 if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
@@ -1590,13 +1607,15 @@ struct Engine {
             qw38::hc_prepare(blas, mtp_w.mlp_hc, mtp_sc.mtp_hyper, mixed, hc_sc, M, stream);
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
-                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
+                __nv_bfloat16* p_dst = use_direct_send ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 qw38::mtp_moe_forward(blas, mtp_w.moe[size_t(i)], mtp_w.fp8_exp_gu[size_t(i)], mtp_w.fp8_exp_dn[size_t(i)],
                                       moe_sc, mtp_sc, mixed, p_dst, M, stream);
             }
             if (use_direct_ar) {
-                direct_ar_wait(coll, part_stride * 2);
-                direct_hc_inject(coll, mtp_sc.mtp_hyper, hc_sc.inj, M);
+                const __nv_bfloat16* own_p = use_direct_send ? nullptr : (parts + size_t(o.rank0) * part_stride);
+                if (use_direct_send) direct_ar_wait(coll, part_stride * 2);
+                else direct_copy_ring_wait(coll, own_p, part_stride * 2);
+                direct_hc_inject(coll, mtp_sc.mtp_hyper, hc_sc.inj, M, own_p);
                 ++coll;
             } else {
                 if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);

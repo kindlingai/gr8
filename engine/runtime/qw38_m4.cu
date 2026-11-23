@@ -172,11 +172,23 @@ struct Wire {
         k_qw38_ar_ring_wait<<<1, 32, 0, st>>>(a);
     }
 
-    void fast_hc_inject(int c, __nv_bfloat16* hyper, const float* inj, int M, cudaStream_t st) const {
+    void fast_copy_ring_wait(int c, const __nv_bfloat16* own_part, size_t bytes, cudaStream_t st) const {
+        const size_t wire = (bytes + 15) / 16 * 16;
+        const size_t n16 = wire / 16;
+        const unsigned grid = static_cast<unsigned>((n16 + 255) / 256);
+        ink2::k_ink2_ar_copy<<<grid, 256, 0, st>>>(
+            reinterpret_cast<const uint4*>(own_part),
+            reinterpret_cast<uint4*>(f.send + g6::fab_send_off(f, static_cast<int>(step & 1), c)), n16);
+        Qw38ArWait a{f, wire, d_step, ink2::INK2_ERR_AR | (static_cast<unsigned>(c) << 8), static_cast<int>(step & 1), c};
+        k_qw38_ar_ring_wait<<<1, 32, 0, st>>>(a);
+    }
+
+    void fast_hc_inject(int c, __nv_bfloat16* hyper, const float* inj, int M, cudaStream_t st,
+                        const __nv_bfloat16* own_override = nullptr) const {
         const int par = static_cast<int>(step & 1);
         const __nv_bfloat16* pt[4] = {nullptr, nullptr, nullptr, nullptr};
         for (int p = 0; p < nr; ++p) {
-            if (p == rank) pt[p] = reinterpret_cast<const __nv_bfloat16*>(f.send + g6::fab_send_off(f, par, c));
+            if (p == rank) pt[p] = own_override ? own_override : reinterpret_cast<const __nv_bfloat16*>(f.send + g6::fab_send_off(f, par, c));
             else pt[p] = reinterpret_cast<const __nv_bfloat16*>(f.recv + g6::fab_recv_off(f, par, c, p));
         }
         qw38::k_hc_inject_ptrs<<<M * 5, 64, 0, st>>>(hyper, pt[0], pt[1], pt[2], pt[3], inj, M, nr, rank);
@@ -371,8 +383,11 @@ int main(int argc, char** argv) {
             e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.fast_dev(c, p, b, e.stream); };
             e.direct_send_dst = [&](int c) { return wire.fast_send_dst(c); };
             e.direct_ar_wait = [&](int c, size_t b) { wire.fast_ar_wait(c, b, e.stream); };
-            e.direct_hc_inject = [&](int c, __nv_bfloat16* h, const float* inj, int M) {
-                wire.fast_hc_inject(c, h, inj, M, e.stream);
+            e.direct_copy_ring_wait = [&](int c, const __nv_bfloat16* own, size_t b) {
+                wire.fast_copy_ring_wait(c, own, b, e.stream);
+            };
+            e.direct_hc_inject = [&](int c, __nv_bfloat16* h, const float* inj, int M, const __nv_bfloat16* own) {
+                wire.fast_hc_inject(c, h, inj, M, e.stream, own);
             };
             e.direct_hc_inject_norm = [&](int c, __nv_bfloat16* h, const __nv_bfloat16* wn, const __nv_bfloat16* wi,
                                           __nv_bfloat16* hn, float* inj_io, int M) {
