@@ -314,4 +314,20 @@ class Fabric {
   Impl* impl_ = nullptr;
 };
 
+// Symmetric balanced dual-rail assignment for nr ranks via circle-method 1-factorization.
+// Guarantees dual_rail_of(p, me, nr) == dual_rail_of(me, p, nr) for every pair (so both endpoints
+// of an RC QP land on the same RoCE subnet/rail), exact 6/6 QP balance at TP=4 (8/7 edges at TP=6,
+// 14/14 at TP=8), and optimal per-rank degree balance (|deg0 - deg1| <= 1 for all even nr).
+inline int dual_rail_of(int p, int me, int nr) {
+  const int a = p < me ? p : me, b = p < me ? me : p;
+  const int N = (nr & 1) ? nr + 1 : nr;
+  const int M = N - 1;
+  const int r = (b == M) ? (2 * a) % M : (a + b) % M;
+  return (r < M - 1) ? (r & 1) : (a & 1);
+}
+
+// Staggered peer order for send k in [1, nr - 1]: every rank sends to a distinct peer in each round,
+// avoiding (nr - 1):1 rank-0 incast across switch ports.
+inline int stagger_peer(int me, int k, int nr) { return (me + k) % nr; }
+
 }  // namespace g6

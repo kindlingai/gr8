@@ -316,7 +316,9 @@ struct Fabric::Impl {
   int pinned_cpu = -1;                               // CPU registered with progress_cpus.h (-1 = none)
   std::atomic<int> proxy_tid{0};                     // thread id of the running proxy, registered with progress_cpus.h (0 = none)
   std::atomic<bool> proxy_started{false};            // the proxy thread has pinned itself and registered its tid
-  int rail_of(int p, int me) const { return ring ? ring_rail[p] : nrails == 1 ? 0 : (p + me) % 2; }
+  // Non-striped (decode / CP) fabrics use balanced 1-factorization rail_of (exact 6/6 QP split at TP=4);
+  // striped prefill fabrics already split every peer across both rails and keep stock (p + me) % 2 mapping.
+  int rail_of(int p, int me) const { return ring ? ring_rail[p] : nrails == 1 ? 0 : (stripe ? (p + me) % 2 : dual_rail_of(p, me, nr)); }
   // the stripe QP's rail: the other rail (two-rail), or at a three-rank ring the same port's device on the other PCIe
   // root (rails 2 / 3, the TP=4 relay devices), so the two halves of a write take separate PCIe x4 links
   int rail2_of(int p, int me) const { return ring ? ring_rail[p] + 2 : 1 - rail_of(p, me); }
@@ -997,7 +999,8 @@ void Fabric::start_proxy() {
           const uint32_t bytes = job.sizes[c];
           char* src = dev_.send + L.send_at(c, par);
           *(volatile unsigned long long*)(src + bytes) = seq;
-          for (int p = 0; p < nr; p++) {
+          for (int kk = 1; kk < nr; kk++) {
+            const int p = stagger_peer(me, kk, nr);
             const int j = L.slot_of(c, p, me);
             if (j < 0) continue;
             Rail& R = I.rails[I.rail_of(p, me)];
@@ -1040,7 +1043,8 @@ void Fabric::start_proxy() {
         if (psplit) *(volatile unsigned long long*)(src + job.pair_common) = seq;  // common-prefix tail for non-pair peers
         if (xr) xr[1] = xr[5] = xt_tick();
         StripeW sw[8]; int ns = 0;
-        for (int p = 0; p < nr; p++) {
+        for (int idx = 0; idx < nr; idx++) {
+          const int p = I.stripe ? idx : (idx == 0 ? me : stagger_peer(me, idx, nr));
           if (p == me || (mask_bit(job.p2p, c) && p != job.peer)) continue;   // p2p: one peer only (RS or AG)
           Rail& R = I.rails[I.rail_of(p, me)];
           char* sp = rs ? src + fab_rs_slice_off(job.rs_ss, p) : src;   // reduce-scatter: peer p gets slice p only
