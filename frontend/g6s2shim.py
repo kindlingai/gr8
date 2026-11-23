@@ -89,6 +89,8 @@ IMAGE_PATCH, IMAGE_DOWN, IMAGE_MAX_SPAN = 14, 3, 1024
 GLM5V_IMAGE_TOKEN, GLM5V_MERGE, GLM5V_MIN_TOKENS, GLM5V_MAX_TOKENS = 154854, 2, 16, 8000
 # Inkling-2-Small (vision.s2 says ink2): engine/runtime/ink2_vision_plan.h
 INK2_IMAGE_TOKEN, INK2_PATCH, INK2_MERGE, INK2_MIN_TOKENS, INK2_MAX_TOKENS = 200054, 20, 2, 1, 6400
+# Qwen3.8-Flash-Next (vision.s2 says qw38): engine/runtime/qw38_vision_plan.h
+QW38_IMAGE_TOKEN, QW38_PATCH, QW38_MERGE, QW38_MIN_TOKENS, QW38_MAX_TOKENS = 248056, 16, 2, 1, 16384
 IMAGES_MAX = 16
 IMAGES_B64_MAX = 48 << 20
 
@@ -268,13 +270,24 @@ def ink2_span(vit_h: int, vit_w: int) -> int | None:
     return n if INK2_MIN_TOKENS <= n <= INK2_MAX_TOKENS else None
 
 
+def qw38_span(vit_h: int, vit_w: int) -> int | None:
+    """The span of a Qwen3.8-Flash-Next patch grid, None when its processor cannot produce it (qw38v::span_of)."""
+    m = QW38_MERGE
+    if vit_h < m or vit_w < m or vit_h % m or vit_w % m:
+        return None
+    n = (vit_h // m) * (vit_w // m)
+    return n if QW38_MIN_TOKENS <= n <= QW38_MAX_TOKENS else None
+
+
 def image_span(vit_h: int, vit_w: int, model: str = 'ds41') -> int | None:
     """The span of a patch grid, None when the model's processor cannot produce it (ds41v::grid_of, glm5v::span_of,
-    ink2v::span_of)."""
+    ink2v::span_of, qw38v::span_of)."""
     if model == 'glm5v':
         return glm5v_span(vit_h, vit_w)
     if model == 'ink2':
         return ink2_span(vit_h, vit_w)
+    if model == 'qw38':
+        return qw38_span(vit_h, vit_w)
     lim = IMAGE_DOWN * IMAGE_MAX_SPAN
     if not (1 <= vit_h <= lim and 1 <= vit_w <= lim):
         return None
@@ -284,11 +297,11 @@ def image_span(vit_h: int, vit_w: int, model: str = 'ds41') -> int | None:
 
 
 def vision_model(path: str) -> str:
-    """The image geometry vision.s2 names: glm5v (GLM-5.3-Flash), ink2 (Inkling-2-Small), else ds41 (its file holds 1)."""
+    """The image geometry vision.s2 names: glm5v, ink2, qw38, else ds41 (its file holds 1)."""
     try:
         with open(path) as fh:
             words = fh.read().split()
-        return words[0] if words in (['glm5v'], ['ink2']) else 'ds41'
+        return words[0] if words in (['glm5v'], ['ink2'], ['qw38']) else 'ds41'
     except OSError:
         return 'ds41'
 
@@ -297,8 +310,8 @@ def images_field(images, prompt, model: str = 'ds41') -> tuple[str, str | None]:
     """The generate frame's `images` -> (the request line's img fields or '', error or None). Checks what
     g6s2::parse_request checks (a request it refuses ends the epoch): the grid, the span inside the prompt and made of the
     image token, ascending spans, the pixel bytes' size. model: the engine's image geometry (vision.s2)."""
-    token = {'glm5v': GLM5V_IMAGE_TOKEN, 'ink2': INK2_IMAGE_TOKEN}.get(model, IMAGE_TOKEN)
-    patch = INK2_PATCH if model == 'ink2' else IMAGE_PATCH
+    token = {'glm5v': GLM5V_IMAGE_TOKEN, 'ink2': INK2_IMAGE_TOKEN, 'qw38': QW38_IMAGE_TOKEN}.get(model, IMAGE_TOKEN)
+    patch = {'ink2': INK2_PATCH, 'qw38': QW38_PATCH}.get(model, IMAGE_PATCH)
     if images is None or images == []:
         return '', None
     if not isinstance(images, list) or len(images) > IMAGES_MAX:
