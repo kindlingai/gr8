@@ -47,7 +47,7 @@ Update the matching items in the same PR as a change (or during each `v*` releas
 - [ ] **README features in plain language:** When a user-visible capability, default, or workflow lands or changes,
       update [README.md](README.md) ([What gr8 does today](README.md#what-gr8-does-today),
       [Models and install](README.md#models-and-install), [Running it](README.md#running-it)) with a short, easy
-      explanation and any rollback flag.
+      explanation, any rollback flag, and inline credit for the contributor(s) who built or improved it.
 - [ ] **Instructions for agents building on gr8:** Keep [README.md](README.md#building-on-gr8) (including the current
       `v*` release and digest example), [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md), [docs/DEPLOY.md](docs/DEPLOY.md),
       [frontend/README.md](frontend/README.md), and [RELEASING.md](RELEASING.md) accurate whenever flags, endpoints,
@@ -77,14 +77,20 @@ Update the matching items in the same PR as a change (or during each `v*` releas
 - [ ] **Breaking-change list:** Call out any breaking change (CLI/knobs, HTTP API/protocol, weights/steering schema, or
       128 GB GB10 runtime/numerical contract) with exact before/after migration steps in the PR and in the release's
       `Breaking changes` section ([RELEASING.md](RELEASING.md#3-breaking-changes-and-release-notes)).
-- [ ] **CREDITS.md:** Add or extend contributor entries in [CREDITS.md](CREDITS.md) and keep
-      [README.md](README.md#credits) in sync whenever contributions land ([Contributor credit](#contributor-credit)).
+- [ ] **CREDITS.md and README attribution:** Add or extend contributor entries in [CREDITS.md](CREDITS.md), keep
+      [README.md](README.md#credits) in sync, and credit contributors inline in the [README.md](README.md) sections
+      that explain the features or capabilities they contributed ([Contributor credit](#contributor-credit)).
 
 ## Contributor credit
 
 External contributors should add their GitHub username to [CREDITS.md](CREDITS.md) in their contribution PR, with a
 short description of their work and links to relevant PRs or commits when available. Extend an existing entry when
 adding more work. Keep the full contributor list in the README's Credits section in sync with CREDITS.md.
+
+In addition to [CREDITS.md](CREDITS.md) and [README.md#credits](README.md#credits), credit contributors inline in the
+[README.md](README.md) sections that explain what their contribution is (for example in
+[What gr8 does today](README.md#what-gr8-does-today) or the matching feature/model section), so readers immediately see
+who built or improved each capability.
 
 When preparing a PR on someone else's behalf, ensure their work is credited and preserve their Git author/coauthor
 attribution. Describe proposed work accurately without presenting it as a merged or measured improvement.
