@@ -896,28 +896,45 @@ static cudaError_t select_index(const G6Attn& a,Work& w,int start,int count,cuda
 #ifndef SEL32
 #error "DEC_IDX31 needs SEL32 (index_scores_m writes no ids; only the full sort reads them)"
 #endif
-// DEC_IDX31: decode-sized query tiles (<= IDX31_ROWS rows) score with shared keys and select with the live-context bound.
-// Both assume one sequence: one key table and one live context for every row. An S2 batched step (rows of several
-// sessions, each with its own table and bounds, FOR_ROW) takes the per-row kernels instead.
+// DEC_IDX31: decode-sized query tiles (<= IDX31_ROWS rows) score with shared keys (index_scores_m) when all rows share
+// one sequence; S2 batched steps use session-grouped index_scores_g (sharing each key tile across up to G same-session
+// rows and skipping remote CP tiles). Both solo and S2 batched steps use live-context-bounded 1-launch select_index31
+// (decsel2) for context > TOP.
 constexpr int IDX31_ROWS=8;
-static bool idx31_ok(const G6Attn& a,int n){
+static bool s2_batched_step(const G6Attn& a){
 #ifdef DEC_S2
-    if(a.s2_batched)return false;
+    return a.s2_batched!=0;
+#else
+    (void)a;return false;
 #endif
+}
+static bool idx31_ok(const G6Attn& a,int n){
+    if(s2_batched_step(a))return false;
     return n<=IDX31_ROWS;
 }
 template<class Input>
-static void launch_index_scores31(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
-    if(idx31_ok(a,n))launch_index_scores_m(a,input,w,start,n,st);else launch_index_scores(a,input,w,start,n,st);
+static void launch_index_scores31(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool write_tail=true){
+    if(idx31_ok(a,n))launch_index_scores_m(a,input,w,start,n,st,write_tail);
+    else if(attn_idx_grp()||s2_batched_step(a)){
+        const int G=attn_idx_grp()?attn_idx_grp():16;
+        launch_index_scores_g(a,input,w,start,n,G,st,/*write_ids=*/false,write_tail);
+    }else launch_index_scores(a,input,w,start,n,st);
 }
 template<class Input>
-static cudaError_t select_index_dec(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int rank=0){
-    return idx31_ok(a,n)?select_index31(a,input,w,start,n,st,rank):select_index(a,input,w,start,n,st,rank);
+static cudaError_t select_index_dec(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int rank=0,uint64_t* cand_out=nullptr){
+    return select_index31(a,input,w,start,n,st,rank,cand_out);
 }
-static bool idx_keys_shared(const G6Attn& a,int n){return idx31_ok(a,n);}   // index_scores_m: keys read once per step
+[[maybe_unused]] static bool idx_keys_shared(const G6Attn& a,int n){return idx31_ok(a,n);}   // index_scores_m: keys read once per step
 #define LAUNCH_INDEX_SCORES launch_index_scores31
 #define SELECT_INDEX select_index_dec
 #else
+static bool s2_batched_step(const G6Attn& a){
+#ifdef DEC_S2
+    return a.s2_batched!=0;
+#else
+    (void)a;return false;
+#endif
+}
 #define LAUNCH_INDEX_SCORES launch_index_scores
 #define SELECT_INDEX select_index
 static bool idx_keys_shared(const G6Attn&,int){return false;}
@@ -989,10 +1006,23 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
         if(a.reuse_indices){AMARK(1);if(!fr)ga::reuse<<<n,256,0,stream>>>(input,start);}
         else if(pos){if(!fr)ga::pos_index<<<n,256,0,stream>>>(input,start);AMARK(1);}
         else{if(!fr)prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);
+#if defined(DEC_IDX31) && DEC_IDX31
+            launch_index_scores31(a,input,w,start,n,stream,/*write_tail=*/a.context<=TOP);
+            AMARK(1);
+            e=select_index_dec(a,input,w,start,n,stream,attn_sel2());if(e!=cudaSuccess)return e;
+#elif defined(SEL32)
+            const bool dec_fast=a.context>TOP;
+            if(attn_idx_grp()||s2_batched_step(a))launch_index_scores_g(a,input,w,start,n,attn_idx_grp()?attn_idx_grp():16,stream,/*write_ids=*/false,/*write_tail=*/!dec_fast);
+            else LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);
+            AMARK(1);
+            e=dec_fast?decsel2::launch(a,input,w,start,n,nullptr,stream):SELECT_INDEX(a,input,w,start,n,stream,attn_sel2());if(e!=cudaSuccess)return e;
+#else
             if(attn_idx_grp()&&!idx_keys_shared(a,n))launch_index_scores_g(a,input,w,start,n,attn_idx_grp(),stream);
             else LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);
             AMARK(1);
-            e=SELECT_INDEX(a,input,w,start,n,stream,attn_sel2());if(e!=cudaSuccess)return e;}
+            e=SELECT_INDEX(a,input,w,start,n,stream,attn_sel2());if(e!=cudaSuccess)return e;
+#endif
+        }
         AMARK(2);
         const bool qt=use_qt(a,w,n);
 #if defined(DEC_AVP) && DEC_AVP
@@ -1132,11 +1162,28 @@ static cudaError_t cp_index_body(const G6Attn& a,Input input,Work& w,uint64_t* c
     cp_cand_pack<<<n,256,0,stream>>>(input,0,a.context>32768?w.s1:w.si,mine);
 #else
     prep_index<<<dim3(n,32),128,0,stream>>>(input,0,w.iq,w.weights);
-    LAUNCH_INDEX_SCORES(a,input,w,0,n,stream);
-    cudaError_t e=SELECT_INDEX(a,input,w,0,n,stream);if(e!=cudaSuccess)return e;
+#if defined(DEC_IDX31) && DEC_IDX31
+    const bool fused_cp=a.context>TOP;
+    launch_index_scores31(a,input,w,0,n,stream,/*write_tail=*/!fused_cp);
+    cudaError_t e=select_index_dec(a,input,w,0,n,stream,attn_sel2(),fused_cp?mine:nullptr);if(e!=cudaSuccess)return e;
+    // remote rows: my local list holds every key of mine the merge can keep, so the fetch runs under the all-gather
+    if(a.rt_group)rt_resolve<<<1,1024,0,stream>>>(input,n);
+    if(!fused_cp)cp_cand_pack<<<n,256,0,stream>>>(input,0,w.si,mine);
+#elif defined(SEL32)
+    const bool fused_cp=a.context>TOP;
+    if(attn_idx_grp()||s2_batched_step(a))launch_index_scores_g(a,input,w,0,n,attn_idx_grp()?attn_idx_grp():16,stream,/*write_ids=*/false,/*write_tail=*/!fused_cp);
+    else LAUNCH_INDEX_SCORES(a,input,w,0,n,stream);
+    cudaError_t e=fused_cp?decsel2::launch(a,input,w,0,n,mine,stream):SELECT_INDEX(a,input,w,0,n,stream,attn_sel2());if(e!=cudaSuccess)return e;
+    if(a.rt_group)rt_resolve<<<1,1024,0,stream>>>(input,n);
+    if(!fused_cp)cp_cand_pack<<<n,256,0,stream>>>(input,0,w.si,mine);
+#else
+    if(attn_idx_grp()&&!idx_keys_shared(a,n))launch_index_scores_g(a,input,w,0,n,attn_idx_grp(),stream);
+    else LAUNCH_INDEX_SCORES(a,input,w,0,n,stream);
+    cudaError_t e=SELECT_INDEX(a,input,w,0,n,stream,attn_sel2());if(e!=cudaSuccess)return e;
     // remote rows: my local list holds every key of mine the merge can keep, so the fetch runs under the all-gather
     if(a.rt_group)rt_resolve<<<1,1024,0,stream>>>(input,n);
     cp_cand_pack<<<n,256,0,stream>>>(input,0,w.si,mine);
+#endif
 #endif
     return cudaGetLastError();
 }
