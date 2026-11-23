@@ -880,7 +880,7 @@ mod tests {
     #[ignore = "fresh knob table supplied by fold_knob_fresh_process"]
     fn fold_knob_child() {
         assert_eq!(crate::ds41::plan("",4,0,&Default::default()).err().unwrap(),"GR8_KV4_FOLD=1 is for GLM-5.3 G6_KV4 only");
-        let mut err=[0i8;256];
+        let mut err=[0 as std::ffi::c_char;256];
         let p=std::ptr::null();
         let handle=unsafe{crate::g6l_release_plan(p,p,p,p,4,0,0,0,p,p,err.as_mut_ptr(),err.len())};
         assert!(handle.is_null());

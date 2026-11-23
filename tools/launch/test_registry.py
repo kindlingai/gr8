@@ -184,7 +184,9 @@ chmod +x "$2"
                      (models.GLM53, 'fp8', {'GR8_TESTS': 'only'}),
                      (models.GLM53F, 'fp8', {}), (models.GLM53F, 'int4', {}),
                      (models.DS41, 'fp8', {}), (models.DS41, 'fp8', {'DS41_WHAT': 'sim'}),
-                     (models.DS41, 'int4', {})]
+                     (models.DS41, 'int4', {}),
+                     (models.QW38, 'fp8', {}), (models.QW38, 'fp8', {'QW38_WHAT': 'sim'}),
+                     (models.QW38, 'int4', {})]
 
             def run_case(model, fmt, changes, index):
                 out = work / ('out-' + str(index))
@@ -208,7 +210,7 @@ chmod +x "$2"
                     self.assertFalse((out / model.engine).exists())
                     self.assertTrue((out / 'sampler_u01_test').exists())
                     return
-                sim_only = changes.get('DS41_WHAT') == 'sim'
+                sim_only = bool(model.build_what_env and changes.get(model.build_what_env) == 'sim')
                 binary = model.simulator if sim_only else model.engine + ('-int4' if fmt == 'int4' else '')
                 content = (out / binary).read_text()
                 self.assertIn(' '.join(model.build_widths) + '|', content)
@@ -232,7 +234,7 @@ chmod +x "$2"
                                          'MODEL': 'qwen', 'GR8_XGRAMMAR': '0'},
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 2)
-            self.assertIn('MODEL=qwen: glm, flash, ds41 or ink2', result.stderr)
+            self.assertIn('MODEL=qwen: glm, flash, ds41, ink2 or qw38', result.stderr)
 
             # Full-checkout fallback: use the real query implementation with a fixture registration.
             registry = repo / 'tools/launch/models.py'

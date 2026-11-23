@@ -1557,9 +1557,9 @@ class Supervisor:
             self.scale_abort_all(s, str(e) or type(e).__name__)
 
     def scale_layout(self, s):
-        """GLM-5.3: the new members' layout planned from the running one (bin/g6layout plan), so each box keeps the expert
-        halves it holds and fetches only what it lacks. None: the new width's formula (no planner here, or it failed)."""
-        if models.of(self.o) is not models.GLM53 or not (self.variant and self.variant.path):
+        """GLM-5.3 / Qwen3.8-Flash-Next: the new members' layout planned from the running one (bin/g6layout plan), so
+        each box keeps the expert halves it holds and fetches only what it lacks. None: the new width's formula."""
+        if models.of(self.o) not in (models.GLM53, models.QW38) or not (self.variant and self.variant.path):
             return None
         d = os.path.join(self.out, 'scale')
         os.makedirs(d, exist_ok=True)

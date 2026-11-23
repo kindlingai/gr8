@@ -288,7 +288,8 @@ class Release:
         # sharding units a rank reads, fetch only those byte ranges here.
         dense = sorted(p for p in t if p.startswith('dense/') and p.endswith('.safetensors')
                        and not p.startswith('dense/vision-'))
-        return slices + dense + (self.vision_files() if self.vision else [])
+        ple = sorted(p for p in t if p.startswith('ple/'))
+        return slices + dense + ple + (self.vision_files() if self.vision else [])
 
     def reuse(self):
         """Hard-link the files an older commit of this release left in the cache, where the hub gives the file the same

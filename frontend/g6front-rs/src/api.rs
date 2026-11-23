@@ -551,7 +551,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
             let (th, e) = dialect::resolve_ds(body, st.thinking, st.ds_effort, st.ds_thinking_default)?;
             (th, e, None, None)
         }
-        Dialect::Hf => {
+        Dialect::Hf | Dialect::Qwen => {
             let (th, en) = dialect::resolve_hf(body, &st.tpl().levels, st.thinking)?;
             (th, st.ds_effort, en, None)
         }
@@ -616,13 +616,13 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         };
         // GLM renders its lowest effort with the think block open, and Inkling's effort line says it: only an hf
         // template's open think block is closed here
-        if th.off && st.dialect == Dialect::Hf {
+        if th.off && matches!(st.dialect, Dialect::Hf | Dialect::Qwen) {
             text = dialect::hf_thinking_off(text, agp_on);
         }
         text
     };
-    let hf_prompt_ends_think = st.dialect == Dialect::Hf && !cfm_on && pyjson::py_rstrip(&text).ends_with("<think>");
-    let thinking_off = th.off || (st.dialect == Dialect::Hf && pyjson::py_rstrip(&text).ends_with("</think>"));
+    let hf_prompt_ends_think = matches!(st.dialect, Dialect::Hf | Dialect::Qwen) && !cfm_on && pyjson::py_rstrip(&text).ends_with("<think>");
+    let thinking_off = th.off || (matches!(st.dialect, Dialect::Hf | Dialect::Qwen) && pyjson::py_rstrip(&text).ends_with("</think>"));
     let (t1, chars) = (std::time::Instant::now(), text.len());
     // The same Tok checkpoint cache serves chat, /tokenize previews and the shorter system-span query.
     // The DeepSeek prompt text opens with its BOS, so no special tokens are added to it
@@ -695,7 +695,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     };
     // An Inkling prompt ends at `<|end_message|>`: the model opens its own thinking block in the reply.
     let prompt_think_open = match st.dialect {
-        Dialect::Hf if !cfm_on => hf_prompt_ends_think,
+        Dialect::Hf | Dialect::Qwen if !cfm_on => hf_prompt_ends_think,
         Dialect::Inkling => false,
         _ => tok_think_open,
     };
@@ -705,6 +705,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let force = match st.dialect {
         Dialect::Ds41 => choice.forced_ids_ds(&st.tok, close)?,
         Dialect::Hf => choice.forced_ids_hf(&st.tok, close)?,
+        Dialect::Qwen => choice.forced_ids_qwen(&st.tok, close)?,
         Dialect::Inkling => choice.forced_ids_ink(tools.as_ref(), &st.tok, close)?,
         Dialect::Glm => choice.forced_ids(&st.tok, close)?,
     };
@@ -938,7 +939,7 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         let p = AnyParser::new(st.dialect, cr.tools.as_ref(), &choice_value, include_reasoning)
             .emit_undeclared(st.emit_undeclared)
             .guard_names(guard_names.clone());
-        if st.dialect == Dialect::Hf {
+        if matches!(st.dialect, Dialect::Hf | Dialect::Qwen) {
             if prompt_think_open {
                 p.in_think()
             } else if thinking_off {
@@ -1857,7 +1858,7 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
             } else {
                 // the same effort and the same refusals as a chat request, so the counts agree
                 let (th, hf_enable, ink_effort) = match st.dialect {
-                    Dialect::Hf => {
+                    Dialect::Hf | Dialect::Qwen => {
                         let (th, en) = dialect::resolve_hf(&body, &st.tpl().levels, st.thinking)?;
                         (th, en, None)
                     }
@@ -1882,7 +1883,7 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 } else {
                     (st.tpl().render(Some(&msgs), tools.as_ref(), kw)?, Vec::new())
                 };
-                if th.off && st.dialect == Dialect::Hf {
+                if th.off && matches!(st.dialect, Dialect::Hf | Dialect::Qwen) {
                     text = dialect::hf_thinking_off(text, agp_on);
                 }
                 let ids = st

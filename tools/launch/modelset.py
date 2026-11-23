@@ -237,19 +237,20 @@ def expert_gb(path, tp):
         manifest = json.load(f)
         layers = manifest['layers']
     hidden = int(manifest.get('hidden_size') or release_hidden(path) or 6144)
+    nh = int(manifest.get('nh') or 16)
     half_bytes = {k: hidden * 16 * k for k in (2, 3, 4)}
     per = [0] * tp
     for key, e in layers.items():
         l = int(key)
         sh = e.get('shared') or 0
         if isinstance(sh, int):
-            sh = {'gate': [sh] * 16, 'up': [sh] * 16, 'down': sh}
+            sh = {'gate': [sh] * nh, 'up': [sh] * nh, 'down': sh}
         rows = [(x, e['gate'][x], e['up'][x], e['down'][x]) for x in range(len(e['down']))]
         if sh['down']:
-            rows.append((len(e['down']), sh['gate'], sh['up'], sh['down']))      # the shared expert is e = 256 in the half rule
+            rows.append((len(e['down']), sh['gate'], sh['up'], sh['down']))      # the shared expert is e = NE in the half rule
         for x, g, u, d in rows:
-            for h in range(16):
-                per[(16 * x + h + l) % tp] += half_bytes[g[h]] + half_bytes[u[h]] + half_bytes[d]
+            for h in range(len(g)):
+                per[(nh * x + h + l) % tp] += half_bytes[g[h]] + half_bytes[u[h]] + half_bytes[d]
     return max(per) / 1e9
 
 

@@ -125,12 +125,27 @@ INK2 = Model('ink2', 'Inkling-2-Small', 'https://huggingface.co/thinkingmachines
              serve_options=('MTP', 'CHUNK', 'EAGER'), engine_prefixes=('GR8_INK2_',), vision_knob='GR8_INK2_VISION',
              min_free_gib=8,
              build_widths=('1', '4', '6'), build_define='G6_MODEL_INK2', build_fc2gl=4, build_what_env='INK2_WHAT')
+# Qwen3.8-Flash-Next: hybrid 36 Gated DeltaNet + 12 Gated GQA (QSA block-4 sparse indexer), 4-stream hyper-connections,
+# layer-1 PLE NVMe row store, 512 pmcgx routed experts (top-10) + BF16 gated shared expert. Supports weight paging
+# (GR8_PTAB=0|1|2) and live dynamic scaling (`./gr8 qw38 scale` across TP=1..4 with g6layout + GR8_KV_REWIDTH).
+QW38 = Model('qw38', 'Qwen3.8-Flash-Next', 'https://huggingface.co/kindlingai/Qwen3.8-Flash-Next-exlr8-k2-k3-k4',
+             'g6m4_qw38', 'qw38', ('2', '1', '4', '3'),
+             {'bit200': 2.0, 'bit300': 3.0, 'bit400': 4.0},
+             {1: ('bit300',), 2: ('bit300',), 3: ('bit300',), 4: ('bit300',)},
+             'gr8-qw38', 'Qwen4ExpForConditionalGeneration', False, False, True,
+             dialect='qwen', served=('qwen3.8-flash-next', 'qw38'), vocab=248320, eos_ids=(248046, 248044),
+             max_positions=262144, per_slot_pool=True, stage_relay=True,
+             engine_profile='qw38', simulator='m4sim_qw38', smoke_script='smoketest/qw38.sh',
+             serve_options=('MTP', 'CHUNK', 'EAGER'), engine_prefixes=('GR8_QW38_',),
+             min_free_gib=8, checkpoint_cache=True,
+             build_widths=('1', '2', '3', '4'), build_define='G6_MODEL_QW38', build_fc2gl=4, build_what_env='QW38_WHAT',
+             scalable=True)
 # The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on
 # a CPU. Its release is a directory with responses.toml and the tokenizer files.
 PSEUDO = Model('pseudo', 'the pseudo engine', '', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo',
                'GlmMoeDsaForCausalLM', False, False, False, fabric=False, shim_legacy=True, engine_profile='pseudo', simulator='', second_rail='prefill',
                vocab=154880, eos_ids=(154820, 154827, 154829), scalable=True)
-MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, INK2, PSEUDO)}
+MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, INK2, QW38, PSEUDO)}
 
 
 # The models a runner names. pseudo, the test engine, is served when named but left out of the lists.

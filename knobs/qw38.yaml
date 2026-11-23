@@ -1,0 +1,74 @@
+# Qwen3.8-Flash-Next runtime settings. knobs/README.md describes the fields.
+prefix: "GR8_QW38_"
+knobs:
+  GR8_QW38_PROFILE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = record CUDA event timings per component (HC, GDN, Full Attn+QSA, MoE, PLE I/O, PLE GPU, AllReduce, Head)
+      and print a summary breakdown on rank 0 at the end of a standalone run. 0 (the default) = off.
+  GR8_QW38_PLE_CACHE_MIB:
+    scope: local
+    kind: int
+    default: "1024"
+    values: "0..131072"
+    legacy: []
+    doc: >-
+      RAM LRU cache size in MiB for the Layer-1 PLE NVMe rowstore (exlr8-ple-L001.bin, 320 B rows). 0 disables caching
+      and reads every row directly from NVMe. Default: 1024 MiB.
+  GR8_QW38_FAST_AR:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = on a multi-rank cluster (TP >= 2), per-rank partials cross the RDMA fabric from the device via
+      device-driven collectives. 0 = host-staged fallback per collective. Every rank must agree.
+  GR8_QW38_WIDE:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = reorder K2/K3 PMCGX routed-expert weights in-place to wide-load order after loading (before
+      ptab::build SCATTER) for coalesced 256-byte tile loads. 0 = stock tile order. Same output bits. Every rank must agree.
+  GR8_QW38_GRAPH:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = capture and replay CUDA graphs for decode steps (compatible with fixed-address GR8_PTAB=1|2
+      piece tables and multi-box single-step FAST_AR). 0 = eager launches. Every rank must agree.
+  GR8_QW38_PLE_ASYNC:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = prefetch Layer-1 PLE n-gram rows on a background thread concurrently with Layer-0 GPU execution.
+      0 = synchronous PLE fetch at Layer-1 entry.
+  GR8_QW38_WIDTHS:
+    scope: local
+    kind: path
+    unset: "auto-detect manifests/exlr8-manifest-bit300.json (or bit400/bit200) in the release directory"
+    legacy: []
+    doc: >-
+      Path to an exlr8 width manifest JSON file when --widths is not passed on the command line.
+  GR8_QW38_DENSE_FP8:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = quantize dense decode projections (GDN, Full Attn, HC, shared expert) in-memory on GPU at load
+      time to block-32 FP8 E4M3 (with FP16 scales) for 2x lower decode memory bandwidth while keeping prefill in BF16.
+      0 = keep all dense decode projections in BF16. Every rank must agree.

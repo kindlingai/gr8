@@ -14,9 +14,9 @@
 //!   names when `emit_undeclared` is false, malformed JSON, or unclosed `<tool_call>` text at the end of the reply fall
 //!   back to `content` without dropping bytes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::parser::{plausible_name, tool_call_id, Delta, FullParse, ToolDelta};
 use crate::pyjson::{self, is_py_space, py_rstrip, py_strip};
@@ -47,7 +47,9 @@ enum CallOutcome {
 
 pub struct HfParser {
     tools: HashSet<String>,
+    param_types: HashMap<String, HashMap<String, String>>,
     parse_tools: bool,
+    xml_tools: bool,
     emit_undeclared: bool,
     pub include_reasoning: bool,
     mode: Mode,
@@ -64,18 +66,34 @@ pub struct HfParser {
 impl HfParser {
     pub fn new(tools: Option<&Value>, tool_choice: &Value, include_reasoning: bool) -> HfParser {
         let mut names = HashSet::new();
+        let mut param_types: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut any = false;
         if let Some(Value::Array(ts)) = tools {
             any = !ts.is_empty();
             for t in ts {
-                if let Some(n) = t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) {
-                    names.insert(n.to_string());
+                if let Some(func) = t.get("function") {
+                    if let Some(n) = func.get("name").and_then(Value::as_str) {
+                        names.insert(n.to_string());
+                        if let Some(props) = func.get("parameters").and_then(|p| p.get("properties")).and_then(Value::as_object) {
+                            let mut pt = HashMap::new();
+                            for (k, v) in props {
+                                if let Some(ty) = v.get("type").and_then(Value::as_str) {
+                                    pt.insert(k.clone(), ty.to_string());
+                                }
+                            }
+                            if !pt.is_empty() {
+                                param_types.insert(n.to_string(), pt);
+                            }
+                        }
+                    }
                 }
             }
         }
         HfParser {
             tools: names,
+            param_types,
             parse_tools: any && tool_choice.as_str() != Some("none"),
+            xml_tools: false,
             emit_undeclared: false,
             include_reasoning,
             mode: Mode::Start,
@@ -88,6 +106,13 @@ impl HfParser {
             after_valid_call: false,
             calls: Vec::new(),
         }
+    }
+
+    /// Enable Qwen XML `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>` parsing
+    /// (with fallback to JSON `<tool_call>`).
+    pub fn with_xml_tools(mut self) -> HfParser {
+        self.xml_tools = true;
+        self
     }
 
     /// The prompt closed the think block (or thinking was turned off): the reply starts directly on content.
@@ -237,7 +262,15 @@ impl HfParser {
                         let raw_inner: String = self.buf.drain(..end).collect();
                         self.buf.drain(..TOOL_CLOSE.len());
                         self.mode = Mode::Content;
-                        match parse_tool_json(&raw_inner, &self.tools, self.emit_undeclared) {
+                        let outcome = if self.xml_tools {
+                            match parse_tool_xml(&raw_inner, &self.tools, &self.param_types, self.emit_undeclared) {
+                                CallOutcome::RawText => parse_tool_json(&raw_inner, &self.tools, self.emit_undeclared),
+                                ok => ok,
+                            }
+                        } else {
+                            parse_tool_json(&raw_inner, &self.tools, self.emit_undeclared)
+                        };
+                        match outcome {
                             CallOutcome::Call { name, arguments } => {
                                 self.deferred_content.clear();
                                 self.post_call_ws.clear();
@@ -388,6 +421,119 @@ fn parse_tool_json(inner: &str, known: &HashSet<String>, emit_undeclared: bool) 
         },
         Some(_) => return CallOutcome::RawText,
     };
+    CallOutcome::Call { name: name.to_string(), arguments }
+}
+
+/// Strip at most one leading newline (`\r\n` or `\n`) and one trailing newline (`\r\n` or `\n`),
+/// matching Qwen3.8's `<parameter=key>\nvalue\n</parameter>` framing while preserving internal lines.
+fn strip_one_edge_newline(s: &str) -> &str {
+    let s = s.strip_prefix("\r\n").or_else(|| s.strip_prefix('\n')).unwrap_or(s);
+    s.strip_suffix("\r\n").or_else(|| s.strip_suffix('\n')).unwrap_or(s)
+}
+
+fn coerce_xml_param(raw: &str, schema_ty: Option<&str>) -> Value {
+    let val = strip_one_edge_newline(raw);
+    match schema_ty {
+        Some("string") => Value::String(val.to_string()),
+        Some("integer") => {
+            if let Ok(i) = py_strip(val).parse::<i64>() {
+                Value::Number(i.into())
+            } else {
+                Value::String(val.to_string())
+            }
+        }
+        Some("number") => {
+            if let Ok(v) = serde_json::from_str::<Value>(py_strip(val)) {
+                if v.is_number() {
+                    return v;
+                }
+            }
+            Value::String(val.to_string())
+        }
+        Some("boolean") => match py_strip(val) {
+            "true" | "True" => Value::Bool(true),
+            "false" | "False" => Value::Bool(false),
+            _ => Value::String(val.to_string()),
+        },
+        Some("array" | "object") => serde_json::from_str::<Value>(py_strip(val)).unwrap_or_else(|_| Value::String(val.to_string())),
+        _ => {
+            let t = py_strip(val);
+            if matches!(t, "true" | "false" | "null") || t.starts_with('{') || t.starts_with('[')
+                || (!t.is_empty() && t.as_bytes()[0].is_ascii_digit() || t.starts_with('-'))
+            {
+                if let Ok(v) = serde_json::from_str::<Value>(t) {
+                    return v;
+                }
+            }
+            Value::String(val.to_string())
+        }
+    }
+}
+
+/// Parse Qwen XML tool call payload:
+/// `<function=NAME>\n<parameter=K1>\nV1\n</parameter>\n...</function>`
+fn parse_tool_xml(
+    inner: &str,
+    known: &HashSet<String>,
+    param_types: &HashMap<String, HashMap<String, String>>,
+    emit_undeclared: bool,
+) -> CallOutcome {
+    const FUNC_OPEN: &str = "<function=";
+    const FUNC_CLOSE: &str = "</function>";
+    const PARAM_OPEN: &str = "<parameter=";
+    const PARAM_CLOSE: &str = "</parameter>";
+
+    let trimmed = py_strip(inner);
+    let Some(rest) = trimmed.strip_prefix(FUNC_OPEN) else {
+        return CallOutcome::RawText;
+    };
+    let Some(gt) = rest.find('>') else {
+        return CallOutcome::RawText;
+    };
+    let name = py_strip(&rest[..gt]);
+    if name.is_empty() {
+        return CallOutcome::RawText;
+    }
+    let name_ok = known.contains(name) || (emit_undeclared && plausible_name(name));
+    if !name_ok {
+        return CallOutcome::RawText;
+    }
+    let body_with_close = &rest[gt + 1..];
+    let Some(func_end) = body_with_close.rfind(FUNC_CLOSE) else {
+        return CallOutcome::RawText;
+    };
+    let trailing = py_strip(&body_with_close[func_end + FUNC_CLOSE.len()..]);
+    if !trailing.is_empty() {
+        return CallOutcome::RawText;
+    }
+    let mut body = &body_with_close[..func_end];
+    let mut args = Map::new();
+    let schema = param_types.get(name);
+    while let Some(po) = body.find(PARAM_OPEN) {
+        if !py_strip(&body[..po]).is_empty() {
+            return CallOutcome::RawText;
+        }
+        let after_po = &body[po + PARAM_OPEN.len()..];
+        let Some(pgt) = after_po.find('>') else {
+            return CallOutcome::RawText;
+        };
+        let key = py_strip(&after_po[..pgt]);
+        if key.is_empty() {
+            return CallOutcome::RawText;
+        }
+        let val_start = &after_po[pgt + 1..];
+        let Some(pc) = val_start.find(PARAM_CLOSE) else {
+            return CallOutcome::RawText;
+        };
+        let raw_val = &val_start[..pc];
+        let ty = schema.and_then(|m| m.get(key)).map(String::as_str);
+        args.insert(key.to_string(), coerce_xml_param(raw_val, ty));
+        body = &val_start[pc + PARAM_CLOSE.len()..];
+    }
+    if !py_strip(body).is_empty() {
+        return CallOutcome::RawText;
+    }
+    let arguments = pyjson::to_string(&Value::Object(args));
     CallOutcome::Call { name: name.to_string(), arguments }
 }
 
@@ -704,6 +850,86 @@ mod tests {
                     "step={step} {text}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn qwen_xml_tool_calls_full_and_streamed() {
+        let tools = json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "integer"},
+                            "metric": {"type": "boolean"}
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "body": {"type": "string"}
+                        }
+                    }
+                }
+            }
+        ]);
+        let text = "<think>Check weather and write note.</think>\n\n\
+            <tool_call>\n\
+            <function=get_weather>\n\
+            <parameter=city>\n\
+            Tokyo\n\
+            </parameter>\n\
+            <parameter=days>\n\
+            3\n\
+            </parameter>\n\
+            <parameter=metric>\n\
+            true\n\
+            </parameter>\n\
+            </function>\n\
+            </tool_call>\n\
+            <tool_call>\n\
+            <function=write_file>\n\
+            <parameter=path>\n\
+            /tmp/out.txt\n\
+            </parameter>\n\
+            <parameter=body>\n\
+            line 1\n\
+            line 2\n\
+            </parameter>\n\
+            </function>\n\
+            </tool_call>";
+        let want = as_got(HfParser::new(Some(&tools), &json!("auto"), true).with_xml_tools().parse_full(text));
+        assert_eq!(want.0.as_deref(), Some("Check weather and write note."));
+        assert_eq!(want.1, None);
+        assert_eq!(want.2.len(), 2);
+        assert_eq!(want.2[0].0, "get_weather");
+        let a0: Value = serde_json::from_str(&want.2[0].1).unwrap();
+        assert_eq!(a0, json!({"city": "Tokyo", "days": 3, "metric": true}));
+        assert_eq!(want.2[1].0, "write_file");
+        let a1: Value = serde_json::from_str(&want.2[1].1).unwrap();
+        assert_eq!(a1, json!({"path": "/tmp/out.txt", "body": "line 1\nline 2"}));
+        for k in [1, 2, 3, 7, 13] {
+            assert_eq!(
+                stream_chars(HfParser::new(Some(&tools), &json!("auto"), true).with_xml_tools(), text, k),
+                want,
+                "chunk {k}"
+            );
+            assert_eq!(
+                stream_raw_bytes(HfParser::new(Some(&tools), &json!("auto"), true).with_xml_tools(), text, k),
+                want,
+                "bytes {k}"
+            );
         }
     }
 }

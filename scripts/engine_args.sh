@@ -20,7 +20,7 @@ _model_registry=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/launch" && pwd)/mo
 model_field() { python3 "$_model_registry" get "${GR8_MODEL:-glm53}" "$@"; }
 _engine_profile=$(model_field engine_profile) || return 2
 _engine_binary=$(model_field engine) || return 2
-case $_engine_profile in glm|flash|ds41|ink2|pseudo) ;;
+case $_engine_profile in glm|flash|ds41|ink2|qw38|pseudo) ;;
   *) echo "unknown engine profile: $_engine_profile" >&2; return 2 ;;
 esac
 
@@ -323,6 +323,29 @@ ink2_defaults() {
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-0}
 }
 
+# Qwen3.8-Flash-Next: TP 1, 2, 3 or 4, hybrid 36 GDN + 12 QSA full-attention layers, layer-1 PLE NVMe store,
+# weight paging (PTAB=0|1|2) and live scaling (`./gr8 qw38 scale` with g6layout + GR8_KV_REWIDTH).
+qw38_defaults() {
+  case $TP in 1|2|3|4) ;; *) echo "engine_defaults: TP=$TP; Qwen3.8-Flash-Next wants 1, 2, 3 or 4" >&2; return 2 ;; esac
+  local k
+  for k in DFLASH PF_OWN SPEC_ADAPT; do
+    [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: Qwen3.8-Flash-Next has no $k" >&2; return 2; }
+  done
+  case ${REUSE:-0} in 0|1) ;; *) echo "engine_defaults: REUSE=${REUSE}: Qwen3.8-Flash-Next needs REUSE=0 or 1" >&2; return 2 ;; esac
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-65536}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-0}
+  case $TP in
+    1) SESS=${SESS:-2} ;;
+    *) SESS=${SESS:-4} ;;
+  esac
+  CHUNK=${CHUNK:-8}
+  case $CHUNK in [1-8]) ;; *) echo "engine_defaults: CHUNK=$CHUNK: Qwen3.8-Flash-Next takes 1 to 8 prompt rows a step" >&2; return 2 ;; esac
+  EAGER=${EAGER:-0}
+  case $EAGER in 0|1) ;; *) echo "engine_defaults: EAGER=$EAGER: 0 (--graph) or 1 (eager, no --graph)" >&2; return 2 ;; esac
+  case $MTP in [0-3]) ;; *) echo "engine_defaults: MTP=$MTP: Qwen3.8-Flash-Next drafts 0 to 3 tokens a round" >&2; return 2 ;; esac
+  case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: Qwen3.8-Flash-Next serves 1 to 8 sessions" >&2; return 2 ;; esac
+  S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-0}
+}
+
 # The pseudo engine: no KV pool to size, MTP, drafter or fabric. CAP bounds a request's prompt plus max_tokens.
 pseudo_defaults() {
   SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-202752}; READY_TMO=${READY_TMO:-60}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
@@ -339,6 +362,7 @@ engine_defaults() {
   [ "$_engine_profile" = flash ] && { flash_defaults; return; }
   [ "$_engine_profile" = ds41 ] && { ds41_defaults; return; }
   [ "$_engine_profile" = ink2 ] && { ink2_defaults; return; }
+  [ "$_engine_profile" = qw38 ] && { qw38_defaults; return; }
   [ "$_engine_profile" = pseudo ] && { pseudo_defaults; return; }
   local _cap_set=${CAP:+1} _base_p=0; DISPRAM_MIN_BYTES=0
   case $TP in
@@ -495,6 +519,12 @@ ink2_env() {
   ENGINE_ENV="${EXTRA_ENV:-}"
 }
 
+# Qwen3.8-Flash-Next: passes PTAB (GR8_PTAB=0|1|2) and EXTRA_ENV through.
+qw38_env() {
+  ENGINE_BIN=$_engine_binary
+  ENGINE_ENV="${PTAB:+GR8_PTAB=$PTAB }${EXTRA_ENV:-}"
+}
+
 engine_env() {
   if [ "${KV4_FOLD:-0}" = 1 ] && { [ "$(model_field kv4_fold)" != 1 ] || [ "${KV_FORMAT:-fp8}" != int4 ] || [ "${KVB:-bf16}" = fp8 ]; }; then
     echo "engine_env: KV4_FOLD=1 requires glm53 int4 KV and BF16 kv_b" >&2; return 2
@@ -502,6 +532,7 @@ engine_env() {
   [ "$_engine_profile" = flash ] && { flash_env; return 0; }
   [ "$_engine_profile" = ds41 ] && { ds41_env; return 0; }
   [ "$_engine_profile" = ink2 ] && { ink2_env; return 0; }
+  [ "$_engine_profile" = qw38 ] && { qw38_env; return 0; }
   [ "$_engine_profile" = pseudo ] && { ENGINE_BIN=$_engine_binary; ENGINE_ENV=""; return 0; }
   ENGINE_BIN=$_engine_binary; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=$_engine_binary-int4
   ENGINE_ENV="GR8_PF_TILE=64 GR8_PF_DENSE=8192 GR8_PF_RS=1 GR8_PF_STREAMS=2 GR8_PF_ATTN_ROWS=${PF_ATTN_ROWS:-1024} GR8_PF_OWN=$PF_OWN \
@@ -675,6 +706,26 @@ engine_args() {
   if [ "$_engine_profile" = ink2 ]; then
     a="--layers all --v2-dense ${V2_DENSE:-$rp} --top-p-cands 256 --chunk $CHUNK --temp 0.7 --cap $CAP --graph \
 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
+    [ "${EAGER:-0}" = 1 ] && a=${a/ --graph / }
+    [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
+    a="$a ${EXTRA_ARGS:-}"
+    [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    if [ -n "${KV_STORE:-}" ] && [ "$KV_STORE" != off ]; then
+      local t IFS=';'
+      for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
+      unset IFS
+      [ -n "${KV_KEEP:-}" ] && a="$a --kv-keep $KV_KEEP"
+      [ -n "${KV_SYSTEM_AFTER:-}" ] && a="$a --kv-system-after $KV_SYSTEM_AFTER"
+      [ -n "${KV_WRITE_LIMIT:-}" ] && a="$a --kv-write-limit $KV_WRITE_LIMIT"
+    fi
+    (set -f; echo $a)
+    return
+  fi
+  # Qwen3.8-Flash-Next: exlr8 v2 indexed release (--packs), width manifest (--widths), optional --layout, and KV_STORE.
+  if [ "$_engine_profile" = qw38 ]; then
+    a="--layers all --packs ${V2_DENSE:-${V2:-$rp}} ${V2_WIDTHS:+--widths $V2_WIDTHS} ${LAYOUT:+--layout $LAYOUT} \
+--top-p-cands 256 --chunk $CHUNK --prefill 256 --temp 0.7 --cap $CAP --graph --mtp $MTP \
+--serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
     [ "${EAGER:-0}" = 1 ] && a=${a/ --graph / }
     [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
     a="$a ${EXTRA_ARGS:-}"

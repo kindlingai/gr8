@@ -679,4 +679,70 @@ inline KvStateDesc ink2_kv_state(const std::vector<Ink2KvLayer>& layers, uint32_
     return d;
 }
 
+// Qwen3.8-Flash-Next (model_geom_qw38.h): per-rank state of all sessions for StashPool + GR8_KV_REWIDTH.
+//   pages  for each of the 12 full-attention layers (plus MTP when enabled):
+//            - KV page plane: [slots][max_pages][2][64][nh_kv][256] BF16 (row_bytes = 2 * nh_kv * 256 * 2)
+//            - QSA compressed K plane: [slots][max_pages][16][128] BF16 (token_ratio = 4, row_bytes = 256)
+//   tail   36 Gated DeltaNet layers' FP32 recurrent states S [nh_v][128][128] and conv1d histories [3][qkv_local],
+//          layer-1 PLE dilated conv1d history [9][10240] BF16 + 2 prior n-gram token IDs [2] int32, and per full-attention layer one unfinished staging page.
+struct Qw38FullKvLayer {
+    uint8_t* kv_pages = nullptr;     // [slots][max_pages][2][64][nh_kv * 256] BF16
+    uint8_t* kv_staging = nullptr;   // [slots][2][64][nh_kv * 256] BF16
+    uint8_t* idx_pages = nullptr;    // [slots][max_pages][16][128] BF16 (blocks of 4)
+    uint8_t* idx_staging = nullptr;  // [slots][16][128] BF16
+};
+struct Qw38GdnStateLayer {
+    uint8_t* S = nullptr;            // [slots][nh_v][128][128] FP32
+    uint8_t* conv = nullptr;         // [slots][3][qkv_local] BF16
+};
+inline KvStateDesc qw38_kv_state(const std::vector<Qw38FullKvLayer>& full_layers,
+                                 const std::vector<Qw38GdnStateLayer>& gdn_layers,
+                                 uint8_t* ple_conv, uint8_t* ple_ctx, uint32_t slots, uint32_t max_pages_per_slot,
+                                 uint32_t nh_kv, uint32_t nh_v, uint32_t qkv_local,
+                                 uint32_t max_nh_kv = 0, uint32_t max_nh_v = 0, uint32_t max_qkv_local = 0) {
+    KvStateDesc d;
+    d.model_tag = "qw38";
+    d.max_slots = slots;
+    d.max_pages_per_slot = max_pages_per_slot;
+    d.allow_partial_pages = false;
+    const uint64_t kv_row = uint64_t(2) * nh_kv * 256u * 2u;
+    const uint64_t kv_page = uint64_t(KV_STATE_PAGE_TOKENS) * kv_row;
+    const uint64_t idx_row = 128u * 2u;
+    const uint64_t idx_page = (KV_STATE_PAGE_TOKENS / 4u) * idx_row;
+    for (const auto& y : full_layers) {
+        d.page_planes.push_back(KvPagePlane{y.kv_pages, uint64_t(max_pages_per_slot) * kv_page, KV_STATE_PAGE_TOKENS, uint32_t(kv_row), 1});
+        d.page_planes.push_back(KvPagePlane{y.idx_pages, uint64_t(max_pages_per_slot) * idx_page, KV_STATE_PAGE_TOKENS / 4u, uint32_t(idx_row), 4});
+        d.tail_extents.push_back(KvTailExtent{y.kv_staging, kv_page, kv_page});
+        d.tail_extents.push_back(KvTailExtent{y.idx_staging, idx_page, idx_page});
+    }
+    const uint64_t s_bytes = uint64_t(nh_v) * 128u * 128u * 4u;
+    const uint64_t c_bytes = uint64_t(3u) * qkv_local * 2u;
+    for (const auto& g : gdn_layers) {
+        d.tail_extents.push_back(KvTailExtent{g.S, s_bytes, s_bytes});
+        d.tail_extents.push_back(KvTailExtent{g.conv, c_bytes, c_bytes});
+    }
+    const uint64_t ple_bytes = uint64_t(9u) * 10240u * 2u;
+    const uint64_t ple_ctx_bytes = uint64_t(2u) * 4u;
+    if (ple_conv) d.tail_extents.push_back(KvTailExtent{ple_conv, ple_bytes, ple_bytes});
+    if (ple_ctx) d.tail_extents.push_back(KvTailExtent{ple_ctx, ple_ctx_bytes, ple_ctx_bytes});
+    // Ensure uneven TP ranks (e.g. TP=3 where rank 1 holds 2 KV heads and ranks 0/2 hold 1) agree on StashPool block size
+    const uint32_t mkv = std::max(nh_kv, max_nh_kv);
+    const uint32_t mv = std::max(nh_v, max_nh_v);
+    const uint32_t mq = std::max(qkv_local, max_qkv_local);
+    if (mkv > nh_kv || mv > nh_v || mq > qkv_local) {
+        const size_t max_kvp = size_t(KV_STATE_PAGE_TOKENS) * 2 * mkv * 256 * 2;
+        const size_t max_pb = full_layers.size() * (max_kvp + size_t(idx_page));
+        const size_t max_slot = (max_pb + 4095u) / 4096u * 4096u;
+        const size_t max_cap = max_slot - sizeof(KvStateHeader32);
+        const size_t max_tail = full_layers.size() * (max_kvp + size_t(idx_page))
+            + gdn_layers.size() * (size_t(mv) * 128 * 128 * 4 + size_t(3) * mq * 2)
+            + (ple_conv ? size_t(ple_bytes) : 0)
+            + (ple_ctx ? size_t(ple_ctx_bytes) : 0);
+        d.min_block_bytes = max_pb;
+        d.min_state_blocks = max_tail ? uint32_t((max_tail + max_cap - 1) / max_cap) : 0u;
+    }
+    d.validate();
+    return d;
+}
+
 } // namespace g6s2
