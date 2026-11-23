@@ -276,8 +276,9 @@ class NativeDispatch {
         *(draft ? c_.draft_input : c_.input) = input;
         *(draft ? draft_layout_ : layout_) = layout;
         if (draft) {
-            std::vector<uint32_t> sizes(3,uint32_t(rows*::HID*2));
-            sizes[2] = uint32_t(glue::head_bytes(rows,model.nc)); c_.draft_fabric.enqueue_step(input.step,sizes);
+            const int frows = g6rt::draft_solo_cache_only(model, rows, chain) ? 1 : rows;
+            std::vector<uint32_t> sizes(3,uint32_t(frows*::HID*2));
+            sizes[2] = uint32_t(glue::head_bytes(frows,model.nc)); c_.draft_fabric.enqueue_step(input.step,sizes);
             if (c_.enqueue_draft_extra) c_.enqueue_draft_extra(input.step,rows);
         } else c_.enqueue_main(input, use_cp); // preserves existing RS order/fabric layout
         const auto tl0 = tmr_ || rlog_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; // after fabric enqueue, BEFORE the solo/S2 launch branches (design r4 fix 2)

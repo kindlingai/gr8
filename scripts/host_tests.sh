@@ -155,6 +155,10 @@ run_job fabric_order_test '
   g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_order_test.cpp" -o "$D/fabric_order_test"
   "$D/fabric_order_test"
 '
+run_job fabric_balance_test '
+  g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_balance_test.cpp" -o "$D/fabric_balance_test"
+  "$D/fabric_balance_test"
+'
 run_job fabric_runs_test '
   g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_runs_test.cpp" -o "$D/fabric_runs_test"
   "$D/fabric_runs_test"

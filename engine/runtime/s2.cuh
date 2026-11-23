@@ -116,6 +116,8 @@ struct S2Model
     // the main model's tail entries of the run with this list (logical page -> page, -1 none), or null: all -1
     std::function<const std::vector<int>*(const std::vector<int>& list)> rt_tail;
     unsigned* last_rows = nullptr;                           // draft model, GR8_MTP_LASTROW: bit r = row r is its session's last
+    __half* dh2_x = nullptr;                                 // draft model, GR8_MTP_LASTROW + GR8_DRAFT_HEAD2 (M > MXM): [S2N][HID]
+    int* dh2_map = nullptr;                                  // [MX]: compacted slot [0, ns) for terminal rows, -1 otherwise
 };
 
 // pages base, base + 1, .., base + pages - 1: the contiguous run the allocator grants
@@ -288,6 +290,8 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     s->hcat = dmalloc<__half>((size_t)MX * HID);
     s->hprev_b = dmalloc<__half>((size_t)S2N * HID);
     s->last_rows = dmalloc<unsigned>(1);
+    s->dh2_x = dmalloc<__half>((size_t)S2N * HID);
+    s->dh2_map = dmalloc<int>(MX);
 #if G6_MODEL_FLASH
     s->hcatn = dmalloc<float>((size_t)MX * HID);
     s->hprevn_b = dmalloc<float>((size_t)S2N * HID);
@@ -1128,6 +1132,46 @@ inline const unsigned* s2_last_rows(Model& m, cudaStream_t st)
     S2Model& s = *m.s2;
     k_s2_last_rows<<<1, 32, 0, st>>>(reinterpret_cast<const uint32_t*>(s.in), s.last_rows);
     return s.last_rows;
+}
+
+// GR8_MTP_LASTROW + GR8_DRAFT_HEAD2 (M > head2::MXM): compact each session's terminal row into dh2_x[0..ns-1]
+// (zero-filling [ns..ns_cap)) and build dh2_map[0..M-1] (-1 for nonterminal rows, j for session j's terminal row).
+__global__ void __launch_bounds__(256) k_s2_dh2_compact(const uint32_t* in, const __half* x, __half* dst, int* row_map, int M)
+{
+    __shared__ S2In sh;
+    const int t = threadIdx.x;
+    s2in_copy(reinterpret_cast<uint32_t*>(&sh), in, t, 256);
+    __syncthreads();
+    const int j = blockIdx.x;
+    uint4* d4 = reinterpret_cast<uint4*>(dst + (size_t)j * HID);
+    if (j < sh.ns)
+    {
+        const int last = sh.row0[j] + sh.rows[j] - 1;
+        const uint4* s4 = reinterpret_cast<const uint4*>(x + (size_t)last * HID);
+        for (int i = t; i < HID * 2 / 16; i += 256) d4[i] = s4[i];
+    }
+    else
+    {
+        const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+        for (int i = t; i < HID * 2 / 16; i += 256) d4[i] = z;
+    }
+    if (j == 0)
+    {
+        if (t < M) row_map[t] = -1;
+        __syncthreads();
+        if (t < sh.ns && t < S2N) row_map[sh.row0[t] + sh.rows[t] - 1] = t;
+    }
+}
+inline bool s2_dh2_prepare_compact(Model& m, int M, const __half** x_out, const int** map_out, int* rows_out, cudaStream_t st)
+{
+    if (!m.s2 || m.s2->nslots > head2::MXM) return false;
+    S2Model& s = *m.s2;
+    const int ns_cap = s.nslots;
+    k_s2_dh2_compact<<<ns_cap, 256, 0, st>>>(reinterpret_cast<const uint32_t*>(s.in), m.x, s.dh2_x, s.dh2_map, M);
+    *x_out = s.dh2_x;
+    *map_out = s.dh2_map;
+    *rows_out = ns_cap;
+    return true;
 }
 
 // after the step's stream is synchronized: step_line over the rows r0..r0+n-1 of a step (tokens, logprobs, target

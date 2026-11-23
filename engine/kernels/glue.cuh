@@ -136,7 +136,7 @@ __device__ __forceinline__ void publish_cluster(const g6::FabricDev& f, int c, u
 // Threads 0..nr-1 each spin on one peer's tail (at byte offset `payload` of its slot); the CTA then proceeds.
 // Timeout or an error already raised elsewhere -> error word, stop waiting (host aborts the step).
 __device__ __forceinline__ void wait_peers(const g6::FabricDev& f, u64 step, int c, u64 seq, size_t payload,
-                                           unsigned code)
+                                           unsigned code, bool record_xt = true)
 {
     const int p = threadIdx.x;
     if (p < f.nr && p != f.rank)
@@ -153,7 +153,7 @@ __device__ __forceinline__ void wait_peers(const g6::FabricDev& f, u64 step, int
                 break;
             }
         }
-        if (f.xt && p < 8) xt_rec(f, step, c)[g6::XT_TAIL + p] = xt_now();
+        if (record_xt && f.xt && p < 8) xt_rec(f, step, c)[g6::XT_TAIL + p] = xt_now();
     }
     __syncthreads();
 }
@@ -374,9 +374,10 @@ struct ArNormArgs
     float eps;
     SteerArgs steer{};
 #ifdef DEC_SLOT
-    u32* xf16;                    // nullptr, or the mma B fragment table of out (bind.cuh Xfrag layout, rows >= M zero)
-    u32* xbf16;                   //   the same values rounded to BF16 (nullptr: not wanted)
+    u32* xf16 = nullptr;          // nullptr, or the mma B fragment table of out (bind.cuh Xfrag layout, rows >= M zero)
+    u32* xbf16 = nullptr;         //   the same values rounded to BF16 (nullptr: not wanted)
 #endif
+    unsigned wait_code = 0;       // non-zero: fuse wait_peers(c, M*HID*2, wait_code) into k_ar_add_norm
 };
 
 __device__ __forceinline__ u32 h2w_to_bf2(u32 w)
@@ -411,10 +412,28 @@ __device__ __forceinline__ void frag_store(const uint4& o, int col0, int m, int 
 }
 #endif
 
-// grid (RN_CL, M), block RN_T. Slot payload = M x 6144 BF16 row-major. Launch k_wait_peers(c, M*6144*2) first.
+// grid (RN_CL, M), block RN_T. Slot payload = M x 6144 BF16 row-major.
+// When a.wait_code != 0, cluster rank 0 spins on peer tails and syncs the cluster, then other CTAs perform a single
+// system-scope acquire load before reading peer slots (eliminating the separate k_wait_peers launch).
 __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_norm(ArNormArgs a)
 {
     const u64 step = *a.stepp;
+    if (a.wait_code)
+    {
+        const size_t payload = (size_t)a.M * HID * 2;
+        const u64 seq = g6::coll_seq(step, a.c, a.f.ncoll);
+        const cg::cluster_group cl = cg::this_cluster();
+        if (cl.block_rank() == 0)
+            wait_peers(a.f, step, a.c, seq, payload, a.wait_code, blockIdx.y == 0);
+        cl.sync();
+        if (cl.block_rank() != 0)
+        {
+            const int p = threadIdx.x;
+            if (p < a.f.nr && p != a.f.rank)
+                (void)ld_acquire_sys(reinterpret_cast<const u64*>(peer_slot(a.f, step, a.c, p) + payload));
+            __syncthreads();
+        }
+    }
     const int m = blockIdx.y;
     const int col0 = blockIdx.x * RN_COLS + threadIdx.x * 8;
     const size_t off = ((size_t)m * HID + col0) * 2;

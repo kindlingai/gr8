@@ -273,8 +273,11 @@ class Fabric {
   // to peer p only, into p's recv slot [c][me] at offset 0, tail right after it; sizes[c] is ignored for them.
   // skip: collectives the proxy neither waits for nor sends this step (GR8_PF_OWN=3 has no collective 0)
   // mask / skip / p2p are CollMask: collectives 0..127 (c >= 128 reads as 0); a plain `unsigned` converts (bits 0..31).
-  // p2p: reduce-scatter collectives (bits also set in mask) whose slice goes to `peer` only; the other peers get no
-  // write (GR8_PF_OWN=4: the attention partial of the counterpart's rows, collective 0)
+  // p2p: collectives (RS or non-RS) whose payload goes to `peer` only; the other peers get no write
+  // (GR8_PF_OWN=4: c0 = counterpart's attention partial, c4 = owner selected IDs when all consumers are pair-owned).
+  // pair_split: non-RS collectives whose send slot lays out [0..pair_common) common payload, [pair_common..pair_common+8)
+  // common tail word, 8-B pad, [pair_common+16..sizes[c]) pair-only payload, [sizes[c]..sizes[c]+8) full tail word.
+  // `peer` receives sizes[c] bytes (+ tail); all other peers receive pair_common bytes (+ tail).
   // order: the collectives the proxy handles this step, in the order it waits for and sends them (fabric_order.h). Empty =
   // 0..sizes.size()-1 in numeric order. Use it when the GPU publishes in another order than c (DS41 with Engram: the
   // Engram reduce runs mid-step, so the proxy must wait for it there, not after the head). Each entry
@@ -286,7 +289,8 @@ class Fabric {
               // needs FabricConfig::sge2: RS collectives whose send slot is flat (the producer wrote [rows][row] in place):
               // slice p = [p ss, p ss + bytes[p]) with ss = the slice payload (no tail gap); its tail word sits after the NR slices at
               // NR ss + 8 p, and travels as the second SGE of the slice's write (the receiver's layout is unchanged). flat is a subset of mask.
-              CollMask flat; };
+              CollMask flat;
+              CollMask pair_split; uint32_t pair_common = 0; };
   void enqueue_step(unsigned long long step, const std::vector<uint32_t>& sizes, const Rs& rs);
   // bulk mode: one proxy job, in enqueue order: wait doorbell[db] >= seq; if wait_flag >= 0 wait flags[wait_flag][p] >=
   // wait_min for every peer p; RDMA-write every (offset, bytes) range of my bulk area to every peer at the same offset;
@@ -317,5 +321,21 @@ class Fabric {
   FabricDev dev_{};
   Impl* impl_ = nullptr;
 };
+
+// Symmetric balanced dual-rail assignment for nr ranks via circle-method 1-factorization.
+// Guarantees dual_rail_of(p, me, nr) == dual_rail_of(me, p, nr) for every pair (so both endpoints
+// of an RC QP land on the same RoCE subnet/rail), exact 6/6 QP balance at TP=4 (8/7 edges at TP=6,
+// 14/14 at TP=8), and optimal per-rank degree balance (|deg0 - deg1| <= 1 for all even nr).
+inline int dual_rail_of(int p, int me, int nr) {
+  const int a = p < me ? p : me, b = p < me ? me : p;
+  const int N = (nr & 1) ? nr + 1 : nr;
+  const int M = N - 1;
+  const int r = (b == M) ? (2 * a) % M : (a + b) % M;
+  return (r < M - 1) ? (r & 1) : (a & 1);
+}
+
+// Staggered peer order for send k in [1, nr - 1]: every rank sends to a distinct peer in each round,
+// avoiding (nr - 1):1 rank-0 incast across switch ports.
+inline int stagger_peer(int me, int k, int nr) { return (me + k) % nr; }
 
 }  // namespace g6

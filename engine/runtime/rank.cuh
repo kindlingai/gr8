@@ -1952,8 +1952,16 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
     // the last layer's MLP wait: the head's records (the MTP draft: its W_M under GR8_MTP_L2PF 1; the main model: W_H)
     else if (c / 2 + 1 == m.nl)
         l2pf_window(m, l2pf_is_draft(m) ? l2pf::W_M : l2pf::W_H, l2pf::T_HEAD, c / 2, M, &m.f, c, (size_t)M * HID * 2, st);
-    glue::k_wait_peers<<<1, 32, 0, st>>>(m.f, m.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
-    dmark(c % 2 == 0 ? DP_WAIT_A : DP_WAIT_M, st);
+    const bool split_wait = ev_prof().rec || dec_prof().on || (l2pf::cfg().armed && M >= 6);
+    if (split_wait)
+    {
+        glue::k_wait_peers<<<1, 32, 0, st>>>(m.f, m.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
+        dmark(c % 2 == 0 ? DP_WAIT_A : DP_WAIT_M, st);
+    }
+    else
+    {
+        a.wait_code = glue::ERR_AR;
+    }
     glue::k_ar_add_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
     dmark(c % 2 == 0 ? DP_NORM_A : DP_NORM_M, st);
 }
@@ -1974,6 +1982,7 @@ inline void route_ovl_init(Model& m)
 constexpr int RLOG = 4 + SMAX;           // RoutePlan head: n_slots (slots, an expert can take several), pad_[3], slot_expert[SMAX]
 #ifdef DEC_S2
 inline const unsigned* s2_last_rows(Model& m, cudaStream_t st);
+inline bool s2_dh2_prepare_compact(Model& m, int M, const __half** x_out, const int** map_out, int* rows_out, cudaStream_t st);
 #endif
 // GR8_MTP_LASTROW=1 (default 0; needs --mtp; every rank, read at boot before any capture): the MTP draft step routes only
 // the last row of each session (the step's last row on today's path; on the S2 path each session's last row, from S2In,
@@ -2012,8 +2021,8 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
 #endif
             keep = 1u << (M - 1);
         }
-        if (!moe_union_cap::launch_router_plan(b.router, y.router_bias, M, m.logits, m.plan, keep, keep_dev, st) &&
-            !moe_rtr_fin_opt::launch_router_plan(m.mrfo, b.router, y.router_bias, M, m.logits, m.plan, keep, keep_dev, st))
+        if (!moe_rtr_fin_opt::launch_router_plan(m.mrfo, b.router, y.router_bias, M, m.logits, m.plan, keep, keep_dev, st) &&
+            !moe_union_cap::launch_router_plan(b.router, y.router_bias, M, m.logits, m.plan, keep, keep_dev, st))
         {
             bind::launch(b.router, st);
             glue::k_router_plan<<<1, glue::NEXP, 0, st>>>(m.logits, y.router_bias, M, m.plan, keep, keep_dev);
@@ -2189,6 +2198,11 @@ inline void prepare(Model& m, int M, cudaStream_t st)
 #endif
     route_ovl_init(m);
     head_for(m, M);
+    if (m.route_last && M > 1 && !m.s2on && m.nl == 1)
+    {
+        layer_for(m, 0, M - 1);
+        prepare(m, 1, st);
+    }
     for (int i = 0; i < m.nl; ++i)
     {
         Layer& y = m.layers[i];
@@ -2399,6 +2413,21 @@ inline void launch_head_local(Model& m, int M, cudaStream_t st)
         dmark(DP_HEAD_L, st);
         return;
     }
+#ifdef DEC_S2
+    if (m.dh2_mode == 1 && m.s2on && m.route_last && M > head2::MXM)
+    {
+        const __half* cx = nullptr;
+        const int* rmap = nullptr;
+        int ns_cap = 0;
+        if (s2_dh2_prepare_compact(m, M, &cx, &rmap, &ns_cap, st))
+        {
+            head2::launch_front(m.dh2, cx, HID, m.hlog, m.vn, m.vn, ns_cap, st);
+            head2::k_head_local_sl_map<<<M, 1024, 0, st>>>(head_args(m, M), m.dh2.cand, m.dh2.cl, rmap);
+            dmark(DP_HEAD_L, st);
+            return;
+        }
+    }
+#endif
 #if G6_MODEL_FLASH
     if(m.resid4 || m.flash_draft) {
         if(m.flash_draft) {
@@ -2768,6 +2797,44 @@ inline void launch_draft_keep(Draft& D, int M, cudaStream_t st)
 #endif
     k_mtp_keep<<<1, 256, 0, st>>>(D.d.x + (size_t)(M - 1) * HID, D.hprev);
 }
+// Solo GR8_MTP_LASTROW cache-only nonterminal rows: copy row M - 1 to row 0 before running the terminal M = 1 pass,
+// then scatter row 0's sampled token and log-probabilities back to slot M - 1 for step_out.
+__global__ void __launch_bounds__(256) k_mtp_pick_last_row(float* resid, __half* x, int* tok, int* pos, int* tgt, glue::SampleRow* srow, int M)
+{
+    const int t = threadIdx.x, last = M - 1;
+    uint4* r0 = reinterpret_cast<uint4*>(resid);
+    const uint4* rL = reinterpret_cast<const uint4*>(resid + (size_t)last * HID);
+    for (int i = t; i < HID * 4 / 16; i += 256) r0[i] = rL[i];
+    uint4* x0 = reinterpret_cast<uint4*>(x);
+    const uint4* xL = reinterpret_cast<const uint4*>(x + (size_t)last * HID);
+    for (int i = t; i < HID * 2 / 16; i += 256) x0[i] = xL[i];
+    if (t == 0)
+    {
+        tok[0] = tok[last];
+        pos[0] = pos[last];
+        tgt[0] = tgt[last];
+        srow[0] = srow[last];
+    }
+}
+__global__ void __launch_bounds__(32) k_mtp_scatter_last_out(int* tok_out, float* lp, float* lpt, int M)
+{
+    if (threadIdx.x == 0)
+    {
+        const int last = M - 1;
+        tok_out[last] = tok_out[0];
+        lp[last] = lp[0];
+        lpt[last] = lpt[0];
+    }
+}
+inline bool draft_solo_cache_only(const Model& d, int M, bool chain)
+{
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+    return !d.s2on && d.route_last && !chain && M > 1 && !d.qs.mode && !d.qs.iq;
+#else
+    (void)d; (void)M; (void)chain;
+    return false;
+#endif
+}
 // the whole draft step of one rank in stream order (real fabric)
 inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStream_t st)
 {
@@ -2780,6 +2847,40 @@ inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStre
     l2pf::arm(true);                  // GR8_MTP_L2PF (needs GR8_L2PF): the windows below may fork; joined at the end
     launch_step_in(d, st);
     launch_draft_embed(D, M, chain, st);
+    // Solo GR8_MTP_LASTROW first-form draft (M > 1): rows 0..M-2 are cache-only (kv_a, idx_k, append_kv, append_index);
+    // only row M - 1 needs q_a/q_b/idx_q, sparse attention, o_proj, ARs, MLP, and lm_head/head2. Bit-identical on row M-1
+    // and on layer 78's KV + indexer caches.
+    if (draft_solo_cache_only(d, M, chain))
+    {
+        Layer& y = d.layers[0];
+        const bind::Layer& b_prev = layer_for(d, 0, M - 1);
+        bind::launch(b_prev.xf_x, st);
+        bind::launch(b_prev.kv_a, st);
+        bind::launch(b_prev.idx_k, st);
+        if (d.graph)
+        {
+            if (!y.rp_on[d.cur][M]) die("prepare(d, M) was not called before a draft graph step");
+            G6RT_CK(g6_attn_replay_append(&y.rp[d.cur][M], M - 1, st));
+        }
+        else
+        {
+            const G6AttnStep s = attn_step(d, 0, M - 1, context);
+            G6RT_CK(g6_attn_bind_prepare(&y.ab, &s, st));
+            G6RT_CK(g6_attn_append(&y.ab.args, st));
+        }
+        k_mtp_pick_last_row<<<1, 256, 0, st>>>(d.resid, d.x, d.tok, d.pos, d.tgt, d.srow, M);
+        launch_attn_block(d, 0, 1, context, st);
+        launch_consume(d, 0, 1, d.layers[0].mlp_norm, d.x2, st);
+        launch_mlp_block(d, 0, 1, st);
+        launch_consume(d, 1, 1, d.final_norm, d.x, st);
+        launch_head_local(d, 1, st);
+        launch_head_merge(d, 1, st);
+        k_mtp_scatter_last_out<<<1, 32, 0, st>>>(d.tok_out, d.lp, d.lpt, M);
+        launch_step_out(d, M, st);
+        k_mtp_keep<<<1, 256, 0, st>>>(d.x, D.hprev);
+        l2pf::join(st);
+        return;
+    }
     launch_attn_block(d, 0, M, context, st);
     launch_consume(d, 0, M, d.layers[0].mlp_norm, d.x2, st);
     launch_mlp_block(d, 0, M, st);

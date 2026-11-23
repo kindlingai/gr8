@@ -759,6 +759,437 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
 }
 
 // ---------------------------------------------------------------------------------------------
+// Multi-tile (nt in 2..4) FC1 & FC2 bodies: when >8 tokens hit the same expert (or the
+// trellis shared expert at M > 8), the leader slot processes nt consecutive 8-token tiles in a
+// single pass over the expert's weights, keeping identical per-token k-range / partial sums
+// (0-ULP bit-exact to nt separate 8-token slots) while eliminating duplicate weight streaming.
+template <int BITS, bool E4, bool BS, int CB>
+__device__ __forceinline__ void tr3_fc1_body_nt(const K1Args& A, int plan, int ss0, int b, int mat, int h,
+                                                const long long* tr, const uint8_t* mw, int nt, int4 m4, u32* smem)
+{
+    const int masks[4] = {m4.x, m4.y, m4.z, m4.w};
+    constexpr int TB = 32 * BITS;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int s_ks1 = __ffs(A.KS1) - 1, s_wg = __ffs(A.WG) - 1;
+    if (b >= static_cast<int>(tr[3])) return;
+    const size_t row = static_cast<size_t>(tr[2]) + b;
+    const int KSU = KSH >> s_ks1;
+    const int ks0 = h * KSU;
+    const int q = warp >> 3, j = warp & 7;
+    const int steps = KSU >> s_wg;
+    const int ksq = q * steps;
+    const int csteps = (A.WG == 4) ? 8 : (A.WG == 2 ? (steps < 24 ? steps : 24) : (steps < 48 ? steps : 48));
+    const int cblks = csteps >> 3;
+    const __half* suh = A.t_v1 + (row * 2 + mat) * HID;
+    const bool wide4 = BS && BITS == 4 && A.t_wide4;
+    const bool wide = !wide4 && trw_ok<BITS>() && A.t_wide;
+    const int prev_lane = (lane + 31) & 31;
+
+    Tr3Lane<BITS, E4, CB> ld;
+    ld.init(lane);
+
+    float acc[4][4];
+    #pragma unroll
+    for (int ti = 0; ti < 4; ++ti) acc[ti][0] = acc[ti][1] = acc[ti][2] = acc[ti][3] = 0.f;
+
+    for (int c0 = 0; c0 < steps; c0 += csteps)
+    {
+        if (c0) __syncthreads();
+        const int g_base = (ks0 + ksq + c0) >> 3;
+        const uint8_t* g4 = mw + static_cast<size_t>(g_base) * TR4W_GROUP + (j * 2) * 512 + lane * 16;
+        const uint8_t* base = mw + (static_cast<size_t>(ks0 + ksq + c0) * 8 + j) * TB;
+        const uint8_t* g0 = base - static_cast<size_t>(j) * TB + j * 256 + lane * 8;
+        uint4 nw4_0 = make_uint4(0u, 0u, 0u, 0u), nw4_1 = make_uint4(0u, 0u, 0u, 0u);
+        u64 nw[3] = {0, 0, 0};
+        u32 na[TR3_UNR];
+        if constexpr (BS && BITS == 4)
+        {
+            if (wide4)
+            {
+                nw4_0 = tr4w_ld128(g4);
+                nw4_1 = tr4w_ld128(g4 + 512);
+            }
+        }
+        if constexpr (trw_ok<BITS>())
+        {
+            if (wide)
+            {
+                #pragma unroll
+                for (int n = 0; n < trw_nw<BITS>(); ++n) nw[n] = ld_nc64(g0 + n * 2048);
+            }
+        }
+        if (!wide4 && !wide)
+        {
+            #pragma unroll
+            for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(base + static_cast<size_t>(p) * 8 * TB, lane);
+        }
+
+        // Prologue for all nt tiles in this chunk (each warp group qq gets its own contiguous csteps slice)
+        #pragma unroll 1
+        for (int ti = 0; ti < nt; ++ti)
+        {
+            const int ss = ss0 + ti;
+            const int mask_t = masks[ti];
+            const int nact = __popc(mask_t & 0xff);
+            const int m0 = __ffs(mask_t) - 1;
+            const int ntask = nact * A.WG * cblks;
+            for (int task = warp; task < ntask; task += nwarps)
+            {
+                const int col = (nact == 1) ? m0 : __fns(mask_t, 0, (task % nact) + 1);
+                const int qblk = task / nact;
+                const int qq = qblk / cblks, b_in_c = qblk % cblks;
+                const int tok = (ss < A.n_slots) ? A.slot_tok[(plan * SMAX + ss) * 8 + col] : (ss - A.n_slots) * 8 + col;
+                const int k = (ks0 + qq * steps + c0 + b_in_c * 8) * 16 + lane * 4;
+                const uint2 xr = *reinterpret_cast<const uint2*>(A.x + tok * HID + k);
+                const uint2 sr = BS ? tr3_hid4<true>(nullptr, A.t_sg, A.t_v1b, row * 2 + mat, k)
+                                    : *reinterpret_cast<const uint2*>(suh + k);
+                const float2 x01 = __half22float2(as_h2(xr.x)), x23 = __half22float2(as_h2(xr.y));
+                const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
+                float v[4] = {x01.x * s01.x, x01.y * s01.y, x23.x * s23.x, x23.y * s23.y};
+                had128(v, lane);
+                store_frag_row(smem + (ti * A.WG + qq) * csteps * 64, b_in_c * 8, col, lane, v);
+            }
+        }
+        __syncthreads();
+
+        const int wg_stride = A.WG * csteps * 64;
+        const u32* xa0 = smem + q * csteps * 64 + lane * 2;
+        const u32* xa1 = xa0 + wg_stride;
+        const u32* xa2 = xa1 + wg_stride;
+        const u32* xa3 = xa2 + wg_stride;
+
+        auto mma_nt = [&](const u32 (&f0)[2], const u32 (&f1)[2], int idx) {
+            mma16816(acc[0], f0[0], f1[0], f0[1], f1[1], xa0[idx], xa0[idx + 1]);
+            mma16816(acc[1], f0[0], f1[0], f0[1], f1[1], xa1[idx], xa1[idx + 1]);
+            if (nt > 2) mma16816(acc[2], f0[0], f1[0], f0[1], f1[1], xa2[idx], xa2[idx + 1]);
+            if (nt > 3) mma16816(acc[3], f0[0], f1[0], f0[1], f1[1], xa3[idx], xa3[idx + 1]);
+        };
+
+        if constexpr (BS && BITS == 4)
+        {
+            if (wide4)
+            {
+                for (int g = 0; g < cblks; ++g)
+                {
+                    const u32 w[8] = {nw4_0.x, nw4_0.y, nw4_0.z, nw4_0.w, nw4_1.x, nw4_1.y, nw4_1.z, nw4_1.w};
+                    if (g + 1 < cblks)
+                    {
+                        const uint8_t* gp = g4 + static_cast<size_t>(g + 1) * TR4W_GROUP;
+                        nw4_0 = tr4w_ld128(gp);
+                        nw4_1 = tr4w_ld128(gp + 512);
+                    }
+                    const int s = g * 8;
+                    #pragma unroll
+                    for (int p = 0; p < 8; ++p)
+                    {
+                        const u32 c = w[p];
+                        const u32 pc = __shfl_sync(0xffffffffu, c, prev_lane);
+                        u32 f0[2], f1[2];
+                        Tr3Lane<4, E4, CB>::decode_m((static_cast<u64>(pc) << 32) | c, 28, f0, f1);
+                        mma_nt(f0, f1, (s + p) * 64);
+                    }
+                }
+                continue;
+            }
+        }
+        if constexpr (trw_ok<BITS>())
+        {
+            if (wide)
+            {
+                for (int s = 0; s < csteps; s += 8)
+                {
+                    const u64 w[3] = {nw[0], nw[1], nw[2]};
+                    if (s + 8 < csteps)
+                    {
+                        #pragma unroll
+                        for (int n = 0; n < trw_nw<BITS>(); ++n) nw[n] = ld_nc64(g0 + static_cast<size_t>(s + 8) * 8 * TB + n * 2048);
+                    }
+                    #pragma unroll
+                    for (int p = 0; p < 8; ++p)
+                    {
+                        const u32 c = trw_chunk<BITS>(w, p);
+                        const u32 pc = __shfl_sync(0xffffffffu, c, prev_lane);
+                        u32 f0[2], f1[2];
+                        Tr3Lane<BITS, E4, CB>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | c, 7 * BITS, f0, f1);
+                        mma_nt(f0, f1, (s + p) * 64);
+                    }
+                }
+                continue;
+            }
+        }
+        for (int s = 0; s < csteps; s += TR3_UNR)
+        {
+            u32 wa[TR3_UNR];
+            #pragma unroll
+            for (int p = 0; p < TR3_UNR; ++p) wa[p] = na[p];
+            if (s + TR3_UNR < csteps)
+            {
+                #pragma unroll
+                for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(base + static_cast<size_t>(s + TR3_UNR + p) * 8 * TB, lane);
+            }
+            #pragma unroll
+            for (int p = 0; p < TR3_UNR; ++p)
+            {
+                u32 f0[2], f1[2];
+                ld.decodew(wa[p], f0, f1);
+                mma_nt(f0, f1, (s + p) * 64);
+            }
+        }
+    }
+
+    const int nl = lane >> 2, c = lane & 3;
+    #pragma unroll
+    for (int ti = 0; ti < 4; ++ti)
+        if (ti < nt)
+        {
+            float* gp = A.gpart + (((static_cast<size_t>(ss0 + ti) * A.B + b) * 2 + mat) * GPMAX + h * A.WG + q) * 8 * 128 + j * 16 + nl;
+            if ((masks[ti] >> (2 * c)) & 1) { gp[2 * c * 128] = acc[ti][0]; gp[2 * c * 128 + 8] = acc[ti][2]; }
+            if ((masks[ti] >> (2 * c + 1)) & 1) { gp[(2 * c + 1) * 128] = acc[ti][1]; gp[(2 * c + 1) * 128 + 8] = acc[ti][3]; }
+        }
+}
+
+template <int BITS, bool E4, int CB, bool BS>
+__device__ __forceinline__ void tr3_fc2_body_nt(const K1Args& A, int ss0, int b, int ns,
+                                                const long long* tr, int nt, int4 m4, u32* smem)
+{
+    const int masks[4] = {m4.x, m4.y, m4.z, m4.w};
+    constexpr int TB = 32 * BITS;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int s_ns2 = __ffs(A.NS2) - 1, s_nw = __ffs(nwarps) - 1;
+    if (b >= static_cast<int>(tr[3])) return;
+    const size_t row = static_cast<size_t>(tr[2]) + b;
+    const int GP = A.KS1 * A.WG;
+    const int NTU = KSH >> s_ns2;
+    const int nt0 = ns * NTU + warp;
+    const int ntiles = (NTU - warp + nwarps - 1) >> s_nw;
+    const int e = static_cast<int>((tr - A.t_tab) / 6);
+    const uint8_t* base = tr3_fc2_block(A.t_fc2, A.t_ptab, e, tr, b, BITS);
+    const bool wide4 = BS && BITS == 4 && A.t_wide42;
+    const bool wide = !wide4 && trw_ok<BITS>() && A.t_wide2;
+    const uint8_t* wg4 = base + static_cast<size_t>(nt0) * TR4W_NT + lane * 16;
+    const uint8_t* wg = base + static_cast<size_t>(nt0) * 8 * TB + lane * 8;
+    auto tile_ptr = [&](int q) { return base + (static_cast<size_t>(nt0 + (q >> 3) * nwarps) * 8 + (q & 7)) * TB; };
+    const int Q = ntiles * 8;
+
+    uint4 nw4_0 = make_uint4(0u, 0u, 0u, 0u), nw4_1 = make_uint4(0u, 0u, 0u, 0u);
+    u64 nw[3] = {0, 0, 0};
+    Tr3Lane<BITS, E4, CB> ld;
+    ld.init(lane);
+    u32 na[TR3_UNR];
+    if (ntiles > 0)
+    {
+        if constexpr (BS && BITS == 4)
+        {
+            if (wide4)
+            {
+                nw4_0 = tr4w_ld128(wg4);
+                nw4_1 = tr4w_ld128(wg4 + 512);
+            }
+        }
+        if constexpr (trw_ok<BITS>())
+        {
+            if (wide)
+            {
+                #pragma unroll
+                for (int n = 0; n < trw_nw<BITS>(); ++n) nw[n] = ld_nc64(wg + n * 256);
+            }
+        }
+        if (!wide4 && !wide && Q > 0)
+        {
+            #pragma unroll
+            for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(tile_ptr(p), lane);
+        }
+    }
+
+    // Prologue: build nt fragment tables at smem[ti * 512], using smem[nt * 512] as 4 KB temp
+    const __half* v2 = A.t_v2 + row * 3 * 128 + lane * 4;
+    float4* gtmp = reinterpret_cast<float4*>(smem + nt * 512);
+    #pragma unroll 1
+    for (int ti = 0; ti < nt; ++ti)
+    {
+        const int ss = ss0 + ti, mask_t = masks[ti];
+        if (nwarps == 8)
+        {
+            const int m = warp;
+            const bool active = ((mask_t >> m) & 1) != 0;
+            float v[4] = {0.f, 0.f, 0.f, 0.f};
+            if (active)
+            {
+                auto reduce_mat = [&](int mat, float (&out)[4]) {
+                    const float* gp = A.gpart + (((static_cast<size_t>(ss) * A.B + b) * 2 + mat) * GPMAX * 8) * 128 + m * 128 + lane * 4;
+                    float4 s = make_float4(0.f, 0.f, 0.f, 0.f);
+                    for (int p = 0; p < GP; ++p)
+                    {
+                        const float4 w = __ldcg(reinterpret_cast<const float4*>(gp + static_cast<size_t>(p) * 8 * 128));
+                        s.x += w.x; s.y += w.y; s.z += w.z; s.w += w.w;
+                    }
+                    float y[4] = {rnd_h(s.x), rnd_h(s.y), rnd_h(s.z), rnd_h(s.w)};
+                    had128(y, lane);
+                    const uint2 sr = *reinterpret_cast<const uint2*>(v2 + mat * 128);
+                    const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
+                    out[0] = rnd_h(y[0] * s01.x); out[1] = rnd_h(y[1] * s01.y);
+                    out[2] = rnd_h(y[2] * s23.x); out[3] = rnd_h(y[3] * s23.y);
+                };
+                float g0[4], g1[4];
+                reduce_mat(0, g0);
+                reduce_mat(1, g1);
+                const uint2 sr = *reinterpret_cast<const uint2*>(v2 + 2 * 128);
+                const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
+                v[0] = rnd_h(swiglu_f(g0[0], g1[0])) * s01.x;
+                v[1] = rnd_h(swiglu_f(g0[1], g1[1])) * s01.y;
+                v[2] = rnd_h(swiglu_f(g0[2], g1[2])) * s23.x;
+                v[3] = rnd_h(swiglu_f(g0[3], g1[3])) * s23.y;
+                had128(v, lane);
+            }
+            store_frag_row(smem + ti * 512, 0, m, lane, v);
+        }
+        else
+        {
+            const int m = warp & 7, mat = warp >> 3;
+            const bool active = ((mask_t >> m) & 1) != 0;
+            float gu0[4] = {0.f, 0.f, 0.f, 0.f};
+            if (warp < 16 && active)
+            {
+                const float* gp = A.gpart + (((static_cast<size_t>(ss) * A.B + b) * 2 + mat) * GPMAX * 8) * 128 + m * 128 + lane * 4;
+                float4 s = make_float4(0.f, 0.f, 0.f, 0.f);
+                for (int p = 0; p < GP; ++p)
+                {
+                    const float4 w = __ldcg(reinterpret_cast<const float4*>(gp + static_cast<size_t>(p) * 8 * 128));
+                    s.x += w.x; s.y += w.y; s.z += w.z; s.w += w.w;
+                }
+                float y[4] = {rnd_h(s.x), rnd_h(s.y), rnd_h(s.z), rnd_h(s.w)};
+                had128(y, lane);
+                const uint2 sr = *reinterpret_cast<const uint2*>(v2 + mat * 128);
+                const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
+                gu0[0] = rnd_h(y[0] * s01.x); gu0[1] = rnd_h(y[1] * s01.y);
+                gu0[2] = rnd_h(y[2] * s23.x); gu0[3] = rnd_h(y[3] * s23.y);
+                if (mat == 1) gtmp[m * 32 + lane] = make_float4(gu0[0], gu0[1], gu0[2], gu0[3]);
+            }
+            __syncthreads();
+            if (warp < 8)
+            {
+                float v[4] = {0.f, 0.f, 0.f, 0.f};
+                if (active)
+                {
+                    const float4 gu1 = gtmp[m * 32 + lane];
+                    const uint2 sr = *reinterpret_cast<const uint2*>(v2 + 2 * 128);
+                    const float2 s01 = __half22float2(as_h2(sr.x)), s23 = __half22float2(as_h2(sr.y));
+                    v[0] = rnd_h(swiglu_f(gu0[0], gu1.x)) * s01.x;
+                    v[1] = rnd_h(swiglu_f(gu0[1], gu1.y)) * s01.y;
+                    v[2] = rnd_h(swiglu_f(gu0[2], gu1.z)) * s23.x;
+                    v[3] = rnd_h(swiglu_f(gu0[3], gu1.w)) * s23.y;
+                    had128(v, lane);
+                }
+                store_frag_row(smem + ti * 512, 0, m, lane, v);
+            }
+            if (ti + 1 < nt) __syncthreads();
+        }
+    }
+    __syncthreads();
+
+    const u32* ha = smem + lane * 2;
+    const int nl = lane >> 2, c = lane & 3;
+    const int prev_lane = (lane + 31) & 31;
+    float acc[4][4];
+    #pragma unroll
+    for (int ti = 0; ti < 4; ++ti) acc[ti][0] = acc[ti][1] = acc[ti][2] = acc[ti][3] = 0.f;
+
+    auto mma_nt = [&](const u32 (&f0)[2], const u32 (&f1)[2], int p_off) {
+        mma16816(acc[0], f0[0], f1[0], f0[1], f1[1], ha[p_off], ha[p_off + 1]);
+        mma16816(acc[1], f0[0], f1[0], f0[1], f1[1], ha[512 + p_off], ha[512 + p_off + 1]);
+        if (nt > 2) mma16816(acc[2], f0[0], f1[0], f0[1], f1[1], ha[1024 + p_off], ha[1024 + p_off + 1]);
+        if (nt > 3) mma16816(acc[3], f0[0], f1[0], f0[1], f1[1], ha[1536 + p_off], ha[1536 + p_off + 1]);
+    };
+
+    auto flush_z = [&](int nt_col) {
+        #pragma unroll
+        for (int ti = 0; ti < 4; ++ti)
+            if (ti < nt)
+            {
+                __half* zp = A.z + ((static_cast<size_t>(ss0 + ti) * A.B + b) * 8 + 2 * c) * HID + nl + nt_col * 16;
+                if ((masks[ti] >> (2 * c)) & 1) { zp[0] = __float2half_rn(acc[ti][0]); zp[8] = __float2half_rn(acc[ti][2]); }
+                if ((masks[ti] >> (2 * c + 1)) & 1) { zp[HID] = __float2half_rn(acc[ti][1]); zp[HID + 8] = __float2half_rn(acc[ti][3]); }
+                acc[ti][0] = acc[ti][1] = acc[ti][2] = acc[ti][3] = 0.f;
+            }
+    };
+
+    if constexpr (BS && BITS == 4)
+    {
+        if (wide4)
+        {
+            for (int i = 0; i < ntiles; ++i)
+            {
+                const u32 w[8] = {nw4_0.x, nw4_0.y, nw4_0.z, nw4_0.w, nw4_1.x, nw4_1.y, nw4_1.z, nw4_1.w};
+                if (i + 1 < ntiles)
+                {
+                    const uint8_t* np = wg4 + static_cast<size_t>(i + 1) * nwarps * TR4W_NT;
+                    nw4_0 = tr4w_ld128(np);
+                    nw4_1 = tr4w_ld128(np + 512);
+                }
+                #pragma unroll
+                for (int p = 0; p < 8; ++p)
+                {
+                    const u32 ch = w[p];
+                    const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+                    u32 f0[2], f1[2];
+                    Tr3Lane<4, E4, CB>::decode_m((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
+                    mma_nt(f0, f1, p * 64);
+                }
+                flush_z(nt0 + i * nwarps);
+            }
+            return;
+        }
+    }
+    if constexpr (trw_ok<BITS>())
+    {
+        if (wide)
+        {
+            for (int i = 0; i < ntiles; ++i)
+            {
+                const u64 w[3] = {nw[0], nw[1], nw[2]};
+                if (i + 1 < ntiles)
+                {
+                    #pragma unroll
+                    for (int n = 0; n < trw_nw<BITS>(); ++n) nw[n] = ld_nc64(wg + static_cast<size_t>(i + 1) * nwarps * 8 * TB + n * 256);
+                }
+                #pragma unroll
+                for (int p = 0; p < 8; ++p)
+                {
+                    const u32 ch = trw_chunk<BITS>(w, p);
+                    const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+                    u32 f0[2], f1[2];
+                    Tr3Lane<BITS, E4, CB>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
+                    mma_nt(f0, f1, p * 64);
+                }
+                flush_z(nt0 + i * nwarps);
+            }
+            return;
+        }
+    }
+    for (int s = 0; s < Q; s += TR3_UNR)
+    {
+        u32 wa[TR3_UNR];
+        #pragma unroll
+        for (int p = 0; p < TR3_UNR; ++p) wa[p] = na[p];
+        if (s + TR3_UNR < Q)
+        {
+            #pragma unroll
+            for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(tile_ptr(s + TR3_UNR + p), lane);
+        }
+        #pragma unroll
+        for (int p = 0; p < TR3_UNR; ++p)
+        {
+            u32 f0[2], f1[2];
+            ld.decodew(wa[p], f0, f1);
+            mma_nt(f0, f1, ((s + p) & 7) * 64);
+        }
+        if (((s + TR3_UNR) & 7) == 0) flush_z(nt0 + (s >> 3) * nwarps);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Finalize: out[m] = f16 or bf16( sum_k w[m][k] * sum_b svh_d[e][b] * H128(z[slot][b][m]) + shared[m] ),
 // fixed k, b order. One CTA = (token, one 128-col block), 8 warps x 1 route each (+ warp 8 for SH), summed through smem
 // in the exact (2q, 2q+1) pair order of the 4-warp kernel.

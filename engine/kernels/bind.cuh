@@ -710,6 +710,10 @@ inline void launch_k1_fc1(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
     k1_pick(k, [&](auto E4, auto K2, auto SH, auto CB) {
+        if constexpr (g6mx::NT > 1)
+        {
+            if (k.a.M > 8) { k1_tr3_fc1_nt<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)><<<k.g1, k.b1, k.sm1, st>>>(k.a); return; }
+        }
         k1_tr3_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)><<<k.g1, k.b1, k.sm1, st>>>(k.a);
     });
 }
@@ -717,6 +721,10 @@ inline void launch_k1_fc2(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
     k1_pick(k, [&](auto E4, auto K2, auto SH, auto CB) {
+        if constexpr (g6mx::NT > 1)
+        {
+            if (k.a.M > 8) { k1_tr3_fc2_nt<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)><<<k.g2, k.b2, k.sm2, st>>>(k.a); return; }
+        }
         k1_tr3_fc2<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)><<<k.g2, k.b2, k.sm2, st>>>(k.a);
     });
 }
@@ -735,6 +743,7 @@ inline void launch_k1_fused(const K1& k, cudaStream_t st)
                 case 4: k1_tr3_fused256_c2<true, true, C><<<k.gf, 256, k.smf, st>>>(k.a); break;
                 case 5: k1_tr3_fused512_w4<C><<<k.gf, 512, k.smf, st>>>(k.a); break;
                 case 6: k1_tr3_fused256_c2<false, false, C><<<k.gf, 256, k.smf, st>>>(k.a); break;
+                case 7: k1_tr3_fused256_c2<true, false, C><<<k.gf, 256, k.smf, st>>>(k.a); break;
             }
         });
         return;
@@ -779,6 +788,16 @@ inline void k1_ovl_fork(const K1& k, const K1Ovl& o, cudaStream_t st)
     cudaEventRecord(o.fork, st);
     cudaStreamWaitEvent(o.side, o.fork, 0);
     k1_pick(k, [&](auto, auto K2, auto, auto CB) {
+        if constexpr (g6mx::NT > 1)
+        {
+            if (k.a.M > 8)
+            {
+                if (k.b1 <= 256) k1_tr3_fc1_ovl_nt<true, K1_V(K2), 1, K1_V(CB), 256, 2><<<g1, k.b1, k.sm1, o.side>>>(k.a);
+                else k1_tr3_fc1_ovl_nt<true, K1_V(K2), 1, K1_V(CB)><<<g1, k.b1, k.sm1, o.side>>>(k.a);
+                if (o.mode == 1) k1_tr3_fc2_ovl_nt<true, K1_V(K2), 1, K1_V(CB)><<<g2, k.b2, k.sm2, o.side>>>(k.a);
+                return;
+            }
+        }
         k1_tr3_fc1_ovl<true, K1_V(K2), 1, K1_V(CB)><<<g1, k.b1, k.sm1, o.side>>>(k.a);
         if (o.mode == 1) k1_tr3_fc2_ovl<true, K1_V(K2), 1, K1_V(CB)><<<g2, k.b2, k.sm2, o.side>>>(k.a);
     });
@@ -789,6 +808,16 @@ inline void launch_k1_ovl(const K1& k, const K1Ovl& o, cudaStream_t st)
 {
     const int g1 = k.a.n_slots * k.a.B * 2 * k.a.KS1, g2 = k.a.n_slots * k.a.B * k.a.NS2;
     k1_pick(k, [&](auto, auto K2, auto, auto CB) {
+        if constexpr (g6mx::NT > 1)
+        {
+            if (k.a.M > 8)
+            {
+                if (k.b1 <= 256) k1_tr3_fc1_ovl_nt<true, K1_V(K2), 2, K1_V(CB), 256, 2><<<g1, k.b1, k.sm1, st>>>(k.a);
+                else k1_tr3_fc1_ovl_nt<true, K1_V(K2), 2, K1_V(CB)><<<g1, k.b1, k.sm1, st>>>(k.a);
+                if (o.mode == 1) k1_tr3_fc2_ovl_nt<true, K1_V(K2), 2, K1_V(CB)><<<g2, k.b2, k.sm2, st>>>(k.a);
+                return;
+            }
+        }
         k1_tr3_fc1_ovl<true, K1_V(K2), 2, K1_V(CB)><<<g1, k.b1, k.sm1, st>>>(k.a);
         if (o.mode == 1) k1_tr3_fc2_ovl<true, K1_V(K2), 2, K1_V(CB)><<<g2, k.b2, k.sm2, st>>>(k.a);
     });
@@ -832,6 +861,7 @@ inline int k1_fused_w4_grid(int fuse_w4, int items, size_t smem, int cb)
             case 4: fn = reinterpret_cast<const void*>(k1_tr3_fused256_c2<true, true, C>); break;
             case 5: fn = reinterpret_cast<const void*>(k1_tr3_fused512_w4<C>); break;
             case 6: fn = reinterpret_cast<const void*>(k1_tr3_fused256_c2<false, false, C>); break;
+            case 7: fn = reinterpret_cast<const void*>(k1_tr3_fused256_c2<true, false, C>); break;
         }
     });
     if (!fn) return 0;
@@ -1067,24 +1097,39 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     // at 3+ rows when 2-bit units are at least half the bytes (5-11%). Fused wins at 1 row (1-3%) and for mostly 3/4-bit
     // layers at 5-8 rows (3-5%). TR3 and v1 layers keep GR8_FUSE as given. GR8_K1_FUSE_POLICY=0: A/B runs only.
     const int rows = split_m ? split_m : M;
-    // GR8_TR3_WIDE4=1 strict 5/5 per-M fused dispatch (bit-exact KS1*WG partial count, stock fallback everywhere else).
+    // Apply fuse policy before fuse_w4 so M >= 2 with trellis shared expert keeps fuse = 0,
+    // preserving GR8_ROUTE_OVL=1 (shared-expert side stream) and separate fc1/fc2 launches.
+    if (v.policy && fuse == 1 && moe && (T.k2 || T.sh_trellis) && (rows == 2 || (rows >= 3 && T.k2 && T.k2_pct >= 50))) fuse = 0;
+    // 16+ rows in the step (S2 batches; split_m keeps rows at the session's class): separate launches, 2-3.5% faster at
+    // 24-32 rows (row_budget_test --time-v2, GB10 2200 MHz: M=24 1551 vs 1577 us, M=32 1752 vs 1812 us)
+    if (v.policy && fuse == 1 && moe && T.sh_trellis && M >= 2) fuse = 0;
+    // GR8_TR3_WIDE4=1 per-M fused dispatch (bit-exact KS1*WG partial count; works with GR8_TR3_W2ALL=1
+    // because fuse_w4 already runs WG=1 with identical KS1*WG partial counts to w2all).
     int fuse_w4 = 0;
-    if (fuse && moe && sh && T.e4m3 && !T.k2 && T.fc1_wide4 && T.fc2_wide4 &&
-        (!split_m || split_m == M) && !v.split && !v.m1 && !v.m2 && !v.m4 && !v.w2all)
+    if (fuse == 1 && moe && sh && T.e4m3 && !T.k2 && T.fc1_wide4 && T.fc2_wide4 &&
+        (!T.k3 || (T.fc1_wide && T.fc2_wide)) && !v.split && !v.m1 && !v.m2 && !v.m4)
     {
         if constexpr (g6nr::EB == 4)
         {
+            const int ks1 = (rows == 1) ? 4 : (rows <= 3) ? 2 : 8;
+            const int s_ns2 = (rows >= 2 && rows <= 3) ? 16 : 24;
+            const int ns2 = (!T.k3 && M <= 3) ? 4 : 2;
             if (!T.k3)
             {
-                if (M == 1) { fuse_w4 = 1; s = K1Split{4, 1, 4, 8, 24}; }
-                else if (M == 2) { fuse_w4 = 2; s = K1Split{2, 1, 4, 8, 16}; }
-                else if (M == 4 || M == 8) { fuse_w4 = 3; s = K1Split{8, 1, 2, 8, 24}; }
+                if (M == 1) { fuse_w4 = 1; s = K1Split{ks1, 1, 4, 8, 24}; }
+                else if (M == 2) { fuse_w4 = 2; s = K1Split{ks1, 1, 4, 8, s_ns2}; }
+                else if (M <= 8) { fuse_w4 = 3; s = K1Split{ks1, 1, ns2, 8, s_ns2}; }
+                else { fuse_w4 = 6; s = K1Split{ks1, 1, 2, 8, s_ns2}; }
             }
-            else if (M == 1) { fuse_w4 = 4; s = K1Split{4, 1, 2, 8, 24}; }
+            else
+            {
+                if (M <= 8) { fuse_w4 = 4; s = K1Split{ks1, 1, 2, 8, s_ns2}; }
+                else { fuse_w4 = 7; s = K1Split{ks1, 1, 2, 8, s_ns2}; }
+            }
         }
         else if constexpr (g6nr::EB == 3)
         {
-            if (!T.k3)
+            if (!T.k3 && (!split_m || split_m == M) && !v.w2all)
             {
                 if (M == 4 || M == 8) { fuse_w4 = 5; s = K1Split{4, 2, 2, 8, 24}; }
                 else if (M == 16) { fuse_w4 = 6; s = K1Split{8, 1, 2, 8, 24}; }
@@ -1093,10 +1138,6 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     }
     if (!fuse_w4)
     {
-        if (v.policy && fuse == 1 && moe && (T.k2 || T.sh_trellis) && (rows == 2 || (rows >= 3 && T.k2 && T.k2_pct >= 50))) fuse = 0;
-        // 16+ rows in the step (S2 batches; split_m keeps rows at the session's class): separate launches, 2-3.5% faster at
-        // 24-32 rows (row_budget_test --time-v2, GB10 2200 MHz: M=24 1551 vs 1577 us, M=32 1752 vs 1812 us)
-        if (v.policy && fuse == 1 && moe && T.sh_trellis && M >= 2) fuse = 0;
         if (moe)
         {
             if (const char* e = k1_bind_split(M, split_m, T.k2, sh, fuse, s, v)) return e;
@@ -1185,7 +1226,13 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     // attribute -> invalid argument at launch, the bin-w1 crash). The fused kernels keep the fragment table.
     // M <= 3 is one row tile, and column c of a slot is token c there (glue.cuh RoutePlan), so the table's rows are columns.
     a.xc = (TR3_XCOMP && !fuse && M <= 3) ? 1 : 0;
+    const int nt_max = (moe && M > 8) ? (g6mx::tiles(M) < 4 ? g6mx::tiles(M) : 4) : 1;
+    const int ksu = KSH / a.KS1, ksteps = ksu / a.WG;
+    const int csteps = (a.WG == 4) ? 8 : (a.WG == 2 ? (ksteps < 24 ? ksteps : 24) : (ksteps < 48 ? ksteps : 48));
+    const size_t sm1_nt = nt_max > 1 ? static_cast<size_t>(nt_max) * a.WG * csteps * 256 : 0;
+    const size_t sm2_nt = nt_max > 1 ? static_cast<size_t>(nt_max) * 2048 + 4096 : 6144;
     k.sm1 = a.xc ? static_cast<size_t>(M) * (KSH / a.KS1 * 16 + 8) * 2 : static_cast<size_t>(KSH / a.KS1) * 256;
+    if (k.sm1 < sm1_nt) k.sm1 = sm1_nt;
     if (k.sm1 < static_cast<size_t>(w1) * 1024 * g6mx::tiles(M)) k.sm1 = static_cast<size_t>(w1) * 1024 * g6mx::tiles(M);   // fc1 k-part sums, one 1 KB slab per warp and row tile
     k.g2 = (a.n_slots + nsh) * a.B * a.NS2 + (sh ? 0 : a.s_ns2); k.b2 = 512;
     // shared fc2: B tables of s_ntp row tiles in smem per pass over the weight stream (1 at M <= 8: sm2 as before)
@@ -1193,16 +1240,17 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     const int fit = KSH * 256 / s_tab;
     a.s_ntp = ntot < fit ? ntot : (fit < 1 ? 1 : fit);
     k.sm2 = static_cast<size_t>(s_tab) * a.s_ntp;
-    if (k.sm2 < 6144) k.sm2 = 6144;
+    if (k.sm2 < sm2_nt) k.sm2 = sm2_nt;
     k.g3 = M * geom::HB; k.b3 = sh ? 288 : 256;            // SH: 8 routed warps + warp 8 for the trellis shared expert
     if (fuse_w4)
     {
         const bool use_xc = (M <= 8);
-        const size_t sm1_w4 = use_xc ? static_cast<size_t>(M) * (static_cast<size_t>(KSH / a.KS1) * 16 + 8) * 2
-                                     : static_cast<size_t>(KSH / a.KS1) * 256;
+        size_t sm1_w4 = use_xc ? static_cast<size_t>(M) * (static_cast<size_t>(KSH / a.KS1) * 16 + 8) * 2
+                               : static_cast<size_t>(KSH / a.KS1) * 256;
+        if (sm1_w4 < sm1_nt) sm1_w4 = sm1_nt;
         k.fuse = fuse;
         k.fuse_w4 = fuse_w4;
-        k.smf = sm1_w4 > 6144 ? sm1_w4 : 6144;
+        k.smf = sm1_w4 > sm2_nt ? sm1_w4 : sm2_nt;
         k.gf = k1_fused_w4_grid(fuse_w4, k.g1 + k.g2, k.smf, k.cb);
         if (!k.gf) return "fused K1 wide4 launch: no resident CTA at its shared memory size";
     }
@@ -1528,12 +1576,26 @@ inline cudaError_t init()
         set(k1_fn_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
         set(k1_fn_fused<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
         set(k1_fn_fc2<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
+        if constexpr (g6mx::NT > 1)
+        {
+            set(reinterpret_cast<const void*>(k1_tr3_fc1_nt<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>));
+            set(reinterpret_cast<const void*>(k1_tr3_fc2_nt<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>));
+        }
         if constexpr (K1_V(SH))                                         // GR8_ROUTE_OVL (k1_ovl_fork / launch_k1_ovl)
         {
             set(reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, K1_V(K2), 1, K1_V(CB)>));
             set(reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, K1_V(K2), 2, K1_V(CB)>));
             set(reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, K1_V(K2), 1, K1_V(CB)>));
             set(reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, K1_V(K2), 2, K1_V(CB)>));
+            if constexpr (g6mx::NT > 1)
+            {
+                set(reinterpret_cast<const void*>(k1_tr3_fc1_ovl_nt<true, K1_V(K2), 1, K1_V(CB), 256, 2>));
+                set(reinterpret_cast<const void*>(k1_tr3_fc1_ovl_nt<true, K1_V(K2), 2, K1_V(CB), 256, 2>));
+                set(reinterpret_cast<const void*>(k1_tr3_fc1_ovl_nt<true, K1_V(K2), 1, K1_V(CB)>));
+                set(reinterpret_cast<const void*>(k1_tr3_fc1_ovl_nt<true, K1_V(K2), 2, K1_V(CB)>));
+                set(reinterpret_cast<const void*>(k1_tr3_fc2_ovl_nt<true, K1_V(K2), 1, K1_V(CB)>));
+                set(reinterpret_cast<const void*>(k1_tr3_fc2_ovl_nt<true, K1_V(K2), 2, K1_V(CB)>));
+            }
             if constexpr (!K1_V(K2))                                    // GR8_TR3_WIDE4 fused kernels
             {
                 set(reinterpret_cast<const void*>(k1_tr3_fused256_c3<true, K1_V(CB)>));
@@ -1542,6 +1604,7 @@ inline cudaError_t init()
                 set(reinterpret_cast<const void*>(k1_tr3_fused256_c2<true, true, K1_V(CB)>));
                 set(reinterpret_cast<const void*>(k1_tr3_fused512_w4<K1_V(CB)>));
                 set(reinterpret_cast<const void*>(k1_tr3_fused256_c2<false, false, K1_V(CB)>));
+                set(reinterpret_cast<const void*>(k1_tr3_fused256_c2<true, false, K1_V(CB)>));
             }
         }
     });

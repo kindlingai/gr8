@@ -3792,8 +3792,9 @@ int main(int argc, char** argv)
                             draft_dump(di);
                             return;
                         }
-                        std::vector<uint32_t> sizes(3, (uint32_t)(di.M * HID * 2));
-                        sizes[2] = (uint32_t)glue::head_bytes(di.M, nc);
+                        const int frows = draft_solo_cache_only(D.d, di.M, false) ? 1 : di.M;
+                        std::vector<uint32_t> sizes(3, (uint32_t)(frows * HID * 2));
+                        sizes[2] = (uint32_t)glue::head_bytes(frows, nc);
                         fabd.enqueue_step(di.step, sizes);
                         const int cur = D.d.cur;            // --graph: the attention replay of the context's bucket (not a captured graph:
                         D.d.cur = bucket_of(D.d, di.context);   // those read the main model's own rows)
@@ -3946,8 +3947,9 @@ int main(int argc, char** argv)
             auto rd = [&](const StepIn& di, bool chain, int s, double& ms) {
                 const int M = di.M;
                 *in_d = di;
-                std::vector<uint32_t> sizes(3, (uint32_t)(M * HID * 2));
-                sizes[2] = (uint32_t)glue::head_bytes(M, nc);
+                const int frows = draft_solo_cache_only(D.d, M, chain) ? 1 : M;
+                std::vector<uint32_t> sizes(3, (uint32_t)(frows * HID * 2));
+                sizes[2] = (uint32_t)glue::head_bytes(frows, nc);
                 fabd.enqueue_step(di.step, sizes);
                 qsd_enqueue(di.step, M);
                 const auto t0 = std::chrono::steady_clock::now();

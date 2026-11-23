@@ -36,3 +36,4 @@ struct G6AttnReplay {
 // All per-step validation/clearing uses a captured device kernel. No allocation,
 // host reads of live control words, graph update or recapture is required.
 extern "C" int g6a_replay_run(const G6AttnReplay*, void* stream);
+extern "C" int g6a_replay_append(const G6AttnReplay*, int n_rows, void* stream);
