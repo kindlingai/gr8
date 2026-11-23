@@ -64,3 +64,13 @@ knobs:
     doc: >-
       1 (the default) = use chunked WY Tensor Core prefill for Gated DeltaNet segments of 32 or more tokens.
       0 = serial per-token recurrence. Every rank must agree.
+  GR8_QW38_DENSE_FP8:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = quantize dense decode projections (GDN, Full Attn, HC, shared expert) in-memory on GPU at load
+      time to block-32 FP8 E4M3 (with FP16 scales) for 2x lower decode memory bandwidth while keeping prefill in BF16.
+      0 = keep all dense decode projections in BF16. Every rank must agree.

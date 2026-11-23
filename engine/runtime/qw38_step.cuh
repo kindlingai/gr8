@@ -259,6 +259,7 @@ struct Options {
     bool ple_direct = true;
     ptab::Mode ptab_mode = ptab::OFF;
     bool wide = true;
+    bool dense_fp8 = true;
     bool profile = false;
 };
 
@@ -294,8 +295,9 @@ struct Engine {
     std::vector<const __nv_bfloat16*> lm_head;
     std::vector<int> v_lo, v_rows;
 
-    // Weight paging pool (GR8_PTAB=1|2)
+    // Weight paging pool (GR8_PTAB=1|2) and on-load FP8 dense arena (GR8_QW38_DENSE_FP8=1)
     ptab::Pool ptab_pool;
+    qw38::Fp8Arena fp8_arena;
 
     // Layer-1 PLE NVMe store + host context per slot
     qw38::PleStore ple_store;
@@ -392,6 +394,7 @@ struct Engine {
         }
         if (o.ptab_mode == ptab::OFF) o.ptab_mode = ptab::mode_env();
         if (const char* we = std::getenv("GR8_QW38_WIDE")) o.wide = (std::atoi(we) != 0);
+        if (const char* fe = std::getenv("GR8_QW38_DENSE_FP8")) o.dense_fp8 = (std::atoi(fe) != 0);
         if (const char* pe = std::getenv("GR8_QW38_PROFILE")) o.profile = (std::atoi(pe) != 0);
         if (const char* cm = std::getenv("GR8_QW38_PLE_CACHE_MIB")) {
             long v = std::atol(cm);
@@ -580,6 +583,46 @@ struct Engine {
                          L.size(), ptab_slab_total / 1e9, ptab_pool.held / 1e9, ptab_reshuf_total, ptab_reloc_total);
         }
 
+        // 3b. On-load block-32 FP8 E4M3 quantization of dense decode projections (GR8_QW38_DENSE_FP8=1)
+        if (o.dense_fp8) {
+            fp8_arena.add(final_hc.down, final_hc.fp8_down, geom::HC_RANK, geom::HC_D);
+            fp8_arena.add(final_hc.up, final_hc.fp8_up, geom::HC_D, geom::HC_RANK);
+            for (auto& y : L) {
+                fp8_arena.add(y.attn_hc.down, y.attn_hc.fp8_down, geom::HC_RANK, geom::HC_D);
+                fp8_arena.add(y.attn_hc.up, y.attn_hc.fp8_up, geom::HC_D, geom::HC_RANK);
+                fp8_arena.add(y.mlp_hc.down, y.mlp_hc.fp8_down, geom::HC_RANK, geom::HC_D);
+                fp8_arena.add(y.mlp_hc.up, y.mlp_hc.fp8_up, geom::HC_D, geom::HC_RANK);
+                for (int i = 0; i < o.nloc; ++i) {
+                    const int r = o.rank0 + i;
+                    auto& rl = y.rk[size_t(i)];
+                    if (y.is_full) {
+                        const int nh_q = geom::nh_q(o.nr);
+                        const int nh_kv = geom::nh_kv(o.nr, r);
+                        fp8_arena.add(rl.attn_w.q_proj, rl.attn_w.fp8_q, nh_q * geom::HEAD_DIM * 2, geom::HID);
+                        fp8_arena.add(rl.attn_w.k_proj, rl.attn_w.fp8_k, nh_kv * geom::HEAD_DIM, geom::HID);
+                        fp8_arena.add(rl.attn_w.v_proj, rl.attn_w.fp8_v, nh_kv * geom::HEAD_DIM, geom::HID);
+                        fp8_arena.add(rl.attn_w.idx_qk_proj, rl.attn_w.fp8_idx, geom::IDX_PROJ_OUT, geom::HID);
+                        fp8_arena.add(rl.attn_w.o_proj, rl.attn_w.fp8_o, geom::HID, nh_q * geom::HEAD_DIM);
+                    } else {
+                        const int nh_v = geom::gdn_vh(o.nr);
+                        const int qkv_loc = geom::gdn_qkv_local(o.nr, r);
+                        fp8_arena.add(rl.gdn_w.in_proj_qkv, rl.gdn_w.fp8_qkv, qkv_loc, geom::HID);
+                        fp8_arena.add(rl.gdn_w.in_proj_z, rl.gdn_w.fp8_z, nh_v * geom::GDN_DV, geom::HID);
+                        fp8_arena.add(rl.gdn_w.out_proj, rl.gdn_w.fp8_out, geom::HID, nh_v * geom::GDN_DV);
+                    }
+                    fp8_arena.add(rl.moe_w.sh_gate, rl.moe_w.fp8_sh_gate, rl.moe_w.sh_i, geom::HID);
+                    fp8_arena.add(rl.moe_w.sh_up, rl.moe_w.fp8_sh_up, rl.moe_w.sh_i, geom::HID);
+                    fp8_arena.add(rl.moe_w.sh_down, rl.moe_w.fp8_sh_down, geom::HID, rl.moe_w.sh_i);
+                }
+            }
+            const auto fp8_t0 = std::chrono::steady_clock::now();
+            const size_t fp8_b = fp8_arena.build(stream);
+            QW38_CK(cudaStreamSynchronize(stream));
+            const double fp8_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fp8_t0).count();
+            std::fprintf(stderr, "# rank %d: GR8_QW38_DENSE_FP8=1: quantized dense decode weights (%.2f GB in %.2f s)\n",
+                         o.rank0, fp8_b / 1e9, fp8_s);
+        }
+
         // 4. Allocate shared step scratch buffers
         const size_t M = size_t(o.max_rows);
         hyper = dalloc<__nv_bfloat16>(M * geom::HC_D);
@@ -738,7 +781,7 @@ struct Engine {
                                             max_pps, max_blocks, stream);
                 } else {
                     qw38::gdn_forward(blas, rl.gdn_w, rl.gdn_st, gdn_sc, mixed, p_dst,
-                                      segs.data(), int(segs.size()), M, o.nr, r, true, stream);
+                                      segs.data(), int(segs.size()), M, o.nr, r, true, stream, d_slot, d_pos);
                 }
             }
             t_end(y.is_full ? prof.attn_ms : prof.gdn_ms);

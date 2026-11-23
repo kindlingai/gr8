@@ -17,6 +17,7 @@
 #include <cublas_v2.h>
 #include <cstdint>
 #include "../model_geom_qw38.h"
+#include "qw38_fp8.cuh"
 
 namespace qw38 {
 
@@ -25,6 +26,8 @@ struct HcWeights {
     const __nv_bfloat16* down = nullptr;    // [320, 10240] BF16
     const __nv_bfloat16* up = nullptr;      // [10240, 320] BF16
     const __nv_bfloat16* inject = nullptr;  // [4, 10240] BF16 (nullptr for final mixer)
+    Fp8Mat fp8_down;                        // optional on-load FP8 [320, 10240]
+    Fp8Mat fp8_up;                          // optional on-load FP8 [10240, 320]
 };
 
 struct HcScratch {
@@ -408,12 +411,154 @@ __global__ void k_hc_up_mix_fused(const __nv_bfloat16* __restrict__ hn,
     }
 }
 
+// Iter 3 Fused FP8 HC Decode Kernels (M <= 8): 2x lower weight bandwidth + 640-CTA up_mix!
+template <int MAX_M>
+__global__ void k_fp8_hc_down_silu_inj(const __nv_bfloat16* __restrict__ hn,
+                                       const uint8_t* __restrict__ dq, const __half* __restrict__ dsc,
+                                       const __nv_bfloat16* __restrict__ w_inj,
+                                       __nv_bfloat16* __restrict__ down_out,
+                                       float* __restrict__ inj_out,
+                                       int M) {
+    const int n = blockIdx.x;
+    const bool is_inj = (n >= geom::HC_RANK);
+    float acc[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+
+    if (is_inj) {
+        const uint4* wrow = reinterpret_cast<const uint4*>(w_inj + static_cast<size_t>(n - geom::HC_RANK) * geom::HC_D);
+        constexpr int K8 = geom::HC_D / 8; // 1280 = 5 * 256
+        #pragma unroll
+        for (int it = 0; it < K8 / 256; ++it) {
+            const int i = it * 256 + threadIdx.x;
+            const uint4 wv = __ldg(wrow + i);
+            #pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (m < M) {
+                    const uint4 av = reinterpret_cast<const uint4*>(hn + static_cast<size_t>(m) * geom::HC_D)[i];
+                    acc[m] += dot_bf16x8(av, wv);
+                }
+            }
+        }
+    } else {
+        constexpr int K16 = geom::HC_D >> 4; // 640
+        constexpr int NB = geom::HC_D >> 5;  // 320
+        const uint4* qrow = reinterpret_cast<const uint4*>(dq + static_cast<size_t>(n) * geom::HC_D);
+        const __half* srow = dsc + static_cast<size_t>(n) * NB;
+        for (int i = threadIdx.x; i < K16; i += 256) {
+            const uint4 wv = __ldg(qrow + i);
+            const float sc = __half2float(__ldg(srow + (i >> 1)));
+            float2 wf[8];
+            fp8x16_unpack(wv, sc, wf);
+            #pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (m < M) {
+                    const uint4* am = reinterpret_cast<const uint4*>(hn + static_cast<size_t>(m) * geom::HC_D);
+                    acc[m] += dot_bf16x16_f2x8(am[2 * i], am[2 * i + 1], wf);
+                }
+            }
+        }
+    }
+
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __shared__ float sm[8][MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            const float v = warp_sum(acc[m]);
+            if (lane == 0) sm[warp][m] = v;
+        }
+    }
+    __syncthreads();
+    if (warp == 0 && lane < M) {
+        float tot = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) tot += sm[w][lane];
+        if (is_inj) {
+            inj_out[lane * geom::HC + (n - geom::HC_RANK)] = 2.0f * sigmoid_f(tot * 0.25f);
+        } else {
+            const float bf = __bfloat162float(__float2bfloat16(tot));
+            down_out[static_cast<size_t>(lane) * geom::HC_RANK + n] = __float2bfloat16(silu_f(bf * 0.25f));
+        }
+    }
+}
+
+// Grid: (2560 / 4 = 640), Block: 128 (4 warps, 1 warp per hidden dim d).
+template <int MAX_M>
+__global__ void k_fp8_hc_up_mix_fused(const __nv_bfloat16* __restrict__ hn,
+                                      const __nv_bfloat16* __restrict__ down,
+                                      const uint8_t* __restrict__ uq, const __half* __restrict__ usc,
+                                      __nv_bfloat16* __restrict__ mixed,
+                                      int M) {
+    const int warp = threadIdx.x >> 5;   // 0..3
+    const int lane = threadIdx.x & 31;   // 0..31
+    const int d = blockIdx.x * 4 + warp;
+    if (d >= geom::HID) return;
+
+    __shared__ uint4 s_down[MAX_M][geom::HC_RANK / 8]; // [MAX_M][40]
+    constexpr int R8 = geom::HC_RANK / 8;              // 40
+    const int tot_u4 = M * R8;
+    for (int i = threadIdx.x; i < tot_u4; i += blockDim.x) {
+        s_down[i / R8][i % R8] = reinterpret_cast<const uint4*>(down + static_cast<size_t>(i / R8) * geom::HC_RANK)[i % R8];
+    }
+    __syncthreads();
+
+    float mix_acc[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) mix_acc[m] = 0.0f;
+
+    constexpr int R16 = geom::HC_RANK >> 4; // 20
+    constexpr int NB = geom::HC_RANK >> 5;  // 10
+    #pragma unroll
+    for (int s = 0; s < geom::HC; ++s) {
+        const size_t row = static_cast<size_t>(s * geom::HID + d);
+        float2 wf[8];
+        if (lane < R16) {
+            const uint4 wv = __ldg(reinterpret_cast<const uint4*>(uq + row * geom::HC_RANK) + lane);
+            const float sc = __half2float(__ldg(usc + row * NB + (lane >> 1)));
+            fp8x16_unpack(wv, sc, wf);
+        }
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+                const float p = (lane < R16) ? dot_bf16x16_f2x8(s_down[m][2 * lane], s_down[m][2 * lane + 1], wf) : 0.0f;
+                const float u_val = warp_sum(p);
+                if (lane == 0) {
+                    const float u_bf = __bfloat162float(__float2bfloat16(u_val));
+                    const float mw = __bfloat162float(__float2bfloat16(sigmoid_f(u_bf)));
+                    mix_acc[m] += mw * __bfloat162float(hn[static_cast<size_t>(m) * geom::HC_D + s * geom::HID + d]);
+                }
+            }
+        }
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) mixed[static_cast<size_t>(m) * geom::HID + d] = __float2bfloat16(mix_acc[m] * 0.25f);
+        }
+    }
+}
+
 // Full GatedResidual prepare: hyper_in [M, 10240] -> mixed [M, 2560] (+ optional inj [M, 4]).
 inline void hc_prepare(cublasHandle_t blas, const HcWeights& w, const __nv_bfloat16* hyper_in,
                        __nv_bfloat16* mixed, HcScratch& sc, int M, cudaStream_t st) {
     k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(hyper_in, w.norm, sc.hn, M, geom::HC, geom::RMS_EPS);
     if (M <= 8) {
         const int down_grid = w.inject ? (geom::HC_RANK + geom::HC) : geom::HC_RANK;
+        if (w.fp8_down.q && w.fp8_up.q) {
+            const int up_grid = geom::HID / 4;
+            if (M == 1) {
+                k_fp8_hc_down_silu_inj<1><<<down_grid, 256, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, 1);
+                k_fp8_hc_up_mix_fused<1><<<up_grid, 128, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, 1);
+            } else if (M <= 4) {
+                k_fp8_hc_down_silu_inj<4><<<down_grid, 256, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
+                k_fp8_hc_up_mix_fused<4><<<up_grid, 128, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
+            } else {
+                k_fp8_hc_down_silu_inj<8><<<down_grid, 256, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
+                k_fp8_hc_up_mix_fused<8><<<up_grid, 128, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
+            }
+            return;
+        }
         const int up_grid = geom::HID / 8;
         if (M == 1) {
             k_hc_down_silu_inj<1><<<down_grid, 256, 0, st>>>(sc.hn, w.down, w.inject, sc.down, sc.inj, 1);

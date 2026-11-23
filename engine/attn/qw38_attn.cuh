@@ -35,6 +35,8 @@ struct FullAttnWeights {
     const __nv_bfloat16* idx_qk_proj = nullptr; // [640, 2560]
     const __nv_bfloat16* idx_q_norm = nullptr;  // [128] (1 + w)
     const __nv_bfloat16* idx_k_norm = nullptr;  // [128] (1 + w)
+    // Optional on-load block-32 FP8 decode weights (GR8_QW38_DENSE_FP8=1)
+    Fp8Mat fp8_q, fp8_k, fp8_v, fp8_idx, fp8_o;
 };
 
 // Paged KV + QSA compressed block-key cache matching qw38_kv_state(...) & qw38_ckpt_rewidth.h byte-for-byte:
@@ -493,12 +495,26 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
     const int q0 = geom::q0(nr, rank);
     const int kv0 = geom::kv0(nr, rank);
 
-    cublasSetStream(blas, st);
     // 1. Projections (Q+gate, K, V, and QSA index_qk)
-    gemm_bf16_nt(blas, M, nh_q * geom::HEAD_DIM * 2, geom::HID, x, w.q_proj, sc.q_gate);
-    gemm_bf16_nt(blas, M, nh_kv * geom::HEAD_DIM, geom::HID, x, w.k_proj, sc.k);
-    gemm_bf16_nt(blas, M, nh_kv * geom::HEAD_DIM, geom::HID, x, w.v_proj, sc.v);
-    gemm_bf16_nt(blas, M, geom::IDX_PROJ_OUT, geom::HID, x, w.idx_qk_proj, sc.idx_qk);
+    if (M <= 8) {
+        if (w.fp8_q.q) {
+            launch_fp8_gemv_smallm<false>(x, w.fp8_q, sc.q_gate, M, st);
+            launch_fp8_gemv_smallm<false>(x, w.fp8_k, sc.k, M, st);
+            launch_fp8_gemv_smallm<false>(x, w.fp8_v, sc.v, M, st);
+            launch_fp8_gemv_smallm<false>(x, w.fp8_idx, sc.idx_qk, M, st);
+        } else {
+            launch_bf16_gemv_smallm<false>(x, w.q_proj, sc.q_gate, M, nh_q * geom::HEAD_DIM * 2, geom::HID, st);
+            launch_bf16_gemv_smallm<false>(x, w.k_proj, sc.k, M, nh_kv * geom::HEAD_DIM, geom::HID, st);
+            launch_bf16_gemv_smallm<false>(x, w.v_proj, sc.v, M, nh_kv * geom::HEAD_DIM, geom::HID, st);
+            launch_bf16_gemv_smallm<false>(x, w.idx_qk_proj, sc.idx_qk, M, geom::IDX_PROJ_OUT, geom::HID, st);
+        }
+    } else {
+        cublasSetStream(blas, st);
+        gemm_bf16_nt(blas, M, nh_q * geom::HEAD_DIM * 2, geom::HID, x, w.q_proj, sc.q_gate);
+        gemm_bf16_nt(blas, M, nh_kv * geom::HEAD_DIM, geom::HID, x, w.k_proj, sc.k);
+        gemm_bf16_nt(blas, M, nh_kv * geom::HEAD_DIM, geom::HID, x, w.v_proj, sc.v);
+        gemm_bf16_nt(blas, M, geom::IDX_PROJ_OUT, geom::HID, x, w.idx_qk_proj, sc.idx_qk);
+    }
 
     // 2. Q norm + RoPE, K norm + RoPE + paged KV scatter
     k_qw38_q_norm_rope<<<M * nh_q, 256, 0, st>>>(sc.q_gate, w.q_norm, row_pos_dev, sc.q, sc.gate, M, nh_q, geom::RMS_EPS);
@@ -518,7 +534,16 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
     k_qw38_gqa_attn<<<M * nh_q, 256, 0, st>>>(sc.q, sc.gate, kv.kv_pages, row_slot_dev, row_pos_dev,
                                               sc.sel_blocks, sc.sel_counts, sc.attn_out,
                                               M, nh_q, nh_kv, q0, kv0, max_pages);
-    gemm_bf16_nt(blas, M, geom::HID, nh_q * geom::HEAD_DIM, sc.attn_out, w.o_proj, out_part);
+    if (M <= 8) {
+        if (w.fp8_o.q) {
+            launch_fp8_gemv_smallm<false>(sc.attn_out, w.fp8_o, out_part, M, st);
+        } else {
+            launch_bf16_gemv_smallm<false>(sc.attn_out, w.o_proj, out_part, M, geom::HID, nh_q * geom::HEAD_DIM, st);
+        }
+    } else {
+        cublasSetStream(blas, st);
+        gemm_bf16_nt(blas, M, geom::HID, nh_q * geom::HEAD_DIM, sc.attn_out, w.o_proj, out_part);
+    }
 }
 
 } // namespace qw38

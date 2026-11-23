@@ -18,6 +18,7 @@
 #include "tr3.cuh"
 #include "ptab.cuh"
 #include "qw38_hc.cuh"
+#include "qw38_fp8.cuh"
 
 namespace qw38 {
 
@@ -28,6 +29,7 @@ struct MoeWeights {
     const __nv_bfloat16* sh_down = nullptr;      // [2560, sh_i] BF16
     const __nv_bfloat16* sh_exp_gate = nullptr;  // [1, 2560] BF16 (scalar sigmoid gate)
     int sh_i = 0;                                // local shared intermediate width (640 / 320 / 224|192 / 160)
+    Fp8Mat fp8_sh_gate, fp8_sh_up, fp8_sh_down;  // optional on-load FP8 shared expert weights
 
     // Routed experts: exlr8 v2 pmcgx (layers 0..47)
     bool is_tr3 = true;
@@ -113,6 +115,55 @@ __global__ void k_qw38_router_and_shgate(const __nv_bfloat16* __restrict__ x,
                 if (n < geom::NEXP) router_logits[static_cast<size_t>(m) * geom::NEXP + n] = tot;
                 else sh_scalar_gate[m] = tot;
             }
+        }
+    }
+}
+
+// Fused FP8 shared expert gate + up + silu*mul for small decode batches (M <= 8).
+template <int MAX_M>
+__global__ void k_fp8_sh_gate_up_silu(const __nv_bfloat16* __restrict__ x,
+                                      const uint8_t* __restrict__ gq, const __half* __restrict__ gsc,
+                                      const uint8_t* __restrict__ uq, const __half* __restrict__ usc,
+                                      __nv_bfloat16* __restrict__ out,
+                                      int M, int sh_i) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * 4 + warp;
+    if (n >= sh_i) return;
+    constexpr int K16 = geom::HID >> 4; // 160
+    constexpr int NB = geom::HID >> 5;  // 80
+    const uint4* grow = reinterpret_cast<const uint4*>(gq + static_cast<size_t>(n) * geom::HID);
+    const uint4* urow = reinterpret_cast<const uint4*>(uq + static_cast<size_t>(n) * geom::HID);
+    const __half* gs = gsc + static_cast<size_t>(n) * NB;
+    const __half* us = usc + static_cast<size_t>(n) * NB;
+    float ag[MAX_M], au[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) { ag[m] = 0.0f; au[m] = 0.0f; }
+
+    for (int i = lane; i < K16; i += 32) {
+        const uint4 gw = __ldg(grow + i);
+        const uint4 uw = __ldg(urow + i);
+        const float g_s = __half2float(__ldg(gs + (i >> 1)));
+        const float u_s = __half2float(__ldg(us + (i >> 1)));
+        float2 gf[8], uf[8];
+        fp8x16_unpack(gw, g_s, gf);
+        fp8x16_unpack(uw, u_s, uf);
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+                const uint4* am = reinterpret_cast<const uint4*>(x + static_cast<size_t>(m) * geom::HID);
+                const uint4 a0 = am[2 * i], a1 = am[2 * i + 1];
+                ag[m] += dot_bf16x16_f2x8(a0, a1, gf);
+                au[m] += dot_bf16x16_f2x8(a0, a1, uf);
+            }
+        }
+    }
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            const float g = __bfloat162float(__float2bfloat16(warp_sum(ag[m])));
+            const float u = __bfloat162float(__float2bfloat16(warp_sum(au[m])));
+            if (lane == 0) out[static_cast<size_t>(m) * sh_i + n] = __float2bfloat16(silu_f(g) * u);
         }
     }
 }
@@ -933,16 +984,20 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
         const int sgrid = (w.sh_i + 3) / 4;
         if (M == 1) {
             k_qw38_router_and_shgate<1><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
-            k_qw38_sh_gate_up_silu<1><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
+            if (w.fp8_sh_gate.q) k_fp8_sh_gate_up_silu<1><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
+            else k_qw38_sh_gate_up_silu<1><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
         } else if (M <= 4) {
             k_qw38_router_and_shgate<4><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
-            k_qw38_sh_gate_up_silu<4><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
+            if (w.fp8_sh_gate.q) k_fp8_sh_gate_up_silu<4><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
+            else k_qw38_sh_gate_up_silu<4><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
         } else {
             k_qw38_router_and_shgate<8><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
-            k_qw38_sh_gate_up_silu<8><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
+            if (w.fp8_sh_gate.q) k_fp8_sh_gate_up_silu<8><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
+            else k_qw38_sh_gate_up_silu<8><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
         }
         k_qw38_router_topk10<<<M, 256, 0, st>>>(sc.router_logits, sc.topk_idx, sc.topk_w, M);
-        launch_bf16_gemv_smallm<false>(sc.sh_gate_buf, w.sh_down, sc.sh_out, M, geom::HID, w.sh_i, st);
+        if (w.fp8_sh_down.q) launch_fp8_gemv_smallm<false>(sc.sh_gate_buf, w.fp8_sh_down, sc.sh_out, M, st);
+        else launch_bf16_gemv_smallm<false>(sc.sh_gate_buf, w.sh_down, sc.sh_out, M, geom::HID, w.sh_i, st);
     } else {
         cublasSetStream(blas, st);
         gemm_bf16_nt_f32(blas, M, geom::NEXP, geom::HID, x, w.router, sc.router_logits);
