@@ -37,8 +37,8 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     const int K = int(sc.mtp);
     require(sc.max_sessions == unsigned(slots) && sc.max_rows <= unsigned(max_rows),
             "qw38: --s2-sessions and --max-rows mismatch");
-    require(K == 0 || (K >= 1 && K <= 3 && c.engine.has_mtp),
-            "qw38: --mtp 1..3 requires loaded L048 MTP drafter");
+    require(K == 0 || (K >= 1 && K <= 5 && c.engine.has_mtp),
+            "qw38: --mtp 1..5 requires loaded L048 MTP drafter");
     const unsigned max_pps = unsigned(c.engine.max_pages_per_slot());
     const unsigned pages = sc.pool_rows / geom::KV_PAGE;
     RunPool pool(pages, pages, sc.pool_rows);
@@ -50,11 +50,11 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     // MTP > 0: pending verify rows of the last trunk forward, cached K drafts, and committed end per slot
     struct Pending {
         int row0 = 0, rows = 0, pos0 = 0;
-        std::array<int, 4> toks{};
+        std::array<int, 6> toks{};
         std::array<int32_t, 2> ple_ctx{geom::TOK_EOS, geom::TOK_EOS};
     };
     struct Drafts {
-        std::array<int, 4> d{};
+        std::array<int, 6> d{};
         int q = -1;
         bool valid = false;
     };
