@@ -893,6 +893,41 @@ __global__ void __launch_bounds__(256) k_qw38_moe_fc2_grp(
     }
 }
 
+// Multi-CTA deterministic vectorized reduction of per-route fc2_part[m*10 + 0..9] + sigmoid(sh_scalar_gate) * sh_out -> out_part [M, 2560] BF16.
+// Grid: (M * 10), Block: 64 -> 10 * 64 * 4 = 2560 EXACT (10x SM parallelism at M=1, zero loop, bit-exact!).
+__global__ void __launch_bounds__(64) k_qw38_moe_combine_det_m10(const float* __restrict__ fc2_part,
+                                                                 const __nv_bfloat16* __restrict__ sh_out,
+                                                                 const float* __restrict__ sh_scalar_gate,
+                                                                 __nv_bfloat16* __restrict__ out_part,
+                                                                 int M) {
+    const int m = blockIdx.x / 10;
+    const int blk = blockIdx.x % 10;
+    if (m >= M) return;
+    const int i = blk * 64 + threadIdx.x; // 0..639 (each = 4 dims -> 2560 exact)
+    const float sg = sigmoid_f(sh_scalar_gate[m]);
+    const __nv_bfloat16* s = sh_out + static_cast<size_t>(m) * geom::HID;
+    __nv_bfloat16* o = out_part + static_cast<size_t>(m) * geom::HID;
+    const float* base = fc2_part + static_cast<size_t>(m * geom::TOPK) * geom::HID;
+
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    #pragma unroll
+    for (int k = 0; k < geom::TOPK; ++k) {
+        const float4 v = reinterpret_cast<const float4*>(base + static_cast<size_t>(k) * geom::HID)[i];
+        acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+    }
+    const uint2 sv = reinterpret_cast<const uint2*>(s)[i];
+    const float2 sf0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&sv.x));
+    const float2 sf1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&sv.y));
+    const float s0 = __bfloat162float(__float2bfloat16(sg * sf0.x));
+    const float s1 = __bfloat162float(__float2bfloat16(sg * sf0.y));
+    const float s2 = __bfloat162float(__float2bfloat16(sg * sf1.x));
+    const float s3 = __bfloat162float(__float2bfloat16(sg * sf1.y));
+    uint2 ov;
+    *reinterpret_cast<__nv_bfloat162*>(&ov.x) = __floats2bfloat162_rn(acc.x + s0, acc.y + s1);
+    *reinterpret_cast<__nv_bfloat162*>(&ov.y) = __floats2bfloat162_rn(acc.z + s2, acc.w + s3);
+    reinterpret_cast<uint2*>(o)[i] = ov;
+}
+
 // Deterministic vectorized reduction of per-route fc2_part[m*10 + 0..9] + sigmoid(sh_scalar_gate) * sh_out -> out_part [M, 2560] BF16.
 __global__ void k_qw38_moe_combine_det(const float* __restrict__ fc2_part,
                                        const __nv_bfloat16* __restrict__ sh_out,
@@ -1656,7 +1691,7 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
             sc.fc1_act, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
             sc.topk_w, w.t_tab, w.t_fc2, w.t_ptab, w.t_sg, w.t_v3b, sc.fc2_part, w.t_eb, w.fc2_wide);
 
-        k_qw38_moe_combine_det<<<M, 256, 0, st>>>(sc.fc2_part, sc.sh_out, sc.sh_scalar_gate, out_part, M);
+        k_qw38_moe_combine_det_m10<<<M * 10, 64, 0, st>>>(sc.fc2_part, sc.sh_out, sc.sh_scalar_gate, out_part, M);
     } else if (w.mtp_gate_up && w.mtp_down) {
         cublasSetStream(blas, st);
         cudaMemsetAsync(sc.routed_acc, 0, static_cast<size_t>(M) * geom::HID * sizeof(float), st);

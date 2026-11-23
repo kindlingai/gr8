@@ -49,9 +49,15 @@ struct GdnWeights {
 
 struct GdnLayerState {
     float* S = nullptr;            // [slots, nh_v, 128, 128] FP32 (active committed state)
-    float* S_snap = nullptr;       // optional [slots, max_K, nh_v, 128, 128] FP32 (for MTP=1..3 exact rollback!)
     __nv_bfloat16* conv = nullptr; // [slots, 3, qkv_local] BF16 (ring ordered oldest..newest: [t-3, t-2, t-1])
     __nv_bfloat16* conv_snap = nullptr; // optional [slots, max_K, 3, qkv_local] BF16
+    // Lightweight MTP verify replay buffers (replaces giant S_snap, saves 2.7 GB VRAM & 2.2x GDN DRAM, bit-exact!):
+    // Verify runs read-only on S and records (qkv_conv, a, b, pos0); commit replays `kept` tokens into S in-place.
+    __nv_bfloat16* v_qkv = nullptr; // optional [slots, v_stride, qkv_local] BF16
+    __nv_bfloat16* v_a = nullptr;   // optional [slots, v_stride, nh_v] BF16
+    __nv_bfloat16* v_b = nullptr;   // optional [slots, v_stride, nh_v] BF16
+    int* v_pos0 = nullptr;          // optional [slots] INT32
+    int v_stride = 0;               // max_V = o.mtp + 1
 };
 
 struct GdnScratch {
@@ -155,7 +161,8 @@ __global__ void k_gdn_conv1d_seg(const __nv_bfloat16* __restrict__ qkv_raw,
                                  __nv_bfloat16* __restrict__ conv_hist,
                                  __nv_bfloat16* __restrict__ conv_snap,
                                  __nv_bfloat16* __restrict__ qkv_out,
-                                 int qkv_dim, int slot, int row0, int pos0, int len, int snap_stride_slots, bool update_state) {
+                                 int qkv_dim, int slot, int row0, int pos0, int len, int snap_stride_slots, bool update_state,
+                                 __nv_bfloat16* __restrict__ v_qkv = nullptr, int v_stride = 0) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= qkv_dim) return;
     const __nv_bfloat16* wc = w + static_cast<size_t>(c) * 4;
@@ -173,7 +180,11 @@ __global__ void k_gdn_conv1d_seg(const __nv_bfloat16* __restrict__ qkv_raw,
         const size_t idx = static_cast<size_t>(row0 + t) * qkv_dim + c;
         const float x = __bfloat162float(qkv_raw[idx]);
         const float y = h0 * w0 + h1 * w1 + h2 * w2 + x * w3;
-        qkv_out[idx] = __float2bfloat16(silu_f(y));
+        const __nv_bfloat16 ov = __float2bfloat16(silu_f(y));
+        qkv_out[idx] = ov;
+        if (v_qkv && t < v_stride) {
+            v_qkv[(static_cast<size_t>(slot) * v_stride + t) * qkv_dim + c] = ov;
+        }
         h0 = h1;
         h1 = h2;
         h2 = x;
@@ -323,17 +334,20 @@ __global__ void k_gdn_rec_norm_gate_batch(const __nv_bfloat16* __restrict__ qkv_
 }
 
 // Recurrent Gated Delta Rule over one multi-token segment (slot, row0, pos0, len).
-// When S_snap != nullptr (MTP verify step), saves post-token-t state into S_snap[slot, t] for t < len - 1!
+// When deferred_commit is true (MTP verify segment with len > 1), leaves S_all untouched and records
+// tiny (v_a, v_b, v_pos0) replay metadata so k_gdn_commit_batch updates S_all once with exact accepted length!
 __global__ void k_gdn_recurrent_seg(const __nv_bfloat16* __restrict__ qkv_conv,
                                     const __nv_bfloat16* __restrict__ a_in,
                                     const __nv_bfloat16* __restrict__ b_in,
                                     const __nv_bfloat16* __restrict__ A_log,
                                     const __nv_bfloat16* __restrict__ dt_bias,
                                     float* __restrict__ S_all,
-                                    float* __restrict__ S_snap,
+                                    __nv_bfloat16* __restrict__ v_a,
+                                    __nv_bfloat16* __restrict__ v_b,
+                                    int* __restrict__ v_pos0,
                                     __nv_bfloat16* __restrict__ core_out,
                                     int nh_k, int nh_v, int k0_global, int v0_global,
-                                    int slot, int row0, int pos0, int len, int snap_k, bool update_state) {
+                                    int slot, int row0, int pos0, int len, int v_stride, bool update_state) {
     const int lv = blockIdx.x;
     if (lv >= nh_v) return;
     const int gv = v0_global + lv;
@@ -363,6 +377,8 @@ __global__ void k_gdn_recurrent_seg(const __nv_bfloat16* __restrict__ qkv_conv,
     const float neg_A = -expf(__bfloat162float(A_log[lv]));
     const float dtb = __bfloat162float(dt_bias[lv]);
     constexpr float inv_sqrt_dk = 0.08838834764831845f;
+    const bool deferred = (v_a != nullptr && v_b != nullptr);
+    if (deferred && tid == 0 && lv == 0 && v_pos0) v_pos0[slot] = pos0;
 
     for (int t = 0; t < len; ++t) {
         const int r = row0 + t;
@@ -374,8 +390,14 @@ __global__ void k_gdn_recurrent_seg(const __nv_bfloat16* __restrict__ qkv_conv,
         if (kh == 0) sq[v] = __bfloat162float(q_ptr[v]);
         else sk[v] = __bfloat162float(k_ptr[v]);
         if (tid == 0) {
-            const float av = __bfloat162float(a_in[static_cast<size_t>(r) * nh_v + lv]);
-            const float bv = __bfloat162float(b_in[static_cast<size_t>(r) * nh_v + lv]);
+            const __nv_bfloat16 abf = a_in[static_cast<size_t>(r) * nh_v + lv];
+            const __nv_bfloat16 bbf = b_in[static_cast<size_t>(r) * nh_v + lv];
+            if (deferred && t < v_stride) {
+                v_a[(static_cast<size_t>(slot) * v_stride + t) * nh_v + lv] = abf;
+                v_b[(static_cast<size_t>(slot) * v_stride + t) * nh_v + lv] = bbf;
+            }
+            const float av = __bfloat162float(abf);
+            const float bv = __bfloat162float(bbf);
             s_meta[0] = expf(neg_A * softplus_f(av + dtb));
             s_meta[1] = sigmoid_f(bv);
         }
@@ -407,7 +429,7 @@ __global__ void k_gdn_recurrent_seg(const __nv_bfloat16* __restrict__ qkv_conv,
         #pragma unroll
         for (int i = 0; i < 64; ++i) {
             s_col[i] *= decay;
-            kv_part += s_col[i] * sk[k_base + i];
+            kv_part = fmaf(s_col[i], sk[k_base + i], kv_part);
         }
         if (kh == 1) sp[v] = kv_part;
         __syncthreads();
@@ -421,23 +443,18 @@ __global__ void k_gdn_recurrent_seg(const __nv_bfloat16* __restrict__ qkv_conv,
         float out_part = 0.0f;
         #pragma unroll
         for (int i = 0; i < 64; ++i) {
-            s_col[i] += sk[k_base + i] * delta_v;
-            out_part += s_col[i] * sq[k_base + i];
+            s_col[i] = fmaf(sk[k_base + i], delta_v, s_col[i]);
+            out_part = fmaf(s_col[i], sq[k_base + i], out_part);
         }
         if (kh == 1) sp[v] = out_part;
         __syncthreads();
         if (kh == 0) {
             core_out[(static_cast<size_t>(r) * nh_v + lv) * 128 + v] = __float2bfloat16(out_part + sp[v]);
         }
-        if (S_snap && t < len - 1 && t < snap_k) {
-            float* S_dst = S_snap + ((static_cast<size_t>(slot) * snap_k + t) * nh_v + lv) * (128 * 128);
-            #pragma unroll
-            for (int i = 0; i < 64; ++i) S_dst[(k_base + i) * 128 + v] = s_col[i];
-        }
         __syncthreads();
     }
 
-    if (update_state) {
+    if (update_state && !deferred) {
         #pragma unroll
         for (int i = 0; i < 64; ++i) S_head[(k_base + i) * 128 + v] = s_col[i];
     }
@@ -464,15 +481,16 @@ __global__ void k_gdn_norm_gate(__nv_bfloat16* __restrict__ core, const __nv_bfl
 }
 
 // Graph-safe batched MTP verify conv1d across S sessions x V tokens/session (V = snap_k + 1, row0 = s * V).
-// Reads slot & pos0 from device arrays d_slot/d_pos (ZERO host-baked segment metadata!).
+// Reads slot & pos0 from device arrays d_slot/d_pos (ZERO host-baked segment metadata!) and saves v_qkv for commit replay.
 __global__ void k_gdn_conv1d_verify_batch(const __nv_bfloat16* __restrict__ qkv_raw,
                                           const __nv_bfloat16* __restrict__ w,
                                           __nv_bfloat16* __restrict__ conv_hist,
                                           __nv_bfloat16* __restrict__ conv_snap,
                                           __nv_bfloat16* __restrict__ qkv_out,
+                                          __nv_bfloat16* __restrict__ v_qkv,
                                           const int* __restrict__ d_slot,
                                           const int* __restrict__ d_pos,
-                                          int S, int V, int snap_k, int qkv_dim, bool update_state) {
+                                          int S, int V, int snap_k, int v_stride, int qkv_dim, bool update_state) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= S * qkv_dim) return;
     const int s = idx / qkv_dim;
@@ -496,7 +514,11 @@ __global__ void k_gdn_conv1d_verify_batch(const __nv_bfloat16* __restrict__ qkv_
         const size_t ri = static_cast<size_t>(row0 + t) * qkv_dim + c;
         const float x = __bfloat162float(qkv_raw[ri]);
         const float y = h0 * w0 + h1 * w1 + h2 * w2 + x * w3;
-        qkv_out[ri] = __float2bfloat16(silu_f(y));
+        const __nv_bfloat16 ov = __float2bfloat16(silu_f(y));
+        qkv_out[ri] = ov;
+        if (v_qkv && t < v_stride) {
+            v_qkv[(static_cast<size_t>(slot) * v_stride + t) * qkv_dim + c] = ov;
+        }
         h0 = h1;
         h1 = h2;
         h2 = x;
@@ -514,7 +536,9 @@ __global__ void k_gdn_conv1d_verify_batch(const __nv_bfloat16* __restrict__ qkv_
     }
 }
 
-// Graph-safe batched MTP verify GDN recurrence + fused NormGate across S sessions x V tokens/session!
+// Graph-safe batched MTP verify GDN recurrence + fused NormGate (READ-ONLY on S_all!).
+// Eliminates all (K+1) x 113 MB/slot S_snap/S writes during verify (5x less verify state DRAM!).
+// Records tiny (v_a, v_b, v_pos0) so k_gdn_commit_batch writes S_all ONCE with exact accepted length.
 // Grid: (S * nh_v), Block: 256 threads (v = 0..127, kh = 0..1).
 __global__ void k_gdn_rec_verify_batch(const __nv_bfloat16* __restrict__ qkv_conv,
                                        const __nv_bfloat16* __restrict__ a_in,
@@ -524,12 +548,14 @@ __global__ void k_gdn_rec_verify_batch(const __nv_bfloat16* __restrict__ qkv_con
                                        const __nv_bfloat16* __restrict__ dt_bias,
                                        const __nv_bfloat16* __restrict__ norm_w,
                                        float* __restrict__ S_all,
-                                       float* __restrict__ S_snap,
+                                       __nv_bfloat16* __restrict__ v_a,
+                                       __nv_bfloat16* __restrict__ v_b,
+                                       int* __restrict__ v_pos0,
                                        __nv_bfloat16* __restrict__ core_out,
                                        const int* __restrict__ d_slot,
                                        const int* __restrict__ d_pos,
-                                       int S, int V, int snap_k, int nh_k, int nh_v, int k0_global, int v0_global,
-                                       float eps, bool update_state) {
+                                       int S, int V, int v_stride, int nh_k, int nh_v, int k0_global, int v0_global,
+                                       float eps) {
     const int idx = blockIdx.x;
     if (idx >= S * nh_v) return;
     const int s = idx / nh_v;
@@ -547,7 +573,7 @@ __global__ void k_gdn_rec_verify_batch(const __nv_bfloat16* __restrict__ qkv_con
     const int kh = tid >> 7;
     const int k_base = kh * 64;
 
-    float* S_head = S_all + (static_cast<size_t>(slot) * nh_v + lv) * (128 * 128);
+    const float* S_head = S_all + (static_cast<size_t>(slot) * nh_v + lv) * (128 * 128);
     float s_col[64];
     if (pos0 == 0) {
         #pragma unroll
@@ -567,6 +593,7 @@ __global__ void k_gdn_rec_verify_batch(const __nv_bfloat16* __restrict__ qkv_con
     const float neg_A = -expf(__bfloat162float(A_log[lv]));
     const float dtb = __bfloat162float(dt_bias[lv]);
     constexpr float inv_sqrt_dk = 0.08838834764831845f;
+    if (tid == 0 && lv == 0 && v_pos0) v_pos0[slot] = pos0;
 
     for (int t = 0; t < V; ++t) {
         const int r = row0 + t;
@@ -578,8 +605,12 @@ __global__ void k_gdn_rec_verify_batch(const __nv_bfloat16* __restrict__ qkv_con
         if (kh == 0) sq[v] = __bfloat162float(q_ptr[v]);
         else sk[v] = __bfloat162float(k_ptr[v]);
         if (tid == 0) {
-            const float av = __bfloat162float(a_in[static_cast<size_t>(r) * nh_v + lv]);
-            const float bv = __bfloat162float(b_in[static_cast<size_t>(r) * nh_v + lv]);
+            const __nv_bfloat16 abf = a_in[static_cast<size_t>(r) * nh_v + lv];
+            const __nv_bfloat16 bbf = b_in[static_cast<size_t>(r) * nh_v + lv];
+            if (v_a && t < v_stride) v_a[(static_cast<size_t>(slot) * v_stride + t) * nh_v + lv] = abf;
+            if (v_b && t < v_stride) v_b[(static_cast<size_t>(slot) * v_stride + t) * nh_v + lv] = bbf;
+            const float av = __bfloat162float(abf);
+            const float bv = __bfloat162float(bbf);
             s_meta[0] = expf(neg_A * softplus_f(av + dtb));
             s_meta[1] = sigmoid_f(bv);
         }
@@ -643,19 +674,115 @@ __global__ void k_gdn_rec_verify_batch(const __nv_bfloat16* __restrict__ qkv_con
         } else {
             __syncthreads();
         }
+        __syncthreads();
+    }
+}
 
-        if (S_snap && t < V - 1 && t < snap_k) {
-            float* S_dst = S_snap + ((static_cast<size_t>(slot) * snap_k + t) * nh_v + lv) * (128 * 128);
-            #pragma unroll
-            for (int i = 0; i < 64; ++i) S_dst[(k_base + i) * 128 + v] = s_col[i];
+struct GdnCommitArgs {
+    int slot[16];
+    int kept[16];
+};
+
+// Fast 2-way V-split batched GDN state commit: replays exact `kept` (1..V) verified tokens into S_all ONCE!
+// No q load/norm, no out_part, no RMSNorm, 2 CTAs/head = 48 CTAs at S=1 on TP=2 (100% SM saturation!).
+// Exact same (kh=0..1, fmaf) arithmetic order as k_gdn_rec_verify_batch -> 100% BIT-IDENTICAL to MTP=0!
+// Grid: (n_commit * nh_v * 2), Block: 128 threads (v_loc = 0..63, kh = 0..1).
+__global__ void __launch_bounds__(128) k_gdn_commit_batch(
+    const __nv_bfloat16* __restrict__ v_qkv,
+    const __nv_bfloat16* __restrict__ v_a,
+    const __nv_bfloat16* __restrict__ v_b,
+    const int* __restrict__ v_pos0,
+    const __nv_bfloat16* __restrict__ A_log,
+    const __nv_bfloat16* __restrict__ dt_bias,
+    float* __restrict__ S_all,
+    GdnCommitArgs args,
+    int n_commit, int v_stride, int nh_k, int nh_v, int k0_global, int v0_global) {
+    const int idx = blockIdx.x;
+    const int v_half = idx & 1;
+    const int rem = idx >> 1;
+    const int lv = rem % nh_v;
+    const int ci = rem / nh_v;
+    if (ci >= n_commit) return;
+
+    const int kept = args.kept[ci];
+    if (kept <= 0) return;
+    const int slot = args.slot[ci];
+    const int pos0 = v_pos0[slot];
+
+    const int gv = v0_global + lv;
+    const int lk = gv / geom::GDN_V_PER_K - k0_global;
+    const int qkv_dim = (2 * nh_k + nh_v) * geom::GDN_DK;
+
+    const int tid = threadIdx.x; // 0..127
+    const int v_loc = tid & 63;  // 0..63
+    const int kh = tid >> 6;     // 0..1
+    const int v = v_half * 64 + v_loc;
+    const int k_base = kh * 64;
+
+    float* S_head = S_all + (static_cast<size_t>(slot) * nh_v + lv) * (128 * 128);
+    float s_col[64];
+    if (pos0 == 0) {
+        #pragma unroll
+        for (int i = 0; i < 64; ++i) s_col[i] = 0.0f;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 64; ++i) s_col[i] = S_head[(k_base + i) * 128 + v];
+    }
+
+    __shared__ float sk[128];
+    __shared__ float sp[64];
+    __shared__ float s_meta[2];
+    __shared__ float kwarp[4];
+
+    const float neg_A = -expf(__bfloat162float(A_log[lv]));
+    const float dtb = __bfloat162float(dt_bias[lv]);
+
+    for (int t = 0; t < kept; ++t) {
+        const __nv_bfloat16* qkv = v_qkv + (static_cast<size_t>(slot) * v_stride + t) * qkv_dim;
+        const __nv_bfloat16* k_ptr = qkv + static_cast<size_t>(nh_k + lk) * 128;
+        const __nv_bfloat16* v_ptr = qkv + static_cast<size_t>(2 * nh_k + lv) * 128;
+
+        const float kv = __bfloat162float(k_ptr[tid]);
+        const float k2 = warp_sum(kv * kv);
+        if ((tid & 31) == 0) kwarp[tid >> 5] = k2;
+        if (tid == 0) {
+            const float av = __bfloat162float(v_a[(static_cast<size_t>(slot) * v_stride + t) * nh_v + lv]);
+            const float bv = __bfloat162float(v_b[(static_cast<size_t>(slot) * v_stride + t) * nh_v + lv]);
+            s_meta[0] = expf(neg_A * softplus_f(av + dtb));
+            s_meta[1] = sigmoid_f(bv);
+        }
+        __syncthreads();
+        const float ksum = kwarp[0] + kwarp[1] + kwarp[2] + kwarp[3];
+        sk[tid] = kv * rsqrtf(ksum + 1e-6f);
+        __syncthreads();
+
+        const float decay = s_meta[0];
+        const float beta = s_meta[1];
+
+        float kv_part = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 64; ++i) {
+            s_col[i] *= decay;
+            kv_part = fmaf(s_col[i], sk[k_base + i], kv_part);
+        }
+        if (kh == 1) sp[v_loc] = kv_part;
+        __syncthreads();
+        if (kh == 0) {
+            const float v_val = __bfloat162float(v_ptr[v]);
+            sp[v_loc] = (v_val - (kv_part + sp[v_loc])) * beta;
+        }
+        __syncthreads();
+        const float delta_v = sp[v_loc];
+
+        #pragma unroll
+        for (int i = 0; i < 64; ++i) {
+            s_col[i] = fmaf(sk[k_base + i], delta_v, s_col[i]);
         }
         __syncthreads();
     }
 
-    if (update_state) {
-        #pragma unroll
-        for (int i = 0; i < 64; ++i) S_head[(k_base + i) * 128 + v] = s_col[i];
-    }
+    #pragma unroll
+    for (int i = 0; i < 64; ++i) S_head[(k_base + i) * 128 + v] = s_col[i];
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1322,11 +1449,12 @@ inline void gdn_forward(cublasHandle_t blas, const GdnWeights& w, GdnLayerState&
             d_slot, d_pos, M, nh_k, nh_v, k0, v0, geom::RMS_EPS, update_state);
     } else if (all_verify) {
         k_gdn_conv1d_verify_batch<<<(nsegs * qkv_dim + 255) / 256, 256, 0, st>>>(
-            sc.qkv_raw, w.conv1d, st_buf.conv, st_buf.conv_snap, sc.qkv_conv,
-            d_slot, d_pos, nsegs, V, snap_k, qkv_dim, update_state);
+            sc.qkv_raw, w.conv1d, st_buf.conv, st_buf.conv_snap, sc.qkv_conv, st_buf.v_qkv,
+            d_slot, d_pos, nsegs, V, snap_k, st_buf.v_stride, qkv_dim, update_state);
         k_gdn_rec_verify_batch<<<nsegs * nh_v, 256, 0, st>>>(
-            sc.qkv_conv, sc.a, sc.b, sc.z, w.A_log, w.dt_bias, w.norm, st_buf.S, st_buf.S_snap, sc.core,
-            d_slot, d_pos, nsegs, V, snap_k, nh_k, nh_v, k0, v0, geom::RMS_EPS, update_state);
+            sc.qkv_conv, sc.a, sc.b, sc.z, w.A_log, w.dt_bias, w.norm, st_buf.S,
+            st_buf.v_a, st_buf.v_b, st_buf.v_pos0, sc.core,
+            d_slot, d_pos, nsegs, V, st_buf.v_stride, nh_k, nh_v, k0, v0, geom::RMS_EPS);
     } else {
         for (int s = 0; s < nsegs; ++s) {
             const StepSeg& g = segs[s];
@@ -1347,12 +1475,16 @@ inline void gdn_forward(cublasHandle_t blas, const GdnWeights& w, GdnLayerState&
                     sc.wy_qe, sc.wy_kd, sc.wy_w, sc.wy_u, sc.wy_aq, sc.wy_glast,
                     st_buf.S, sc.core, nh_v, g.slot, g.row0, g.pos0, g.len, nchunks, g.len, update_state);
             } else {
+                const bool defer_s = (snap_k > 0 && g.len > 1 && st_buf.v_qkv != nullptr);
                 k_gdn_conv1d_seg<<<(qkv_dim + 255) / 256, 256, 0, st>>>(
                     sc.qkv_raw, w.conv1d, st_buf.conv, snap_k > 0 ? st_buf.conv_snap : nullptr, sc.qkv_conv,
-                    qkv_dim, g.slot, g.row0, g.pos0, g.len, snap_k, update_state);
+                    qkv_dim, g.slot, g.row0, g.pos0, g.len, snap_k, update_state,
+                    defer_s ? st_buf.v_qkv : nullptr, defer_s ? st_buf.v_stride : 0);
                 k_gdn_recurrent_seg<<<nh_v, 256, 0, st>>>(
-                    sc.qkv_conv, sc.a, sc.b, w.A_log, w.dt_bias, st_buf.S, snap_k > 0 ? st_buf.S_snap : nullptr, sc.core,
-                    nh_k, nh_v, k0, v0, g.slot, g.row0, g.pos0, g.len, snap_k, update_state);
+                    sc.qkv_conv, sc.a, sc.b, w.A_log, w.dt_bias, st_buf.S,
+                    defer_s ? st_buf.v_a : nullptr, defer_s ? st_buf.v_b : nullptr, defer_s ? st_buf.v_pos0 : nullptr,
+                    sc.core, nh_k, nh_v, k0, v0, g.slot, g.row0, g.pos0, g.len,
+                    defer_s ? st_buf.v_stride : 0, update_state);
             }
         }
         k_gdn_norm_gate_fast<<<(M * nh_v + 3) / 4, 128, 0, st>>>(sc.core, sc.z, w.norm, M, nh_v, geom::RMS_EPS);

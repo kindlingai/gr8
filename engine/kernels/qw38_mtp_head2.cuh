@@ -366,7 +366,7 @@ __global__ void __launch_bounds__(256) k_qw38_mtp_head2_rescore_fp8(
         const uint4 wv = __ldcs(qrow + i);
         const float sc = __half2float(__ldcs(srow + (i >> 1)));
         float2 wf[8];
-        fp8x16_unpack(wv, 1.0f, wf);
+        fp8x16_unpack_raw(wv, wf);
         const float d = dot_bf16x16_f2x8(xm[2 * i], xm[2 * i + 1], wf);
         acc = fmaf(d, sc, acc);
     }

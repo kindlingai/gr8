@@ -64,6 +64,24 @@ inline void quantize_bf16_to_fp8_b32(const __nv_bfloat16* W, uint8_t* q, __half*
     k_quantize_bf16_to_fp8_b32<<<grid, 256, 0, st>>>(W, q, sc, N, K);
 }
 
+// Unpack 4 FP8 E4M3 bytes (u32) -> 2x float2 UNSCALED using native cvt.rn.f16x2.e4m3x2.
+__device__ __forceinline__ void fp8x4_unpack_raw(uint32_t v, float2& f0, float2& f1) {
+    uint32_t r0, r1;
+    const uint16_t lo = static_cast<uint16_t>(v & 0xffffu);
+    const uint16_t hi = static_cast<uint16_t>(v >> 16);
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r0) : "h"(lo));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r1) : "h"(hi));
+    f0 = __half22float2(*reinterpret_cast<const __half2*>(&r0));
+    f1 = __half22float2(*reinterpret_cast<const __half2*>(&r1));
+}
+
+__device__ __forceinline__ void fp8x16_unpack_raw(uint4 wv, float2 (&wf)[8]) {
+    fp8x4_unpack_raw(wv.x, wf[0], wf[1]);
+    fp8x4_unpack_raw(wv.y, wf[2], wf[3]);
+    fp8x4_unpack_raw(wv.z, wf[4], wf[5]);
+    fp8x4_unpack_raw(wv.w, wf[6], wf[7]);
+}
+
 // Unpack 4 FP8 E4M3 bytes (u32) -> 2x float2 multiplied by `scale`, using native cvt.rn.f16x2.e4m3x2.
 __device__ __forceinline__ void fp8x4_unpack(uint32_t v, float scale, float2& f0, float2& f1) {
     uint32_t r0, r1;

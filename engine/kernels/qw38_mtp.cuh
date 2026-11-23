@@ -563,7 +563,7 @@ inline void mtp_moe_forward(cublasHandle_t blas, const MoeWeights& w,
         k_mtp_exp_fc1_bf16<<<fc1_grid, 128, 0, st>>>(x, sc.topk_idx, w.mtp_gate_up, msc.exp_mid, M, w.sh_i);
         k_mtp_exp_fc2_bf16<<<fc2_grid, 128, 0, st>>>(msc.exp_mid, sc.topk_idx, sc.topk_w, w.mtp_down, msc.exp_dn_part, M, w.sh_i);
     }
-    k_qw38_moe_combine_det<<<M, 256, 0, st>>>(msc.exp_dn_part, sc.sh_out, sc.sh_scalar_gate, out_part, M);
+    k_qw38_moe_combine_det_m10<<<M * 10, 64, 0, st>>>(msc.exp_dn_part, sc.sh_out, sc.sh_scalar_gate, out_part, M);
 }
 
 } // namespace qw38

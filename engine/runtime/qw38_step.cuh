@@ -825,7 +825,12 @@ struct Engine {
                     rl.gdn_st.S = dalloc<float>(size_t(o.slots) * size_t(nh_v) * 128 * 128);
                     rl.gdn_st.conv = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::GDN_NHIST * size_t(qkv_loc));
                     if (o.mtp > 0) {
-                        rl.gdn_st.S_snap = dalloc<float>(size_t(o.slots) * size_t(o.mtp) * size_t(nh_v) * 128 * 128);
+                        const int v_stride = o.mtp + 1;
+                        rl.gdn_st.v_stride = v_stride;
+                        rl.gdn_st.v_qkv = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(v_stride) * size_t(qkv_loc));
+                        rl.gdn_st.v_a = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(v_stride) * size_t(nh_v));
+                        rl.gdn_st.v_b = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(v_stride) * size_t(nh_v));
+                        rl.gdn_st.v_pos0 = dalloc<int>(size_t(o.slots));
                         rl.gdn_st.conv_snap = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(o.mtp) * geom::GDN_NHIST * size_t(qkv_loc));
                     }
                 }
@@ -2198,15 +2203,7 @@ struct Engine {
                             sizeof(int3), cudaMemcpyDeviceToDevice, stream));
                     }
                 } else {
-                    const size_t nh_v = size_t(geom::gdn_vh(o.nr));
                     const size_t qkv_l = size_t(geom::gdn_qkv_local(o.nr, r));
-                    if (rl.gdn_st.S_snap) {
-                        const size_t sb = nh_v * 128 * 128 * sizeof(float);
-                        QW38_CK(cudaMemcpyAsync(
-                            rl.gdn_st.S + size_t(slot) * nh_v * 128 * 128,
-                            rl.gdn_st.S_snap + (size_t(slot) * size_t(o.mtp) + size_t(snap_idx)) * nh_v * 128 * 128,
-                            sb, cudaMemcpyDeviceToDevice, stream));
-                    }
                     if (rl.gdn_st.conv_snap) {
                         const size_t cb = geom::GDN_NHIST * qkv_l * 2;
                         QW38_CK(cudaMemcpyAsync(
@@ -2214,6 +2211,40 @@ struct Engine {
                             rl.gdn_st.conv_snap + (size_t(slot) * size_t(o.mtp) + size_t(snap_idx)) * geom::GDN_NHIST * qkv_l,
                             cb, cudaMemcpyDeviceToDevice, stream));
                     }
+                }
+            }
+        }
+    }
+
+    // Batched GDN state commit: replays exact `kept_c[i]` verified tokens into `gdn_st.S` ONCE for each slot!
+    // Paired with read-only `k_gdn_rec_verify_batch`, eliminates `S_snap` (2.7 GB VRAM) and cuts GDN verify/rollback DRAM >2x.
+    void mtp_commit_gdn_batch(const std::vector<int>& slots_c, const std::vector<int>& kept_c) {
+        const int n_tot = static_cast<int>(slots_c.size());
+        if (n_tot <= 0) return;
+        for (int off = 0; off < n_tot; off += 16) {
+            const int n = std::min(16, n_tot - off);
+            qw38::GdnCommitArgs args{};
+            int any = 0;
+            for (int c = 0; c < n; ++c) {
+                args.slot[c] = slots_c[size_t(off + c)];
+                args.kept[c] = kept_c[size_t(off + c)];
+                if (args.kept[c] > 0) ++any;
+            }
+            if (any == 0) continue;
+            for (auto& y : L) {
+                if (y.is_full) continue;
+                for (int i = 0; i < o.nloc; ++i) {
+                    const int r = o.rank0 + i;
+                    auto& rl = y.rk[size_t(i)];
+                    if (!rl.gdn_st.v_qkv || rl.gdn_st.v_stride <= 0) continue;
+                    const int nh_k = geom::gdn_kh(o.nr, r);
+                    const int nh_v = geom::gdn_vh(o.nr);
+                    const int k0 = geom::gdn_k0(o.nr, r);
+                    const int v0 = geom::gdn_v0(o.nr, r);
+                    qw38::k_gdn_commit_batch<<<n * nh_v * 2, 128, 0, stream>>>(
+                        rl.gdn_st.v_qkv, rl.gdn_st.v_a, rl.gdn_st.v_b, rl.gdn_st.v_pos0,
+                        rl.gdn_w.A_log, rl.gdn_w.dt_bias, rl.gdn_st.S,
+                        args, n, rl.gdn_st.v_stride, nh_k, nh_v, k0, v0);
                 }
             }
         }
@@ -2519,7 +2550,9 @@ struct Engine {
         std::vector<RowOut> vout;
         forward(segs, vtoks.data(), vsm.data(), vout, false, K);
 
-        // 3. Exact greedy verification + commit/rollback + MTP KV sync!
+        // 3. Exact greedy verification + batched GDN state commit + lightweight rollback + MTP KV sync!
+        std::vector<int> c_slots(static_cast<size_t>(S));
+        std::vector<int> c_kept(static_cast<size_t>(S));
         for (int s = 0; s < S; ++s) {
             int n_acc = 0;
             for (int k = 0; k < K; ++k) {
@@ -2527,13 +2560,15 @@ struct Engine {
                 else break;
             }
             total_accepted += n_acc;
+            c_slots[size_t(s)] = s;
+            c_kept[size_t(s)] = n_acc + 1;
 
             // Emitted tokens: accepted drafts [0..n_acc-1] + trunk token at row n_acc
             for (int k = 0; k < n_acc; ++k) emitted[size_t(s)].push_back(drafts[size_t(s)][size_t(k)]);
             const int bonus = vout[size_t(s * V + n_acc)].tok;
             emitted[size_t(s)].push_back(bonus);
 
-            // Roll back slot if partial accept (< K)
+            // Roll back lightweight conv/idx_raw if partial accept (< K)
             if (n_acc < K) {
                 mtp_rollback_slot(s, n_acc);
                 // Recompute exact host ple_ctx for the (n_acc + 1) actually committed tokens
@@ -2556,6 +2591,7 @@ struct Engine {
             cur_tok[size_t(s)] = bonus;
             pos[size_t(s)] += n_acc + 1;
         }
+        mtp_commit_gdn_batch(c_slots, c_kept);
     }
 };
 
