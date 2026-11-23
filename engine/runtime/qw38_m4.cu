@@ -15,12 +15,65 @@
 namespace {
 using qw38rt::die;
 
+// Graph-safe device-driven AR ring/wait: reads step counter from device memory so captured CUDA graphs
+// work across all steps of the same parity (par = 0 or 1)!
+struct Qw38ArWait {
+    g6::FabricDev f;
+    size_t bytes;
+    const unsigned long long* d_step;
+    unsigned code;
+    int par, c;
+};
+__global__ void k_qw38_ar_ring_wait(Qw38ArWait a) {
+    const int p = threadIdx.x;
+    const unsigned long long seq = g6::coll_seq(*a.d_step, a.c, a.f.ncoll);
+    if (p == 0) {
+        __threadfence_system();
+        ink2::ar_st_release_sys(a.f.doorbell + a.c, seq);
+    }
+    if (p < a.f.nr && p != a.f.rank) {
+        const unsigned long long* tail = reinterpret_cast<const unsigned long long*>(
+            a.f.recv + g6::fab_recv_off(a.f, a.par, a.c, p) + a.bytes);
+        const long long t0 = clock64();
+        unsigned it = 0;
+        while (ink2::ar_ld_acquire_sys(tail) != seq) {
+            if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(a.f.error) != 0 || clock64() - t0 > INK2_SPIN_TIMEOUT_CYC)) {
+                atomicCAS(a.f.error, 0u, a.code | static_cast<unsigned>(p));
+                break;
+            }
+        }
+    }
+}
+
+inline void qw38_ar_exchange(const g6::FabricDev& f, const unsigned long long* d_step, int par, int c,
+                             char* parts, size_t bytes, cudaStream_t st) {
+    const size_t n16 = bytes / 16;
+    const unsigned grid = static_cast<unsigned>((n16 + 255) / 256);
+    ink2::k_ink2_ar_copy<<<grid, 256, 0, st>>>(
+        reinterpret_cast<const uint4*>(parts + static_cast<size_t>(f.rank) * bytes),
+        reinterpret_cast<uint4*>(f.send + g6::fab_send_off(f, par, c)), n16);
+    Qw38ArWait a{f, bytes, d_step, ink2::INK2_ERR_AR | (static_cast<unsigned>(c) << 8), par, c};
+    k_qw38_ar_ring_wait<<<1, 32, 0, st>>>(a);
+    for (int p = 0; p < f.nr; ++p) {
+        if (p != f.rank) {
+            ink2::k_ink2_ar_copy<true><<<grid, 256, 0, st>>>(
+                reinterpret_cast<const uint4*>(f.recv + g6::fab_recv_off(f, par, c, p)),
+                reinterpret_cast<uint4*>(parts + static_cast<size_t>(p) * bytes), n16);
+        }
+    }
+}
+
 struct Wire {
     g6::Fabric fab;
     g6::FabricDev f{};
     unsigned long long step = 0;
+    unsigned long long* d_step = nullptr;
     int rank = 0, nr = 1;
+    int n_layers = 0;
+    size_t head_rb = 0;
     bool fast = true;
+
+    ~Wire() { if (d_step) cudaFree(d_step); }
 
     void publish() { __atomic_store_n(f.doorbell, g6::coll_seq(step, 0, f.ncoll), __ATOMIC_RELEASE); }
 
@@ -39,24 +92,61 @@ struct Wire {
         }
     }
 
+    // Multi-collective single-step device-driven AR (ncoll = 2*L + 1, ZERO syncs across all 96 layer collectives!)
+    void fast_begin(int M, bool skip_head, cudaStream_t st) {
+        const uint32_t wire_part = static_cast<uint32_t>((size_t(M) * geom::HID * 2 + 15) / 16 * 16);
+        const uint32_t wire_head = static_cast<uint32_t>((size_t(M) * head_rb + 7) / 8 * 8);
+        std::vector<uint32_t> sizes(static_cast<size_t>(2 * n_layers + (skip_head ? 0 : 1)), wire_part);
+        if (!skip_head) sizes.back() = wire_head;
+        fab.enqueue_step(step, sizes);
+        QW38_CK(cudaMemcpyAsync(d_step, &step, sizeof(step), cudaMemcpyHostToDevice, st));
+    }
+
+    void fast_dev(int c, __nv_bfloat16* parts, size_t bytes, cudaStream_t st) {
+        const size_t wire = (bytes + 15) / 16 * 16;
+        qw38_ar_exchange(f, d_step, static_cast<int>(step & 1), c, reinterpret_cast<char*>(parts), wire, st);
+    }
+
+    void fast_host(int c, uint8_t* parts, size_t bytes) {
+        const int par = static_cast<int>(step & 1);
+        const size_t wire = (bytes + 7) / 8 * 8;
+        const unsigned long long seq = g6::coll_seq(step, c, f.ncoll);
+        char* dst = f.send + g6::fab_send_off(f, par, c);
+        std::memcpy(dst, parts + size_t(rank) * bytes, bytes);
+        if (wire > bytes) std::memset(dst + bytes, 0, wire - bytes);
+        __atomic_store_n(f.doorbell + c, seq, __ATOMIC_RELEASE);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int p = 0; p < nr; ++p) {
+            if (p == rank) continue;
+            const char* slot = f.recv + g6::fab_recv_off(f, par, c, p);
+            const auto* tail = reinterpret_cast<const unsigned long long*>(slot + wire);
+            unsigned it = 0;
+            while (__atomic_load_n(tail, __ATOMIC_ACQUIRE) != seq) {
+                if ((++it & 0xFFFFu) == 0 && (*f.error || std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)))
+                    die("rank " + std::to_string(rank) + ": fabric timeout at head collective from rank " + std::to_string(p));
+            }
+            std::memcpy(parts + size_t(p) * bytes, slot, bytes);
+        }
+    }
+
+    void fast_end(cudaStream_t st) {
+        QW38_CK(cudaStreamSynchronize(st));
+        if (!fab.wait_proxy_idle(60.0)) die("fabric proxy timeout at step " + std::to_string(step));
+        if (*f.error) die("fabric device error " + std::to_string(*f.error));
+        ++step;
+    }
+
     void exchange_dev(int, __nv_bfloat16* parts, size_t bytes) {
         const int par = static_cast<int>(step & 1);
         const size_t wire = (bytes + 15) / 16 * 16;
         fab.enqueue_step(step, {static_cast<uint32_t>(wire)});
-        if (fast) {
-            ink2::ar_exchange(f, step, 0, reinterpret_cast<char*>(parts), wire, 0);
-            QW38_CK(cudaStreamSynchronize(0));
-            if (!fab.wait_proxy_idle(60.0)) die("fabric proxy timeout");
-            if (*f.error) die("fabric device error " + std::to_string(*f.error));
-        } else {
-            char* d = reinterpret_cast<char*>(parts);
-            QW38_CK(cudaMemcpy(f.send + g6::fab_send_off(f, par, 0), d + size_t(rank) * bytes, bytes, cudaMemcpyDeviceToHost));
-            publish();
-            wait_host(wire);
-            if (!fab.wait_proxy_idle(60.0)) die("fabric proxy timeout");
-            for (int p = 0; p < nr; ++p)
-                if (p != rank) QW38_CK(cudaMemcpy(d + size_t(p) * bytes, f.recv + g6::fab_recv_off(f, par, 0, p), bytes, cudaMemcpyHostToDevice));
-        }
+        char* d = reinterpret_cast<char*>(parts);
+        QW38_CK(cudaMemcpy(f.send + g6::fab_send_off(f, par, 0), d + size_t(rank) * bytes, bytes, cudaMemcpyDeviceToHost));
+        publish();
+        wait_host(wire);
+        if (!fab.wait_proxy_idle(60.0)) die("fabric proxy timeout");
+        for (int p = 0; p < nr; ++p)
+            if (p != rank) QW38_CK(cudaMemcpy(d + size_t(p) * bytes, f.recv + g6::fab_recv_off(f, par, 0, p), bytes, cudaMemcpyHostToDevice));
         ++step;
     }
 
@@ -120,7 +210,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") mtp = std::atoi(val().c_str());
         else if (a == "--serve") s2dir = val();
         else if (a == "--s2-port") s2port = std::atoi(val().c_str());
-        else if (a == "--s2-sessions") s2sess = std::atoi(val().c_str());
+        else if (a == "--s2-sessions" || a == "--sessions") s2sess = std::atoi(val().c_str());
         else if (a == "--s2-epoch") s2epoch = std::atoi(val().c_str());
         else if (a == "--set-id") set_id = val();
         else if (a == "--reuse-prefix") reuse = true;
@@ -146,7 +236,7 @@ int main(int argc, char** argv) {
     o.nr = G6_NR;
     o.rank0 = rank;
     o.nloc = 1;
-    o.slots = s2dir.empty() ? 1 : s2sess;
+    o.slots = s2sess;
     o.max_rows = std::max(prefill, std::max(chunk, o.slots));
     o.cap = cap;
     o.nc = std::max(nc, 1);
@@ -160,6 +250,7 @@ int main(int argc, char** argv) {
 
     Wire wire;
     if (G6_NR > 1) {
+        if (const char* fe = std::getenv("GR8_QW38_FAST_AR")) wire.fast = (std::atoi(fe) != 0);
         const size_t max_part_b = (size_t(o.max_rows) * geom::HID * 2 + 15) / 16 * 16;
         const size_t max_head_b = (size_t(o.max_rows) * head_row_bytes(o.nc) + 15) / 16 * 16;
         const size_t slot_b = std::max(max_part_b, max_head_b);
@@ -168,7 +259,7 @@ int main(int argc, char** argv) {
         cfg.ips = peers;
         if (!ips2.empty()) cfg.ips2 = split_csv(ips2);
         cfg.proxy_cpu = proxy_cpu;
-        cfg.ncoll = 1;
+        cfg.ncoll = wire.fast ? static_cast<int>(2 * e.L.size() + 1) : 1;
         cfg.stripe_min = cfg.ips2.empty() ? 0 : 65536;
         cfg.slot_bytes = (slot_b + 7) / 8 * 8;
         wire.fab.init(cfg);
@@ -177,9 +268,18 @@ int main(int argc, char** argv) {
         wire.fab.barrier();
         wire.rank = rank;
         wire.nr = G6_NR;
-        if (const char* fe = std::getenv("GR8_QW38_FAST_AR")) wire.fast = (std::atoi(fe) != 0);
-        e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.exchange_dev(c, p, b); };
-        e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.exchange_host(c, p, b); };
+        wire.n_layers = static_cast<int>(e.L.size());
+        wire.head_rb = head_row_bytes(o.nc);
+        if (wire.fast) {
+            wire.d_step = qw38rt::dalloc<unsigned long long>(1);
+            e.step_begin = [&](int M, bool skip_head) { wire.fast_begin(M, skip_head, e.stream); };
+            e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.fast_dev(c, p, b, e.stream); };
+            e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.fast_host(c, p, b); };
+            e.step_end = [&]() { wire.fast_end(e.stream); };
+        } else {
+            e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.exchange_dev(c, p, b); };
+            e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.exchange_host(c, p, b); };
+        }
     }
 
     if (!s2dir.empty()) {
@@ -210,7 +310,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Standalone cluster smoke run
+    // Standalone cluster smoke / benchmark run (supports --sessions 1..8)
     std::vector<int> prompt;
     if (!tokens.empty()) {
         std::stringstream ss(tokens);
@@ -219,34 +319,43 @@ int main(int argc, char** argv) {
     }
     if (prompt.empty()) prompt.push_back(geom::TOK_BOS);
     const int P = static_cast<int>(prompt.size());
+    const int S = std::max(1, s2sess);
     const float inv_temp = temp > 0.f ? 1.f / temp : 0.f;
     std::vector<RowOut> out;
-    std::vector<int> said;
-    int next = 0;
+    std::vector<int> next(static_cast<size_t>(S), 0);
+    std::vector<std::vector<int>> said(static_cast<size_t>(S));
 
-    e.reset_slot(0);
     const auto t_pf0 = std::chrono::steady_clock::now();
-    for (int p = 0; p < P; p += prefill) {
-        const int n = std::min(prefill, P - p);
-        const bool last = (p + n == P);
-        std::vector<qw38::StepSeg> segs = {{0, 0, p, n}};
-        std::vector<RowSample> sm(static_cast<size_t>(n));
-        for (int i = 0; i < n; ++i) sm[size_t(i)] = RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};
-        e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last);
-        if (last) next = out[size_t(n - 1)].tok;
+    for (int s = 0; s < S; ++s) {
+        e.reset_slot(s);
+        for (int p = 0; p < P; p += prefill) {
+            const int n = std::min(prefill, P - p);
+            const bool last = (p + n == P);
+            std::vector<qw38::StepSeg> segs = {{s, 0, p, n}};
+            std::vector<RowSample> sm(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i) sm[size_t(i)] = RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};
+            e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last);
+            if (last) next[size_t(s)] = out[size_t(n - 1)].tok;
+        }
     }
     QW38_CK(cudaStreamSynchronize(e.stream));
     const auto t_pf1 = std::chrono::steady_clock::now();
 
     const auto t_dec0 = std::chrono::steady_clock::now();
     if (gen > 0) {
-        said.push_back(next);
+        for (int s = 0; s < S; ++s) said[size_t(s)].push_back(next[size_t(s)]);
         for (int g = 1; g < gen; ++g) {
-            std::vector<qw38::StepSeg> segs = {{0, 0, P + g - 1, 1}};
-            RowSample sm{inv_temp, top_p, seed, uint32_t(P + g)};
-            e.forward(segs, &next, &sm, out, false);
-            next = out[0].tok;
-            said.push_back(next);
+            std::vector<qw38::StepSeg> segs;
+            std::vector<RowSample> sm;
+            for (int s = 0; s < S; ++s) {
+                segs.push_back({s, s, P + g - 1, 1});
+                sm.push_back(RowSample{inv_temp, top_p, seed, uint32_t(P + g)});
+            }
+            e.forward(segs, next.data(), sm.data(), out, false);
+            for (int s = 0; s < S; ++s) {
+                next[size_t(s)] = out[size_t(s)].tok;
+                said[size_t(s)].push_back(next[size_t(s)]);
+            }
         }
     }
     QW38_CK(cudaStreamSynchronize(e.stream));
@@ -255,13 +364,16 @@ int main(int argc, char** argv) {
     const double pf_ms = std::chrono::duration<double, std::milli>(t_pf1 - t_pf0).count();
     const double dec_ms = std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count();
     if (rank == 0) {
-        std::fprintf(stderr, "# g6m4_qw38 TP=%d P=%d gen=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s)\n",
-                     G6_NR, P, gen, pf_ms, P / (pf_ms / 1e3 + 1e-9), dec_ms,
-                     gen > 1 ? ((gen - 1) / (dec_ms / 1e3 + 1e-9)) : 0.0);
+        const double tps_s = gen > 1 ? ((gen - 1) / (dec_ms / 1e3 + 1e-9)) : 0.0;
+        std::fprintf(stderr, "# g6m4_qw38 TP=%d P=%d gen=%d sess=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s/sess, %.2f agg tok/s)\n",
+                     G6_NR, P, gen, S, pf_ms, (P * S) / (pf_ms / 1e3 + 1e-9), dec_ms, tps_s, tps_s * S);
         if (e.o.profile) e.prof.print(rank);
-        std::printf("session 0:");
-        for (int t : said) std::printf(" %d", t);
-        std::printf("\n");
+        for (int s = 0; s < S; ++s) {
+            std::printf("session %d:", s);
+            for (int t : said[size_t(s)]) std::printf(" %d", t);
+            std::printf("\n");
+        }
     }
+    if (G6_NR > 1) wire.fab.stop_proxy();
     return 0;
 }

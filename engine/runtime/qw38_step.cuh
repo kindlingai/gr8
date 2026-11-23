@@ -353,8 +353,10 @@ struct Engine {
     int* d_pos = nullptr;                 // [max_rows]
 
     // Fabric callbacks (set by g6m4_qw38; nullptr on m4sim_qw38 where all ranks are already in `parts`)
+    std::function<void(int M, bool skip_head)> step_begin;
     std::function<void(int c, __nv_bfloat16* parts, size_t bytes)> gather_dev;
     std::function<void(int c, uint8_t* host_parts, size_t bytes)> gather_host;
+    std::function<void()> step_end;
 
     ProfileAccum prof;
     cudaEvent_t ev0 = nullptr, ev1 = nullptr;
@@ -774,6 +776,9 @@ struct Engine {
         QW38_CK(cudaMemcpyAsync(d_slot, h_slot.data(), size_t(M) * 4, cudaMemcpyHostToDevice, stream));
         QW38_CK(cudaMemcpyAsync(d_pos, h_pos.data(), size_t(M) * 4, cudaMemcpyHostToDevice, stream));
 
+        // 0a. Notify multi-collective fabric step start (single enqueue_step for all 2*L+1 collectives on TP>=2)
+        if (step_begin) step_begin(M, skip_head);
+
         // 0. Kick off async PLE NVMe fetch BEFORE Layer 0 GPU compute so it overlaps completely behind Layer 0!
         bool ple_in_flight = false;
         if (has_ple && o.ple_async && ple_thr.joinable()) {
@@ -901,6 +906,7 @@ struct Engine {
         }
 
         if (skip_head) {
+            if (step_end) step_end();
             if (o.profile) { ++prof.steps; prof.tokens += M; }
             return;
         }
@@ -928,6 +934,7 @@ struct Engine {
         }
         QW38_CK(cudaStreamSynchronize(stream));
         if (o.nr > 1 && gather_host) gather_host(coll++, head_host_parts.data(), rank_pkt_bytes);
+        if (step_end) step_end();
 
         out.resize(size_t(M));
         for (int m = 0; m < M; ++m) {
