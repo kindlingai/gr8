@@ -365,20 +365,30 @@ struct Engine {
     qw38::PleState ple_st;
     qw38::PleScratch ple_sc;
     std::vector<std::array<int32_t, 2>> ple_ctx; // [slots][2] prior tokens (init to TOK_EOS)
-    __nv_bfloat16* ple_pinned = nullptr;         // [max_rows * 2560] pinned host staging (raw BF16 mode)
-    uint8_t* ple_codes_pinned = nullptr;         // [max_rows * 16 * row_bytes] pinned staging (row-trellis mode)
-    uint16_t* ple_svh_pinned = nullptr;          // [max_rows * 16] pinned row scales (row-trellis mode)
-    uint8_t* d_ple_codes = nullptr;              // device staging for compressed row-trellis rows
-    __half* d_ple_svh = nullptr;                 // device staging for row scales
-    __half* d_ple_suh = nullptr;                 // device column scales [nc] (uploaded once at init)
-    // Persistent background thread to overlap PLE NVMe fetch with Layer-0 GPU compute (GR8_QW38_PLE_ASYNC=1)
+    __nv_bfloat16* ple_pinned[2] = {nullptr, nullptr}; // double-buffered [max_rows * 2560] pinned host staging (raw BF16 mode)
+    uint8_t* ple_codes_pinned[2] = {nullptr, nullptr}; // double-buffered [max_rows * 16 * row_bytes] pinned staging (row-trellis mode)
+    uint16_t* ple_svh_pinned[2] = {nullptr, nullptr};  // double-buffered [max_rows * 16] pinned row scales (row-trellis mode)
+    uint8_t* d_ple_codes = nullptr;                    // device staging for compressed row-trellis rows
+    __half* d_ple_svh = nullptr;                       // device staging for row scales
+    __half* d_ple_suh = nullptr;                       // device column scales [nc] (uploaded once at init)
+    cudaEvent_t ple_h2d_done[2] = {nullptr, nullptr};
+    bool ple_h2d_pending[2] = {false, false};
+    int ple_active_buf = 0;
+    // Persistent background thread to overlap PLE NVMe fetch with GPU compute (GR8_QW38_PLE_ASYNC=1)
     std::thread ple_thr;
     std::mutex ple_mu;
     std::condition_variable ple_cv, ple_done_cv;
     bool ple_stop = false, ple_has_job = false, ple_job_done = true, ple_job_ok = true;
+    int ple_job_buf = 0;
     bool ple_job_is_prefetch = false;
     std::vector<uint64_t> ple_job_ids;
     std::vector<uint64_t> ple_next_pf_ids;
+    // Cross-chunk async prefetch tracking (never mutates ple_ctx until consumed by forward())
+    bool ple_pf_valid = false;
+    int ple_pf_buf = 0, ple_pf_slot = -1, ple_pf_pos0 = -1, ple_pf_len = 0;
+    uint64_t ple_pf_hash = 0;
+    std::array<int32_t, 2> ple_pf_ctx_in{geom::TOK_EOS, geom::TOK_EOS};
+    std::array<int32_t, 2> ple_pf_ctx_out{geom::TOK_EOS, geom::TOK_EOS};
 
     struct RankLayer {
         qw38::GdnWeights gdn_w;
@@ -502,9 +512,12 @@ struct Engine {
             ple_cv.notify_one();
             ple_thr.join();
         }
-        if (ple_pinned) cudaFreeHost(ple_pinned);
-        if (ple_codes_pinned) cudaFreeHost(ple_codes_pinned);
-        if (ple_svh_pinned) cudaFreeHost(ple_svh_pinned);
+        for (int b = 0; b < 2; ++b) {
+            if (ple_h2d_done[b]) cudaEventDestroy(ple_h2d_done[b]);
+            if (ple_pinned[b]) cudaFreeHost(ple_pinned[b]);
+            if (ple_codes_pinned[b]) cudaFreeHost(ple_codes_pinned[b]);
+            if (ple_svh_pinned[b]) cudaFreeHost(ple_svh_pinned[b]);
+        }
         if (d_ple_codes) cudaFree(d_ple_codes);
         if (d_ple_svh) cudaFree(d_ple_svh);
         if (d_ple_suh) cudaFree(d_ple_suh);
@@ -656,15 +669,23 @@ struct Engine {
             if (ple_store.is_row_trellis()) {
                 const size_t max_ple_rows = size_t(o.max_rows) * geom::PLE_HEADS;
                 const size_t rb = ple_store.row_bytes();
-                QW38_CK(cudaHostAlloc(&ple_codes_pinned, max_ple_rows * rb, cudaHostAllocDefault));
-                QW38_CK(cudaHostAlloc(&ple_svh_pinned, max_ple_rows * sizeof(uint16_t), cudaHostAllocDefault));
+                for (int b = 0; b < 2; ++b) {
+                    QW38_CK(cudaHostAlloc(&ple_codes_pinned[b], max_ple_rows * rb, cudaHostAllocDefault));
+                    QW38_CK(cudaHostAlloc(&ple_svh_pinned[b], max_ple_rows * sizeof(uint16_t), cudaHostAllocDefault));
+                }
                 d_ple_codes = dalloc<uint8_t>(max_ple_rows * rb);
                 d_ple_svh = dalloc<__half>(max_ple_rows);
                 d_ple_suh = dalloc<__half>(ple_store.suh().size());
                 QW38_CK(cudaMemcpy(d_ple_suh, ple_store.suh().data(), ple_store.suh().size() * sizeof(uint16_t),
                                    cudaMemcpyHostToDevice));
             } else {
-                QW38_CK(cudaHostAlloc(&ple_pinned, size_t(o.max_rows) * geom::PLE_DIM * 2, cudaHostAllocDefault));
+                for (int b = 0; b < 2; ++b) {
+                    QW38_CK(cudaHostAlloc(&ple_pinned[b], size_t(o.max_rows) * geom::PLE_DIM * 2, cudaHostAllocDefault));
+                }
+            }
+            for (int b = 0; b < 2; ++b) {
+                QW38_CK(cudaEventCreateWithFlags(&ple_h2d_done[b], cudaEventDisableTiming));
+                ple_h2d_pending[b] = false;
             }
             if (o.ple_async) {
                 ple_thr = std::thread([this]() {
@@ -673,15 +694,16 @@ struct Engine {
                         ple_cv.wait(lk, [&]() { return ple_has_job; });
                         if (ple_stop) return;
                         ple_has_job = false;
+                        const int buf = ple_job_buf;
                         const bool is_pf = ple_job_is_prefetch;
                         lk.unlock();
                         const bool ok = is_pf
                             ? ple_store.prefetch_rows(ple_job_ids.data(), ple_job_ids.size())
                             : (ple_store.is_row_trellis()
                                    ? ple_store.fetch_trellis_rows(ple_job_ids.data(), ple_job_ids.size(),
-                                                                  ple_codes_pinned, ple_svh_pinned)
+                                                                  ple_codes_pinned[buf], ple_svh_pinned[buf])
                                    : ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
-                                                          reinterpret_cast<uint8_t*>(ple_pinned)));
+                                                          reinterpret_cast<uint8_t*>(ple_pinned[buf])));
                         lk.lock();
                         ple_job_ok = ok;
                         ple_job_done = true;
@@ -1002,10 +1024,10 @@ struct Engine {
         moe_sc.topk_w = dalloc<float>(M * geom::TOPK);
         moe_sc.d_n_groups = dalloc<int>(1);
         moe_sc.grp_exp = dalloc<int>(M * geom::TOPK);
-        moe_sc.grp_off = dalloc<int>(M * geom::TOPK);
         moe_sc.grp_cnt = dalloc<int>(M * geom::TOPK);
+        moe_sc.grp_off = dalloc<int>(M * geom::TOPK);
         moe_sc.grp_routes = dalloc<int>(M * geom::TOPK * 8);
-        moe_sc.x_had = dalloc<float>(M * geom::HID);
+        moe_sc.x_had = dalloc<__half>(M * geom::HID);
         moe_sc.fc1_part = dalloc<float>(8 * geom::TOPK * size_t(g6nr::EB) * 2 * 2 * 128);
         moe_sc.fc1_act = dalloc<__half>(M * geom::TOPK * size_t(g6nr::EB) * 128);
         moe_sc.fc2_part = dalloc<float>(M * geom::TOPK * geom::HID);
@@ -1071,6 +1093,59 @@ struct Engine {
         }
     }
 
+    static uint64_t ple_tok_hash(const int* toks, int len) {
+        uint64_t h = 14695981039346656037ULL;
+        for (int i = 0; i < len; ++i) {
+            h ^= static_cast<uint64_t>(static_cast<uint32_t>(toks[i]));
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    void ple_wait_h2d(int buf) {
+        if (ple_h2d_pending[buf]) {
+            QW38_CK(cudaEventSynchronize(ple_h2d_done[buf]));
+            ple_h2d_pending[buf] = false;
+        }
+    }
+
+    void ple_wait_job() {
+        std::unique_lock<std::mutex> lk(ple_mu);
+        ple_done_cv.wait(lk, [&]() { return ple_job_done; });
+    }
+
+    // Kick off next prefill chunk's PLE NVMe fetch into the alternate pinned buffer so it overlaps
+    // behind the current chunk's Layers 1..47 GPU compute. Never mutates ple_ctx until consumed.
+    void ple_prefetch_next(int slot, int pos0, const int* toks, int len) {
+        if (!has_ple || !o.ple_async || !ple_thr.joinable()) return;
+        if (slot < 0 || slot >= o.slots || len <= 0 || len > o.max_rows || !toks) return;
+        ple_wait_job();
+        const int buf = 1 - ple_active_buf;
+        ple_wait_h2d(buf);
+        const std::array<int32_t, 2> ctx_in = (pos0 == 0)
+            ? std::array<int32_t, 2>{geom::TOK_EOS, geom::TOK_EOS}
+            : ple_ctx[size_t(slot)];
+        std::array<int32_t, 2> ctx_tmp = ctx_in;
+        ple_job_ids.resize(size_t(len) * geom::PLE_HEADS);
+        ple_store.compute_ids(toks, len, ctx_tmp.data(), true, ple_job_ids.data());
+        ple_pf_valid = true;
+        ple_pf_buf = buf;
+        ple_pf_slot = slot;
+        ple_pf_pos0 = pos0;
+        ple_pf_len = len;
+        ple_pf_hash = ple_tok_hash(toks, len);
+        ple_pf_ctx_in = ctx_in;
+        ple_pf_ctx_out = ctx_tmp;
+        {
+            std::lock_guard<std::mutex> lk(ple_mu);
+            ple_job_buf = buf;
+            ple_job_is_prefetch = false;
+            ple_job_done = false;
+            ple_has_job = true;
+        }
+        ple_cv.notify_one();
+    }
+
     // Stage next prefill chunk's PLE row IDs so ple_thr warms PleRowCache during Layers 1..47 of this chunk.
     void stage_ple_prefetch(const int* toks, int n, int32_t ctx0, int32_t ctx1) {
         if (!has_ple || !o.ple_async || !ple_thr.joinable() || n <= 0) return;
@@ -1134,29 +1209,50 @@ struct Engine {
             ple_toks = ple_tok_buf.data();
         }
 
-        // 0b. Kick off async PLE NVMe fetch BEFORE Layer 0 GPU compute so it overlaps completely behind Layer 0!
+        // 0b. Consume cross-chunk PLE prefetch if it matches, else kick off async PLE NVMe fetch
+        //     into the alternate double buffer BEFORE Layer 0 GPU compute!
         bool ple_in_flight = false;
+        int ple_cur_buf = 0;
         if (has_ple && o.ple_async && ple_thr.joinable()) {
-            {
-                // Drain any prior chunk's background cross-chunk prefetch before overwriting ple_job_ids.
-                std::unique_lock<std::mutex> lk(ple_mu);
-                ple_done_cv.wait(lk, [&]() { return ple_job_done; });
+            bool pf_hit = false;
+            if (ple_pf_valid && vis_n == 0 && segs.size() == 1 && segs[0].row0 == 0 &&
+                segs[0].slot == ple_pf_slot && segs[0].pos0 == ple_pf_pos0 && segs[0].len == ple_pf_len) {
+                const std::array<int32_t, 2> cur_ctx = (segs[0].pos0 == 0)
+                    ? std::array<int32_t, 2>{geom::TOK_EOS, geom::TOK_EOS}
+                    : ple_ctx[size_t(segs[0].slot)];
+                if (cur_ctx == ple_pf_ctx_in && ple_tok_hash(ple_toks, M) == ple_pf_hash) {
+                    pf_hit = true;
+                }
             }
-            ple_job_ids.resize(size_t(M) * geom::PLE_HEADS);
-            for (const auto& g : segs) {
-                if (g.len <= 0) continue;
-                if (g.pos0 == 0) ple_ctx[size_t(g.slot)] = {geom::TOK_EOS, geom::TOK_EOS};
-                ple_store.compute_ids(ple_toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
-                                      ple_job_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
+            if (pf_hit) {
+                ple_ctx[size_t(segs[0].slot)] = ple_pf_ctx_out;
+                ple_cur_buf = ple_pf_buf;
+                ple_active_buf = ple_cur_buf;
+                ple_pf_valid = false;
+                ple_in_flight = true;
+            } else {
+                ple_wait_job();
+                ple_pf_valid = false;
+                ple_cur_buf = 1 - ple_active_buf;
+                ple_active_buf = ple_cur_buf;
+                ple_wait_h2d(ple_cur_buf);
+                ple_job_ids.resize(size_t(M) * geom::PLE_HEADS);
+                for (const auto& g : segs) {
+                    if (g.len <= 0) continue;
+                    if (g.pos0 == 0) ple_ctx[size_t(g.slot)] = {geom::TOK_EOS, geom::TOK_EOS};
+                    ple_store.compute_ids(ple_toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
+                                          ple_job_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(ple_mu);
+                    ple_job_buf = ple_cur_buf;
+                    ple_job_is_prefetch = false;
+                    ple_job_done = false;
+                    ple_has_job = true;
+                }
+                ple_cv.notify_one();
+                ple_in_flight = true;
             }
-            {
-                std::lock_guard<std::mutex> lk(ple_mu);
-                ple_job_is_prefetch = false;
-                ple_job_done = false;
-                ple_has_job = true;
-            }
-            ple_cv.notify_one();
-            ple_in_flight = true;
         }
 
         auto finish_ple_io = [&]() {
@@ -1176,6 +1272,9 @@ struct Engine {
                     ple_cv.notify_one();
                 }
             } else {
+                ple_cur_buf = 1 - ple_active_buf;
+                ple_active_buf = ple_cur_buf;
+                ple_wait_h2d(ple_cur_buf);
                 std::vector<uint64_t> all_ids(size_t(M) * geom::PLE_HEADS);
                 for (const auto& g : segs) {
                     if (g.len <= 0) continue;
@@ -1184,10 +1283,12 @@ struct Engine {
                                           all_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
                 }
                 if (ple_store.is_row_trellis()) {
-                    if (!ple_store.fetch_trellis_rows(all_ids.data(), all_ids.size(), ple_codes_pinned, ple_svh_pinned))
+                    if (!ple_store.fetch_trellis_rows(all_ids.data(), all_ids.size(),
+                                                      ple_codes_pinned[ple_cur_buf], ple_svh_pinned[ple_cur_buf]))
                         die("PLE fetch_trellis_rows failed");
                 } else {
-                    if (!ple_store.fetch_rows(all_ids.data(), all_ids.size(), reinterpret_cast<uint8_t*>(ple_pinned)))
+                    if (!ple_store.fetch_rows(all_ids.data(), all_ids.size(),
+                                              reinterpret_cast<uint8_t*>(ple_pinned[ple_cur_buf])))
                         die("PLE fetch_rows failed");
                 }
             }
@@ -1198,14 +1299,16 @@ struct Engine {
         auto upload_ple_to_dev = [&]() {
             if (ple_store.is_row_trellis()) {
                 const size_t n_ple_rows = size_t(M) * geom::PLE_HEADS;
-                QW38_CK(cudaMemcpyAsync(d_ple_codes, ple_codes_pinned, n_ple_rows * ple_store.row_bytes(),
+                QW38_CK(cudaMemcpyAsync(d_ple_codes, ple_codes_pinned[ple_cur_buf], n_ple_rows * ple_store.row_bytes(),
                                         cudaMemcpyHostToDevice, stream));
-                QW38_CK(cudaMemcpyAsync(d_ple_svh, ple_svh_pinned, n_ple_rows * sizeof(uint16_t),
+                QW38_CK(cudaMemcpyAsync(d_ple_svh, ple_svh_pinned[ple_cur_buf], n_ple_rows * sizeof(uint16_t),
                                         cudaMemcpyHostToDevice, stream));
             } else {
-                QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2,
+                QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned[ple_cur_buf], size_t(M) * geom::PLE_DIM * 2,
                                         cudaMemcpyHostToDevice, stream));
             }
+            QW38_CK(cudaEventRecord(ple_h2d_done[ple_cur_buf], stream));
+            ple_h2d_pending[ple_cur_buf] = true;
         };
 
         auto run_ple_gpu = [&]() {
@@ -1262,8 +1365,13 @@ struct Engine {
             }
         };
 
-        auto run_head_gpu = [&]() {
-            qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
+        auto run_head_gpu = [&](bool fuse_prev_inject = false) {
+            if (M > 12 && fuse_prev_inject) {
+                qw38::hc_prepare_prefill_fused(blas, final_hc, hyper, mixed, hc_sc, M,
+                                               parts, o.nr, part_stride, stream);
+            } else {
+                qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
+            }
             constexpr int HEAD_CHUNK = 256;
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
@@ -1400,9 +1508,16 @@ struct Engine {
         };
 
         int coll = 0;
+        bool pending_inject = false;
         for (size_t li = 0; li < L.size(); ++li) {
             Layer& y = L[li];
             if (geom::is_ple(y.l) && has_ple) {
+                if (pending_inject) {
+                    t_start();
+                    qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                    t_end(prof.hc_ms);
+                    pending_inject = false;
+                }
                 finish_ple_io();
                 t_start();
                 upload_ple_to_dev();
@@ -1411,7 +1526,13 @@ struct Engine {
             }
 
             t_start();
-            qw38::hc_prepare(blas, y.attn_hc, hyper, mixed, hc_sc, M, stream);
+            if (M > 12) {
+                qw38::hc_prepare_prefill_fused(blas, y.attn_hc, hyper, mixed, hc_sc, M,
+                                               pending_inject ? parts : nullptr, o.nr, part_stride, stream);
+                pending_inject = false;
+            } else {
+                qw38::hc_prepare(blas, y.attn_hc, hyper, mixed, hc_sc, M, stream);
+            }
             t_end(prof.hc_ms);
 
             t_start();
@@ -1440,13 +1561,23 @@ struct Engine {
                 else ++coll;
                 t_end(prof.ar_ms);
 
-                t_start();
-                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
-                t_end(prof.hc_ms);
+                if (M > 12) {
+                    pending_inject = true;
+                } else {
+                    t_start();
+                    qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                    t_end(prof.hc_ms);
+                }
             }
 
             t_start();
-            qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
+            if (M > 12) {
+                qw38::hc_prepare_prefill_fused(blas, y.mlp_hc, hyper, mixed, hc_sc, M,
+                                               pending_inject ? parts : nullptr, o.nr, part_stride, stream);
+                pending_inject = false;
+            } else {
+                qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
+            }
             t_end(prof.hc_ms);
 
             t_start();
@@ -1468,20 +1599,31 @@ struct Engine {
                 else ++coll;
                 t_end(prof.ar_ms);
 
-                t_start();
-                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
-                t_end(prof.hc_ms);
+                if (M > 12) {
+                    pending_inject = true;
+                } else {
+                    t_start();
+                    qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                    t_end(prof.hc_ms);
+                }
             }
         }
 
         if (skip_head) {
+            if (pending_inject) {
+                t_start();
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                t_end(prof.hc_ms);
+                pending_inject = false;
+            }
             if (step_end) step_end();
             if (o.profile) { ++prof.steps; prof.tokens += M; }
             return;
         }
 
         t_start();
-        run_head_gpu();
+        run_head_gpu(pending_inject);
+        pending_inject = false;
         QW38_CK(cudaStreamSynchronize(stream));
         if (o.nr > 1 && gather_host) gather_host(coll++, head_host_parts, rank_pkt_bytes);
         if (step_end) step_end();
@@ -1568,9 +1710,9 @@ struct Engine {
                 qw38::gemm_bf16_nt(blas, len, geom::IDX_PROJ_OUT, geom::HID, mixed, aw.idx_qk_proj, attn_sc.idx_qk);
             }
             qw38::k_qw38_kv_write<<<len * nh_kv, 256, 0, stream>>>(attn_sc.k, attn_sc.v, aw.k_norm, d_slot, d_pos, kv.kv_pages, len, nh_kv, max_pps, geom::RMS_EPS, d_rope);
-            qw38::k_qsa_k_update_seg<<<1, 128, 0, stream>>>(attn_sc.idx_qk, aw.idx_k_norm, kv.idx_raw, nullptr, kv.idx_pages,
-                                                            max_pps, seg.slot, seg.row0, seg.pos0, seg.len, 0, geom::RMS_EPS,
-                                                            kv.idx_raw_thw, nullptr, d_rope);
+            qw38::qsa_k_update_seg_fast(attn_sc.idx_qk, aw.idx_k_norm, kv.idx_raw, nullptr, kv.idx_pages,
+                                        max_pps, seg.slot, seg.row0, seg.pos0, seg.len, 0, geom::RMS_EPS, stream,
+                                        kv.idx_raw_thw, nullptr, d_rope);
         }
     }
 

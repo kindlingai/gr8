@@ -1275,8 +1275,8 @@ inline void gdn_forward(cublasHandle_t blas, const GdnWeights& w, GdnLayerState&
     const int v0 = geom::gdn_v0(nr, rank);
     const int qkv_dim = geom::gdn_qkv_local(nr, rank);
 
-    // 1. Input projections (coalesced FP8/BF16 uint4 GEMV for M <= 16, cuBLAS tensor cores for M > 16)
-    if ((M <= 16 && w.fp8_qkv.q) || M <= 8) {
+    // 1. Input projections (coalesced FP8/BF16 uint4 GEMV for M <= 20, cuBLAS tensor cores for M > 20)
+    if ((M <= 20 && w.fp8_qkv.q) || M <= 8) {
         if (w.fp8_qkv.q) {
             launch_fp8_gemv_smallm<false>(x, w.fp8_qkv, sc.qkv_raw, M, st);
             launch_fp8_gemv_smallm<false>(x, w.fp8_z, sc.z, M, st);
@@ -1289,7 +1289,8 @@ inline void gdn_forward(cublasHandle_t blas, const GdnWeights& w, GdnLayerState&
         else if (M <= 4) k_gdn_in_proj_ab<4><<<ab_grid, 128, 0, st>>>(x, w.in_proj_a, w.in_proj_b, sc.a, sc.b, M, nh_v);
         else if (M <= 8) k_gdn_in_proj_ab<8><<<ab_grid, 128, 0, st>>>(x, w.in_proj_a, w.in_proj_b, sc.a, sc.b, M, nh_v);
         else if (M <= 12) k_gdn_in_proj_ab<12><<<ab_grid, 128, 0, st>>>(x, w.in_proj_a, w.in_proj_b, sc.a, sc.b, M, nh_v);
-        else k_gdn_in_proj_ab<16><<<ab_grid, 128, 0, st>>>(x, w.in_proj_a, w.in_proj_b, sc.a, sc.b, M, nh_v);
+        else if (M <= 16) k_gdn_in_proj_ab<16><<<ab_grid, 128, 0, st>>>(x, w.in_proj_a, w.in_proj_b, sc.a, sc.b, M, nh_v);
+        else k_gdn_in_proj_ab<20><<<ab_grid, 128, 0, st>>>(x, w.in_proj_a, w.in_proj_b, sc.a, sc.b, M, nh_v);
     } else {
         cublasSetStream(blas, st);
         gemm_bf16_nt(blas, M, qkv_dim, geom::HID, x, w.in_proj_qkv, sc.qkv_raw);
@@ -1358,7 +1359,7 @@ inline void gdn_forward(cublasHandle_t blas, const GdnWeights& w, GdnLayerState&
     }
 
     // 3. Output projection
-    if ((M <= 16 && w.fp8_out.q) || M <= 8) {
+    if ((M <= 20 && w.fp8_out.q) || M <= 8) {
         if (w.fp8_out.q) {
             launch_fp8_gemv_smallm<false>(sc.core, w.fp8_out, out_part, M, st);
         } else {

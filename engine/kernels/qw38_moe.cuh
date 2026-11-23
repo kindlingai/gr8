@@ -59,10 +59,10 @@ struct MoeScratch {
     // Grouped routing buffers for PMCGX routed experts:
     int* d_n_groups = nullptr;         // [1] INT32
     int* grp_exp = nullptr;            // [max_M * 10] INT32
-    int* grp_off = nullptr;            // [max_M * 10] INT32 (packed route offset for prefill G=32/48)
     int* grp_cnt = nullptr;            // [max_M * 10] INT32
-    int* grp_routes = nullptr;         // [max_M * 10 * 8] INT32 (or packed [max_M * 10] for prefill)
-    float* x_had = nullptr;            // [max_M, 2560] FP32 (pre-rotated H128(x * sg_in) for prefill)
+    int* grp_off = nullptr;            // [max_M * 10] INT32 (prefill compact group route offset)
+    int* grp_routes = nullptr;         // [max_M * 10 * 8] INT32
+    __half* x_had = nullptr;           // [max_M, 2560] FP16 (pre-rotated H128(x * t_sg_in) for prefill)
     // Per-route intermediate activations & outputs:
     float* fc1_part = nullptr;         // [8 * 10 * g6nr::EB * 2 * 2 * 128] FP32 (for M <= 8 KS=2 path)
     __half* fc1_act = nullptr;         // [max_M * 10, g6nr::EB, 128] FP16 (post silu(g)*u, H128(act*suh_d) ready!)
@@ -928,6 +928,605 @@ __global__ void k_qw38_moe_combine_det(const float* __restrict__ fc2_part,
     }
 }
 
+// =================================================================================================
+// Prefill Wide-Load Grouped PMCGX MoE (M >= 32, wide == 1):
+//   1. k_qw38_moe_prerot_x: pre-rotate H128(x * t_sg_in) ONCE per token (saves 19x redundant had128)
+//   2. k_qw38_moe_build_groups_pf<PF_GRP>: pack routes into <= PF_GRP groups (32 for eb<=4, 16 for eb>4)
+//   3. k_qw38_moe_fc1_pf_wide<PF_GRP>: 2-pass wide FC1 (4x weight reuse per load vs 8-row groups)
+//   4. k_qw38_moe_fc2_multi_hb_dyn<PF_GRP, HB_PER_CTA>: multi-HB FC2 loading fc1_act ONCE into dyn smem,
+//      fusing b-loop before single had128 via 2.2 KB y_raw[8][136] slice buffer, writing FP16 fc2_part_h
+//   5. k_qw38_moe_combine_det_h16: deterministic FP16 route reduction + gated shared expert
+// =================================================================================================
+template <int PF_GRP>
+__global__ void k_qw38_moe_build_groups_pf(const int* __restrict__ topk_idx,
+                                           int* __restrict__ d_n_groups,
+                                           int* __restrict__ grp_exp,
+                                           int* __restrict__ grp_cnt,
+                                           int* __restrict__ grp_off,
+                                           int* __restrict__ grp_routes,
+                                           int n_routes) {
+    constexpr int NE = geom::NEXP;
+    const int tid = threadIdx.x; // 0..511
+    const int lane = tid & 31, warp = tid >> 5;
+
+    __shared__ int cnt[NE];
+    __shared__ int g_off[NE];
+    __shared__ int r_off[NE];
+    __shared__ int cur[NE];
+    __shared__ int gwsum[16];
+    __shared__ int rwsum[16];
+
+    cnt[tid] = 0;
+    cur[tid] = 0;
+    __syncthreads();
+
+    for (int r = tid; r < n_routes; r += NE) {
+        atomicAdd(&cnt[topk_idx[r]], 1);
+    }
+    __syncthreads();
+
+    const int c = cnt[tid];
+    const int ng = (c + PF_GRP - 1) / PF_GRP;
+
+    // Exclusive prefix sums of ng and c across 512 experts (16 warps x 32 lanes)
+    int gval = ng, rval = c;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const int gn = __shfl_up_sync(0xffffffffu, gval, off);
+        const int rn = __shfl_up_sync(0xffffffffu, rval, off);
+        if (lane >= off) { gval += gn; rval += rn; }
+    }
+    if (lane == 31) { gwsum[warp] = gval; rwsum[warp] = rval; }
+    __syncthreads();
+    if (warp == 0) {
+        int gw = (lane < 16) ? gwsum[lane] : 0;
+        int rw = (lane < 16) ? rwsum[lane] : 0;
+        #pragma unroll
+        for (int off = 1; off < 16; off <<= 1) {
+            const int gn = __shfl_up_sync(0xffffffffu, gw, off);
+            const int rn = __shfl_up_sync(0xffffffffu, rw, off);
+            if (lane >= off) { gw += gn; rw += rn; }
+        }
+        if (lane < 16) { gwsum[lane] = gw; rwsum[lane] = rw; }
+    }
+    __syncthreads();
+
+    const int gb = (warp > 0 ? gwsum[warp - 1] : 0) + (gval - ng);
+    const int rb = (warp > 0 ? rwsum[warp - 1] : 0) + (rval - c);
+    g_off[tid] = gb;
+    r_off[tid] = rb;
+    if (tid == NE - 1) d_n_groups[0] = gb + ng;
+
+    for (int k = 0; k < ng; ++k) {
+        const int g = gb + k;
+        grp_exp[g] = tid;
+        grp_off[g] = rb + k * PF_GRP;
+        grp_cnt[g] = min(PF_GRP, c - k * PF_GRP);
+    }
+    __syncthreads();
+
+    for (int r = tid; r < n_routes; r += NE) {
+        const int e = topk_idx[r];
+        const int pos = atomicAdd(&cur[e], 1);
+        grp_routes[r_off[e] + pos] = r;
+    }
+}
+
+__global__ void k_qw38_moe_prerot_x(const __nv_bfloat16* __restrict__ x_in,
+                                    const __half* __restrict__ t_sg,
+                                    __half* __restrict__ x_had,
+                                    int M) {
+    const int idx = blockIdx.x;
+    const int hb = idx % geom::HB;
+    const int t = idx / geom::HB;
+    if (t >= M) return;
+    const int lane = threadIdx.x;
+    const __nv_bfloat16* xh = x_in + static_cast<size_t>(t) * geom::HID + hb * 128 + lane * 4;
+    const uint2 xv = *reinterpret_cast<const uint2*>(xh);
+    const uint2 sv = *reinterpret_cast<const uint2*>(t_sg + hb * 128 + lane * 4);
+    const float2 xf0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+    const float2 xf1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+    const float2 sf0 = __half22float2(*reinterpret_cast<const __half2*>(&sv.x));
+    const float2 sf1 = __half22float2(*reinterpret_cast<const __half2*>(&sv.y));
+    float vx[4] = {xf0.x * sf0.x, xf0.y * sf0.y, xf1.x * sf1.x, xf1.y * sf1.y};
+    had128(vx, lane);
+    uint2 ov;
+    *reinterpret_cast<__half2*>(&ov.x) = __floats2half2_rn(vx[0], vx[1]);
+    *reinterpret_cast<__half2*>(&ov.y) = __floats2half2_rn(vx[2], vx[3]);
+    *reinterpret_cast<uint2*>(x_had + (static_cast<size_t>(t) * geom::HB + hb) * 128 + lane * 4) = ov;
+}
+
+template <int BITS, int PF_SLICES, int PF_GRP>
+__device__ __forceinline__ void pmcgx_fc1_hb_wide_pf(const uint8_t* mw, int hb, int warp, int lane,
+                                                     const __half (&x_rot)[PF_GRP][136], int cnt, int ns,
+                                                     float (&c)[PF_SLICES][4]) {
+    const int row0 = lane >> 2, col = lane & 3;
+    const int prev_lane = (lane + 31) & 31;
+    if constexpr (BITS == 4) {
+        const uint8_t* g4 = mw + static_cast<size_t>(hb) * TR4W_GROUP + (warp * 2) * 512 + lane * 16;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint4 wh = tr4w_ld128(g4 + h * 512);
+            const u32 w[4] = {wh.x, wh.y, wh.z, wh.w};
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const u32 ch = w[p];
+                const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+                u32 f0[2], f1[2];
+                Tr3Lane<4, true, TR3_PMCGX>::decode_m((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
+                const int kp = h * 4 + p;
+                #pragma unroll
+                for (int s = 0; s < PF_SLICES; ++s) {
+                    if (s < ns) {
+                        const int r = s * 8 + row0;
+                        const u32 b0 = (r < cnt) ? *reinterpret_cast<const u32*>(x_rot[r] + kp * 16 + 2 * col) : 0u;
+                        const u32 b1 = (r < cnt) ? *reinterpret_cast<const u32*>(x_rot[r] + kp * 16 + 2 * col + 8) : 0u;
+                        mma16816(c[s], f0[0], f1[0], f0[1], f1[1], b0, b1);
+                    }
+                }
+            }
+        }
+    } else {
+        const uint8_t* g0 = mw + static_cast<size_t>(hb) * (2048 * BITS) + static_cast<size_t>(warp) * 256 + lane * 8;
+        u64 w[3] = {0, 0, 0};
+        #pragma unroll
+        for (int n = 0; n < BITS; ++n) w[n] = ld_nc64(g0 + n * 2048);
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const u32 ch = trw_chunk<BITS>(w, p);
+            const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            u32 f0[2], f1[2];
+            Tr3Lane<BITS, true, TR3_PMCGX>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
+            #pragma unroll
+            for (int s = 0; s < PF_SLICES; ++s) {
+                if (s < ns) {
+                    const int r = s * 8 + row0;
+                    const u32 b0 = (r < cnt) ? *reinterpret_cast<const u32*>(x_rot[r] + p * 16 + 2 * col) : 0u;
+                    const u32 b1 = (r < cnt) ? *reinterpret_cast<const u32*>(x_rot[r] + p * 16 + 2 * col + 8) : 0u;
+                    mma16816(c[s], f0[0], f1[0], f0[1], f1[1], b0, b1);
+                }
+            }
+        }
+    }
+}
+
+template <int PF_SLICES, int PF_GRP>
+__device__ __forceinline__ void pmcgx_fc1_hb_wide_pf_disp(const uint8_t* mw, int bits, int hb, int warp, int lane,
+                                                          const __half (&x_rot)[PF_GRP][136], int cnt, int ns,
+                                                          float (&c)[PF_SLICES][4]) {
+    if (bits == 3) pmcgx_fc1_hb_wide_pf<3, PF_SLICES, PF_GRP>(mw, hb, warp, lane, x_rot, cnt, ns, c);
+    else if (bits == 4) pmcgx_fc1_hb_wide_pf<4, PF_SLICES, PF_GRP>(mw, hb, warp, lane, x_rot, cnt, ns, c);
+    else pmcgx_fc1_hb_wide_pf<2, PF_SLICES, PF_GRP>(mw, hb, warp, lane, x_rot, cnt, ns, c);
+}
+
+template <int PF_GRP>
+__global__ void __launch_bounds__(256, 2) k_qw38_moe_fc1_pf_wide(
+    const __half* __restrict__ x_had,
+    const int* __restrict__ d_n_groups,
+    const int* __restrict__ grp_exp,
+    const int* __restrict__ grp_cnt,
+    const int* __restrict__ grp_off,
+    const int* __restrict__ grp_routes,
+    const long long* __restrict__ t_tab,
+    const long long* __restrict__ t_kmix,
+    const uint8_t* __restrict__ t_fc1,
+    const uint8_t* const* __restrict__ t_ptab,
+    const __half* __restrict__ t_v1b,
+    const __half* __restrict__ t_v2,
+    __half* __restrict__ fc1_act,
+    int eb) {
+    constexpr int PF_SLICES = PF_GRP / 8;
+    const int idx = blockIdx.x;
+    const int b = idx % eb;
+    const int g = idx / eb;
+    if (g >= d_n_groups[0]) return;
+
+    const int e = grp_exp[g];
+    const long long* tr = t_tab + 6 * e;
+    if (b >= static_cast<int>(tr[3])) return;
+
+    const int cnt = grp_cnt[g];
+    const int ns = (cnt + 7) >> 3;
+    const int roff = grp_off[g];
+    const size_t brow = static_cast<size_t>(tr[2]) + b;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int row0 = lane >> 2, col = lane & 3;
+
+    __shared__ int s_tok[PF_GRP];
+    __shared__ int s_route[PF_GRP];
+    if (tid < cnt) {
+        const int r = grp_routes[roff + tid];
+        s_route[tid] = r;
+        s_tok[tid] = r / geom::TOPK;
+    }
+    __syncthreads();
+
+    __shared__ __half x_rot[PF_GRP][136];
+    __shared__ __half y_gate[PF_GRP][136];
+
+    // Pass 0: GATE
+    {
+        const uint8_t* mw = nullptr;
+        const int bits = tr3_fc1_unit(t_fc1, t_ptab, t_kmix, e, tr, 2 * b + 0, mw);
+        float c[PF_SLICES][4];
+        #pragma unroll
+        for (int s = 0; s < PF_SLICES; ++s) c[s][0] = c[s][1] = c[s][2] = c[s][3] = 0.f;
+
+        for (int hb = 0; hb < geom::HB; ++hb) {
+            const float bscale = __half2float(t_v1b[(brow * 2 + 0) * geom::HB + hb]);
+            const __half2 bsh = __float2half2_rn(bscale);
+            for (int r = warp; r < cnt; r += 8) {
+                const uint2 xv = *reinterpret_cast<const uint2*>(
+                    x_had + (static_cast<size_t>(s_tok[r]) * geom::HB + hb) * 128 + lane * 4);
+                uint2 ov;
+                *reinterpret_cast<__half2*>(&ov.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsh);
+                *reinterpret_cast<__half2*>(&ov.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsh);
+                *reinterpret_cast<uint2*>(x_rot[r] + lane * 4) = ov;
+            }
+            __syncthreads();
+            pmcgx_fc1_hb_wide_pf_disp<PF_SLICES, PF_GRP>(mw, bits, hb, warp, lane, x_rot, cnt, ns, c);
+            __syncthreads();
+        }
+
+        #pragma unroll
+        for (int s = 0; s < PF_SLICES; ++s) {
+            if (s < ns) {
+                const int t0 = s * 8 + 2 * col, t1 = t0 + 1;
+                if (t0 < cnt) {
+                    y_gate[t0][warp * 16 + row0] = __float2half_rn(c[s][0]);
+                    y_gate[t0][warp * 16 + row0 + 8] = __float2half_rn(c[s][2]);
+                }
+                if (t1 < cnt) {
+                    y_gate[t1][warp * 16 + row0] = __float2half_rn(c[s][1]);
+                    y_gate[t1][warp * 16 + row0 + 8] = __float2half_rn(c[s][3]);
+                }
+            }
+        }
+        __syncthreads();
+
+        const uint2 sgv = *reinterpret_cast<const uint2*>(t_v2 + (brow * 3 + 0) * 128 + lane * 4);
+        const float2 sg0 = __half22float2(*reinterpret_cast<const __half2*>(&sgv.x));
+        const float2 sg1 = __half22float2(*reinterpret_cast<const __half2*>(&sgv.y));
+        for (int r = warp; r < cnt; r += 8) {
+            const uint2 yv = *reinterpret_cast<const uint2*>(y_gate[r] + lane * 4);
+            const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&yv.x));
+            const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&yv.y));
+            float vg[4] = {f0.x, f0.y, f1.x, f1.y};
+            had128(vg, lane);
+            uint2 ov;
+            *reinterpret_cast<__half2*>(&ov.x) = __floats2half2_rn(vg[0] * sg0.x, vg[1] * sg0.y);
+            *reinterpret_cast<__half2*>(&ov.y) = __floats2half2_rn(vg[2] * sg1.x, vg[3] * sg1.y);
+            *reinterpret_cast<uint2*>(y_gate[r] + lane * 4) = ov;
+        }
+        __syncthreads();
+    }
+
+    // Pass 1: UP + silu(gate)*up * suh_d -> had128 -> fc1_act
+    {
+        const uint8_t* mw = nullptr;
+        const int bits = tr3_fc1_unit(t_fc1, t_ptab, t_kmix, e, tr, 2 * b + 1, mw);
+        float c[PF_SLICES][4];
+        #pragma unroll
+        for (int s = 0; s < PF_SLICES; ++s) c[s][0] = c[s][1] = c[s][2] = c[s][3] = 0.f;
+
+        for (int hb = 0; hb < geom::HB; ++hb) {
+            const float bscale = __half2float(t_v1b[(brow * 2 + 1) * geom::HB + hb]);
+            const __half2 bsh = __float2half2_rn(bscale);
+            for (int r = warp; r < cnt; r += 8) {
+                const uint2 xv = *reinterpret_cast<const uint2*>(
+                    x_had + (static_cast<size_t>(s_tok[r]) * geom::HB + hb) * 128 + lane * 4);
+                uint2 ov;
+                *reinterpret_cast<__half2*>(&ov.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsh);
+                *reinterpret_cast<__half2*>(&ov.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsh);
+                *reinterpret_cast<uint2*>(x_rot[r] + lane * 4) = ov;
+            }
+            __syncthreads();
+            pmcgx_fc1_hb_wide_pf_disp<PF_SLICES, PF_GRP>(mw, bits, hb, warp, lane, x_rot, cnt, ns, c);
+            __syncthreads();
+        }
+
+        #pragma unroll
+        for (int s = 0; s < PF_SLICES; ++s) {
+            if (s < ns) {
+                const int t0 = s * 8 + 2 * col, t1 = t0 + 1;
+                if (t0 < cnt) {
+                    x_rot[t0][warp * 16 + row0] = __float2half_rn(c[s][0]);
+                    x_rot[t0][warp * 16 + row0 + 8] = __float2half_rn(c[s][2]);
+                }
+                if (t1 < cnt) {
+                    x_rot[t1][warp * 16 + row0] = __float2half_rn(c[s][1]);
+                    x_rot[t1][warp * 16 + row0 + 8] = __float2half_rn(c[s][3]);
+                }
+            }
+        }
+        __syncthreads();
+
+        const uint2 suv = *reinterpret_cast<const uint2*>(t_v2 + (brow * 3 + 1) * 128 + lane * 4);
+        const uint2 sdv = *reinterpret_cast<const uint2*>(t_v2 + (brow * 3 + 2) * 128 + lane * 4);
+        const float2 su0 = __half22float2(*reinterpret_cast<const __half2*>(&suv.x));
+        const float2 su1 = __half22float2(*reinterpret_cast<const __half2*>(&suv.y));
+        const float2 sd0 = __half22float2(*reinterpret_cast<const __half2*>(&sdv.x));
+        const float2 sd1 = __half22float2(*reinterpret_cast<const __half2*>(&sdv.y));
+        const float su[4] = {su0.x, su0.y, su1.x, su1.y};
+        const float sd[4] = {sd0.x, sd0.y, sd1.x, sd1.y};
+
+        for (int r = warp; r < cnt; r += 8) {
+            const uint2 uv = *reinterpret_cast<const uint2*>(x_rot[r] + lane * 4);
+            const float2 uf0 = __half22float2(*reinterpret_cast<const __half2*>(&uv.x));
+            const float2 uf1 = __half22float2(*reinterpret_cast<const __half2*>(&uv.y));
+            float vu[4] = {uf0.x, uf0.y, uf1.x, uf1.y};
+            had128(vu, lane);
+
+            const uint2 gv = *reinterpret_cast<const uint2*>(y_gate[r] + lane * 4);
+            const float2 gf0 = __half22float2(*reinterpret_cast<const __half2*>(&gv.x));
+            const float2 gf1 = __half22float2(*reinterpret_cast<const __half2*>(&gv.y));
+            const float g_arr[4] = {gf0.x, gf0.y, gf1.x, gf1.y};
+
+            float va[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float u = __half2float(__float2half_rn(vu[i] * su[i]));
+                const float act = __half2float(__float2half_rn(silu_f(g_arr[i]) * u));
+                va[i] = act * sd[i];
+            }
+            had128(va, lane);
+            __half* dst = fc1_act + (static_cast<size_t>(s_route[r]) * eb + b) * 128 + lane * 4;
+            uint2 ov;
+            *reinterpret_cast<__half2*>(&ov.x) = __floats2half2_rn(va[0], va[1]);
+            *reinterpret_cast<__half2*>(&ov.y) = __floats2half2_rn(va[2], va[3]);
+            *reinterpret_cast<uint2*>(dst) = ov;
+        }
+    }
+}
+
+template <int BITS, int PF_SLICES, int X2_STRIDE>
+__device__ __forceinline__ void pmcgx_fc2_ntile_wide_pf(const uint8_t* mw, int n_tile, int lane,
+                                                        const __half* x2_b_base, int cnt, int ns,
+                                                        float (&c)[PF_SLICES][4]) {
+    const int row0 = lane >> 2, col = lane & 3;
+    const int prev_lane = (lane + 31) & 31;
+    if constexpr (BITS == 4) {
+        const uint8_t* wg4 = mw + static_cast<size_t>(n_tile) * TR4W_NT + lane * 16;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint4 wh = tr4w_ld128(wg4 + h * 512);
+            const u32 w[4] = {wh.x, wh.y, wh.z, wh.w};
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const u32 ch = w[p];
+                const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+                u32 f0[2], f1[2];
+                Tr3Lane<4, true, TR3_PMCGX>::decode_m((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
+                const int ks = h * 4 + p;
+                #pragma unroll
+                for (int s = 0; s < PF_SLICES; ++s) {
+                    if (s < ns) {
+                        const int r = s * 8 + row0;
+                        const __half* xr = x2_b_base + r * X2_STRIDE + ks * 16 + 2 * col;
+                        const u32 b0 = (r < cnt) ? *reinterpret_cast<const u32*>(xr) : 0u;
+                        const u32 b1 = (r < cnt) ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
+                        mma16816(c[s], f0[0], f1[0], f0[1], f1[1], b0, b1);
+                    }
+                }
+            }
+        }
+    } else {
+        const uint8_t* wg = mw + static_cast<size_t>(n_tile) * (8 * 32 * BITS) + lane * 8;
+        u64 w[3] = {0, 0, 0};
+        #pragma unroll
+        for (int n = 0; n < BITS; ++n) w[n] = ld_nc64(wg + n * 256);
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const u32 ch = trw_chunk<BITS>(w, p);
+            const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            u32 f0[2], f1[2];
+            Tr3Lane<BITS, true, TR3_PMCGX>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
+            #pragma unroll
+            for (int s = 0; s < PF_SLICES; ++s) {
+                if (s < ns) {
+                    const int r = s * 8 + row0;
+                    const __half* xr = x2_b_base + r * X2_STRIDE + p * 16 + 2 * col;
+                    const u32 b0 = (r < cnt) ? *reinterpret_cast<const u32*>(xr) : 0u;
+                    const u32 b1 = (r < cnt) ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
+                    mma16816(c[s], f0[0], f1[0], f0[1], f1[1], b0, b1);
+                }
+            }
+        }
+    }
+}
+
+template <int PF_SLICES, int X2_STRIDE>
+__device__ __forceinline__ void pmcgx_fc2_ntile_wide_pf_disp(const uint8_t* mw, int bits, int n_tile, int lane,
+                                                             const __half* x2_b_base, int cnt, int ns,
+                                                             float (&c)[PF_SLICES][4]) {
+    if (bits == 3) pmcgx_fc2_ntile_wide_pf<3, PF_SLICES, X2_STRIDE>(mw, n_tile, lane, x2_b_base, cnt, ns, c);
+    else if (bits == 4) pmcgx_fc2_ntile_wide_pf<4, PF_SLICES, X2_STRIDE>(mw, n_tile, lane, x2_b_base, cnt, ns, c);
+    else pmcgx_fc2_ntile_wide_pf<2, PF_SLICES, X2_STRIDE>(mw, n_tile, lane, x2_b_base, cnt, ns, c);
+}
+
+template <int PF_GRP, int HB_PER_CTA>
+__global__ void __launch_bounds__(256) k_qw38_moe_fc2_multi_hb_dyn(
+    const __half* __restrict__ fc1_act,
+    const int* __restrict__ d_n_groups,
+    const int* __restrict__ grp_exp,
+    const int* __restrict__ grp_cnt,
+    const int* __restrict__ grp_off,
+    const int* __restrict__ grp_routes,
+    const float* __restrict__ topk_w,
+    const long long* __restrict__ t_tab,
+    const uint8_t* __restrict__ t_fc2,
+    const uint8_t* const* __restrict__ t_ptab,
+    const __half* __restrict__ t_sg,
+    const __half* __restrict__ t_v3b,
+    __half* __restrict__ fc2_part_h,
+    int eb) {
+    constexpr int PF_SLICES = PF_GRP / 8;
+    constexpr int N_HB_GROUPS = geom::HB / HB_PER_CTA;
+    constexpr int X2_STRIDE = 136;
+    const int idx = blockIdx.x;
+    const int hbg = idx % N_HB_GROUPS;
+    const int g = idx / N_HB_GROUPS;
+    if (g >= d_n_groups[0]) return;
+
+    const int e = grp_exp[g];
+    const long long* tr = t_tab + 6 * e;
+    const int nb = static_cast<int>(tr[3]);
+    const int bits = static_cast<int>(tr[4]);
+    const int cnt = grp_cnt[g];
+    const int ns = (cnt + 7) >> 3;
+    const int roff = grp_off[g];
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int row0 = lane >> 2, col = lane & 3;
+
+    __shared__ int s_route[PF_GRP];
+    __shared__ float s_rw[PF_GRP];
+    __shared__ __half y_raw[8][136];
+    extern __shared__ __half x2_dyn[];
+
+    if (tid < cnt) {
+        const int r = grp_routes[roff + tid];
+        s_route[tid] = r;
+        s_rw[tid] = topk_w[r];
+    }
+    __syncthreads();
+
+    for (int b = 0; b < nb; ++b) {
+        __half* xb = x2_dyn + b * (PF_GRP * X2_STRIDE);
+        for (int r = warp; r < cnt; r += 8) {
+            const __half* src = fc1_act + (static_cast<size_t>(s_route[r]) * eb + b) * 128 + lane * 4;
+            *reinterpret_cast<uint2*>(xb + r * X2_STRIDE + lane * 4) = *reinterpret_cast<const uint2*>(src);
+        }
+    }
+    __syncthreads();
+
+    const int hb0 = hbg * HB_PER_CTA;
+    for (int hi = 0; hi < HB_PER_CTA; ++hi) {
+        const int hb = hb0 + hi;
+        const int n_tile = hb * 8 + warp;
+
+        float c_tot[PF_SLICES][4];
+        #pragma unroll
+        for (int s = 0; s < PF_SLICES; ++s) c_tot[s][0] = c_tot[s][1] = c_tot[s][2] = c_tot[s][3] = 0.f;
+
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* mw = tr3_fc2_block(t_fc2, t_ptab, e, tr, b, bits);
+            float cb[PF_SLICES][4];
+            #pragma unroll
+            for (int s = 0; s < PF_SLICES; ++s) cb[s][0] = cb[s][1] = cb[s][2] = cb[s][3] = 0.f;
+            pmcgx_fc2_ntile_wide_pf_disp<PF_SLICES, X2_STRIDE>(
+                mw, bits, n_tile, lane, x2_dyn + b * (PF_GRP * X2_STRIDE), cnt, ns, cb);
+            const size_t brow = static_cast<size_t>(tr[2]) + b;
+            const float bscale = __half2float(t_v3b[brow * geom::HB + hb]);
+            #pragma unroll
+            for (int s = 0; s < PF_SLICES; ++s) {
+                c_tot[s][0] += cb[s][0] * bscale;
+                c_tot[s][1] += cb[s][1] * bscale;
+                c_tot[s][2] += cb[s][2] * bscale;
+                c_tot[s][3] += cb[s][3] * bscale;
+            }
+        }
+
+        const uint2 sv = *reinterpret_cast<const uint2*>(t_sg + geom::HID + hb * 128 + lane * 4);
+        const float2 sf0 = __half22float2(*reinterpret_cast<const __half2*>(&sv.x));
+        const float2 sf1 = __half22float2(*reinterpret_cast<const __half2*>(&sv.y));
+        const float sg_v[4] = {sf0.x, sf0.y, sf1.x, sf1.y};
+
+        for (int s = 0; s < ns; ++s) {
+            const int t0 = s * 8 + 2 * col, t1 = t0 + 1;
+            if (t0 < cnt) {
+                y_raw[2 * col][warp * 16 + row0] = __float2half_rn(c_tot[s][0]);
+                y_raw[2 * col][warp * 16 + row0 + 8] = __float2half_rn(c_tot[s][2]);
+            }
+            if (t1 < cnt) {
+                y_raw[2 * col + 1][warp * 16 + row0] = __float2half_rn(c_tot[s][1]);
+                y_raw[2 * col + 1][warp * 16 + row0 + 8] = __float2half_rn(c_tot[s][3]);
+            }
+            __syncthreads();
+
+            const int r = s * 8 + warp;
+            if (r < cnt) {
+                const uint2 yv = *reinterpret_cast<const uint2*>(y_raw[warp] + lane * 4);
+                const float2 yf0 = __half22float2(*reinterpret_cast<const __half2*>(&yv.x));
+                const float2 yf1 = __half22float2(*reinterpret_cast<const __half2*>(&yv.y));
+                float v[4] = {yf0.x, yf0.y, yf1.x, yf1.y};
+                had128(v, lane);
+                const float rw = s_rw[r];
+                __half* dst = fc2_part_h + static_cast<size_t>(s_route[r]) * geom::HID + hb * 128 + lane * 4;
+                uint2 ov;
+                *reinterpret_cast<__half2*>(&ov.x) = __floats2half2_rn(rw * v[0] * sg_v[0], rw * v[1] * sg_v[1]);
+                *reinterpret_cast<__half2*>(&ov.y) = __floats2half2_rn(rw * v[2] * sg_v[2], rw * v[3] * sg_v[3]);
+                *reinterpret_cast<uint2*>(dst) = ov;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+__global__ void k_qw38_moe_combine_det_h16(const __half* __restrict__ fc2_part_h,
+                                           const __nv_bfloat16* __restrict__ sh_out,
+                                           const float* __restrict__ sh_scalar_gate,
+                                           __nv_bfloat16* __restrict__ out_part,
+                                           int M) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const float sg = sigmoid_f(sh_scalar_gate[m]);
+    const __nv_bfloat16* s = sh_out + static_cast<size_t>(m) * geom::HID;
+    __nv_bfloat16* o = out_part + static_cast<size_t>(m) * geom::HID;
+    const __half* base = fc2_part_h + static_cast<size_t>(m * geom::TOPK) * geom::HID;
+
+    constexpr int D4 = geom::HID >> 2;
+    for (int i = threadIdx.x; i < D4; i += blockDim.x) {
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int k = 0; k < geom::TOPK; ++k) {
+            const uint2 v = reinterpret_cast<const uint2*>(base + static_cast<size_t>(k) * geom::HID)[i];
+            const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&v.x));
+            const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&v.y));
+            acc[0] += f0.x; acc[1] += f0.y; acc[2] += f1.x; acc[3] += f1.y;
+        }
+        const uint2 sv = reinterpret_cast<const uint2*>(s)[i];
+        const float2 sf0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&sv.x));
+        const float2 sf1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&sv.y));
+        const float s0 = __bfloat162float(__float2bfloat16(sg * sf0.x));
+        const float s1 = __bfloat162float(__float2bfloat16(sg * sf0.y));
+        const float s2 = __bfloat162float(__float2bfloat16(sg * sf1.x));
+        const float s3 = __bfloat162float(__float2bfloat16(sg * sf1.y));
+        uint2 ov;
+        *reinterpret_cast<__nv_bfloat162*>(&ov.x) = __floats2bfloat162_rn(acc[0] + s0, acc[1] + s1);
+        *reinterpret_cast<__nv_bfloat162*>(&ov.y) = __floats2bfloat162_rn(acc[2] + s2, acc[3] + s3);
+        reinterpret_cast<uint2*>(o)[i] = ov;
+    }
+}
+
+template <int PF_GRP, int HB_PER_CTA>
+inline void launch_moe_pf_wide(const MoeWeights& w, MoeScratch& sc, const __nv_bfloat16* x,
+                               __nv_bfloat16* out_part, int M, cudaStream_t st) {
+    const int n_routes = M * geom::TOPK;
+    const int grid_G = std::min(n_routes, geom::NEXP + (n_routes + PF_GRP - 1) / PF_GRP);
+    constexpr int N_HBG = geom::HB / HB_PER_CTA;
+    const size_t fc2_smem = static_cast<size_t>(w.t_eb) * PF_GRP * 136 * sizeof(__half);
+    if (fc2_smem > 44000) {
+        cudaFuncSetAttribute(k_qw38_moe_fc2_multi_hb_dyn<PF_GRP, HB_PER_CTA>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(fc2_smem));
+    }
+    __half* fc2_part_h = reinterpret_cast<__half*>(sc.fc2_part);
+    k_qw38_moe_prerot_x<<<M * geom::HB, 32, 0, st>>>(x, w.t_sg, sc.x_had, M);
+    k_qw38_moe_build_groups_pf<PF_GRP><<<1, geom::NEXP, 0, st>>>(
+        sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_off, sc.grp_routes, n_routes);
+    k_qw38_moe_fc1_pf_wide<PF_GRP><<<grid_G * w.t_eb, 256, 0, st>>>(
+        sc.x_had, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_off, sc.grp_routes,
+        w.t_tab, w.t_kmix, w.t_fc1, w.t_ptab, w.t_v1b, w.t_v2, sc.fc1_act, w.t_eb);
+    k_qw38_moe_fc2_multi_hb_dyn<PF_GRP, HB_PER_CTA><<<grid_G * N_HBG, 256, fc2_smem, st>>>(
+        sc.fc1_act, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_off, sc.grp_routes,
+        sc.topk_w, w.t_tab, w.t_fc2, w.t_ptab, w.t_sg, w.t_v3b, fc2_part_h, w.t_eb);
+    k_qw38_moe_combine_det_h16<<<M, 256, 0, st>>>(fc2_part_h, sc.sh_out, sc.sh_scalar_gate, out_part, M);
+}
+
 // Shared expert activation: sh_gate = bf16(silu(sh_gate) * sh_up) (for large M > 8 cuBLAS path)
 __global__ void k_silu_mul_bf16(__nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up, int N) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -977,394 +1576,11 @@ __global__ void k_qw38_mtp_exp_accum(const __nv_bfloat16* __restrict__ dn_out,
     }
 }
 
-// =================================================================================================
-// Opt #1: Batched Grouped Pipelined PMCGX MoE Prefill (G=32 / G=48, wide-load, deterministic FP32)
-// Pre-rotates x once per token (10x less had128 work), packs up to 32/48 routes per expert CTA
-// (up to 6x fewer weight loads), overlaps next hb/b weight prefetch with MMA, and uses union smem.
-// =================================================================================================
-__global__ void __launch_bounds__(128) k_qw38_moe_pre_had_f32(
-    const __nv_bfloat16* __restrict__ x,
-    const __half* __restrict__ t_sg,
-    float* __restrict__ x_had,
-    int M) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int idx = blockIdx.x * 4 + warp;
-    if (idx >= M * geom::HB) return;
-    const int m = idx / geom::HB, hb = idx % geom::HB;
-    const uint2 xv = *reinterpret_cast<const uint2*>(x + static_cast<size_t>(m) * geom::HID + hb * 128 + lane * 4);
-    const uint2 sv = *reinterpret_cast<const uint2*>(t_sg + hb * 128 + lane * 4);
-    const float2 xf0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
-    const float2 xf1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
-    const float2 sf0 = __half22float2(*reinterpret_cast<const __half2*>(&sv.x));
-    const float2 sf1 = __half22float2(*reinterpret_cast<const __half2*>(&sv.y));
-    float v[4] = {xf0.x * sf0.x, xf0.y * sf0.y, xf1.x * sf1.x, xf1.y * sf1.y};
-    had128(v, lane);
-    *reinterpret_cast<float4*>(x_had + (static_cast<size_t>(m) * geom::HB + hb) * 128 + lane * 4) =
-        make_float4(v[0], v[1], v[2], v[3]);
-}
-
-template <int G_MAX>
-__global__ void k_qw38_moe_build_groups_pf(const int* __restrict__ topk_idx,
-                                           int* __restrict__ d_n_groups,
-                                           int* __restrict__ grp_exp,
-                                           int* __restrict__ grp_off,
-                                           int* __restrict__ grp_cnt,
-                                           int* __restrict__ grp_routes,
-                                           int n_routes) {
-    const int tid = threadIdx.x;
-    __shared__ int cnt[geom::NEXP], e_off[geom::NEXP], cur[geom::NEXP];
-    cnt[tid] = 0; cur[tid] = 0;
-    __syncthreads();
-    for (int r = tid; r < n_routes; r += geom::NEXP) atomicAdd(&cnt[topk_idx[r]], 1);
-    __syncthreads();
-    const int lane = tid & 31, warp = tid >> 5;
-    const int c_tot = cnt[tid], ng = (c_tot + G_MAX - 1) / G_MAX;
-    int vc = c_tot, vg = ng;
-    #pragma unroll
-    for (int off = 1; off < 32; off <<= 1) {
-        int nc = __shfl_up_sync(0xffffffffu, vc, off), ngg = __shfl_up_sync(0xffffffffu, vg, off);
-        if (lane >= off) { vc += nc; vg += ngg; }
-    }
-    __shared__ int wc[16], wg[16];
-    if (lane == 31) { wc[warp] = vc; wg[warp] = vg; }
-    __syncthreads();
-    if (warp == 0) {
-        int ac = (lane < 16) ? wc[lane] : 0, ag = (lane < 16) ? wg[lane] : 0;
-        #pragma unroll
-        for (int off = 1; off < 16; off <<= 1) {
-            int nc = __shfl_up_sync(0xffffffffu, ac, off), ngg = __shfl_up_sync(0xffffffffu, ag, off);
-            if (lane >= off) { ac += nc; ag += ngg; }
-        }
-        if (lane < 16) { wc[lane] = ac; wg[lane] = ag; }
-    }
-    __syncthreads();
-    const int eb_off = (warp > 0 ? wc[warp - 1] : 0) + (vc - c_tot);
-    const int g_base = (warp > 0 ? wg[warp - 1] : 0) + (vg - ng);
-    e_off[tid] = eb_off;
-    if (tid == geom::NEXP - 1) d_n_groups[0] = g_base + ng;
-    for (int gi = 0; gi < ng; ++gi) {
-        const int g = g_base + gi, rem = c_tot - gi * G_MAX;
-        grp_exp[g] = tid; grp_off[g] = eb_off + gi * G_MAX; grp_cnt[g] = (rem < G_MAX) ? rem : G_MAX;
-    }
-    __syncthreads();
-    for (int r = tid; r < n_routes; r += geom::NEXP) {
-        const int e = topk_idx[r], pos = atomicAdd(&cur[e], 1);
-        grp_routes[e_off[e] + pos] = r;
-    }
-}
-
-template <int NG8, int BITS>
-__device__ __forceinline__ void pmcgx_fc1_pipe_f32(
-    const float* __restrict__ x_had, const int* __restrict__ s_tok, const __half* __restrict__ v1b_row,
-    const uint8_t* mw, int cnt, int warp, int lane, __half (&x_rot)[NG8 * 8][136], float (&c)[NG8][4]) {
-    const int row0 = lane >> 2, col = lane & 3, prev_lane = (lane + 31) & 31;
-    u64 w_cur[3] = {0, 0, 0};
-    uint4 wh_cur0 = {}, wh_cur1 = {};
-    if constexpr (BITS == 4) {
-        const uint8_t* g4 = mw + (warp * 2) * 512 + lane * 16;
-        wh_cur0 = tr4w_ld128(g4); wh_cur1 = tr4w_ld128(g4 + 512);
-    } else {
-        const uint8_t* g0 = mw + static_cast<size_t>(warp) * 256 + lane * 8;
-        #pragma unroll
-        for (int n = 0; n < BITS; ++n) w_cur[n] = ld_nc64(g0 + n * 2048);
-    }
-    for (int hb = 0; hb < geom::HB; ++hb) {
-        const float bscale = __half2float(v1b_row[hb]);
-        for (int t = warp; t < cnt; t += 8) {
-            const float4 vh = *reinterpret_cast<const float4*>(
-                x_had + (static_cast<size_t>(s_tok[t]) * geom::HB + hb) * 128 + lane * 4);
-            uint2 hv;
-            *reinterpret_cast<__half2*>(&hv.x) = __floats2half2_rn(vh.x * bscale, vh.y * bscale);
-            *reinterpret_cast<__half2*>(&hv.y) = __floats2half2_rn(vh.z * bscale, vh.w * bscale);
-            *reinterpret_cast<uint2*>(x_rot[t] + lane * 4) = hv;
-        }
-        __syncthreads();
-        u64 w_nxt[3] = {0, 0, 0}; uint4 wh_nxt0 = {}, wh_nxt1 = {};
-        if (hb + 1 < geom::HB) {
-            if constexpr (BITS == 4) {
-                const uint8_t* g4 = mw + static_cast<size_t>(hb + 1) * TR4W_GROUP + (warp * 2) * 512 + lane * 16;
-                wh_nxt0 = tr4w_ld128(g4); wh_nxt1 = tr4w_ld128(g4 + 512);
-            } else {
-                const uint8_t* g0 = mw + static_cast<size_t>(hb + 1) * (2048 * BITS) + static_cast<size_t>(warp) * 256 + lane * 8;
-                #pragma unroll
-                for (int n = 0; n < BITS; ++n) w_nxt[n] = ld_nc64(g0 + n * 2048);
-            }
-        }
-        if constexpr (BITS == 4) {
-            const u32 w0[4] = {wh_cur0.x, wh_cur0.y, wh_cur0.z, wh_cur0.w};
-            const u32 w1[4] = {wh_cur1.x, wh_cur1.y, wh_cur1.z, wh_cur1.w};
-            #pragma unroll
-            for (int p = 0; p < 8; ++p) {
-                const u32 ch = (p < 4) ? w0[p] : w1[p - 4];
-                const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
-                u32 f0[2], f1[2];
-                Tr3Lane<4, true, TR3_PMCGX>::decode_m((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
-                #pragma unroll
-                for (int g8 = 0; g8 < NG8; ++g8) {
-                    if (g8 == 0 || g8 * 8 < cnt) {
-                        const int r = g8 * 8 + row0; const bool act = (r < cnt);
-                        const u32 b0 = act ? *reinterpret_cast<const u32*>(x_rot[r] + p * 16 + 2 * col) : 0u;
-                        const u32 b1 = act ? *reinterpret_cast<const u32*>(x_rot[r] + p * 16 + 2 * col + 8) : 0u;
-                        mma16816(c[g8], f0[0], f1[0], f0[1], f1[1], b0, b1);
-                    }
-                }
-            }
-            wh_cur0 = wh_nxt0; wh_cur1 = wh_nxt1;
-        } else {
-            #pragma unroll
-            for (int p = 0; p < 8; ++p) {
-                const u32 ch = trw_chunk<BITS>(w_cur, p);
-                const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
-                u32 f0[2], f1[2];
-                Tr3Lane<BITS, true, TR3_PMCGX>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
-                #pragma unroll
-                for (int g8 = 0; g8 < NG8; ++g8) {
-                    if (g8 == 0 || g8 * 8 < cnt) {
-                        const int r = g8 * 8 + row0; const bool act = (r < cnt);
-                        const u32 b0 = act ? *reinterpret_cast<const u32*>(x_rot[r] + p * 16 + 2 * col) : 0u;
-                        const u32 b1 = act ? *reinterpret_cast<const u32*>(x_rot[r] + p * 16 + 2 * col + 8) : 0u;
-                        mma16816(c[g8], f0[0], f1[0], f0[1], f1[1], b0, b1);
-                    }
-                }
-            }
-            #pragma unroll
-            for (int n = 0; n < BITS; ++n) w_cur[n] = w_nxt[n];
-        }
-        __syncthreads();
-    }
-}
-
-template <int NG8>
-__global__ void __launch_bounds__(256) k_qw38_moe_fc1_pf(
-    const float* __restrict__ x_had, const int* __restrict__ d_n_groups,
-    const int* __restrict__ grp_exp, const int* __restrict__ grp_off,
-    const int* __restrict__ grp_cnt, const int* __restrict__ grp_routes,
-    const long long* __restrict__ t_tab, const long long* __restrict__ t_kmix,
-    const uint8_t* __restrict__ t_fc1, const uint8_t* const* __restrict__ t_ptab,
-    const __half* __restrict__ t_v1b, const __half* __restrict__ t_v2,
-    __half* __restrict__ fc1_act, int eb) {
-    constexpr int G_MAX = NG8 * 8;
-    const int idx = blockIdx.x, b = idx % eb, g = idx / eb;
-    if (g >= d_n_groups[0]) return;
-    const int e = grp_exp[g]; const long long* tr = t_tab + 6 * e;
-    if (b >= static_cast<int>(tr[3])) return;
-    const int cnt = grp_cnt[g], goff = grp_off[g];
-    const size_t brow = static_cast<size_t>(tr[2]) + b;
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, row0 = lane >> 2, col = lane & 3;
-    __shared__ int s_tok[G_MAX], s_route[G_MAX];
-    if (tid < cnt) { const int r = grp_routes[goff + tid]; s_route[tid] = r; s_tok[tid] = r / geom::TOPK; }
-    __syncthreads();
-    __shared__ __half y_gate[G_MAX][128];
-    __shared__ union { __half x_rot[G_MAX][136]; __half y_up[G_MAX][128]; } sm;
-    for (int mat = 0; mat < 2; ++mat) {
-        const uint8_t* mw = nullptr;
-        const int bits = tr3_fc1_unit(t_fc1, t_ptab, t_kmix, e, tr, 2 * b + mat, mw);
-        float c[NG8][4];
-        #pragma unroll
-        for (int g8 = 0; g8 < NG8; ++g8) c[g8][0] = c[g8][1] = c[g8][2] = c[g8][3] = 0.f;
-        const __half* v1b_row = t_v1b + (brow * 2 + mat) * geom::HB;
-        if (bits == 3) pmcgx_fc1_pipe_f32<NG8, 3>(x_had, s_tok, v1b_row, mw, cnt, warp, lane, sm.x_rot, c);
-        else if (bits == 4) pmcgx_fc1_pipe_f32<NG8, 4>(x_had, s_tok, v1b_row, mw, cnt, warp, lane, sm.x_rot, c);
-        else pmcgx_fc1_pipe_f32<NG8, 2>(x_had, s_tok, v1b_row, mw, cnt, warp, lane, sm.x_rot, c);
-        __half (*ydst)[128] = (mat == 0) ? y_gate : sm.y_up;
-        #pragma unroll
-        for (int g8 = 0; g8 < NG8; ++g8) {
-            const int t0 = g8 * 8 + 2 * col, t1 = t0 + 1;
-            if (t0 < cnt) { ydst[t0][warp * 16 + row0] = __float2half_rn(c[g8][0]); ydst[t0][warp * 16 + row0 + 8] = __float2half_rn(c[g8][2]); }
-            if (t1 < cnt) { ydst[t1][warp * 16 + row0] = __float2half_rn(c[g8][1]); ydst[t1][warp * 16 + row0 + 8] = __float2half_rn(c[g8][3]); }
-        }
-        __syncthreads();
-    }
-    const __half* svh_g = t_v2 + (brow * 3 + 0) * 128 + lane * 4;
-    const __half* svh_u = t_v2 + (brow * 3 + 1) * 128 + lane * 4;
-    const __half* suh_d = t_v2 + (brow * 3 + 2) * 128 + lane * 4;
-    float sg[4], su[4], sd[4];
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) { sg[i] = __half2float(svh_g[i]); su[i] = __half2float(svh_u[i]); sd[i] = __half2float(suh_d[i]); }
-    for (int t = warp; t < cnt; t += 8) {
-        float vg[4], vu[4];
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) { vg[i] = __half2float(y_gate[t][lane * 4 + i]); vu[i] = __half2float(sm.y_up[t][lane * 4 + i]); }
-        had128(vg, lane); had128(vu, lane);
-        float va[4];
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float gv = __half2float(__float2half_rn(vg[i] * sg[i]));
-            const float uv = __half2float(__float2half_rn(vu[i] * su[i]));
-            va[i] = __half2float(__float2half_rn(silu_f(gv) * uv)) * sd[i];
-        }
-        had128(va, lane);
-        uint2 hv;
-        *reinterpret_cast<__half2*>(&hv.x) = __floats2half2_rn(va[0], va[1]);
-        *reinterpret_cast<__half2*>(&hv.y) = __floats2half2_rn(va[2], va[3]);
-        *reinterpret_cast<uint2*>(fc1_act + (static_cast<size_t>(s_route[t]) * eb + b) * 128 + lane * 4) = hv;
-    }
-}
-
-template <int NG8>
-__global__ void __launch_bounds__(256) k_qw38_moe_fc2_pf(
-    const __half* __restrict__ fc1_act, const int* __restrict__ d_n_groups,
-    const int* __restrict__ grp_exp, const int* __restrict__ grp_off,
-    const int* __restrict__ grp_cnt, const int* __restrict__ grp_routes,
-    const float* __restrict__ topk_w, const long long* __restrict__ t_tab,
-    const uint8_t* __restrict__ t_fc2, const uint8_t* const* __restrict__ t_ptab,
-    const __half* __restrict__ t_sg, const __half* __restrict__ t_v3b,
-    float* __restrict__ fc2_part, int eb) {
-    constexpr int G_MAX = NG8 * 8;
-    const int idx = blockIdx.x, hb = idx % geom::HB, g = idx / geom::HB;
-    if (g >= d_n_groups[0]) return;
-    const int e = grp_exp[g]; const long long* tr = t_tab + 6 * e;
-    const int nb = static_cast<int>(tr[3]), bits = static_cast<int>(tr[4]), cnt = grp_cnt[g], goff = grp_off[g];
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, row0 = lane >> 2, col = lane & 3;
-    const int n_tile = hb * 8 + warp, prev_lane = (lane + 31) & 31;
-
-    __shared__ int s_route[G_MAX];
-    __shared__ float s_rw[G_MAX];
-    if (tid < cnt) { const int r = grp_routes[goff + tid]; s_route[tid] = r; s_rw[tid] = topk_w[r]; }
-    __syncthreads();
-
-    float sg_v[4];
-    {
-        const uint2 sv = *reinterpret_cast<const uint2*>(t_sg + geom::HID + hb * 128 + lane * 4);
-        const float2 sf0 = __half22float2(*reinterpret_cast<const __half2*>(&sv.x));
-        const float2 sf1 = __half22float2(*reinterpret_cast<const __half2*>(&sv.y));
-        sg_v[0] = sf0.x; sg_v[1] = sf0.y; sg_v[2] = sf1.x; sg_v[3] = sf1.y;
-    }
-
-    __shared__ union { __half x2_sm[G_MAX][136]; __half y_raw[G_MAX][128]; } sm;
-    float sum_v[NG8][4];
-    #pragma unroll
-    for (int g8 = 0; g8 < NG8; ++g8) sum_v[g8][0] = sum_v[g8][1] = sum_v[g8][2] = sum_v[g8][3] = 0.f;
-
-    u64 w_cur[3] = {0, 0, 0}; uint4 wh_cur0 = {}, wh_cur1 = {};
-    auto load_w = [&](int b_idx, u64 (&w)[3], uint4& wh0, uint4& wh1) {
-        const uint8_t* mw = tr3_fc2_block(t_fc2, t_ptab, e, tr, b_idx, bits);
-        if (bits == 3) {
-            const uint8_t* wg = mw + static_cast<size_t>(n_tile) * (8 * 32 * 3) + lane * 8;
-            w[0] = ld_nc64(wg); w[1] = ld_nc64(wg + 256); w[2] = ld_nc64(wg + 512);
-        } else if (bits == 4) {
-            const uint8_t* wg4 = mw + static_cast<size_t>(n_tile) * TR4W_NT + lane * 16;
-            wh0 = tr4w_ld128(wg4); wh1 = tr4w_ld128(wg4 + 512);
-        } else {
-            const uint8_t* wg = mw + static_cast<size_t>(n_tile) * (8 * 32 * 2) + lane * 8;
-            w[0] = ld_nc64(wg); w[1] = ld_nc64(wg + 256);
-        }
-    };
-    if (nb > 0) load_w(0, w_cur, wh_cur0, wh_cur1);
-
-    for (int b = 0; b < nb; ++b) {
-        for (int t = warp; t < cnt; t += 8) {
-            const __half* x2 = fc1_act + (static_cast<size_t>(s_route[t]) * eb + b) * 128 + lane * 4;
-            *reinterpret_cast<uint2*>(sm.x2_sm[t] + lane * 4) = *reinterpret_cast<const uint2*>(x2);
-        }
-        __syncthreads();
-
-        u64 w_nxt[3] = {0, 0, 0}; uint4 wh_nxt0 = {}, wh_nxt1 = {};
-        if (b + 1 < nb) load_w(b + 1, w_nxt, wh_nxt0, wh_nxt1);
-
-        float c[NG8][4];
-        #pragma unroll
-        for (int g8 = 0; g8 < NG8; ++g8) c[g8][0] = c[g8][1] = c[g8][2] = c[g8][3] = 0.f;
-
-        if (bits == 3) {
-            #pragma unroll
-            for (int p = 0; p < 8; ++p) {
-                const u32 ch = trw_chunk<3>(w_cur, p);
-                const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
-                u32 f0[2], f1[2];
-                Tr3Lane<3, true, TR3_PMCGX>::decode_m((static_cast<u64>(pc) << 24) | ch, 21, f0, f1);
-                #pragma unroll
-                for (int g8 = 0; g8 < NG8; ++g8) {
-                    if (g8 == 0 || g8 * 8 < cnt) {
-                        const int r = g8 * 8 + row0; const bool act = (r < cnt);
-                        const u32 b0 = act ? *reinterpret_cast<const u32*>(sm.x2_sm[r] + p * 16 + 2 * col) : 0u;
-                        const u32 b1 = act ? *reinterpret_cast<const u32*>(sm.x2_sm[r] + p * 16 + 2 * col + 8) : 0u;
-                        mma16816(c[g8], f0[0], f1[0], f0[1], f1[1], b0, b1);
-                    }
-                }
-            }
-        } else if (bits == 4) {
-            const u32 w0[4] = {wh_cur0.x, wh_cur0.y, wh_cur0.z, wh_cur0.w};
-            const u32 w1[4] = {wh_cur1.x, wh_cur1.y, wh_cur1.z, wh_cur1.w};
-            #pragma unroll
-            for (int p = 0; p < 8; ++p) {
-                const u32 ch = (p < 4) ? w0[p] : w1[p - 4];
-                const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
-                u32 f0[2], f1[2];
-                Tr3Lane<4, true, TR3_PMCGX>::decode_m((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
-                #pragma unroll
-                for (int g8 = 0; g8 < NG8; ++g8) {
-                    if (g8 == 0 || g8 * 8 < cnt) {
-                        const int r = g8 * 8 + row0; const bool act = (r < cnt);
-                        const u32 b0 = act ? *reinterpret_cast<const u32*>(sm.x2_sm[r] + p * 16 + 2 * col) : 0u;
-                        const u32 b1 = act ? *reinterpret_cast<const u32*>(sm.x2_sm[r] + p * 16 + 2 * col + 8) : 0u;
-                        mma16816(c[g8], f0[0], f1[0], f0[1], f1[1], b0, b1);
-                    }
-                }
-            }
-        } else {
-            #pragma unroll
-            for (int p = 0; p < 8; ++p) {
-                const u32 ch = trw_chunk<2>(w_cur, p);
-                const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
-                u32 f0[2], f1[2];
-                Tr3Lane<2, true, TR3_PMCGX>::decode_m((static_cast<u64>(pc) << 16) | ch, 14, f0, f1);
-                #pragma unroll
-                for (int g8 = 0; g8 < NG8; ++g8) {
-                    if (g8 == 0 || g8 * 8 < cnt) {
-                        const int r = g8 * 8 + row0; const bool act = (r < cnt);
-                        const u32 b0 = act ? *reinterpret_cast<const u32*>(sm.x2_sm[r] + p * 16 + 2 * col) : 0u;
-                        const u32 b1 = act ? *reinterpret_cast<const u32*>(sm.x2_sm[r] + p * 16 + 2 * col + 8) : 0u;
-                        mma16816(c[g8], f0[0], f1[0], f0[1], f1[1], b0, b1);
-                    }
-                }
-            }
-        }
-        w_cur[0] = w_nxt[0]; w_cur[1] = w_nxt[1]; w_cur[2] = w_nxt[2];
-        wh_cur0 = wh_nxt0; wh_cur1 = wh_nxt1;
-        __syncthreads();
-
-        #pragma unroll
-        for (int g8 = 0; g8 < NG8; ++g8) {
-            const int t0 = g8 * 8 + 2 * col, t1 = t0 + 1;
-            if (t0 < cnt) { sm.y_raw[t0][warp * 16 + row0] = __float2half_rn(c[g8][0]); sm.y_raw[t0][warp * 16 + row0 + 8] = __float2half_rn(c[g8][2]); }
-            if (t1 < cnt) { sm.y_raw[t1][warp * 16 + row0] = __float2half_rn(c[g8][1]); sm.y_raw[t1][warp * 16 + row0 + 8] = __float2half_rn(c[g8][3]); }
-        }
-        __syncthreads();
-
-        const size_t brow = static_cast<size_t>(tr[2]) + b;
-        const float bscale = __half2float(t_v3b[brow * geom::HB + hb]);
-        #pragma unroll
-        for (int g8 = 0; g8 < NG8; ++g8) {
-            const int t = g8 * 8 + warp;
-            if (t < cnt) {
-                float v[4];
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) v[i] = __half2float(sm.y_raw[t][lane * 4 + i]);
-                had128(v, lane);
-                const float rw = s_rw[t];
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) sum_v[g8][i] += rw * (v[i] * (sg_v[i] * bscale));
-            }
-        }
-        __syncthreads();
-    }
-
-    #pragma unroll
-    for (int g8 = 0; g8 < NG8; ++g8) {
-        const int t = g8 * 8 + warp;
-        if (t < cnt) {
-            float* dst = fc2_part + static_cast<size_t>(s_route[t]) * geom::HID + hb * 128 + lane * 4;
-            *reinterpret_cast<float4*>(dst) = make_float4(sum_v[g8][0], sum_v[g8][1], sum_v[g8][2], sum_v[g8][3]);
-        }
-    }
-}
-
 // Execute one Qwen3.8 MoE block (512 routed + gated shared expert) -> out_part [M, 2560] BF16.
 inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc,
                         const __nv_bfloat16* x, __nv_bfloat16* out_part, int M, cudaStream_t st) {
-    // 1. Router logits + shared expert (fused coalesced uint4 GEMV for M <= 16, cuBLAS tensor cores for M > 16)
-    if ((M <= 16 && w.fp8_sh_gate.q) || M <= 8) {
+    // 1. Router logits + shared expert (fused coalesced uint4 GEMV for M <= 20, cuBLAS tensor cores for M > 20)
+    if ((M <= 20 && w.fp8_sh_gate.q) || M <= 8) {
         const int rgrid = (geom::NEXP + 1 + 3) / 4; // 129 CTAs
         const int sgrid = (w.sh_i + 3) / 4;
         if (M == 1) {
@@ -1382,9 +1598,12 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
         } else if (M <= 12) {
             k_qw38_router_and_shgate<12><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
             k_fp8_sh_gate_up_silu<12><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
-        } else {
+        } else if (M <= 16) {
             k_qw38_router_and_shgate<16><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
             k_fp8_sh_gate_up_silu<16><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
+        } else {
+            k_qw38_router_and_shgate<20><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
+            k_fp8_sh_gate_up_silu<20><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
         }
         k_qw38_router_topk10<<<M, 256, 0, st>>>(sc.router_logits, sc.topk_idx, sc.topk_w, M);
         if (w.fp8_sh_down.q) launch_fp8_gemv_smallm<false>(sc.sh_gate_buf, w.fp8_sh_down, sc.sh_out, M, st);
@@ -1405,65 +1624,39 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
 
     // 2. Routed experts + 3. Combine routed + gated shared -> out_part [M, 2560] BF16
     if (w.is_tr3) {
-        const int n_routes = M * geom::TOPK;
-        constexpr int pf_min_m = (g6nr::NR == 1) ? 8 : 64;
-        if (M > pf_min_m && w.fc1_wide && w.fc2_wide && sc.x_had && sc.grp_off) {
-            k_qw38_moe_pre_had_f32<<<(M * geom::HB + 3) / 4, 128, 0, st>>>(x, w.t_sg, sc.x_had, M);
-            if (M >= 1536) {
-                constexpr int NG8 = 6;
-                constexpr int G_MAX = NG8 * 8;
-                k_qw38_moe_build_groups_pf<G_MAX><<<1, geom::NEXP, 0, st>>>(
-                    sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_off, sc.grp_cnt, sc.grp_routes, n_routes);
-                const int grid_G = std::min(n_routes, geom::NEXP + (n_routes + G_MAX - 1) / G_MAX);
-                k_qw38_moe_fc1_pf<NG8><<<grid_G * w.t_eb, 256, 0, st>>>(
-                    sc.x_had, sc.d_n_groups, sc.grp_exp, sc.grp_off, sc.grp_cnt, sc.grp_routes,
-                    w.t_tab, w.t_kmix, w.t_fc1, w.t_ptab, w.t_v1b, w.t_v2, sc.fc1_act, w.t_eb);
-                k_qw38_moe_fc2_pf<NG8><<<grid_G * geom::HB, 256, 0, st>>>(
-                    sc.fc1_act, sc.d_n_groups, sc.grp_exp, sc.grp_off, sc.grp_cnt, sc.grp_routes,
-                    sc.topk_w, w.t_tab, w.t_fc2, w.t_ptab, w.t_sg, w.t_v3b, sc.fc2_part, w.t_eb);
-            } else {
-                constexpr int NG8 = 4;
-                constexpr int G_MAX = NG8 * 8;
-                k_qw38_moe_build_groups_pf<G_MAX><<<1, geom::NEXP, 0, st>>>(
-                    sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_off, sc.grp_cnt, sc.grp_routes, n_routes);
-                const int grid_G = std::min(n_routes, geom::NEXP + (n_routes + G_MAX - 1) / G_MAX);
-                k_qw38_moe_fc1_pf<NG8><<<grid_G * w.t_eb, 256, 0, st>>>(
-                    sc.x_had, sc.d_n_groups, sc.grp_exp, sc.grp_off, sc.grp_cnt, sc.grp_routes,
-                    w.t_tab, w.t_kmix, w.t_fc1, w.t_ptab, w.t_v1b, w.t_v2, sc.fc1_act, w.t_eb);
-                k_qw38_moe_fc2_pf<NG8><<<grid_G * geom::HB, 256, 0, st>>>(
-                    sc.fc1_act, sc.d_n_groups, sc.grp_exp, sc.grp_off, sc.grp_cnt, sc.grp_routes,
-                    sc.topk_w, w.t_tab, w.t_fc2, w.t_ptab, w.t_sg, w.t_v3b, sc.fc2_part, w.t_eb);
-            }
-            k_qw38_moe_combine_det<<<M, 256, 0, st>>>(sc.fc2_part, sc.sh_out, sc.sh_scalar_gate, out_part, M);
-        } else {
-            int grid_G = 0;
-            if (M == 1) {
-                k_qw38_moe_groups_m1<<<1, 32, 0, st>>>(sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes);
-                grid_G = geom::TOPK;
-            } else {
-                k_qw38_moe_build_groups<<<1, geom::NEXP, 0, st>>>(
-                    sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes, n_routes);
-                grid_G = std::min(n_routes, geom::NEXP + (n_routes + 7) / 8);
-            }
-
-            if (M <= 8 && sc.fc1_part) {
-                k_qw38_moe_fc1_ks2<<<grid_G * w.t_eb * 4, 256, 0, st>>>(
-                    x, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
-                    w.t_tab, w.t_kmix, w.t_fc1, w.t_ptab, w.t_sg, w.t_v1b, sc.fc1_part, w.t_eb, w.fc1_wide);
-                k_qw38_moe_fc1_epilogue_ks2<<<n_routes * w.t_eb, 32, 0, st>>>(
-                    sc.fc1_part, sc.topk_idx, w.t_tab, w.t_v2, sc.fc1_act, M, w.t_eb);
-            } else {
-                k_qw38_moe_fc1_grp<<<grid_G * w.t_eb, 256, 0, st>>>(
-                    x, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
-                    w.t_tab, w.t_kmix, w.t_fc1, w.t_ptab, w.t_sg, w.t_v1b, w.t_v2, sc.fc1_act, w.t_eb, w.fc1_wide);
-            }
-
-            k_qw38_moe_fc2_grp<<<grid_G * geom::HB, 256, 0, st>>>(
-                sc.fc1_act, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
-                sc.topk_w, w.t_tab, w.t_fc2, w.t_ptab, w.t_sg, w.t_v3b, sc.fc2_part, w.t_eb, w.fc2_wide);
-
-            k_qw38_moe_combine_det<<<M, 256, 0, st>>>(sc.fc2_part, sc.sh_out, sc.sh_scalar_gate, out_part, M);
+        if (M >= 32 && w.fc1_wide && w.fc2_wide && sc.grp_off && sc.x_had) {
+            if (w.t_eb <= 4) launch_moe_pf_wide<32, 10>(w, sc, x, out_part, M, st);
+            else launch_moe_pf_wide<16, 10>(w, sc, x, out_part, M, st);
+            return;
         }
+        const int n_routes = M * geom::TOPK;
+        int grid_G = 0;
+        if (M == 1) {
+            k_qw38_moe_groups_m1<<<1, 32, 0, st>>>(sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes);
+            grid_G = geom::TOPK;
+        } else {
+            k_qw38_moe_build_groups<<<1, geom::NEXP, 0, st>>>(
+                sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes, n_routes);
+            grid_G = std::min(n_routes, geom::NEXP + (n_routes + 7) / 8);
+        }
+
+        if (M <= 8 && sc.fc1_part) {
+            k_qw38_moe_fc1_ks2<<<grid_G * w.t_eb * 4, 256, 0, st>>>(
+                x, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
+                w.t_tab, w.t_kmix, w.t_fc1, w.t_ptab, w.t_sg, w.t_v1b, sc.fc1_part, w.t_eb, w.fc1_wide);
+            k_qw38_moe_fc1_epilogue_ks2<<<n_routes * w.t_eb, 32, 0, st>>>(
+                sc.fc1_part, sc.topk_idx, w.t_tab, w.t_v2, sc.fc1_act, M, w.t_eb);
+        } else {
+            k_qw38_moe_fc1_grp<<<grid_G * w.t_eb, 256, 0, st>>>(
+                x, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
+                w.t_tab, w.t_kmix, w.t_fc1, w.t_ptab, w.t_sg, w.t_v1b, w.t_v2, sc.fc1_act, w.t_eb, w.fc1_wide);
+        }
+
+        k_qw38_moe_fc2_grp<<<grid_G * geom::HB, 256, 0, st>>>(
+            sc.fc1_act, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
+            sc.topk_w, w.t_tab, w.t_fc2, w.t_ptab, w.t_sg, w.t_v3b, sc.fc2_part, w.t_eb, w.fc2_wide);
+
+        k_qw38_moe_combine_det<<<M, 256, 0, st>>>(sc.fc2_part, sc.sh_out, sc.sh_scalar_gate, out_part, M);
     } else if (w.mtp_gate_up && w.mtp_down) {
         cublasSetStream(blas, st);
         cudaMemsetAsync(sc.routed_acc, 0, static_cast<size_t>(M) * geom::HID * sizeof(float), st);
