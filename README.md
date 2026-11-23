@@ -6,7 +6,7 @@ involved) before asking the setup questions or touching a box.
 
 Need help? Join us on Discord: https://discord.gg/8EAvYPV2rE
 
-gr8 serves GLM-5.3, GLM-5.3-Flash and DeepSeek-V4.1-Flash on one to six DGX Spark (GB10) boxes (the count depends on
+gr8 serves GLM-5.3, GLM-5.3-Flash, DeepSeek-V4.1-Flash and Qwen3.8-Flash-Next on one to six DGX Spark (GB10) boxes (the count depends on
 the model, see below), with an OpenAI-compatible API on the first box. gr8 is written from scratch in CUDA and uses no
 vLLM, PyTorch or NCCL at serve time. *Beta release. If you run it, please tell us what breaks:
 [issues](https://github.com/kindlingai/gr8/issues) and PRs are welcome.*
@@ -300,8 +300,8 @@ Each model's page gives its box count. [docs/GLM-5.3.md](docs/GLM-5.3.md#what-yo
 The model is split across all the boxes (tensor parallel, TP). Each box runs one engine process (`g6m4`) and is one
 rank. The ranks talk over RoCE v2 through gr8's own RDMA code.
 
-Every box runs the same `./gr8 <model> up`, where the model is `glm53`, `glm53f` or `ds41`
-([docs/DEPLOY.md](docs/DEPLOY.md)). The first address in `--peers` is the
+Every box runs the same `./gr8 <model> up`, where the model is `glm53`, `glm53f`, `ds41` or `qw38`
+([docs/DEPLOY.md](docs/DEPLOY.md), [docs/QWEN38.md](docs/QWEN38.md)). The first address in `--peers` is the
 head: it runs the API on port 8100. Before any engine starts, the boxes compare their options, model and engine build,
 and if one box differs, every box stops and prints the difference. Without `--peers`, the boxes find each other through
 a local mentat daemon (`--mentat localhost`, the default).
@@ -328,7 +328,7 @@ supervisor log names the line that says why. Logs are in `out/` on each box (`su
 `shim.log` and `front.log` on the head). Each boot moves the previous engine logs to `out/prev1`, and keeps the three
 boots before it (`prev1` is the newest), so a restart does not overwrite the boot you want to look at.
 
-`./gr8 glm53 scale --tp 3 --peers A,B,C` (or `glm53f`) moves a serving cluster to another width or set of boxes by an
+`./gr8 glm53 scale --tp 3 --peers A,B,C` (or `glm53f`, `qw38`) moves a serving cluster to another width or set of boxes by an
 orderly restart. Every box of the new list makes its files ready while the cluster serves; then the front end holds
 new requests, the running ones finish (`--drain-timeout`, 300 s by default), the old engines quit and the new list
 boots. Requests sent meanwhile wait and are answered by the new width. With a persisted KV store

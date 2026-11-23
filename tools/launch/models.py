@@ -128,7 +128,7 @@ INK2 = Model('ink2', 'Inkling-2-Small', 'https://huggingface.co/thinkingmachines
 # Qwen3.8-Flash-Next: hybrid 36 Gated DeltaNet + 12 Gated GQA (QSA block-4 sparse indexer), 4-stream hyper-connections,
 # layer-1 PLE NVMe row store, 512 pmcgx routed experts (top-10) + BF16 gated shared expert. Supports weight paging
 # (GR8_PTAB=0|1|2) and live dynamic scaling (`./gr8 qw38 scale` across TP=1..4 with g6layout + GR8_KV_REWIDTH).
-QW38 = Model('qw38', 'Qwen3.8-Flash-Next', 'https://huggingface.co/kindlingai/qwen38-flash-next-exlr8',
+QW38 = Model('qw38', 'Qwen3.8-Flash-Next', 'https://huggingface.co/kindlingai/Qwen3.8-Flash-Next-exlr8-k2-k3-k4',
              'g6m4_qw38', 'qw38', ('2', '1', '4', '3'),
              {'bit200': 2.0, 'bit300': 3.0, 'bit400': 4.0},
              {1: ('bit300',), 2: ('bit300',), 3: ('bit300',), 4: ('bit300',)},

@@ -210,7 +210,7 @@ chmod +x "$2"
                     self.assertFalse((out / model.engine).exists())
                     self.assertTrue((out / 'sampler_u01_test').exists())
                     return
-                sim_only = changes.get('DS41_WHAT') == 'sim'
+                sim_only = bool(model.build_what_env and changes.get(model.build_what_env) == 'sim')
                 binary = model.simulator if sim_only else model.engine + ('-int4' if fmt == 'int4' else '')
                 content = (out / binary).read_text()
                 self.assertIn(' '.join(model.build_widths) + '|', content)
