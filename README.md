@@ -214,8 +214,10 @@ If you are an agent (or developer) building on gr8, start from the matching entr
   it, instead of becoming the control token's id. Long prompts keep the parallel encode and the prefix cache.
   Roll back with `--literal-content 0` / `LITERAL_CONTENT=0`
   ([literal control tokens](frontend/README.md#literal-control-tokens-in-message-content)).
-- **Image input.** DeepSeek-V4.1-Flash and GLM-5.3-Flash take images in chat requests (opt-in, `GR8_DS41_VISION=1`,
-  [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`, [docs/FLASH-VISION.md](docs/FLASH-VISION.md)).
+- **Image input.** DeepSeek-V4.1-Flash, GLM-5.3-Flash, and Qwen3.8-Flash-Next take images in chat requests (opt-in,
+  `GR8_DS41_VISION=1`, [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`,
+  [docs/FLASH-VISION.md](docs/FLASH-VISION.md); `GR8_QW38_VISION=1`,
+  [docs/QWEN38.md#image-input-vision](docs/QWEN38.md#image-input-vision)).
 - **A Docker image.** `ghcr.io/kindlingai/gr8` has the engine for every TP width and all three models, so GLM-5.3 on
   three to six boxes needs no build ([Docker Compose](docs/DEPLOY.md#docker-compose)). The one-box and two-box recipes publish their
   own images.

@@ -479,6 +479,605 @@ pub fn heads_in(canon: &[u8], heads: usize, outer: usize, inner: usize, nr: usiz
     Ok(out)
 }
 
+// ---- Draft (DFlash2 GQA ring) and linear-attention (KDA + conv) canonical state (#161) ----
+
+const DFL_MAGIC: &[u8; 8] = b"g6cdfl1\0";
+const KDA_MAGIC: &[u8; 8] = b"g6ckda1\0";
+const SES_MAGIC: &[u8; 8] = b"g6cses1\0";
+
+/// Geometry of a DFlash2 GQA drafter ring (engine/runtime/dflash.cuh: [L][NKR][RING][HD] fp16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DflSpec {
+    pub layers: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub elem_bytes: u32,
+}
+
+impl DflSpec {
+    fn row_bytes(&self) -> Result<usize, Error> {
+        if self.layers == 0 || self.kv_heads == 0 || self.head_dim == 0 || self.elem_bytes == 0 {
+            return Err(Error::Bad("DFlash2 geometry must be nonzero"));
+        }
+        (self.head_dim as usize)
+            .checked_mul(self.elem_bytes as usize)
+            .ok_or(Error::Bad("DFlash2 row size overflow"))
+    }
+}
+
+/// One layout's DFlash2 ring distribution: either split across `nr` ranks (`kv_heads % nr == 0`, no layer rotation) or
+/// replicated on every rank (`replicated == true`, e.g. TP=3 and TP=6 where `dfl::REP` holds all `kv_heads`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DflLayout {
+    pub nr: u32,
+    pub ring: u32,
+    pub replicated: bool,
+}
+
+impl DflLayout {
+    fn nkr(&self, spec: &DflSpec) -> Result<usize, Error> {
+        let _ = spec.row_bytes()?;
+        if self.nr == 0 || self.nr > 64 || self.ring == 0 {
+            return Err(Error::Bad("DFlash2 layout nr (1..=64) or ring (nonzero)"));
+        }
+        if self.replicated {
+            Ok(spec.kv_heads as usize)
+        } else if !spec.kv_heads.is_multiple_of(self.nr) {
+            Err(Error::Bad("split DFlash2 layout requires kv_heads divisible by nr"))
+        } else {
+            Ok((spec.kv_heads / self.nr) as usize)
+        }
+    }
+
+    fn rank_half_bytes(&self, spec: &DflSpec) -> Result<usize, Error> {
+        let row = spec.row_bytes()?;
+        let nkr = self.nkr(spec)?;
+        (spec.layers as usize)
+            .checked_mul(nkr)
+            .and_then(|x| x.checked_mul(self.ring as usize))
+            .and_then(|x| x.checked_mul(row))
+            .ok_or(Error::Bad("DFlash2 ring buffer size overflow"))
+    }
+}
+
+/// One rank's host copy of Dfl::kring and Dfl::vring: each [layers][nkr][ring][head_dim * elem_bytes].
+pub struct DflRing<'a> {
+    pub k: &'a [u8],
+    pub v: &'a [u8],
+}
+
+pub struct DflRingMut<'a> {
+    pub k: &'a mut [u8],
+    pub v: &'a mut [u8],
+}
+
+/// Canonical DFlash2 GQA drafter ring for logical positions [lo, hi): k and v each [layers][kv_heads][rows][row_bytes],
+/// independent of ring length and TP width.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DflCanon {
+    pub spec: DflSpec,
+    pub lo: u64,
+    pub hi: u64,
+    pub k: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+impl DflCanon {
+    pub fn rows(&self) -> Result<u64, Error> {
+        self.hi.checked_sub(self.lo).ok_or(Error::Bad("DFlash2 hi < lo"))
+    }
+
+    fn half_bytes_for(spec: &DflSpec, rows: u64) -> Result<usize, Error> {
+        let row = spec.row_bytes()?;
+        let r = usize::try_from(rows).map_err(|_| Error::Bad("DFlash2 rows overflow"))?;
+        (spec.layers as usize)
+            .checked_mul(spec.kv_heads as usize)
+            .and_then(|x| x.checked_mul(r))
+            .and_then(|x| x.checked_mul(row))
+            .ok_or(Error::Bad("DFlash2 canonical size overflow"))
+    }
+
+    fn check_shape(&self) -> Result<usize, Error> {
+        let rows = self.rows()?;
+        let half = Self::half_bytes_for(&self.spec, rows)?;
+        if self.k.len() != half || self.v.len() != half {
+            return Err(Error::Mismatch("DFlash2 data of another shape than the header"));
+        }
+        Ok(rows as usize)
+    }
+
+    pub fn byte_len(&self) -> usize {
+        DFL_MAGIC.len() + 32 + self.k.len() + self.v.len()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.byte_len());
+        out.extend_from_slice(DFL_MAGIC);
+        out.extend_from_slice(&self.spec.layers.to_le_bytes());
+        out.extend_from_slice(&self.spec.kv_heads.to_le_bytes());
+        out.extend_from_slice(&self.spec.head_dim.to_le_bytes());
+        out.extend_from_slice(&self.spec.elem_bytes.to_le_bytes());
+        out.extend_from_slice(&self.lo.to_le_bytes());
+        out.extend_from_slice(&self.hi.to_le_bytes());
+        out.extend_from_slice(&self.k);
+        out.extend_from_slice(&self.v);
+        out
+    }
+
+    pub fn from_bytes(v: &[u8]) -> Result<DflCanon, Error> {
+        let bad = Error::Bad("not a canonical DFlash2 blob, or cut short");
+        if v.len() < DFL_MAGIC.len() + 32 || &v[..8] != DFL_MAGIC {
+            return Err(bad);
+        }
+        let u32_at = |o: usize| u32::from_le_bytes(v[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(v[o..o + 8].try_into().unwrap());
+        let spec = DflSpec {
+            layers: u32_at(8),
+            kv_heads: u32_at(12),
+            head_dim: u32_at(16),
+            elem_bytes: u32_at(20),
+        };
+        let (lo, hi) = (u64_at(24), u64_at(32));
+        let Some(rows) = hi.checked_sub(lo) else { return Err(bad) };
+        let Ok(half) = Self::half_bytes_for(&spec, rows) else { return Err(bad) };
+        let Some(total) = half.checked_mul(2) else { return Err(bad) };
+        if v.len() - 40 != total {
+            return Err(bad);
+        }
+        Ok(DflCanon {
+            spec,
+            lo,
+            hi,
+            k: v[40..40 + half].to_vec(),
+            v: v[40 + half..40 + total].to_vec(),
+        })
+    }
+}
+
+/// Exports logical positions [lo, hi) from every rank's DFlash2 ring into canonical form.
+/// With `check == true` on a replicated layout, verifies every rank holds identical live rows.
+pub fn dfl_export(
+    spec: DflSpec,
+    layout: &DflLayout,
+    rings: &[DflRing<'_>],
+    lo: u64,
+    hi: u64,
+    check: bool,
+) -> Result<DflCanon, Error> {
+    let row = spec.row_bytes()?;
+    let nkr = layout.nkr(&spec)?;
+    let rank_half = layout.rank_half_bytes(&spec)?;
+    let rows_u64 = hi.checked_sub(lo).ok_or(Error::Bad("DFlash2 hi < lo"))?;
+    if rows_u64 > layout.ring as u64 {
+        return Err(Error::Bad("DFlash2 row span exceeds ring capacity"));
+    }
+    if rings.len() != layout.nr as usize {
+        return Err(Error::Bad("one DFlash2 ring per rank"));
+    }
+    for r in rings {
+        if r.k.len() != rank_half || r.v.len() != rank_half {
+            return Err(Error::Bad("a rank's DFlash2 ring has the wrong size"));
+        }
+    }
+    let rows = rows_u64 as usize;
+    let half = DflCanon::half_bytes_for(&spec, rows_u64)?;
+    let mut k_out = vec![0u8; half];
+    let mut v_out = vec![0u8; half];
+    let (nl, nkv, ring) = (spec.layers as usize, spec.kv_heads as usize, layout.ring as usize);
+
+    for l in 0..nl {
+        if layout.replicated {
+            for h in 0..nkv {
+                let src_base = (l * nkr + h) * ring;
+                let dst_base = (l * nkv + h) * rows;
+                for o in 0..rows {
+                    let pos = lo + o as u64;
+                    let slot = (pos % layout.ring as u64) as usize;
+                    let s = (src_base + slot) * row;
+                    let d = (dst_base + o) * row;
+                    k_out[d..d + row].copy_from_slice(&rings[0].k[s..s + row]);
+                    v_out[d..d + row].copy_from_slice(&rings[0].v[s..s + row]);
+                    if check {
+                        for (r, rr) in rings.iter().enumerate().skip(1) {
+                            if rr.k[s..s + row] != rings[0].k[s..s + row]
+                                || rr.v[s..s + row] != rings[0].v[s..s + row]
+                            {
+                                return Err(Error::Disagree { binding: l, page: pos as usize, rank: r });
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for (r, rr) in rings.iter().enumerate() {
+                for hl in 0..nkr {
+                    let h = r * nkr + hl;
+                    let src_base = (l * nkr + hl) * ring;
+                    let dst_base = (l * nkv + h) * rows;
+                    for o in 0..rows {
+                        let slot = ((lo + o as u64) % layout.ring as u64) as usize;
+                        let s = (src_base + slot) * row;
+                        let d = (dst_base + o) * row;
+                        k_out[d..d + row].copy_from_slice(&rr.k[s..s + row]);
+                        v_out[d..d + row].copy_from_slice(&rr.v[s..s + row]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(DflCanon { spec, lo, hi, k: k_out, v: v_out })
+}
+
+/// Imports canonical DFlash2 ring rows [lo, hi) into one rank's ring at `layout`. Only ring slots in [lo, hi) mod ring
+/// are written, so bulk + tail imports compose cleanly. Returns the number of logical positions written (`hi - lo`).
+pub fn dfl_import(
+    canon: &DflCanon,
+    spec: DflSpec,
+    layout: &DflLayout,
+    rank: u32,
+    dst: &mut DflRingMut<'_>,
+) -> Result<u64, Error> {
+    if canon.spec != spec {
+        return Err(Error::Mismatch("DFlash2 geometry"));
+    }
+    let rows = canon.check_shape()?;
+    let row = spec.row_bytes()?;
+    let nkr = layout.nkr(&spec)?;
+    let rank_half = layout.rank_half_bytes(&spec)?;
+    if rank >= layout.nr {
+        return Err(Error::Bad("rank outside the DFlash2 layout"));
+    }
+    if rows as u64 > layout.ring as u64 {
+        return Err(Error::Bad("DFlash2 canonical span exceeds target ring capacity"));
+    }
+    if dst.k.len() != rank_half || dst.v.len() != rank_half {
+        return Err(Error::Bad("destination DFlash2 ring has the wrong size"));
+    }
+    let (nl, nkv, ring) = (spec.layers as usize, spec.kv_heads as usize, layout.ring as usize);
+    let h_base = if layout.replicated { 0 } else { rank as usize * nkr };
+
+    for l in 0..nl {
+        for hl in 0..nkr {
+            let h = h_base + hl;
+            let src_base = (l * nkv + h) * rows;
+            let dst_base = (l * nkr + hl) * ring;
+            for o in 0..rows {
+                let slot = ((canon.lo + o as u64) % layout.ring as u64) as usize;
+                let s = (src_base + o) * row;
+                let d = (dst_base + slot) * row;
+                dst.k[d..d + row].copy_from_slice(&canon.k[s..s + row]);
+                dst.v[d..d + row].copy_from_slice(&canon.v[s..s + row]);
+            }
+        }
+    }
+    Ok(rows as u64)
+}
+
+/// Geometry of KDA linear-attention + short-convolution state (engine/kda/math.h, s2/flash_ckpt_rewidth.h).
+/// Per KDA slot `li` (model layer `layer_ids[li]`):
+/// - rank layout: `S [nhmax][dk][dv]` then `C [nhist * n_streams][nhmax][dk]` (element size `elem_bytes`),
+///   active heads `0..nh`, padding slots `nh..nhmax` zeroed.
+/// - canonical layout: `S [heads][dk][dv]` then `C [nhist * n_streams][heads][dk]`, head order `0..heads`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KdaSpec {
+    pub heads: u32,
+    pub dk: u32,
+    pub dv: u32,
+    pub nhist: u32,
+    pub n_streams: u32,
+    pub elem_bytes: u32,
+    pub layer_ids: Vec<u32>,
+}
+
+/// Rank `rank` of `nr`'s head range `(h0, nh)` at model layer `layer` (matches kda::heads in engine/kda/math.h).
+pub fn kda_rank_heads(heads: usize, nr: usize, layer: usize, rank: usize) -> (usize, usize) {
+    let j = (rank + nr - (layer % nr)) % nr;
+    (start(heads, nr, j), width(heads, nr, j))
+}
+
+/// Maximum heads held by any rank at width `nr` (matches kda::nhmax in engine/kda/math.h).
+pub fn kda_nhmax(heads: usize, nr: usize) -> usize {
+    heads.div_ceil(nr)
+}
+
+impl KdaSpec {
+    fn check(&self) -> Result<(usize, usize, usize), Error> {
+        if self.heads == 0
+            || self.dk == 0
+            || self.dv == 0
+            || self.nhist == 0
+            || self.n_streams == 0
+            || self.elem_bytes == 0
+            || self.layer_ids.is_empty()
+        {
+            return Err(Error::Bad("KDA geometry must be nonzero"));
+        }
+        let s_head = (self.dk as usize)
+            .checked_mul(self.dv as usize)
+            .and_then(|x| x.checked_mul(self.elem_bytes as usize))
+            .ok_or(Error::Bad("KDA S head size overflow"))?;
+        let c_head = (self.dk as usize)
+            .checked_mul(self.elem_bytes as usize)
+            .ok_or(Error::Bad("KDA conv head size overflow"))?;
+        let c_rows = (self.nhist as usize)
+            .checked_mul(self.n_streams as usize)
+            .ok_or(Error::Bad("KDA conv rows overflow"))?;
+        Ok((s_head, c_head, c_rows))
+    }
+
+    /// Bytes of one rank's KDA buffer across all slots in `layer_ids` at width `nr`.
+    pub fn rank_bytes(&self, nr: u32) -> Result<usize, Error> {
+        let (s_head, c_head, c_rows) = self.check()?;
+        let heads = self.heads as usize;
+        if nr == 0 || nr as usize > heads {
+            return Err(Error::Bad("KDA nr must be in 1..=heads"));
+        }
+        let nhm = kda_nhmax(heads, nr as usize);
+        let s_layer = nhm.checked_mul(s_head).ok_or(Error::Bad("KDA rank S size overflow"))?;
+        let c_layer = c_rows
+            .checked_mul(nhm)
+            .and_then(|x| x.checked_mul(c_head))
+            .ok_or(Error::Bad("KDA rank conv size overflow"))?;
+        let per_layer = s_layer.checked_add(c_layer).ok_or(Error::Bad("KDA rank layer size overflow"))?;
+        self.layer_ids
+            .len()
+            .checked_mul(per_layer)
+            .ok_or(Error::Bad("KDA rank total size overflow"))
+    }
+
+    /// Bytes of canonical KDA state across all slots in `layer_ids`.
+    pub fn canon_bytes(&self) -> Result<usize, Error> {
+        self.rank_bytes(1)
+    }
+}
+
+/// Canonical KDA linear-attention + short-convolution state across all KDA layers, independent of TP width.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KdaCanon {
+    pub spec: KdaSpec,
+    pub data: Vec<u8>,
+}
+
+impl KdaCanon {
+    fn check_shape(&self) -> Result<(), Error> {
+        let want = self.spec.canon_bytes()?;
+        if self.data.len() != want {
+            return Err(Error::Mismatch("KDA data of another shape than the header"));
+        }
+        Ok(())
+    }
+
+    pub fn byte_len(&self) -> usize {
+        KDA_MAGIC.len() + 28 + self.spec.layer_ids.len() * 4 + self.data.len()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.byte_len());
+        out.extend_from_slice(KDA_MAGIC);
+        out.extend_from_slice(&self.spec.heads.to_le_bytes());
+        out.extend_from_slice(&self.spec.dk.to_le_bytes());
+        out.extend_from_slice(&self.spec.dv.to_le_bytes());
+        out.extend_from_slice(&self.spec.nhist.to_le_bytes());
+        out.extend_from_slice(&self.spec.n_streams.to_le_bytes());
+        out.extend_from_slice(&self.spec.elem_bytes.to_le_bytes());
+        out.extend_from_slice(&(self.spec.layer_ids.len() as u32).to_le_bytes());
+        for &l in &self.spec.layer_ids {
+            out.extend_from_slice(&l.to_le_bytes());
+        }
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    pub fn from_bytes(v: &[u8]) -> Result<KdaCanon, Error> {
+        let bad = Error::Bad("not a canonical KDA blob, or cut short");
+        if v.len() < KDA_MAGIC.len() + 28 || &v[..8] != KDA_MAGIC {
+            return Err(bad);
+        }
+        let u32_at = |o: usize| u32::from_le_bytes(v[o..o + 4].try_into().unwrap());
+        let heads = u32_at(8);
+        let dk = u32_at(12);
+        let dv = u32_at(16);
+        let nhist = u32_at(20);
+        let n_streams = u32_at(24);
+        let elem_bytes = u32_at(28);
+        let n_layers = u32_at(32) as usize;
+        let Some(ids_bytes) = n_layers.checked_mul(4) else { return Err(bad) };
+        let at = 36;
+        if ids_bytes > v.len() - at {
+            return Err(bad);
+        }
+        let mut layer_ids = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            layer_ids.push(u32_at(at + i * 4));
+        }
+        let spec = KdaSpec { heads, dk, dv, nhist, n_streams, elem_bytes, layer_ids };
+        let Ok(need) = spec.canon_bytes() else { return Err(bad) };
+        let data_at = at + ids_bytes;
+        if v.len() - data_at != need {
+            return Err(bad);
+        }
+        Ok(KdaCanon { spec, data: v[data_at..].to_vec() })
+    }
+}
+
+/// Gathers KDA linear-attention + short-conv state from `nr` ranks into canonical head order.
+pub fn kda_export(spec: &KdaSpec, nr: u32, ranks: &[&[u8]]) -> Result<KdaCanon, Error> {
+    let (s_head, c_head, c_rows) = spec.check()?;
+    let rank_need = spec.rank_bytes(nr)?;
+    let canon_need = spec.canon_bytes()?;
+    if ranks.len() != nr as usize {
+        return Err(Error::Bad("one KDA buffer per rank"));
+    }
+    for buf in ranks {
+        if buf.len() != rank_need {
+            return Err(Error::Bad("a rank's KDA buffer has the wrong size"));
+        }
+    }
+    let heads = spec.heads as usize;
+    let nhm = kda_nhmax(heads, nr as usize);
+    let r_s_layer = nhm * s_head;
+    let r_c_layer = c_rows * nhm * c_head;
+    let r_stride = r_s_layer + r_c_layer;
+    let c_s_layer = heads * s_head;
+    let c_c_layer = c_rows * heads * c_head;
+    let c_stride = c_s_layer + c_c_layer;
+
+    let mut data = vec![0u8; canon_need];
+    for (li, &layer) in spec.layer_ids.iter().enumerate() {
+        let dst_s = li * c_stride;
+        let dst_c = dst_s + c_s_layer;
+        for (r, buf) in ranks.iter().enumerate() {
+            let (h0, nh) = kda_rank_heads(heads, nr as usize, layer as usize, r);
+            let src_s = li * r_stride;
+            let src_c = src_s + r_s_layer;
+            data[dst_s + h0 * s_head..dst_s + (h0 + nh) * s_head]
+                .copy_from_slice(&buf[src_s..src_s + nh * s_head]);
+            for k in 0..c_rows {
+                let s_off = src_c + k * nhm * c_head;
+                let d_off = dst_c + (k * heads + h0) * c_head;
+                data[d_off..d_off + nh * c_head].copy_from_slice(&buf[s_off..s_off + nh * c_head]);
+            }
+        }
+    }
+    Ok(KdaCanon { spec: spec.clone(), data })
+}
+
+/// Scatters canonical KDA state into rank `rank` of `nr`'s buffer, zeroing any padding heads `nh..nhmax`.
+pub fn kda_import(canon: &KdaCanon, spec: &KdaSpec, nr: u32, rank: u32, dst: &mut [u8]) -> Result<usize, Error> {
+    if canon.spec != *spec {
+        return Err(Error::Mismatch("KDA geometry"));
+    }
+    canon.check_shape()?;
+    let (s_head, c_head, c_rows) = spec.check()?;
+    let rank_need = spec.rank_bytes(nr)?;
+    if rank >= nr {
+        return Err(Error::Bad("rank outside the KDA layout"));
+    }
+    if dst.len() != rank_need {
+        return Err(Error::Bad("destination KDA buffer has the wrong size"));
+    }
+    dst.fill(0);
+    let heads = spec.heads as usize;
+    let nhm = kda_nhmax(heads, nr as usize);
+    let r_s_layer = nhm * s_head;
+    let r_c_layer = c_rows * nhm * c_head;
+    let r_stride = r_s_layer + r_c_layer;
+    let c_s_layer = heads * s_head;
+    let c_c_layer = c_rows * heads * c_head;
+    let c_stride = c_s_layer + c_c_layer;
+
+    for (li, &layer) in spec.layer_ids.iter().enumerate() {
+        let (h0, nh) = kda_rank_heads(heads, nr as usize, layer as usize, rank as usize);
+        let src_s = li * c_stride;
+        let src_c = src_s + c_s_layer;
+        let dst_s = li * r_stride;
+        let dst_c = dst_s + r_s_layer;
+        dst[dst_s..dst_s + nh * s_head]
+            .copy_from_slice(&canon.data[src_s + h0 * s_head..src_s + (h0 + nh) * s_head]);
+        for k in 0..c_rows {
+            let s_off = src_c + (k * heads + h0) * c_head;
+            let d_off = dst_c + k * nhm * c_head;
+            dst[d_off..d_off + nh * c_head].copy_from_slice(&canon.data[s_off..s_off + nh * c_head]);
+        }
+    }
+    Ok(rank_need)
+}
+
+/// Checks and returns replicated opaque state (e.g. Flash raw indexer rings or MTP metadata) across ranks.
+pub fn replicated_export(ranks: &[&[u8]], check: bool) -> Result<Vec<u8>, Error> {
+    if ranks.is_empty() {
+        return Err(Error::Bad("at least one rank required"));
+    }
+    let first = ranks[0];
+    for (r, &b) in ranks.iter().enumerate().skip(1) {
+        if b.len() != first.len() {
+            return Err(Error::Bad("replicated state length differs across ranks"));
+        }
+        if check && b != first {
+            return Err(Error::Disagree { binding: 0, page: 0, rank: r });
+        }
+    }
+    Ok(first.to_vec())
+}
+
+/// Complete canonical session envelope: KV pages (main + unsharded MTP), optional DFlash2 ring, optional KDA linear
+/// attention + conv state, and optional replicated opaque state (e.g. Flash raw index rings / draft scalars).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionCanon {
+    pub kv: Option<Canon>,
+    pub dfl: Option<DflCanon>,
+    pub kda: Option<KdaCanon>,
+    pub extra: Vec<u8>,
+}
+
+impl SessionCanon {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let kv_b = self.kv.as_ref().map(Canon::to_bytes).unwrap_or_default();
+        let dfl_b = self.dfl.as_ref().map(DflCanon::to_bytes).unwrap_or_default();
+        let kda_b = self.kda.as_ref().map(KdaCanon::to_bytes).unwrap_or_default();
+        pack_session_parts(&kv_b, &dfl_b, &kda_b, &self.extra)
+    }
+
+    pub fn from_bytes(v: &[u8]) -> Result<SessionCanon, Error> {
+        let s = unpack_session_slices(v)?;
+        let kv = if s.kv.is_empty() { None } else { Some(Canon::from_bytes(s.kv)?) };
+        let dfl = if s.dfl.is_empty() { None } else { Some(DflCanon::from_bytes(s.dfl)?) };
+        let kda = if s.kda.is_empty() { None } else { Some(KdaCanon::from_bytes(s.kda)?) };
+        Ok(SessionCanon { kv, dfl, kda, extra: s.extra.to_vec() })
+    }
+}
+
+fn pack_session_parts(kv: &[u8], dfl: &[u8], kda: &[u8], extra: &[u8]) -> Vec<u8> {
+    let total = SES_MAGIC.len() + 32 + kv.len() + dfl.len() + kda.len() + extra.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(SES_MAGIC);
+    out.extend_from_slice(&(kv.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(dfl.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(kda.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(extra.len() as u64).to_le_bytes());
+    out.extend_from_slice(kv);
+    out.extend_from_slice(dfl);
+    out.extend_from_slice(kda);
+    out.extend_from_slice(extra);
+    out
+}
+
+struct SessionSlices<'a> {
+    kv: &'a [u8],
+    dfl: &'a [u8],
+    kda: &'a [u8],
+    extra: &'a [u8],
+}
+
+fn unpack_session_slices(v: &[u8]) -> Result<SessionSlices<'_>, Error> {
+    let bad = Error::Bad("not a canonical session blob, or cut short");
+    if v.len() < SES_MAGIC.len() + 32 || &v[..8] != SES_MAGIC {
+        return Err(bad);
+    }
+    let u64_at = |o: usize| u64::from_le_bytes(v[o..o + 8].try_into().unwrap());
+    let lens = [u64_at(8), u64_at(16), u64_at(24), u64_at(32)];
+    let mut sum = 0usize;
+    let mut parts = [0usize; 4];
+    for (i, &l) in lens.iter().enumerate() {
+        let Ok(n) = usize::try_from(l) else { return Err(bad) };
+        let Some(next) = sum.checked_add(n) else { return Err(bad) };
+        sum = next;
+        parts[i] = n;
+    }
+    if v.len() - 40 != sum {
+        return Err(bad);
+    }
+    let mut at = 40;
+    let kv = &v[at..at + parts[0]];
+    at += parts[0];
+    let dfl = &v[at..at + parts[1]];
+    at += parts[1];
+    let kda = &v[at..at + parts[2]];
+    at += parts[2];
+    let extra = &v[at..at + parts[3]];
+    Ok(SessionSlices { kv, dfl, kda, extra })
+}
+
 // ---- C interface (g6kvman.h g6kv_canon_*) ----
 
 use std::cell::RefCell;
@@ -639,4 +1238,410 @@ pub unsafe extern "C" fn g6kv_canon_import(
         }
         Err(e) => fail(e),
     }
+}
+
+unsafe fn c_slice<'a>(p: *const u8, n: usize) -> Option<&'a [u8]> {
+    if n == 0 {
+        Some(&[])
+    } else if p.is_null() {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(p, n))
+    }
+}
+
+unsafe fn c_slice_mut<'a>(p: *mut u8, n: usize) -> Option<&'a mut [u8]> {
+    if n == 0 {
+        Some(&mut [])
+    } else if p.is_null() {
+        None
+    } else {
+        Some(std::slice::from_raw_parts_mut(p, n))
+    }
+}
+
+unsafe fn write_out(bytes: &[u8], out: *mut u8, cap: usize, need: *mut usize) -> i32 {
+    if need.is_null() {
+        return fail(Error::Bad("null need pointer"));
+    }
+    *need = bytes.len();
+    if cap < bytes.len() || (!bytes.is_empty() && out.is_null()) {
+        return 1;
+    }
+    if !bytes.is_empty() {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+    }
+    0
+}
+
+/// Gathers head-split state [outer][w][inner] from `nr` head groups into canonical [outer][heads][inner].
+///
+/// # Safety
+/// Every pointer valid for the sizes given.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_canon_heads_out(
+    ranks: *const *const u8,
+    rank_bytes: *const usize,
+    nr: u32,
+    heads: u32,
+    outer: usize,
+    inner: usize,
+    out: *mut u8,
+    cap: usize,
+    need: *mut usize,
+) -> i32 {
+    if need.is_null() || nr == 0 || ranks.is_null() || rank_bytes.is_null() {
+        return fail(Error::Bad("null or zero argument"));
+    }
+    let mut parts = Vec::with_capacity(nr as usize);
+    for r in 0..nr as usize {
+        let Some(s) = c_slice(*ranks.add(r), *rank_bytes.add(r)) else {
+            return fail(Error::Bad("null rank head buffer"));
+        };
+        parts.push(s);
+    }
+    match heads_out(&parts, heads as usize, outer, inner) {
+        Ok(b) => write_out(&b, out, cap, need),
+        Err(e) => fail(e),
+    }
+}
+
+/// Scatters canonical [outer][heads][inner] into head group `group` of `nr`.
+///
+/// # Safety
+/// Every pointer valid for the sizes given.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_canon_heads_in(
+    canon: *const u8,
+    canon_bytes: usize,
+    heads: u32,
+    outer: usize,
+    inner: usize,
+    nr: u32,
+    group: u32,
+    out: *mut u8,
+    cap: usize,
+    need: *mut usize,
+) -> i32 {
+    if need.is_null() {
+        return fail(Error::Bad("null argument"));
+    }
+    let Some(src) = c_slice(canon, canon_bytes) else {
+        return fail(Error::Bad("null canonical head buffer"));
+    };
+    match heads_in(src, heads as usize, outer, inner, nr as usize, group as usize) {
+        Ok(b) => write_out(&b, out, cap, need),
+        Err(e) => fail(e),
+    }
+}
+
+/// Exports DFlash2 GQA drafter ring positions [lo, hi) from `nr` ranks into a `g6cdfl1` blob.
+///
+/// # Safety
+/// Every pointer valid for the sizes given.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_canon_dfl_export(
+    layers: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    elem_bytes: u32,
+    nr: u32,
+    ring: u32,
+    replicated: i32,
+    k_ranks: *const *const u8,
+    k_bytes: *const usize,
+    v_ranks: *const *const u8,
+    v_bytes: *const usize,
+    lo: u64,
+    hi: u64,
+    check: i32,
+    out: *mut u8,
+    cap: usize,
+    need: *mut usize,
+) -> i32 {
+    if need.is_null() || nr == 0 || k_ranks.is_null() || k_bytes.is_null() || v_ranks.is_null() || v_bytes.is_null() {
+        return fail(Error::Bad("null or zero argument"));
+    }
+    let mut rings = Vec::with_capacity(nr as usize);
+    for r in 0..nr as usize {
+        let (Some(k), Some(v)) = (c_slice(*k_ranks.add(r), *k_bytes.add(r)), c_slice(*v_ranks.add(r), *v_bytes.add(r)))
+        else {
+            return fail(Error::Bad("null DFlash2 ring buffer"));
+        };
+        rings.push(DflRing { k, v });
+    }
+    let spec = DflSpec { layers, kv_heads, head_dim, elem_bytes };
+    let layout = DflLayout { nr, ring, replicated: replicated != 0 };
+    match dfl_export(spec, &layout, &rings, lo, hi, check != 0) {
+        Ok(c) => {
+            *need = c.byte_len();
+            if cap < *need || out.is_null() {
+                return 1;
+            }
+            let b = c.to_bytes();
+            std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Imports a `g6cdfl1` blob into rank `rank` of `nr`'s DFlash2 K/V rings.
+///
+/// # Safety
+/// Every pointer valid for the sizes given.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_canon_dfl_import(
+    blob: *const u8,
+    n: usize,
+    layers: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    elem_bytes: u32,
+    nr: u32,
+    ring: u32,
+    replicated: i32,
+    rank: u32,
+    k_dst: *mut u8,
+    k_bytes: usize,
+    v_dst: *mut u8,
+    v_bytes: usize,
+    written: *mut u64,
+) -> i32 {
+    let (Some(b), Some(k), Some(v)) = (c_slice(blob, n), c_slice_mut(k_dst, k_bytes), c_slice_mut(v_dst, v_bytes))
+    else {
+        return fail(Error::Bad("null argument"));
+    };
+    let c = match DflCanon::from_bytes(b) {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let spec = DflSpec { layers, kv_heads, head_dim, elem_bytes };
+    let layout = DflLayout { nr, ring, replicated: replicated != 0 };
+    let mut dst = DflRingMut { k, v };
+    match dfl_import(&c, spec, &layout, rank, &mut dst) {
+        Ok(w) => {
+            if !written.is_null() {
+                *written = w;
+            }
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Bytes of one rank's KDA linear-attention + short-conv buffer across `n_layers` slots at width `nr` (0 on error).
+#[no_mangle]
+pub extern "C" fn g6kv_canon_kda_rank_bytes(
+    heads: u32,
+    dk: u32,
+    dv: u32,
+    nhist: u32,
+    n_streams: u32,
+    elem_bytes: u32,
+    n_layers: u32,
+    nr: u32,
+) -> usize {
+    if n_layers == 0 {
+        return 0;
+    }
+    let spec = KdaSpec { heads, dk, dv, nhist, n_streams, elem_bytes, layer_ids: vec![0; n_layers as usize] };
+    spec.rank_bytes(nr).unwrap_or(0)
+}
+
+/// Exports KDA linear-attention + short-conv state from `nr` ranks into a `g6ckda1` blob.
+///
+/// # Safety
+/// Every pointer valid for the sizes given.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_canon_kda_export(
+    heads: u32,
+    dk: u32,
+    dv: u32,
+    nhist: u32,
+    n_streams: u32,
+    elem_bytes: u32,
+    layer_ids: *const u32,
+    n_layers: u32,
+    nr: u32,
+    ranks: *const *const u8,
+    rank_bytes: *const usize,
+    out: *mut u8,
+    cap: usize,
+    need: *mut usize,
+) -> i32 {
+    if need.is_null() || nr == 0 || n_layers == 0 || layer_ids.is_null() || ranks.is_null() || rank_bytes.is_null() {
+        return fail(Error::Bad("null or zero argument"));
+    }
+    let ids = std::slice::from_raw_parts(layer_ids, n_layers as usize).to_vec();
+    let spec = KdaSpec { heads, dk, dv, nhist, n_streams, elem_bytes, layer_ids: ids };
+    let mut parts = Vec::with_capacity(nr as usize);
+    for r in 0..nr as usize {
+        let Some(s) = c_slice(*ranks.add(r), *rank_bytes.add(r)) else {
+            return fail(Error::Bad("null KDA rank buffer"));
+        };
+        parts.push(s);
+    }
+    match kda_export(&spec, nr, &parts) {
+        Ok(c) => {
+            *need = c.byte_len();
+            if cap < *need || out.is_null() {
+                return 1;
+            }
+            let b = c.to_bytes();
+            std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len());
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Imports a `g6ckda1` blob into rank `rank` of `nr`'s KDA buffer.
+///
+/// # Safety
+/// Every pointer valid for the sizes given.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_canon_kda_import(
+    blob: *const u8,
+    n: usize,
+    heads: u32,
+    dk: u32,
+    dv: u32,
+    nhist: u32,
+    n_streams: u32,
+    elem_bytes: u32,
+    layer_ids: *const u32,
+    n_layers: u32,
+    nr: u32,
+    rank: u32,
+    dst: *mut u8,
+    dst_bytes: usize,
+    written: *mut usize,
+) -> i32 {
+    if n_layers == 0 || layer_ids.is_null() {
+        return fail(Error::Bad("null or zero layer_ids"));
+    }
+    let (Some(b), Some(out)) = (c_slice(blob, n), c_slice_mut(dst, dst_bytes)) else {
+        return fail(Error::Bad("null argument"));
+    };
+    let c = match KdaCanon::from_bytes(b) {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let ids = std::slice::from_raw_parts(layer_ids, n_layers as usize).to_vec();
+    let spec = KdaSpec { heads, dk, dv, nhist, n_streams, elem_bytes, layer_ids: ids };
+    match kda_import(&c, &spec, nr, rank, out) {
+        Ok(w) => {
+            if !written.is_null() {
+                *written = w;
+            }
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Packs validated optional KV, DFlash2, KDA and extra slices into one `g6cses1` session envelope.
+///
+/// # Safety
+/// Every pointer valid for the sizes given.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_canon_session_pack(
+    kv: *const u8,
+    kv_n: usize,
+    dfl: *const u8,
+    dfl_n: usize,
+    kda: *const u8,
+    kda_n: usize,
+    extra: *const u8,
+    extra_n: usize,
+    out: *mut u8,
+    cap: usize,
+    need: *mut usize,
+) -> i32 {
+    if need.is_null() {
+        return fail(Error::Bad("null need pointer"));
+    }
+    let (Some(kv_s), Some(dfl_s), Some(kda_s), Some(extra_s)) =
+        (c_slice(kv, kv_n), c_slice(dfl, dfl_n), c_slice(kda, kda_n), c_slice(extra, extra_n))
+    else {
+        return fail(Error::Bad("null section with nonzero length"));
+    };
+    if !kv_s.is_empty() {
+        if let Err(e) = Canon::from_bytes(kv_s) {
+            return fail(e);
+        }
+    }
+    if !dfl_s.is_empty() {
+        if let Err(e) = DflCanon::from_bytes(dfl_s) {
+            return fail(e);
+        }
+    }
+    if !kda_s.is_empty() {
+        if let Err(e) = KdaCanon::from_bytes(kda_s) {
+            return fail(e);
+        }
+    }
+    let total = SES_MAGIC.len() + 32 + kv_s.len() + dfl_s.len() + kda_s.len() + extra_s.len();
+    *need = total;
+    if cap < total || out.is_null() {
+        return 1;
+    }
+    let packed = pack_session_parts(kv_s, dfl_s, kda_s, extra_s);
+    std::ptr::copy_nonoverlapping(packed.as_ptr(), out, packed.len());
+    0
+}
+
+/// Unpacks and validates a `g6cses1` session envelope, returning pointers and lengths into `blob`.
+///
+/// # Safety
+/// Every pointer valid for the sizes given.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_canon_session_unpack(
+    blob: *const u8,
+    n: usize,
+    kv: *mut *const u8,
+    kv_n: *mut usize,
+    dfl: *mut *const u8,
+    dfl_n: *mut usize,
+    kda: *mut *const u8,
+    kda_n: *mut usize,
+    extra: *mut *const u8,
+    extra_n: *mut usize,
+) -> i32 {
+    let Some(b) = c_slice(blob, n) else {
+        return fail(Error::Bad("null blob"));
+    };
+    let s = match unpack_session_slices(b) {
+        Ok(x) => x,
+        Err(e) => return fail(e),
+    };
+    if !s.kv.is_empty() {
+        if let Err(e) = Canon::from_bytes(s.kv) {
+            return fail(e);
+        }
+    }
+    if !s.dfl.is_empty() {
+        if let Err(e) = DflCanon::from_bytes(s.dfl) {
+            return fail(e);
+        }
+    }
+    if !s.kda.is_empty() {
+        if let Err(e) = KdaCanon::from_bytes(s.kda) {
+            return fail(e);
+        }
+    }
+    let put = |s: &[u8], pp: *mut *const u8, pn: *mut usize| {
+        if !pp.is_null() {
+            *pp = if s.is_empty() { std::ptr::null() } else { s.as_ptr() };
+        }
+        if !pn.is_null() {
+            *pn = s.len();
+        }
+    };
+    put(s.kv, kv, kv_n);
+    put(s.dfl, dfl, dfl_n);
+    put(s.kda, kda, kda_n);
+    put(s.extra, extra, extra_n);
+    0
 }
