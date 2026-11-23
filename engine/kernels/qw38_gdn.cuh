@@ -74,6 +74,7 @@ struct GdnScratch {
     uint16_t* wy_u = nullptr;           // [nh_v, max_M, 128] BF16
     uint16_t* wy_aq = nullptr;          // [nh_v, max_M, 64] BF16
     float* wy_glast = nullptr;          // [nh_v, (max_M + 63) / 64] FP32
+    uint8_t* x8 = nullptr;              // shared MXFP8 A-record scratch (optional)
 };
 
 // Fused BF16 GEMV for in_proj_a [nh_v, 2560] + in_proj_b [nh_v, 2560] (M <= 8).
@@ -1402,8 +1403,22 @@ inline void gdn_forward(cublasHandle_t blas, const GdnWeights& w, GdnLayerState&
     const int v0 = geom::gdn_v0(nr, rank);
     const int qkv_dim = geom::gdn_qkv_local(nr, rank);
 
-    // 1. Input projections (coalesced FP8/BF16 uint4 GEMV for M <= 20, cuBLAS tensor cores for M > 20)
-    if ((M <= 20 && w.fp8_qkv.q) || M <= 8) {
+    // 1. Input projections (MXFP8 TC for M >= 16, coalesced FP8/BF16 GEMV for small M, BF16 cuBLAS fallback)
+    const bool use_mx_tc = (M >= 16 && w.fp8_qkv.mx_sc && w.fp8_z.mx_sc && sc.x8);
+    if (use_mx_tc) {
+        qw38_bf16_to_mx8(x, sc.x8, M, geom::HID, st);
+        qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_qkv, sc.qkv_raw, M, st);
+        qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_z, sc.z, M, st);
+        if (M <= 20) {
+            const int ab_grid = (2 * nh_v + 3) / 4;
+            if (M <= 16) k_gdn_in_proj_ab<16><<<ab_grid, 128, 0, st>>>(x, w.in_proj_a, w.in_proj_b, sc.a, sc.b, M, nh_v);
+            else k_gdn_in_proj_ab<20><<<ab_grid, 128, 0, st>>>(x, w.in_proj_a, w.in_proj_b, sc.a, sc.b, M, nh_v);
+        } else {
+            cublasSetStream(blas, st);
+            gemm_bf16_nt(blas, M, nh_v, geom::HID, x, w.in_proj_a, sc.a);
+            gemm_bf16_nt(blas, M, nh_v, geom::HID, x, w.in_proj_b, sc.b);
+        }
+    } else if ((M <= 20 && w.fp8_qkv.q) || M <= 8) {
         if (w.fp8_qkv.q) {
             launch_fp8_gemv_smallm<false>(x, w.fp8_qkv, sc.qkv_raw, M, st);
             launch_fp8_gemv_smallm<false>(x, w.fp8_z, sc.z, M, st);
@@ -1491,7 +1506,10 @@ inline void gdn_forward(cublasHandle_t blas, const GdnWeights& w, GdnLayerState&
     }
 
     // 3. Output projection
-    if ((M <= 20 && w.fp8_out.q) || M <= 8) {
+    if (M >= 16 && w.fp8_out.mx_sc && sc.x8) {
+        qw38_bf16_to_mx8(sc.core, sc.x8, M, nh_v * geom::GDN_DV, st);
+        qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_out, out_part, M, st);
+    } else if ((M <= 20 && w.fp8_out.q) || M <= 8) {
         if (w.fp8_out.q) {
             launch_fp8_gemv_smallm<false>(sc.core, w.fp8_out, out_part, M, st);
         } else {

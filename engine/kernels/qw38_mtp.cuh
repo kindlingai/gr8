@@ -370,11 +370,12 @@ __global__ void __launch_bounds__(256) k_mtp_exp_fc2_int4(
     if (sub_l == 0) dn_part[static_cast<size_t>(route) * geom::HID + d] = topk_w[route] * acc;
 }
 
-// Fast GPU-native MTP Routed MoE FC1 (gate+up+silu) in block-32 FP8 (fallback when GR8_QW38_MTP_FAST=0).
+// Fast GPU-native MTP Routed MoE FC1 (gate+up+silu) in block-32 FP8/MXFP8 (fallback when GR8_QW38_MTP_FAST=0).
+template <bool MX_SC = false>
 __global__ void __launch_bounds__(128) k_mtp_exp_fc1_fp8(
     const __nv_bfloat16* __restrict__ x,
     const int* __restrict__ topk_idx,
-    const uint8_t* __restrict__ gu_q, const __half* __restrict__ gu_sc,
+    const uint8_t* __restrict__ gu_q, const __half* __restrict__ gu_sc, const uint8_t* __restrict__ gu_mx,
     __nv_bfloat16* __restrict__ mid_out,
     int M, int sh_i) {
     const int n_blks = (sh_i + 3) >> 2;
@@ -397,16 +398,16 @@ __global__ void __launch_bounds__(128) k_mtp_exp_fc1_fp8(
     constexpr int NB = geom::HID >> 5;  // 80
     const uint4* gq = reinterpret_cast<const uint4*>(gu_q + g_row * geom::HID);
     const uint4* uq = reinterpret_cast<const uint4*>(gu_q + u_row * geom::HID);
-    const __half* gs = gu_sc + g_row * NB;
-    const __half* us = gu_sc + u_row * NB;
+    const size_t gsb = g_row * NB;
+    const size_t usb = u_row * NB;
     const uint4* xm = reinterpret_cast<const uint4*>(x + static_cast<size_t>(m) * geom::HID);
 
     float ag = 0.0f, au = 0.0f;
     for (int i = lane; i < K16; i += 32) {
         const uint4 a0 = xm[2 * i], a1 = xm[2 * i + 1];
         float2 gf[8], uf[8];
-        fp8x16_unpack(__ldg(gq + i), __half2float(__ldg(gs + (i >> 1))), gf);
-        fp8x16_unpack(__ldg(uq + i), __half2float(__ldg(us + (i >> 1))), uf);
+        fp8x16_unpack(__ldg(gq + i), load_fp8_scale<MX_SC>(gu_sc, gu_mx, gsb + (i >> 1)), gf);
+        fp8x16_unpack(__ldg(uq + i), load_fp8_scale<MX_SC>(gu_sc, gu_mx, usb + (i >> 1)), uf);
         ag += dot_bf16x16_f2x8(a0, a1, gf);
         au += dot_bf16x16_f2x8(a0, a1, uf);
     }
@@ -415,12 +416,13 @@ __global__ void __launch_bounds__(128) k_mtp_exp_fc1_fp8(
     if (lane == 0) mid_out[static_cast<size_t>(route) * sh_i + n] = __float2bfloat16(silu_f(g) * u);
 }
 
-// Fast GPU-native MTP Routed MoE FC2 (down) in block-32 FP8 (fallback when GR8_QW38_MTP_FAST=0).
+// Fast GPU-native MTP Routed MoE FC2 (down) in block-32 FP8/MXFP8 (fallback when GR8_QW38_MTP_FAST=0).
+template <bool MX_SC = false>
 __global__ void __launch_bounds__(128) k_mtp_exp_fc2_fp8(
     const __nv_bfloat16* __restrict__ mid_in,
     const int* __restrict__ topk_idx,
     const float* __restrict__ topk_w,
-    const uint8_t* __restrict__ dn_q, const __half* __restrict__ dn_sc,
+    const uint8_t* __restrict__ dn_q, const __half* __restrict__ dn_sc, const uint8_t* __restrict__ dn_mx,
     float* __restrict__ dn_part,
     int M, int sh_i) {
     constexpr int D_BLKS = geom::HID >> 2; // 640
@@ -438,13 +440,13 @@ __global__ void __launch_bounds__(128) k_mtp_exp_fc2_fp8(
     const int k16 = sh_i >> 4;
     const int nb = sh_i >> 5;
     const uint4* dq = reinterpret_cast<const uint4*>(dn_q + row * sh_i);
-    const __half* ds = dn_sc + row * nb;
+    const size_t dsb = row * nb;
     const uint4* am = reinterpret_cast<const uint4*>(mid_in + static_cast<size_t>(route) * sh_i);
 
     float acc = 0.0f;
     for (int i = lane; i < k16; i += 32) {
         float2 wf[8];
-        fp8x16_unpack(__ldg(dq + i), __half2float(__ldg(ds + (i >> 1))), wf);
+        fp8x16_unpack(__ldg(dq + i), load_fp8_scale<MX_SC>(dn_sc, dn_mx, dsb + (i >> 1)), wf);
         acc += dot_bf16x16_f2x8(am[2 * i], am[2 * i + 1], wf);
     }
     const float tot = warp_sum(acc);
@@ -520,15 +522,15 @@ inline void mtp_moe_forward(cublasHandle_t blas, const MoeWeights& w,
         const int sgrid = (w.sh_i + 3) / 4;
         if (M == 1) {
             k_qw38_router_and_shgate<1><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
-            if (w.fp8_sh_gate.q) k_fp8_sh_gate_up_silu<1><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
+            if (w.fp8_sh_gate.q) launch_fp8_sh_gate_up_silu<1>(x, w.fp8_sh_gate, w.fp8_sh_up, sc.sh_gate_buf, M, w.sh_i, st);
             else k_qw38_sh_gate_up_silu<1><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
         } else if (M <= 4) {
             k_qw38_router_and_shgate<4><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
-            if (w.fp8_sh_gate.q) k_fp8_sh_gate_up_silu<4><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
+            if (w.fp8_sh_gate.q) launch_fp8_sh_gate_up_silu<4>(x, w.fp8_sh_gate, w.fp8_sh_up, sc.sh_gate_buf, M, w.sh_i, st);
             else k_qw38_sh_gate_up_silu<4><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
         } else {
             k_qw38_router_and_shgate<8><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
-            if (w.fp8_sh_gate.q) k_fp8_sh_gate_up_silu<8><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
+            if (w.fp8_sh_gate.q) launch_fp8_sh_gate_up_silu<8>(x, w.fp8_sh_gate, w.fp8_sh_up, sc.sh_gate_buf, M, w.sh_i, st);
             else k_qw38_sh_gate_up_silu<8><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
         }
         k_qw38_router_topk10<<<M, 256, 0, st>>>(sc.router_logits, sc.topk_idx, sc.topk_w, M);
@@ -555,8 +557,13 @@ inline void mtp_moe_forward(cublasHandle_t blas, const MoeWeights& w,
     } else if (fp8_gu.q && fp8_dn.q) {
         const int fc1_grid = n_routes * ((w.sh_i + 3) / 4);
         const int fc2_grid = n_routes * (geom::HID / 4);
-        k_mtp_exp_fc1_fp8<<<fc1_grid, 128, 0, st>>>(x, sc.topk_idx, fp8_gu.q, fp8_gu.sc, msc.exp_mid, M, w.sh_i);
-        k_mtp_exp_fc2_fp8<<<fc2_grid, 128, 0, st>>>(msc.exp_mid, sc.topk_idx, sc.topk_w, fp8_dn.q, fp8_dn.sc, msc.exp_dn_part, M, w.sh_i);
+        if (fp8_gu.mx_sc) {
+            k_mtp_exp_fc1_fp8<true><<<fc1_grid, 128, 0, st>>>(x, sc.topk_idx, fp8_gu.q, fp8_gu.sc, fp8_gu.mx_sc, msc.exp_mid, M, w.sh_i);
+            k_mtp_exp_fc2_fp8<true><<<fc2_grid, 128, 0, st>>>(msc.exp_mid, sc.topk_idx, sc.topk_w, fp8_dn.q, fp8_dn.sc, fp8_dn.mx_sc, msc.exp_dn_part, M, w.sh_i);
+        } else {
+            k_mtp_exp_fc1_fp8<false><<<fc1_grid, 128, 0, st>>>(x, sc.topk_idx, fp8_gu.q, fp8_gu.sc, fp8_gu.mx_sc, msc.exp_mid, M, w.sh_i);
+            k_mtp_exp_fc2_fp8<false><<<fc2_grid, 128, 0, st>>>(msc.exp_mid, sc.topk_idx, sc.topk_w, fp8_dn.q, fp8_dn.sc, fp8_dn.mx_sc, msc.exp_dn_part, M, w.sh_i);
+        }
     } else {
         const int fc1_grid = n_routes * ((w.sh_i + 3) / 4);
         const int fc2_grid = n_routes * (geom::HID / 4);

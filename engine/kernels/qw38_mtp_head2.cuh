@@ -369,10 +369,12 @@ __global__ void __launch_bounds__(1024) k_qw38_head2_top(
     }
 }
 
-// Stage 3a (MTP draft): Exact FP8 rescore of SL=64 candidates (Grid dim3(M, 8), Block 256).
+// Stage 3a (MTP draft): Exact FP8/MXFP8 rescore of SL=64 candidates (Grid dim3(M, 8), Block 256).
+template <bool MX_SC = false>
 __global__ void __launch_bounds__(256) k_qw38_mtp_head2_rescore_fp8(
     const uint8_t* __restrict__ Bq,
     const __half* __restrict__ Bsc,
+    const uint8_t* __restrict__ Bmx,
     const __nv_bfloat16* __restrict__ x,
     const int* __restrict__ cand,
     float* __restrict__ y,
@@ -386,13 +388,15 @@ __global__ void __launch_bounds__(256) k_qw38_mtp_head2_rescore_fp8(
     constexpr int K16 = geom::HID >> 4; // 160
     constexpr int NB = geom::HID >> 5;  // 80
     const uint4* qrow = reinterpret_cast<const uint4*>(Bq + static_cast<size_t>(v) * geom::HID);
-    const __half* srow = Bsc + static_cast<size_t>(v) * NB;
+    const size_t sbase = static_cast<size_t>(v) * NB;
     const uint4* xm = reinterpret_cast<const uint4*>(x + static_cast<size_t>(m) * geom::HID);
 
     float acc = 0.0f;
     for (int i = lane; i < K16; i += 32) {
         const uint4 wv = __ldcs(qrow + i);
-        const float sc = __half2float(__ldcs(srow + (i >> 1)));
+        const float sc = MX_SC
+            ? __uint_as_float(static_cast<uint32_t>(__ldcs(Bmx + sbase + (i >> 1))) << 23)
+            : __half2float(__ldcs(Bsc + sbase + (i >> 1)));
         float2 wf[8];
         fp8x16_unpack_raw(wv, wf);
         const float d = dot_bf16x16_f2x8(xm[2 * i], xm[2 * i + 1], wf);
@@ -405,11 +409,13 @@ __global__ void __launch_bounds__(256) k_qw38_mtp_head2_rescore_fp8(
     }
 }
 
-// Stage 3b (Trunk): Bit-exact FP8 rescore of SL=256 candidates matching k_fp8_gemv_1warp arithmetic identically!
+// Stage 3b (Trunk): Bit-exact FP8/MXFP8 rescore of SL=256 candidates matching k_fp8_gemv_1warp arithmetic identically!
 // Grid: dim3(M, SL_TRUNK / 8 = 32), Block: 256 (8 candidates/CTA).
+template <bool MX_SC = false>
 __global__ void __launch_bounds__(256) k_qw38_head2_rescore_fp8_exact(
     const uint8_t* __restrict__ Bq,
     const __half* __restrict__ Bsc,
+    const uint8_t* __restrict__ Bmx,
     const __nv_bfloat16* __restrict__ x,
     const int* __restrict__ cand,
     float* __restrict__ cl) {
@@ -421,13 +427,13 @@ __global__ void __launch_bounds__(256) k_qw38_head2_rescore_fp8_exact(
     constexpr int K16 = geom::HID >> 4; // 160
     constexpr int NB = geom::HID >> 5;  // 80
     const uint4* qrow = reinterpret_cast<const uint4*>(Bq + static_cast<size_t>(v) * geom::HID);
-    const __half* srow = Bsc + static_cast<size_t>(v) * NB;
+    const size_t sbase = static_cast<size_t>(v) * NB;
     const uint4* xm = reinterpret_cast<const uint4*>(x + static_cast<size_t>(m) * geom::HID);
 
     float acc = 0.0f;
     for (int i = lane; i < K16; i += 32) {
         const uint4 wv = __ldg(qrow + i);
-        const float sc = __half2float(__ldg(srow + (i >> 1)));
+        const float sc = load_fp8_scale<MX_SC>(Bsc, Bmx, sbase + (i >> 1));
         float2 wf[8];
         fp8x16_unpack(wv, sc, wf);
         acc += dot_bf16x16_f2x8(xm[2 * i], xm[2 * i + 1], wf);
@@ -632,8 +638,13 @@ inline void mtp_head2_argmax_pair(const MtpHead2& h2, const Fp8Mat& fp8_lm, cons
                                   int M, cudaStream_t st) {
     launch_mtp_head2_screen(h2, x, head_logits, M, st);
     k_qw38_head2_top<MtpHead2::SL, false><<<M, 1024, 0, st>>>(head_logits, h2.vr, sc.cand);
-    k_qw38_mtp_head2_rescore_fp8<<<dim3(M, 8), 256, 0, st>>>(
-        fp8_lm.q, fp8_lm.sc, x, sc.cand, head_logits, sc.cl, h2.vr, false);
+    if (fp8_lm.mx_sc) {
+        k_qw38_mtp_head2_rescore_fp8<true><<<dim3(M, 8), 256, 0, st>>>(
+            fp8_lm.q, fp8_lm.sc, fp8_lm.mx_sc, x, sc.cand, head_logits, sc.cl, h2.vr, false);
+    } else {
+        k_qw38_mtp_head2_rescore_fp8<false><<<dim3(M, 8), 256, 0, st>>>(
+            fp8_lm.q, fp8_lm.sc, fp8_lm.mx_sc, x, sc.cand, head_logits, sc.cl, h2.vr, false);
+    }
     k_qw38_mtp_head2_argmax_pair<<<M, 64, 0, st>>>(sc.cl, sc.cand, h2.v0, out_pair);
 }
 
@@ -642,8 +653,13 @@ inline void mtp_head2_pack(const MtpHead2& h2, const Fp8Mat& fp8_lm, const __nv_
                            int NC, uint8_t* out_pkt, size_t rb, int M, bool argmax_only, cudaStream_t st) {
     launch_mtp_head2_screen(h2, x, head_logits, M, st);
     k_qw38_head2_top<MtpHead2::SL, false><<<M, 1024, 0, st>>>(head_logits, h2.vr, h2sc.cand);
-    k_qw38_mtp_head2_rescore_fp8<<<dim3(M, 8), 256, 0, st>>>(
-        fp8_lm.q, fp8_lm.sc, x, h2sc.cand, head_logits, h2sc.cl, h2.vr, !argmax_only);
+    if (fp8_lm.mx_sc) {
+        k_qw38_mtp_head2_rescore_fp8<true><<<dim3(M, 8), 256, 0, st>>>(
+            fp8_lm.q, fp8_lm.sc, fp8_lm.mx_sc, x, h2sc.cand, head_logits, h2sc.cl, h2.vr, !argmax_only);
+    } else {
+        k_qw38_mtp_head2_rescore_fp8<false><<<dim3(M, 8), 256, 0, st>>>(
+            fp8_lm.q, fp8_lm.sc, fp8_lm.mx_sc, x, h2sc.cand, head_logits, h2sc.cl, h2.vr, !argmax_only);
+    }
     if (argmax_only) {
         k_qw38_mtp_head2_argmax_pkt<<<M, 64, 0, st>>>(h2sc.cl, h2sc.cand, h2.v0, out_pkt, rb);
     } else {
@@ -657,8 +673,13 @@ inline void trunk_head2_pack(const MtpHead2& h2, const Fp8Mat& fp8_lm, const __n
     launch_mtp_head2_screen(h2, x, head_logits, M, st);
     k_qw38_head2_top<MtpHead2::SL_TRUNK, true><<<M, 1024, 0, st>>>(
         head_logits, h2.vr, h2sc.cand, h2sc.tail_dsum, h2sc.screen_max);
-    k_qw38_head2_rescore_fp8_exact<<<dim3(M, MtpHead2::SL_TRUNK / 8), 256, 0, st>>>(
-        fp8_lm.q, fp8_lm.sc, x, h2sc.cand, h2sc.cl);
+    if (fp8_lm.mx_sc) {
+        k_qw38_head2_rescore_fp8_exact<true><<<dim3(M, MtpHead2::SL_TRUNK / 8), 256, 0, st>>>(
+            fp8_lm.q, fp8_lm.sc, fp8_lm.mx_sc, x, h2sc.cand, h2sc.cl);
+    } else {
+        k_qw38_head2_rescore_fp8_exact<false><<<dim3(M, MtpHead2::SL_TRUNK / 8), 256, 0, st>>>(
+            fp8_lm.q, fp8_lm.sc, fp8_lm.mx_sc, x, h2sc.cand, h2sc.cl);
+    }
     k_qw38_head2_pack_256<<<M, 256, 0, st>>>(
         h2sc.cl, h2sc.cand, h2sc.tail_dsum, h2sc.screen_max, h2.v0, NC, out_pkt, rb);
 }

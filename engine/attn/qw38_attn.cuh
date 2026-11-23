@@ -71,6 +71,7 @@ struct FullAttnScratch {
     float* split_m = nullptr;         // [8 * 24 * 24] FP32
     float* split_l = nullptr;         // [8 * 24 * 24] FP32
     float* split_o = nullptr;         // [8 * 24 * 24 * 256] FP32
+    uint8_t* x8 = nullptr;            // shared MXFP8 A-record scratch (optional)
 };
 
 // Qwen4Exp interleaved 3D MRoPE (mrope_section = [11, 11, 10] across 32 pairs, ROPE_DIM = 64):
@@ -1591,7 +1592,13 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
     const bool need_qsa = ((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS;
 
     // 1. Projections (Q+gate, K, V, and QSA index_qk)
-    if ((M <= 20 && w.fp8_q.q) || M <= 8) {
+    if (M >= 16 && w.fp8_q.mx_sc && w.fp8_k.mx_sc && w.fp8_v.mx_sc && w.fp8_idx.mx_sc && sc.x8) {
+        qw38_bf16_to_mx8(x, sc.x8, M, geom::HID, st);
+        qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_q, sc.q_gate, M, st);
+        qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_k, sc.k, M, st);
+        qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_v, sc.v, M, st);
+        qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_idx, sc.idx_qk, M, st);
+    } else if ((M <= 20 && w.fp8_q.q) || M <= 8) {
         if (w.fp8_q.q) {
             launch_fp8_gemv_smallm<false>(x, w.fp8_q, sc.q_gate, M, st);
             launch_fp8_gemv_smallm<false>(x, w.fp8_k, sc.k, M, st);
@@ -1683,7 +1690,10 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
         }
     }
 
-    if ((M <= 20 && w.fp8_o.q) || M <= 8) {
+    if (M >= 16 && w.fp8_o.mx_sc && sc.x8) {
+        qw38_bf16_to_mx8(sc.attn_out, sc.x8, M, nh_q * geom::HEAD_DIM, st);
+        qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_o, out_part, M, st);
+    } else if ((M <= 20 && w.fp8_o.q) || M <= 8) {
         if (w.fp8_o.q) {
             launch_fp8_gemv_smallm<false>(sc.attn_out, w.fp8_o, out_part, M, st);
         } else {

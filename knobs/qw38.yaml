@@ -103,6 +103,16 @@ knobs:
       1 (the default) = accelerate trunk decode/verify lm_head (M <= 16) with a 2-bit block-32 full-vocab screen
       followed by bit-exact FP8 rescore of the top-256 candidates (reusing the MTP 2-bit head table at zero extra VRAM
       when MTP > 0). 0 = full-vocab FP8 lm_head. Every rank must agree.
+  GR8_QW38_PF_MXFP8:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = quantize dense FP8 weights with OCP MXFP8 UE8M0 block-32 scales (saving 131 MB VRAM vs FP16
+      scales) and run Blackwell native MXFP8 Tensor Core GEMMs (m16n8k32) for M >= 16 (c4/c8 verify and prefill).
+      0 = FP16-scaled FP8 decode GEMV and BF16 cuBLAS prefill. Every rank must agree.
   GR8_QW38_VISION:
     scope: agree
     kind: flag

@@ -318,6 +318,7 @@ struct Options {
     bool dense_fp8 = true;
     bool mtp_fast = true;
     bool trunk_head2 = true;
+    bool pf_mxfp8 = true;
     bool ple_async = true;
     bool use_graph = true;
     bool profile = false;
@@ -419,6 +420,7 @@ struct Engine {
     qw38::FullAttnScratch attn_sc;
     qw38::MoeScratch moe_sc;
     qw38::HeadPackScratch head_sc;
+    uint8_t* x8_scratch = nullptr;        // shared MXFP8 A-record scratch (GR8_QW38_PF_MXFP8=1)
     float* head_logits = nullptr;         // [max_rows, max_v_rows] FP32
     uint8_t* head_dev_pkt = nullptr;      // [max_rows * head_row_bytes(nc)]
     uint8_t* head_host_parts = nullptr;   // [nr * max_rows * head_row_bytes(nc)] pinned host staging (graph-safe D2H!)
@@ -620,6 +622,7 @@ struct Engine {
         o.dense_fp8 = knob::qw38_dense_fp8();
         o.mtp_fast = knob::qw38_mtp_fast();
         o.trunk_head2 = knob::qw38_trunk_head2();
+        o.pf_mxfp8 = knob::qw38_pf_mxfp8();
         o.ple_async = knob::qw38_ple_async();
         o.use_graph = knob::qw38_graph();
         o.profile = knob::qw38_profile();
@@ -1041,7 +1044,8 @@ struct Engine {
                 }
             }
             const auto fp8_t0 = std::chrono::steady_clock::now();
-            const size_t fp8_b = fp8_arena.build(stream);
+            const size_t fp8_b = fp8_arena.build(stream, o.pf_mxfp8);
+            if (o.pf_mxfp8) qw38::qw38_mxfp8_init_attrs();
             size_t i4_b = 0, h2_b = 0;
             const bool need_h2 = o.trunk_head2 || (has_mtp && o.mtp_fast);
             if (has_mtp && o.mtp_fast) {
@@ -1135,6 +1139,16 @@ struct Engine {
         moe_sc.sh_up_buf = dalloc<__nv_bfloat16>(M * geom::SHARED_I);
         moe_sc.sh_out = dalloc<__nv_bfloat16>(M * geom::HID);
         moe_sc.sh_scalar_gate = dalloc<float>(M);
+
+        if (o.dense_fp8 && o.pf_mxfp8) {
+            const size_t max_k_mx = std::max<size_t>(geom::HC_D, std::max<size_t>(size_t(max_nh_v) * geom::GDN_DV, size_t(max_nh_q) * geom::HEAD_DIM));
+            const size_t x8_bytes = ((M + 15) / 16) * (max_k_mx / 32) * qw38::MX8_REC;
+            x8_scratch = dalloc<uint8_t>(x8_bytes);
+            hc_sc.x8 = x8_scratch;
+            gdn_sc.x8 = x8_scratch;
+            attn_sc.x8 = x8_scratch;
+            moe_sc.x8 = x8_scratch;
+        }
 
         constexpr size_t HEAD_CHUNK = 256;
         const size_t HM = std::min<size_t>(M, HEAD_CHUNK);
@@ -1527,7 +1541,11 @@ struct Engine {
                                                head_logits, mtp_h2_sc, o.nc,
                                                head_dev_pkt + size_t(r0) * hrb, hrb, mc, stream);
                     } else {
-                        if (head_M <= 20 && i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
+                        if (head_M >= 16 && x8_scratch && i < static_cast<int>(fp8_lm_head.size()) &&
+                            fp8_lm_head[size_t(i)].mx_sc && (fp8_lm_head[size_t(i)].N & 15) == 0) {
+                            qw38::qw38_bf16_to_mx8(mx_ptr, x8_scratch, mc, geom::HID, stream);
+                            qw38::qw38_gemm_mx8_nt<true>(x8_scratch, fp8_lm_head[size_t(i)], head_logits, mc, stream);
+                        } else if (head_M <= 20 && i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
                             qw38::launch_fp8_gemv_smallm<true>(mx_ptr, fp8_lm_head[size_t(i)], head_logits, mc, stream);
                         } else if (head_M <= 8) {
                             qw38::launch_bf16_gemv_smallm<true>(mx_ptr, lm_head[size_t(i)], head_logits, mc, v_rows[size_t(i)], geom::HID, stream);
