@@ -1190,8 +1190,13 @@ struct Engine {
             }
         };
 
-        auto run_head_gpu = [&]() {
-            qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
+        auto run_head_gpu = [&](bool fuse_prev_inject = false) {
+            if (M > 12 && fuse_prev_inject) {
+                qw38::hc_prepare_prefill_fused(blas, final_hc, hyper, mixed, hc_sc, M,
+                                               parts, o.nr, part_stride, stream);
+            } else {
+                qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
+            }
             constexpr int HEAD_CHUNK = 256;
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
@@ -1328,9 +1333,16 @@ struct Engine {
         };
 
         int coll = 0;
+        bool pending_inject = false;
         for (size_t li = 0; li < L.size(); ++li) {
             Layer& y = L[li];
             if (geom::is_ple(y.l) && has_ple) {
+                if (pending_inject) {
+                    t_start();
+                    qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                    t_end(prof.hc_ms);
+                    pending_inject = false;
+                }
                 finish_ple_io();
                 t_start();
                 QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
@@ -1339,7 +1351,13 @@ struct Engine {
             }
 
             t_start();
-            qw38::hc_prepare(blas, y.attn_hc, hyper, mixed, hc_sc, M, stream);
+            if (M > 12) {
+                qw38::hc_prepare_prefill_fused(blas, y.attn_hc, hyper, mixed, hc_sc, M,
+                                               pending_inject ? parts : nullptr, o.nr, part_stride, stream);
+                pending_inject = false;
+            } else {
+                qw38::hc_prepare(blas, y.attn_hc, hyper, mixed, hc_sc, M, stream);
+            }
             t_end(prof.hc_ms);
 
             t_start();
@@ -1368,13 +1386,23 @@ struct Engine {
                 else ++coll;
                 t_end(prof.ar_ms);
 
-                t_start();
-                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
-                t_end(prof.hc_ms);
+                if (M > 12) {
+                    pending_inject = true;
+                } else {
+                    t_start();
+                    qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                    t_end(prof.hc_ms);
+                }
             }
 
             t_start();
-            qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
+            if (M > 12) {
+                qw38::hc_prepare_prefill_fused(blas, y.mlp_hc, hyper, mixed, hc_sc, M,
+                                               pending_inject ? parts : nullptr, o.nr, part_stride, stream);
+                pending_inject = false;
+            } else {
+                qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
+            }
             t_end(prof.hc_ms);
 
             t_start();
@@ -1396,20 +1424,31 @@ struct Engine {
                 else ++coll;
                 t_end(prof.ar_ms);
 
-                t_start();
-                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
-                t_end(prof.hc_ms);
+                if (M > 12) {
+                    pending_inject = true;
+                } else {
+                    t_start();
+                    qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                    t_end(prof.hc_ms);
+                }
             }
         }
 
         if (skip_head) {
+            if (pending_inject) {
+                t_start();
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                t_end(prof.hc_ms);
+                pending_inject = false;
+            }
             if (step_end) step_end();
             if (o.profile) { ++prof.steps; prof.tokens += M; }
             return;
         }
 
         t_start();
-        run_head_gpu();
+        run_head_gpu(pending_inject);
+        pending_inject = false;
         QW38_CK(cudaStreamSynchronize(stream));
         if (o.nr > 1 && gather_host) gather_host(coll++, head_host_parts, rank_pkt_bytes);
         if (step_end) step_end();
