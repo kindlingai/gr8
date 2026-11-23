@@ -214,8 +214,10 @@ If you are an agent (or developer) building on gr8, start from the matching entr
   it, instead of becoming the control token's id. Long prompts keep the parallel encode and the prefix cache.
   Roll back with `--literal-content 0` / `LITERAL_CONTENT=0`
   ([literal control tokens](frontend/README.md#literal-control-tokens-in-message-content)).
-- **Image input.** DeepSeek-V4.1-Flash and GLM-5.3-Flash take images in chat requests (opt-in, `GR8_DS41_VISION=1`,
-  [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`, [docs/FLASH-VISION.md](docs/FLASH-VISION.md)).
+- **Image input.** DeepSeek-V4.1-Flash, GLM-5.3-Flash, and Qwen3.8-Flash-Next take images in chat requests (opt-in,
+  `GR8_DS41_VISION=1`, [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`,
+  [docs/FLASH-VISION.md](docs/FLASH-VISION.md); `GR8_QW38_VISION=1`,
+  [docs/QWEN38.md#image-input-vision](docs/QWEN38.md#image-input-vision)).
 - **A Docker image.** `ghcr.io/kindlingai/gr8` has the engine for every TP width and all three models, so GLM-5.3 on
   three to six boxes needs no build ([Docker Compose](docs/DEPLOY.md#docker-compose)). The one-box and two-box recipes publish their
   own images.
@@ -362,9 +364,10 @@ The head serves the OpenAI API on port 8100. [frontend/README.md](frontend/READM
 |---|---|---|
 | 8100 | the OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`) | head |
 | 7340 | the supervisors: the handshake before boot, then status, logs and down | every box |
-| 7341 | the multi-session control channel between the ranks | head |
+| 7341–7342 | the multi-session S2 control channel between the ranks (alternating ports under `GR8_FABRIC_POOL`) | head |
 | 7343 | during `scale` with a persisted KV store: each box serves its store to the new ranks (`bin/kvman-peer`, `CONTROL_PORT + 3`) | every box |
-| 18600-18659 | fabric bootstrap and the per-collective regions | head |
+| 18600–18679 | fabric bootstrap and per-collective regions (group range 1; `18700–18779` for alternating group range 2 under `GR8_FABRIC_POOL`) | head |
+| 18800 | fabric pool control link when `GR8_FABRIC_POOL` is enabled | pool head |
 
 ## Layout
 

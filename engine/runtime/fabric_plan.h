@@ -19,6 +19,7 @@
 #include "s2/cp_rows.h"
 #include "../comms/cplayout.h"
 #include "../comms/fabric.h"
+#include "../comms/fabric_pool.h"
 #include "../knobs-rs/gr8_knobs.h"
 #if G6_MODEL_FLASH
 #include "../attn/flash_pool_owner.h"
@@ -527,6 +528,27 @@ inline void fabric_plan_apply(const FabricPlan& p)
 #else
     (void)p;
 #endif
+}
+
+// Rewrites every planned fabric (early and late) for group `g` of a FabricPool (#154): applies group_fabric() with
+// each entry's port_off so every fabric uses the group's rank, addresses and alternating port range. Mesh only.
+inline void fabric_plan_apply_group(FabricPlan& p, const g6::PoolConfig& pc, const g6::Group& g)
+{
+    for (PlannedFabric& e : p.fabrics)
+        e.cfg = g6::group_fabric(pc, g, e.cfg, e.port_off);
+}
+
+// Tears down a group's open fabrics cleanly (#154): barrier on the main fabric so no peer still writes, then close()
+// every initialized fabric in reverse creation order (uninitialized entries are a no-op).
+inline void fabric_close_group(g6::Fabric* const (&fabs)[kFabKinds])
+{
+    if (fabs[0] && fabs[0]->dev().nr > 0)
+    {
+        fabs[0]->wait_proxy_idle();
+        fabs[0]->barrier();
+    }
+    for (int i = kFabKinds - 1; i >= 0; --i)
+        if (fabs[i]) fabs[i]->close();
 }
 
 // Creates the planned fabrics main builds before the model, in plan order, each with its proxy, and calls up(entry,
