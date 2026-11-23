@@ -276,6 +276,7 @@ int main(int argc, char** argv) {
             e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.fast_dev(c, p, b, e.stream); };
             e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.fast_host(c, p, b); };
             e.step_end = [&]() { wire.fast_end(e.stream); };
+            e.step_parity = [&]() -> int { return static_cast<int>(wire.step & 1); };
         } else {
             e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.exchange_dev(c, p, b); };
             e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.exchange_host(c, p, b); };

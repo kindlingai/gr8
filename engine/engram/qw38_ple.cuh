@@ -131,24 +131,86 @@ __global__ void k_ple_dilated_conv_add_seg(const __nv_bfloat16* __restrict__ gv,
     }
 }
 
+// Batched single-token decode dilated-3 conv1d + residual add across all M rows in ONE graph-safe launch!
+// Grid: ((M * HC_D + 255) / 256), Block: 256.
+__global__ void k_ple_dilated_conv_add_dec_batch(const __nv_bfloat16* __restrict__ gv,
+                                                 const __nv_bfloat16* __restrict__ gv_norm,
+                                                 const __nv_bfloat16* __restrict__ w,
+                                                 __nv_bfloat16* __restrict__ conv_hist,
+                                                 __nv_bfloat16* __restrict__ hyper_in,
+                                                 const int* __restrict__ d_slot,
+                                                 const int* __restrict__ d_pos,
+                                                 int M, bool update_state) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int tot = M * geom::HC_D;
+    if (idx >= tot) return;
+    const int m = idx / geom::HC_D;
+    const int c = idx % geom::HC_D;
+    const int slot = d_slot[m];
+    const int pos = d_pos[m];
+
+    const __nv_bfloat16* wc = w + static_cast<size_t>(c) * 4;
+    const float w0 = __bfloat162float(wc[0]);
+    const float w1 = __bfloat162float(wc[1]);
+    const float w2 = __bfloat162float(wc[2]);
+    const float w3 = __bfloat162float(wc[3]);
+
+    __nv_bfloat16* hbase = conv_hist + static_cast<size_t>(slot) * geom::PLE_NHIST * geom::HC_D;
+    float h[geom::PLE_NHIST];
+    #pragma unroll
+    for (int k = 0; k < geom::PLE_NHIST; ++k) {
+        h[k] = (pos > 0) ? __bfloat162float(hbase[static_cast<size_t>(k) * geom::HC_D + c]) : 0.0f;
+    }
+
+    const float x = __bfloat162float(gv_norm[idx]);
+    const float conv = h[0] * w0 + h[3] * w1 + h[6] * w2 + x * w3;
+    const float conv_act = __bfloat162float(__float2bfloat16(silu_f(conv)));
+    const float ple_out = __bfloat162float(gv[idx]) + conv_act;
+    hyper_in[idx] = __float2bfloat16(__bfloat162float(hyper_in[idx]) + ple_out);
+
+    if (update_state) {
+        #pragma unroll
+        for (int k = 0; k < geom::PLE_NHIST - 1; ++k) hbase[static_cast<size_t>(k) * geom::HC_D + c] = __float2bfloat16(h[k + 1]);
+        hbase[static_cast<size_t>(geom::PLE_NHIST - 1) * geom::HC_D + c] = __float2bfloat16(x);
+    }
+}
+
 // Run Layer-1 PLE in place on `hyper_in` [M, 10240] BF16, assuming `sc.emb` [M, 2560] BF16 is already populated.
+// Graph-safe when M <= 8 and d_slot/d_pos are provided for all-len-1 decode steps!
 inline void ple_forward(cublasHandle_t blas, const PleWeights& w, PleState& st_buf, PleScratch& sc,
                         __nv_bfloat16* hyper_in, const StepSeg* segs, int nsegs, int M,
-                        bool update_state, cudaStream_t st) {
-    cublasSetStream(blas, st);
-    gemm_bf16_nt(blas, M, geom::HC_D, geom::PLE_DIM, sc.emb, w.key_proj, sc.key);
-    gemm_bf16_nt(blas, M, geom::HID, geom::PLE_DIM, sc.emb, w.value_proj, sc.val);
+                        bool update_state, cudaStream_t st,
+                        const int* d_slot = nullptr, const int* d_pos = nullptr) {
+    if (M <= 8) {
+        launch_bf16_gemv_smallm<false>(sc.emb, w.key_proj, sc.key, M, geom::HC_D, geom::PLE_DIM, st);
+        launch_bf16_gemv_smallm<false>(sc.emb, w.value_proj, sc.val, M, geom::HID, geom::PLE_DIM, st);
+    } else {
+        cublasSetStream(blas, st);
+        gemm_bf16_nt(blas, M, geom::HC_D, geom::PLE_DIM, sc.emb, w.key_proj, sc.key);
+        gemm_bf16_nt(blas, M, geom::HID, geom::PLE_DIM, sc.emb, w.value_proj, sc.val);
+    }
 
     k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(sc.key, w.norm_key, sc.key, M, geom::HC, geom::RMS_EPS);
     k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(hyper_in, w.norm_query, sc.query, M, geom::HC, geom::RMS_EPS);
     k_ple_gate<<<M * geom::HC, 256, 0, st>>>(sc.key, sc.query, sc.val, sc.gv, M);
     k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(sc.gv, w.norm_conv, sc.gv_norm, M, geom::HC, geom::RMS_EPS);
 
-    for (int s = 0; s < nsegs; ++s) {
-        if (segs[s].len <= 0) continue;
-        k_ple_dilated_conv_add_seg<<<(geom::HC_D + 255) / 256, 256, 0, st>>>(
-            sc.gv, sc.gv_norm, w.conv1d, st_buf.conv_hist, hyper_in,
-            segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, update_state);
+    bool all_len1 = (d_slot != nullptr && d_pos != nullptr && nsegs == M);
+    if (all_len1) {
+        for (int s = 0; s < nsegs; ++s) {
+            if (segs[s].len != 1 || segs[s].row0 != s) { all_len1 = false; break; }
+        }
+    }
+    if (all_len1) {
+        k_ple_dilated_conv_add_dec_batch<<<(M * geom::HC_D + 255) / 256, 256, 0, st>>>(
+            sc.gv, sc.gv_norm, w.conv1d, st_buf.conv_hist, hyper_in, d_slot, d_pos, M, update_state);
+    } else {
+        for (int s = 0; s < nsegs; ++s) {
+            if (segs[s].len <= 0) continue;
+            k_ple_dilated_conv_add_seg<<<(geom::HC_D + 255) / 256, 256, 0, st>>>(
+                sc.gv, sc.gv_norm, w.conv1d, st_buf.conv_hist, hyper_in,
+                segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, update_state);
+        }
     }
 }
 

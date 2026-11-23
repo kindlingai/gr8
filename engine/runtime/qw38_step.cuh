@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -264,6 +265,7 @@ struct Options {
     bool wide = true;
     bool dense_fp8 = true;
     bool ple_async = true;
+    bool use_graph = true;
     bool profile = false;
 };
 
@@ -347,7 +349,8 @@ struct Engine {
     qw38::HeadPackScratch head_sc;
     float* head_logits = nullptr;         // [max_rows, max_v_rows] FP32
     uint8_t* head_dev_pkt = nullptr;      // [max_rows * head_row_bytes(nc)]
-    std::vector<uint8_t> head_host_parts; // [nr * max_rows * head_row_bytes(nc)]
+    uint8_t* head_host_parts = nullptr;   // [nr * max_rows * head_row_bytes(nc)] pinned host staging (graph-safe D2H!)
+    int* h_meta_pinned = nullptr;         // [3 * max_rows] pinned host staging for tok/slot/pos
     int* d_tok = nullptr;                 // [max_rows]
     int* d_slot = nullptr;                // [max_rows]
     int* d_pos = nullptr;                 // [max_rows]
@@ -357,20 +360,45 @@ struct Engine {
     std::function<void(int c, __nv_bfloat16* parts, size_t bytes)> gather_dev;
     std::function<void(int c, uint8_t* host_parts, size_t bytes)> gather_host;
     std::function<void()> step_end;
+    std::function<int()> step_parity;     // returns 0 or 1 for double-buffered multi-box graph capture
+
+    // CUDA Graph cache for decode steps (M <= 8, all_len1, !skip_head; 100% compatible with GR8_PTAB=1|2 & FAST_AR!)
+    struct GraphKey {
+        int M, need_qsa, ns_attn, par;
+        bool operator<(const GraphKey& b) const {
+            if (M != b.M) return M < b.M;
+            if (need_qsa != b.need_qsa) return need_qsa < b.need_qsa;
+            if (ns_attn != b.ns_attn) return ns_attn < b.ns_attn;
+            return par < b.par;
+        }
+    };
+    struct GraphPair {
+        cudaGraphExec_t exec_a = nullptr; // embed + Layer 0 (overlapped with PLE NVMe fetch)
+        cudaGraphExec_t exec_b = nullptr; // L1 PLE + Layers 1..47 + Final HC + lm_head + head_pack + D2H
+    };
+    std::map<GraphKey, GraphPair> graphs;
 
     ProfileAccum prof;
     cudaEvent_t ev0 = nullptr, ev1 = nullptr;
 
     ~Engine() {
+        for (auto& kv : graphs) {
+            if (kv.second.exec_a) cudaGraphExecDestroy(kv.second.exec_a);
+            if (kv.second.exec_b) cudaGraphExecDestroy(kv.second.exec_b);
+        }
+        graphs.clear();
         if (ple_thr.joinable()) {
             { std::lock_guard<std::mutex> lk(ple_mu); ple_stop = true; ple_has_job = true; }
             ple_cv.notify_one();
             ple_thr.join();
         }
         if (ple_pinned) cudaFreeHost(ple_pinned);
+        if (head_host_parts) cudaFreeHost(head_host_parts);
+        if (h_meta_pinned) cudaFreeHost(h_meta_pinned);
         if (blas) cublasDestroy(blas);
         if (ev0) cudaEventDestroy(ev0);
         if (ev1) cudaEventDestroy(ev1);
+        if (stream) cudaStreamDestroy(stream);
     }
 
     int max_pages_per_slot() const { return max_pps; }
@@ -415,12 +443,14 @@ struct Engine {
         if (const char* we = std::getenv("GR8_QW38_WIDE")) o.wide = (std::atoi(we) != 0);
         if (const char* fe = std::getenv("GR8_QW38_DENSE_FP8")) o.dense_fp8 = (std::atoi(fe) != 0);
         if (const char* ae = std::getenv("GR8_QW38_PLE_ASYNC")) o.ple_async = (std::atoi(ae) != 0);
+        if (const char* ge = std::getenv("GR8_QW38_GRAPH")) o.use_graph = (std::atoi(ge) != 0);
         if (const char* pe = std::getenv("GR8_QW38_PROFILE")) o.profile = (std::atoi(pe) != 0);
         if (const char* cm = std::getenv("GR8_QW38_PLE_CACHE_MIB")) {
             long v = std::atol(cm);
             if (v >= 0) o.ple_cache_mib = size_t(v);
         }
 
+        QW38_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         cublasCreate(&blas);
         QW38_CK(cudaEventCreate(&ev0));
         QW38_CK(cudaEventCreate(&ev1));
@@ -728,7 +758,9 @@ struct Engine {
         head_sc.surv_id = dalloc<int>(M * qw38::HEAD_MAX_SURV);
         const size_t hrb = head_row_bytes(o.nc);
         head_dev_pkt = dalloc<uint8_t>(M * hrb);
-        head_host_parts.assign(size_t(o.nr) * M * hrb, 0);
+        QW38_CK(cudaHostAlloc(&head_host_parts, size_t(o.nr) * M * hrb, cudaHostAllocDefault));
+        std::memset(head_host_parts, 0, size_t(o.nr) * M * hrb);
+        QW38_CK(cudaHostAlloc(&h_meta_pinned, 3 * M * sizeof(int), cudaHostAllocDefault));
 
         d_tok = dalloc<int>(M);
         d_slot = dalloc<int>(M);
@@ -762,24 +794,38 @@ struct Engine {
     void forward(const std::vector<qw38::StepSeg>& segs, const int* toks, const RowSample* samples,
                  std::vector<RowOut>& out, bool skip_head = false) {
         int M = 0;
-        for (const auto& g : segs) M += g.len;
+        int max_pos = 0;
+        bool all_len1 = true;
+        for (size_t s = 0; s < segs.size(); ++s) {
+            const auto& g = segs[s];
+            M += g.len;
+            if (g.len > 0) {
+                const int ep = g.pos0 + g.len - 1;
+                if (ep > max_pos) max_pos = ep;
+            }
+            if (g.len != 1 || g.row0 != static_cast<int>(s)) all_len1 = false;
+        }
         if (M <= 0 || M > o.max_rows) die("forward: bad M=" + std::to_string(M));
+        all_len1 = all_len1 && (static_cast<int>(segs.size()) == M);
 
-        std::vector<int> h_slot(static_cast<size_t>(M)), h_pos(static_cast<size_t>(M));
+        int* h_tok_p = h_meta_pinned;
+        int* h_slot_p = h_meta_pinned + o.max_rows;
+        int* h_pos_p = h_meta_pinned + 2 * o.max_rows;
+        std::memcpy(h_tok_p, toks, size_t(M) * sizeof(int));
         for (const auto& g : segs) {
             for (int t = 0; t < g.len; ++t) {
-                h_slot[size_t(g.row0 + t)] = g.slot;
-                h_pos[size_t(g.row0 + t)] = g.pos0 + t;
+                h_slot_p[g.row0 + t] = g.slot;
+                h_pos_p[g.row0 + t] = g.pos0 + t;
             }
         }
-        QW38_CK(cudaMemcpyAsync(d_tok, toks, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
-        QW38_CK(cudaMemcpyAsync(d_slot, h_slot.data(), size_t(M) * 4, cudaMemcpyHostToDevice, stream));
-        QW38_CK(cudaMemcpyAsync(d_pos, h_pos.data(), size_t(M) * 4, cudaMemcpyHostToDevice, stream));
+        QW38_CK(cudaMemcpyAsync(d_tok, h_tok_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
+        QW38_CK(cudaMemcpyAsync(d_slot, h_slot_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
+        QW38_CK(cudaMemcpyAsync(d_pos, h_pos_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
 
         // 0a. Notify multi-collective fabric step start (single enqueue_step for all 2*L+1 collectives on TP>=2)
         if (step_begin) step_begin(M, skip_head);
 
-        // 0. Kick off async PLE NVMe fetch BEFORE Layer 0 GPU compute so it overlaps completely behind Layer 0!
+        // 0b. Kick off async PLE NVMe fetch BEFORE Layer 0 GPU compute so it overlaps completely behind Layer 0!
         bool ple_in_flight = false;
         if (has_ple && o.ple_async && ple_thr.joinable()) {
             ple_job_ids.resize(size_t(M) * geom::PLE_HEADS);
@@ -798,7 +844,172 @@ struct Engine {
             ple_in_flight = true;
         }
 
-        // 0b. Token embed -> 4-stream hyper state
+        auto finish_ple_io = [&]() {
+            const auto p0 = std::chrono::steady_clock::now();
+            if (ple_in_flight) {
+                std::unique_lock<std::mutex> lk(ple_mu);
+                ple_done_cv.wait(lk, [&]() { return ple_job_done; });
+                if (!ple_job_ok) die("PLE async fetch_rows failed");
+                ple_in_flight = false;
+            } else {
+                std::vector<uint64_t> all_ids(size_t(M) * geom::PLE_HEADS);
+                for (const auto& g : segs) {
+                    if (g.len <= 0) continue;
+                    if (g.pos0 == 0) ple_ctx[size_t(g.slot)] = {geom::TOK_EOS, geom::TOK_EOS};
+                    ple_store.compute_ids(toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
+                                          all_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
+                }
+                if (!ple_store.fetch_rows(all_ids.data(), all_ids.size(), reinterpret_cast<uint8_t*>(ple_pinned)))
+                    die("PLE fetch_rows failed");
+            }
+            const auto p1 = std::chrono::steady_clock::now();
+            if (o.profile) prof.ple_io_ms += std::chrono::duration<double, std::milli>(p1 - p0).count();
+        };
+
+        const size_t part_stride = size_t(M) * geom::HID;
+        const size_t hrb = head_row_bytes(o.nc);
+        const size_t rank_pkt_bytes = size_t(M) * hrb;
+
+        auto run_layer_gpu = [&](size_t li, int& coll) {
+            Layer& y = L[li];
+            qw38::hc_prepare(blas, y.attn_hc, hyper, mixed, hc_sc, M, stream);
+            for (int i = 0; i < o.nloc; ++i) {
+                const int r = o.rank0 + i;
+                RankLayer& rl = y.rk[size_t(i)];
+                __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
+                if (y.is_full) {
+                    qw38::full_attn_forward(blas, rl.attn_w, rl.kv, attn_sc, mixed, p_dst,
+                                            d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r,
+                                            max_pps, max_blocks, stream);
+                } else {
+                    qw38::gdn_forward(blas, rl.gdn_w, rl.gdn_st, gdn_sc, mixed, p_dst,
+                                      segs.data(), int(segs.size()), M, o.nr, r, true, stream, d_slot, d_pos);
+                }
+            }
+            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+            else ++coll;
+            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+
+            qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
+            for (int i = 0; i < o.nloc; ++i) {
+                const int r = o.rank0 + i;
+                RankLayer& rl = y.rk[size_t(i)];
+                __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
+                qw38::moe_forward(blas, rl.moe_w, moe_sc, mixed, p_dst, M, stream);
+            }
+            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+            else ++coll;
+            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+        };
+
+        auto run_head_gpu = [&]() {
+            qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
+            for (int i = 0; i < o.nloc; ++i) {
+                const int r = o.rank0 + i;
+                if (M <= 8) {
+                    if (i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
+                        qw38::launch_fp8_gemv_smallm<true>(mixed, fp8_lm_head[size_t(i)], head_logits, M, stream);
+                    } else {
+                        qw38::launch_bf16_gemv_smallm<true>(mixed, lm_head[size_t(i)], head_logits, M, v_rows[size_t(i)], geom::HID, stream);
+                    }
+                } else {
+                    cublasSetStream(blas, stream);
+                    qw38::gemm_bf16_nt_f32(blas, M, v_rows[size_t(i)], geom::HID, mixed, lm_head[size_t(i)], head_logits);
+                }
+                qw38::head_pack_fast(head_logits, M, v_rows[size_t(i)], v_lo[size_t(i)], o.nc, head_sc, head_dev_pkt, hrb, stream);
+                QW38_CK(cudaMemcpyAsync(head_host_parts + size_t(r) * rank_pkt_bytes,
+                                        head_dev_pkt, rank_pkt_bytes, cudaMemcpyDeviceToHost, stream));
+            }
+        };
+
+        // Fast CUDA Graph path for decode steps (M <= 8, all_len1, !skip_head, !profile)
+        const bool graph_ok = o.use_graph && !o.profile && !skip_head && M <= 8 && all_len1 &&
+                              (o.nr == 1 || o.nloc == o.nr || static_cast<bool>(step_parity));
+        if (graph_ok) {
+            const int need_qsa = (((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS) ? 1 : 0;
+            const int ns_attn = qw38::gqa_split_count(M, geom::nh_kv(o.nr, o.rank0), max_pos, attn_sc.split_o != nullptr);
+            const int par = step_parity ? step_parity() : 0;
+            const GraphKey gk{M, need_qsa, ns_attn, par};
+            const bool split_l0_ple = (L.size() >= 2 && geom::is_ple(L[1].l) && has_ple);
+
+            auto it = graphs.find(gk);
+            if (it == graphs.end()) {
+                GraphPair gp{};
+                int coll = 0;
+                if (split_l0_ple) {
+                    cudaGraph_t ga = nullptr;
+                    QW38_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+                    qw38::k_embed_hc4<<<M, 256, 0, stream>>>(d_tok, embed, hyper, M);
+                    run_layer_gpu(0, coll);
+                    QW38_CK(cudaStreamEndCapture(stream, &ga));
+                    QW38_CK(cudaGraphInstantiate(&gp.exec_a, ga, nullptr, nullptr, 0));
+                    QW38_CK(cudaGraphDestroy(ga));
+                    QW38_CK(cudaGraphLaunch(gp.exec_a, stream));
+
+                    finish_ple_io();
+                    QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
+
+                    cudaGraph_t gb = nullptr;
+                    QW38_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+                    qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream, d_slot, d_pos);
+                    for (size_t li = 1; li < L.size(); ++li) run_layer_gpu(li, coll);
+                    run_head_gpu();
+                    QW38_CK(cudaStreamEndCapture(stream, &gb));
+                    QW38_CK(cudaGraphInstantiate(&gp.exec_b, gb, nullptr, nullptr, 0));
+                    QW38_CK(cudaGraphDestroy(gb));
+                    QW38_CK(cudaGraphLaunch(gp.exec_b, stream));
+                } else {
+                    if (has_ple) {
+                        finish_ple_io();
+                        QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
+                    }
+                    cudaGraph_t gb = nullptr;
+                    QW38_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+                    qw38::k_embed_hc4<<<M, 256, 0, stream>>>(d_tok, embed, hyper, M);
+                    for (size_t li = 0; li < L.size(); ++li) {
+                        if (geom::is_ple(L[li].l) && has_ple)
+                            qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream, d_slot, d_pos);
+                        run_layer_gpu(li, coll);
+                    }
+                    run_head_gpu();
+                    QW38_CK(cudaStreamEndCapture(stream, &gb));
+                    QW38_CK(cudaGraphInstantiate(&gp.exec_b, gb, nullptr, nullptr, 0));
+                    QW38_CK(cudaGraphDestroy(gb));
+                    QW38_CK(cudaGraphLaunch(gp.exec_b, stream));
+                }
+                graphs.emplace(gk, gp);
+            } else {
+                const GraphPair& gp = it->second;
+                if (gp.exec_a) {
+                    QW38_CK(cudaGraphLaunch(gp.exec_a, stream));
+                    finish_ple_io();
+                    QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
+                } else if (has_ple) {
+                    finish_ple_io();
+                    QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
+                }
+                QW38_CK(cudaGraphLaunch(gp.exec_b, stream));
+            }
+
+            QW38_CK(cudaStreamSynchronize(stream));
+            if (o.nr > 1 && gather_host) gather_host(static_cast<int>(2 * L.size()), head_host_parts, rank_pkt_bytes);
+            if (step_end) step_end();
+
+            out.resize(size_t(M));
+            std::vector<uint8_t> row_parts(size_t(o.nr) * hrb);
+            for (int m = 0; m < M; ++m) {
+                for (int r = 0; r < o.nr; ++r) {
+                    std::memcpy(row_parts.data() + size_t(r) * hrb,
+                                head_host_parts + size_t(r) * rank_pkt_bytes + size_t(m) * hrb, hrb);
+                }
+                out[size_t(m)] = head_merge(row_parts.data(), hrb, o.nr, o.nc);
+                if (samples) out[size_t(m)].tok = sample_row(out[size_t(m)].top, samples[m]);
+                else if (!out[size_t(m)].top.empty()) out[size_t(m)].tok = out[size_t(m)].top[0].id;
+            }
+            return;
+        }
+
+        // Eager / profiled / prefill path
         qw38::k_embed_hc4<<<M, 256, 0, stream>>>(d_tok, embed, hyper, M);
 
         auto t_start = [&]() { if (o.profile) cudaEventRecord(ev0, stream); };
@@ -811,46 +1022,21 @@ struct Engine {
             acc += ms;
         };
 
-        const size_t part_stride = size_t(M) * geom::HID;
         int coll = 0;
-
         for (size_t li = 0; li < L.size(); ++li) {
             Layer& y = L[li];
-
-            // Layer-1 PLE before attn_hyper_connection
             if (geom::is_ple(y.l) && has_ple) {
-                const auto p0 = std::chrono::steady_clock::now();
-                if (ple_in_flight) {
-                    std::unique_lock<std::mutex> lk(ple_mu);
-                    ple_done_cv.wait(lk, [&]() { return ple_job_done; });
-                    if (!ple_job_ok) die("PLE async fetch_rows failed");
-                    ple_in_flight = false;
-                } else {
-                    std::vector<uint64_t> all_ids(size_t(M) * geom::PLE_HEADS);
-                    for (const auto& g : segs) {
-                        if (g.len <= 0) continue;
-                        if (g.pos0 == 0) ple_ctx[size_t(g.slot)] = {geom::TOK_EOS, geom::TOK_EOS};
-                        ple_store.compute_ids(toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
-                                              all_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
-                    }
-                    if (!ple_store.fetch_rows(all_ids.data(), all_ids.size(), reinterpret_cast<uint8_t*>(ple_pinned)))
-                        die("PLE fetch_rows failed");
-                }
-                const auto p1 = std::chrono::steady_clock::now();
-                if (o.profile) prof.ple_io_ms += std::chrono::duration<double, std::milli>(p1 - p0).count();
-
+                finish_ple_io();
                 t_start();
                 QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
-                qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream);
+                qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream, d_slot, d_pos);
                 t_end(prof.ple_gpu_ms);
             }
 
-            // Attention / GDN hyper-connection prepare
             t_start();
             qw38::hc_prepare(blas, y.attn_hc, hyper, mixed, hc_sc, M, stream);
             t_end(prof.hc_ms);
 
-            // Attention or GDN per local rank
             t_start();
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
@@ -867,23 +1053,19 @@ struct Engine {
             }
             t_end(y.is_full ? prof.attn_ms : prof.gdn_ms);
 
-            // Collective 1: exchange partials across ranks (no-op for TP=1 or m4sim)
             t_start();
             if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
             else ++coll;
             t_end(prof.ar_ms);
 
-            // Sum rank-ordered partials + HC inject
             t_start();
             qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
             t_end(prof.hc_ms);
 
-            // MLP hyper-connection prepare
             t_start();
             qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
             t_end(prof.hc_ms);
 
-            // MoE per local rank
             t_start();
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
@@ -893,13 +1075,11 @@ struct Engine {
             }
             t_end(prof.moe_ms);
 
-            // Collective 2: exchange MoE partials across ranks
             t_start();
             if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
             else ++coll;
             t_end(prof.ar_ms);
 
-            // Sum rank-ordered partials + HC inject
             t_start();
             qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
             t_end(prof.hc_ms);
@@ -911,38 +1091,18 @@ struct Engine {
             return;
         }
 
-        // Final HC mixer -> lm_head -> k_ink2_head_pack -> host merge & sample
         t_start();
-        qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
-        const size_t hrb = head_row_bytes(o.nc);
-        const size_t rank_pkt_bytes = size_t(M) * hrb;
-        cublasSetStream(blas, stream);
-        for (int i = 0; i < o.nloc; ++i) {
-            const int r = o.rank0 + i;
-            if (M <= 8) {
-                if (i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
-                    qw38::launch_fp8_gemv_smallm<true>(mixed, fp8_lm_head[size_t(i)], head_logits, M, stream);
-                } else {
-                    qw38::launch_bf16_gemv_smallm<true>(mixed, lm_head[size_t(i)], head_logits, M, v_rows[size_t(i)], geom::HID, stream);
-                }
-            } else {
-                qw38::gemm_bf16_nt_f32(blas, M, v_rows[size_t(i)], geom::HID, mixed, lm_head[size_t(i)], head_logits);
-            }
-            qw38::head_pack_fast(head_logits, M, v_rows[size_t(i)], v_lo[size_t(i)], o.nc, head_sc, head_dev_pkt, hrb, stream);
-            QW38_CK(cudaMemcpyAsync(head_host_parts.data() + size_t(r) * rank_pkt_bytes,
-                                    head_dev_pkt, rank_pkt_bytes, cudaMemcpyDeviceToHost, stream));
-        }
+        run_head_gpu();
         QW38_CK(cudaStreamSynchronize(stream));
-        if (o.nr > 1 && gather_host) gather_host(coll++, head_host_parts.data(), rank_pkt_bytes);
+        if (o.nr > 1 && gather_host) gather_host(coll++, head_host_parts, rank_pkt_bytes);
         if (step_end) step_end();
 
         out.resize(size_t(M));
+        std::vector<uint8_t> row_parts(size_t(o.nr) * hrb);
         for (int m = 0; m < M; ++m) {
-            // Repack rank shares for row m contiguously for head_merge
-            std::vector<uint8_t> row_parts(size_t(o.nr) * hrb);
             for (int r = 0; r < o.nr; ++r) {
                 std::memcpy(row_parts.data() + size_t(r) * hrb,
-                            head_host_parts.data() + size_t(r) * rank_pkt_bytes + size_t(m) * hrb, hrb);
+                            head_host_parts + size_t(r) * rank_pkt_bytes + size_t(m) * hrb, hrb);
             }
             out[size_t(m)] = head_merge(row_parts.data(), hrb, o.nr, o.nc);
             if (samples) out[size_t(m)].tok = sample_row(out[size_t(m)].top, samples[m]);

@@ -40,12 +40,12 @@ knobs:
   GR8_QW38_GRAPH:
     scope: agree
     kind: flag
-    default: "0"
+    default: "1"
     values: "0|1"
     legacy: []
     doc: >-
-      1 = capture and replay CUDA graphs for decode steps (compatible with fixed-address GR8_PTAB=1|2 piece tables).
-      0 (the default) = eager launches. Every rank must agree.
+      1 (the default) = capture and replay CUDA graphs for decode steps (compatible with fixed-address GR8_PTAB=1|2
+      piece tables and multi-box single-step FAST_AR). 0 = eager launches. Every rank must agree.
   GR8_QW38_PLE_ASYNC:
     scope: local
     kind: flag

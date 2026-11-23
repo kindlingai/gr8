@@ -653,6 +653,16 @@ __global__ void k_qw38_gqa_split_reduce(const float* __restrict__ split_m,
     reinterpret_cast<uint4*>(out + static_cast<size_t>(qh) * 256)[lane] = ov;
 }
 
+inline int gqa_split_count(int M, int nh_kv, int max_pos, bool has_split) {
+    if (M <= 8 && max_pos >= 128 && has_split) {
+        int ns = (max_pos >= 512) ? (24 / std::min(M * nh_kv, 6)) : 8;
+        if (ns > 24) ns = 24;
+        if (ns < 2) ns = 2;
+        return ns;
+    }
+    return 1;
+}
+
 // Execute one full-attention + QSA layer on rank `rank` of `nr`.
 // Writes this rank's partial output [M, 2560] BF16 into `out_part`.
 inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, FullLayerKv& kv, FullAttnScratch& sc,
@@ -719,12 +729,7 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
     }
 
     // 4. GQA-12 Tiled FlashAttention (+ Split-KV for decode M <= 8 & ctx >= 128) + output projection
-    int NS = 1;
-    if (M <= 8 && max_pos >= 128 && sc.split_o != nullptr) {
-        NS = (max_pos >= 512) ? (24 / std::min(M * nh_kv, 6)) : 8;
-        if (NS > 24) NS = 24;
-        if (NS < 2) NS = 2;
-    }
+    const int NS = gqa_split_count(M, nh_kv, max_pos, sc.split_o != nullptr);
     k_qw38_gqa_flash_tiled<<<M * nh_kv * NS, 384, 0, st>>>(
         sc.q, sc.gate, kv.kv_pages, row_slot_dev, row_pos_dev,
         need_qsa ? sc.sel_blocks : nullptr, need_qsa ? sc.sel_counts : nullptr,
