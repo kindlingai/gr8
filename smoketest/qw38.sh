@@ -107,4 +107,19 @@ t_tool_call_parsed() {
   ok
 }
 
+# Image input, only with GR8_QW38_VISION_SMOKE=1 (the server must run with GR8_QW38_VISION=1; without the switch the
+# case is skipped). A 160 x 80 PNG as a data URL: the left half red, the right half blue.
+RED_BLUE_PNG='iVBORw0KGgoAAAANSUhEUgAAAKAAAABQCAIAAAARP+ljAAAAxklEQVR42u3RMQ0AAAzDsPIn3ZHYV0shEDlNphrbbQADBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBvzVASYy0OCwGZT6AAAAAElFTkSuQmCC'
+t_vision_red_blue() {
+  [ "${GR8_QW38_VISION_SMOKE:-0}" = 1 ] || return 0
+  post /v1/chat/completions "$(jq -n --arg m "$NAME" --arg u "data:image/png;base64,$RED_BLUE_PNG" '{
+    model:$m, max_tokens:32, temperature:0, chat_template_kwargs:{enable_thinking:false},
+    messages:[{role:"user", content:[
+      {type:"image_url", image_url:{url:$u}},
+      {type:"text", text:"The image has two halves of one colour each. Name the colour of the left half, then the colour of the right half. Reply with the two words only."}]}]}')"
+  status_is 200 || return
+  check "should say red, then blue" '(.choices[0].message.content // "") | ascii_downcase | test("red[^a-z]+(and[^a-z]+)?blue")' || return
+  ok "$(jqb '.usage.prompt_tokens') prompt tok"
+}
+
 run_all

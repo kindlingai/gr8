@@ -51,6 +51,7 @@ ST_DTYPE = {
 TOKENIZER_FILES = (
     "config.json", "generation_config.json", "tokenizer.json",
     "tokenizer_config.json", "chat_template.jinja", "merges.txt",
+    "vocab.json", "preprocessor_config.json",
 )
 
 
@@ -409,12 +410,12 @@ def build_non_expert_and_ple(bf16_dir, out_dir, skip_ple=False, force=False):
         wmap = json.load(f)["weight_map"]
 
     # Group non-expert tensors by destination file
-    dense_names, vocab_names, mtp_names = [], [], []
+    dense_names, vocab_names, mtp_names, vision_names = [], [], [], []
     ple_shards = {}
     for name in sorted(wmap):
         if name.startswith("model.visual."):
-            continue
-        if name in ("model.language_model.embed_tokens.weight", "lm_head.weight"):
+            vision_names.append(name)
+        elif name in ("model.language_model.embed_tokens.weight", "lm_head.weight"):
             vocab_names.append(name)
         elif name.startswith("mtp."):
             mtp_names.append(name)
@@ -447,6 +448,8 @@ def build_non_expert_and_ple(bf16_dir, out_dir, skip_ple=False, force=False):
     pack_group(os.path.join(out_dense, "exlr8-dense.safetensors"), dense_names, "dense")
     pack_group(os.path.join(out_dense, "exlr8-vocab.safetensors"), vocab_names, "vocab")
     pack_group(os.path.join(out_dense, "exlr8-mtp.safetensors"), mtp_names, "mtp")
+    if vision_names:
+        pack_group(os.path.join(out_dense, "vision-bf16.safetensors"), vision_names, "vision")
 
     # PLE contiguous 4 KiB-aligned rowstore
     ple_bin = os.path.join(out_ple, "exlr8-ple-L001.bin")
