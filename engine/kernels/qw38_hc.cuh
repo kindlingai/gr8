@@ -571,9 +571,284 @@ __global__ void __launch_bounds__(256) k_fp8_hc_up_mix_fused(const __nv_bfloat16
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// Fused Prefill Hyper-Connections (M > 12, sm_80+ BF16 MMA):
+//   1. k_hc_fused_norm_inj_320<DO_PREV_INJECT>: 320 threads (10 warps) = 1 uint4/thread for HID=2560.
+//      Optionally fuses the preceding sublayer residual injection (hyper += parts * prev_inj) into
+//      the 4-stream grouped RMSNorm and the 4-row next_inj dot-product, eliminating 2 HBM passes.
+//   2. k_hc_up_mix_tc_128: BM=128 x BN=64 Tensor-Core fused up-projection + sigmoid + 4-stream mix,
+//      eliminating the [M, 10240] sc.up HBM round-trip and halving w_up DRAM reads.
+// ------------------------------------------------------------------------------------------------
+__device__ __forceinline__ void hc_mma_bf16_m16n8k16(float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+
+__device__ __forceinline__ void hc_ldsm4(uint32_t (&a)[4], const void* smem_ptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(s));
+#endif
+}
+
+__device__ __forceinline__ void hc_ldsm2(uint32_t (&b)[2], const void* smem_ptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(s));
+#endif
+}
+
+template <bool DO_PREV_INJECT>
+__global__ void __launch_bounds__(320) k_hc_fused_norm_inj_320(
+    __nv_bfloat16* __restrict__ hyper,
+    const __nv_bfloat16* __restrict__ prev_parts,
+    int nr, size_t rank_stride_elems,
+    const __nv_bfloat16* __restrict__ norm_w,
+    const __nv_bfloat16* __restrict__ w_inj,
+    __nv_bfloat16* __restrict__ hn_out,
+    float* inj_inout,
+    int M, float eps) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int tid = threadIdx.x; // 0..319 (exact 1 uint4 = 8 BF16s per thread for HID=2560)
+    const int lane = tid & 31, warp = tid >> 5;
+
+    uint4 y_reg;
+    float pw[4];
+    if constexpr (DO_PREV_INJECT) {
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) pw[s] = inj_inout[m * 4 + s];
+        if (nr == 1) {
+            y_reg = reinterpret_cast<const uint4*>(prev_parts + static_cast<size_t>(m) * geom::HID)[tid];
+        } else {
+            float y[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            for (int r = 0; r < nr; ++r) {
+                const uint4 pv = reinterpret_cast<const uint4*>(
+                    prev_parts + static_cast<size_t>(r) * rank_stride_elems + static_cast<size_t>(m) * geom::HID)[tid];
+                const __nv_bfloat162* pp = reinterpret_cast<const __nv_bfloat162*>(&pv);
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float2 f = __bfloat1622float2(pp[k]);
+                    y[2 * k] += f.x;
+                    y[2 * k + 1] += f.y;
+                }
+            }
+            __nv_bfloat162* yp = reinterpret_cast<__nv_bfloat162*>(&y_reg);
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) yp[k] = __floats2bfloat162_rn(y[2 * k], y[2 * k + 1]);
+        }
+    }
+
+    __shared__ float sm[10];
+    float inj_acc[4] = {0.f, 0.f, 0.f, 0.f};
+    __nv_bfloat16* h_base = hyper + static_cast<size_t>(m) * geom::HC_D;
+    __nv_bfloat16* hn_base = hn_out + static_cast<size_t>(m) * geom::HC_D;
+
+    #pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        uint4* hr = reinterpret_cast<uint4*>(h_base + s * geom::HID);
+        uint4* yr = reinterpret_cast<uint4*>(hn_base + s * geom::HID);
+        const uint4* wr = reinterpret_cast<const uint4*>(norm_w + s * geom::HID);
+
+        uint4 v0 = hr[tid];
+        if constexpr (DO_PREV_INJECT) {
+            const __nv_bfloat162* hp = reinterpret_cast<const __nv_bfloat162*>(&v0);
+            const __nv_bfloat162* yp = reinterpret_cast<const __nv_bfloat162*>(&y_reg);
+            uint4 nv;
+            __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&nv);
+            const float ws = pw[s];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float2 fh = __bfloat1622float2(hp[k]);
+                const float2 fy = __bfloat1622float2(yp[k]);
+                const float a0 = __bfloat162float(__float2bfloat16(fy.x * ws));
+                const float a1 = __bfloat162float(__float2bfloat16(fy.y * ws));
+                op[k] = __floats2bfloat162_rn(fh.x + a0, fh.y + a1);
+            }
+            v0 = nv;
+            hr[tid] = v0;
+        }
+        float ss = 0.0f;
+        const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&v0);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 f = __bfloat1622float2(xp[k]);
+            ss = fmaf(f.x, f.x, fmaf(f.y, f.y, ss));
+        }
+        ss = warp_sum(ss);
+        if (lane == 0) sm[warp] = ss;
+        __syncthreads();
+        if (warp == 0) {
+            float tot = (lane < 10) ? sm[lane] : 0.0f;
+            tot = warp_sum(tot);
+            if (lane == 0) sm[0] = rsqrtf(tot / float(geom::HID) + eps);
+        }
+        __syncthreads();
+        const float inv = sm[0];
+
+        const uint4 wv = __ldg(wr + tid);
+        const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&wv);
+        uint4 yv;
+        __nv_bfloat162* yp = reinterpret_cast<__nv_bfloat162*>(&yv);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 fx = __bfloat1622float2(xp[k]);
+            const float2 fw = __bfloat1622float2(wp[k]);
+            yp[k] = __floats2bfloat162_rn(fx.x * inv * (1.0f + fw.x), fx.y * inv * (1.0f + fw.y));
+        }
+        yr[tid] = yv;
+        if (w_inj) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint4 iw = __ldg(reinterpret_cast<const uint4*>(
+                    w_inj + static_cast<size_t>(j) * geom::HC_D + s * geom::HID) + tid);
+                inj_acc[j] += dot_bf16x8(yv, iw);
+            }
+        }
+    }
+
+    if (w_inj) {
+        __shared__ float sm_inj[10][4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float v = warp_sum(inj_acc[j]);
+            if (lane == 0) sm_inj[warp][j] = v;
+        }
+        __syncthreads();
+        if (warp == 0 && lane < 4) {
+            float tot = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 10; ++w) tot += sm_inj[w][lane];
+            inj_inout[m * 4 + lane] = 2.0f * sigmoid_f(tot * 0.25f);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256, 2) k_hc_up_mix_tc_128(
+    const __nv_bfloat16* __restrict__ hn,
+    const __nv_bfloat16* __restrict__ down,
+    const __nv_bfloat16* __restrict__ w_up,
+    __nv_bfloat16* __restrict__ mixed,
+    int M) {
+    const int d0 = blockIdx.x * 64;
+    const int m0 = blockIdx.y * 128;
+    if (d0 >= geom::HID || m0 >= M) return;
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tid4 = lane & 3;
+    const int wm = warp * 16;
+
+    constexpr int LD = 72;
+    __shared__ __nv_bfloat16 sD[128][LD];
+    __shared__ __nv_bfloat16 sW[64][LD];
+
+    float mix_acc[8][4] = {};
+
+    const int d_r = lane & 15, d_c = (lane >> 4) * 8;
+    const int w_r = lane & 7,  w_c = ((lane >> 3) & 1) * 8;
+    const int ma = m0 + wm + gid, mb = ma + 8;
+
+    for (int s = 0; s < 4; ++s) {
+        float u_acc[8][4] = {};
+        const __nv_bfloat16* w_s = w_up + static_cast<size_t>(s * geom::HID + d0) * geom::HC_RANK;
+        for (int k0 = 0; k0 < geom::HC_RANK; k0 += 64) {
+            for (int i = tid; i < 128 * 8; i += 256) {
+                const int r = i >> 3, c8 = (i & 7) << 3;
+                const int m = m0 + r;
+                *reinterpret_cast<uint4*>(sD[r] + c8) = (m < M)
+                    ? *reinterpret_cast<const uint4*>(down + static_cast<size_t>(m) * geom::HC_RANK + k0 + c8)
+                    : make_uint4(0, 0, 0, 0);
+            }
+            for (int i = tid; i < 64 * 8; i += 256) {
+                const int r = i >> 3, c8 = (i & 7) << 3;
+                *reinterpret_cast<uint4*>(sW[r] + c8) =
+                    *reinterpret_cast<const uint4*>(w_s + static_cast<size_t>(r) * geom::HC_RANK + k0 + c8);
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const int dk = kk * 16;
+                uint32_t da[4];
+                hc_ldsm4(da, sD[wm + d_r] + dk + d_c);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    uint32_t wb[2];
+                    hc_ldsm2(wb, sW[j * 8 + w_r] + dk + w_c);
+                    hc_mma_bf16_m16n8k16(u_acc[j], da, wb);
+                }
+            }
+            __syncthreads();
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int dc = d0 + j * 8 + 2 * tid4;
+            if (ma < M) {
+                const float2 fh = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
+                    hn + static_cast<size_t>(ma) * geom::HC_D + s * geom::HID + dc));
+                const float mw0 = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[j][0])))));
+                const float mw1 = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[j][1])))));
+                mix_acc[j][0] = fmaf(mw0, fh.x, mix_acc[j][0]);
+                mix_acc[j][1] = fmaf(mw1, fh.y, mix_acc[j][1]);
+            }
+            if (mb < M) {
+                const float2 fh = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
+                    hn + static_cast<size_t>(mb) * geom::HC_D + s * geom::HID + dc));
+                const float mw2 = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[j][2])))));
+                const float mw3 = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(__float2bfloat16(u_acc[j][3])))));
+                mix_acc[j][2] = fmaf(mw2, fh.x, mix_acc[j][2]);
+                mix_acc[j][3] = fmaf(mw3, fh.y, mix_acc[j][3]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int dc = d0 + j * 8 + 2 * tid4;
+        if (ma < M) {
+            *reinterpret_cast<__nv_bfloat162*>(mixed + static_cast<size_t>(ma) * geom::HID + dc) =
+                __floats2bfloat162_rn(mix_acc[j][0] * 0.25f, mix_acc[j][1] * 0.25f);
+        }
+        if (mb < M) {
+            *reinterpret_cast<__nv_bfloat162*>(mixed + static_cast<size_t>(mb) * geom::HID + dc) =
+                __floats2bfloat162_rn(mix_acc[j][2] * 0.25f, mix_acc[j][3] * 0.25f);
+        }
+    }
+}
+
+inline void hc_prepare_prefill_fused(cublasHandle_t blas, const HcWeights& w, __nv_bfloat16* hyper,
+                                     __nv_bfloat16* mixed, HcScratch& sc, int M,
+                                     const __nv_bfloat16* prev_parts, int nr, size_t rank_stride_elems,
+                                     cudaStream_t st) {
+    if (prev_parts) {
+        k_hc_fused_norm_inj_320<true><<<M, 320, 0, st>>>(
+            hyper, prev_parts, nr, rank_stride_elems, w.norm, w.inject, sc.hn, sc.inj, M, geom::RMS_EPS);
+    } else {
+        k_hc_fused_norm_inj_320<false><<<M, 320, 0, st>>>(
+            hyper, nullptr, nr, rank_stride_elems, w.norm, w.inject, sc.hn, sc.inj, M, geom::RMS_EPS);
+    }
+    cublasSetStream(blas, st);
+    gemm_bf16_nt(blas, M, geom::HC_RANK, geom::HC_D, sc.hn, w.down, sc.down);
+    const int n = M * geom::HC_RANK;
+    k_div4_silu_bf16<<<(n + 255) / 256, 256, 0, st>>>(sc.down, n);
+    k_hc_up_mix_tc_128<<<dim3(geom::HID / 64, (M + 127) / 128), 256, 0, st>>>(sc.hn, sc.down, w.up, mixed, M);
+}
+
 // Full GatedResidual prepare: hyper_in [M, 10240] -> mixed [M, 2560] (+ optional inj [M, 4]).
 inline void hc_prepare(cublasHandle_t blas, const HcWeights& w, const __nv_bfloat16* hyper_in,
                        __nv_bfloat16* mixed, HcScratch& sc, int M, cudaStream_t st) {
+    if (M > 12) {
+        hc_prepare_prefill_fused(blas, w, const_cast<__nv_bfloat16*>(hyper_in), mixed, sc, M,
+                                 nullptr, 1, 0, st);
+        return;
+    }
     k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(hyper_in, w.norm, sc.hn, M, geom::HC, geom::RMS_EPS);
     if (M <= 12 && w.fp8_down.q && w.fp8_up.q) {
         const int down_grid = w.inject ? (geom::HC_RANK + geom::HC) : geom::HC_RANK;
