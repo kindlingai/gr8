@@ -6,26 +6,27 @@ One to four DGX Spark (GB10) boxes (`TP=1` to `TP=4`). Weights: the exlr8 v2 rel
 
 ## Results
 
-Measured on 2026-11-22 on GB10 (DGX Spark) boxes with local NVMe release storage, `bit300` (`K3`) and `bit400` (`K4`) manifests, `GR8_QW38_DENSE_FP8=1`, `GR8_QW38_PLE_ASYNC=1`, `GR8_QW38_GRAPH=1`, and dual-rail RoCE `GR8_QW38_FAST_AR=1` on `TP=2`.
+Measured on 2026-11-23 on GB10 (DGX Spark) boxes with local NVMe release storage using the live S2 serving path (`bench/bench.py`, `SESS=8`, `MTP=3`, `GR8_QW38_PLE_CACHE_MIB=4096`, `bit300` / K3 and `bit400` / K4 manifests, and dual-rail RoCE `GR8_QW38_FAST_AR=1` on `TP=2`).
 
-### Single-stream & 5-stream decode (English prose, `P=30`, `gen=96` for `c1`, `gen=64` for `c5`)
+### Live S2 decode & concurrency (`SESS=8`, `MTP=3`, `T=0.7`)
 
-| Configuration | Manifest | `MTP=0` `c1` | `MTP=1` `c1` | `MTP=2` `c1` | `MTP=3` `c1` | `MTP=0` `c5` agg | `MTP=1` `c5` agg | `MTP=3` `c5` agg |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| **1 box (`TP=1`)** | `bit300` | 32.69 tok/s | 45.23 tok/s | 52.68 tok/s | **56.05 tok/s** | 135.62 tok/s | 145.68 tok/s | **165.87 tok/s** |
-| **1 box (`TP=1`, `GR8_PTAB=2`)** | `bit300` | — | — | — | **55.15 tok/s** | — | — | — |
-| **1 box (`TP=1`)** | `bit400` | — | — | — | **54.28 tok/s** | — | — | — |
-| **2 boxes (`TP=2`)** | `bit300` | 48.55 tok/s | 68.79 tok/s | 80.17 tok/s | **81.90 tok/s** | 200.00 tok/s | 212.88 tok/s | **228.18 tok/s** |
-| **2 boxes (`TP=2`)** | `bit400` | — | — | — | **78.20 tok/s** | — | — | **179.14 tok/s** |
+| Configuration | Manifest | Context (`CAP`) | Code | Prose | Structured | Counting | `c1` | `c2` | `c4` | `c8` |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **1 box (`TP=1`)** | `bit300` | `139,264` | **83.0** | **61.5** | **87.4** | **88.8** | **72.6** | **102.1** | **121.7** | **155.2** |
+| **1 box (`TP=1`)** | `bit400` | `139,264` | **78.4** | **55.1** | **81.2** | **82.0** | **65.5** | **93.9** | **106.7** | **140.6** |
+| **2 boxes (`TP=2`)** | `bit300` | `262,208` | **126.8** | **89.2** | **135.1** | **135.8** | **104.1** | **151.2** | **183.5** | **254.5** |
+| **2 boxes (`TP=2`)** | `bit400` | `262,208` | **122.1** | **86.9** | **126.7** | **128.6** | **101.7** | **145.7** | **169.6** | **234.1** |
 
-- `MTP=3` achieves `71%–85%` draft acceptance (`3.13–3.50 tok/round`) on technical prose, with **100% byte-identical greedy token parity** across `MTP=0, 1, 2, 3` and `GR8_PTAB=0` vs `GR8_PTAB=2` on both `TP=1` and 2-box `TP=2`.
+All values are tokens/second (`c1`–`c8` are aggregate throughput across mixed code/prose/structured prompts). On `TP=1 bit300`, `MTP=4` reaches `89.5` code / `97.2` structured / `99.1` counting (`57.7` prose, `c1` `73.1` / `c2` `103.3`).
 
-### Long-context prefill & solo decode (`P=128` and `P=2048`, `MTP=0`, `bit300`)
+### Cold prefill (`bench/bench.py`, salted prompts) & correctness
 
-| Configuration | `P=128` solo decode | `P=2048` prefill | `P=2048` solo decode |
-|---|---:|---:|---:|
-| **1 box (`TP=1`)** | 34.41 tok/s (`bit400`: 32.88) | 1,018.4 tok/s | 32.12 tok/s |
-| **2 boxes (`TP=2`)** | 51.52 tok/s | 1,176.6 tok/s | 46.82 tok/s |
+| Configuration | Manifest | 8K prefill (TTFT) | 32K prefill (TTFT) | 128K prefill (TTFT) | Checks |
+|---|---|---:|---:|---:|---|
+| **1 box (`TP=1`)** | `bit300` | **2,258 tok/s** (`3.64 s`) | **2,269 tok/s** (`14.44 s`) | — | `8/8` smoke, `3/3` count-200, **128K needle PASS** (`131,572` tok), `GR8_PTAB=0 == 2` exact |
+| **1 box (`TP=1`)** | `bit400` | **2,215 tok/s** (`3.71 s`) | **2,200 tok/s** (`14.93 s`) | — | `8/8` smoke, full `CAP=139264` on 1 box |
+| **2 boxes (`TP=2`)** | `bit300` | **3,027 tok/s** (`2.74 s`) | **3,142 tok/s** (`10.46 s`) | **2,973 tok/s** (`44.09 s`) | `8/8` smoke, `3/3` count-200, **128K needle PASS** (`131,069` tok) |
+| **2 boxes (`TP=2`)** | `bit400` | **2,997 tok/s** (`2.74 s`) | **3,069 tok/s** (`10.71 s`) | **2,915 tok/s** (`45.04 s`) | `8/8` smoke |
 
 ## Build and run
 
@@ -66,7 +67,10 @@ Every `GR8_QW38_*` knob is registered in `knobs/qw38.yaml` (documented in [ENV.m
 
 | Knob | Default | Purpose / rollback |
 |---|---|---|
-| `GR8_QW38_DENSE_FP8` | `1` | On-load GPU block-32 FP8 E4M3 quantization of dense decode weights & `lm_head` (`M <= 12`). Set `=0` for pure BF16 dense decode. |
+| `GR8_QW38_DENSE_FP8` | `1` | On-load GPU block-32 FP8 E4M3 quantization of dense decode weights & `lm_head`. Set `=0` for pure BF16 dense decode. |
+| `GR8_QW38_MTP_FAST` | `1` | Fast MTP drafting: 2-bit block-32 draft head screen + exact top-64 rescore, INT4 L048 routed experts (`-1.05 GB` VRAM), and single-graph zero-host-sync K-step greedy argmax drafting. Set `=0` to roll back. |
+| `GR8_QW38_TRUNK_HEAD2` | `1` | Trunk decode/verify `lm_head` (`M <= 48`) 2-bit screen + bit-exact FP8 top-256 rescore (reuses the MTP 2-bit table at zero extra VRAM when `MTP > 0`). Set `=0` for full-vocab FP8 `lm_head`. |
+| `GR8_QW38_PF_MXFP8` | `1` | Blackwell native MXFP8 (`m16n8k32`, UE8M0 block-32 scales) Tensor Core GEMMs for trunk GDN, Full Attn (`Q/K/V/O`), and shared-MoE at `M >= 16` (`c4`/`c8` verify & prefill), keeping exact FP16 scales on HC, `lm_head`, QSA indexer, and MTP. Set `=0` for FP16-scaled FP8 decode + BF16 cuBLAS prefill. |
 | `GR8_QW38_GRAPH` | `1` | Full 48-layer decode + MTP verify & draft CUDA Graph capture on `TP=1` and multi-box RDMA `TP>=2` (compatible with `GR8_PTAB=1\|2`). Set `=0` for eager launches. |
 | `GR8_QW38_WIDE` | `1` | Wide-load K2/K3/K4 PMCGX MoE kernels (`tr3_wide.cuh`). Set `=0` for stock-order PMCGX decode. |
 | `GR8_QW38_PLE_ASYNC` | `1` | Overlaps Layer-1 PLE NVMe `pread` pool behind Layer 0 compute. Set `=0` for synchronous PLE fetch. |
@@ -75,7 +79,7 @@ Every `GR8_QW38_*` knob is registered in `knobs/qw38.yaml` (documented in [ENV.m
 | `GR8_QW38_FAST_AR` | `1` | Single-step multi-collective device-driven RDMA all-reduce (`ncoll = 2*L+1 = 97` on `TP>=2`). Set `=0` for per-collective fallback. |
 | `GR8_QW38_VISION` | `0` | Opt-in multimodal image input (`--serve` only). Loads `dense/vision-bf16.safetensors` (27-layer BF16 ViT, ~898 MB per rank) with interleaved 3D MRoPE (`mrope_section=[11,11,10]`). Set `=0` (default) for text-only serving. |
 | `GR8_PTAB` | `0` | Fixed-address device piece table (`0`=off, `1`=paged, `2`=paged+slab pool) for minimal-move live scaling. |
-| `MTP` (`--mtp`) | `0` | Layer-48 MTP speculative draft depth (`0..3`). |
+| `MTP` (`--mtp`) | `0` | Layer-48 MTP speculative draft depth (`0..5`). |
 
 ## Image input (vision)
 
