@@ -141,7 +141,7 @@ std::vector<std::string> split(const std::string& s)
 int main(int argc, char** argv)
 {
     using namespace ink2rt;
-    std::string dir, layers = "all", tokens, s2dir, set_id, ips, ips2, kv_keep = "all";
+    std::string dir, layers = "all", variant, tokens, s2dir, set_id, ips, ips2, kv_keep = "all";
     std::vector<std::string> kv_tiers;
     int rank = -1, proxy_cpu = -1, gen = 16, chunk = 8, prefill = 512, nc = 256, cap = 262144, mtp = 0, s2port = 7341, s2sess = 1, s2epoch = 0, kv_sys_after = 2;
     double kv_wlim = 0.0;
@@ -162,6 +162,7 @@ int main(int argc, char** argv)
         else if (a == "--v2-dense" || a == "--model") dir = val();
         else if (a == "--manifest" || a == "--pack") val();   // a pack build's flags: the checkpoint is the model here
         else if (a == "--layers") layers = val();
+        else if (a == "--variant") variant = val();
         else if (a == "--tokens") tokens = val();
         else if (a == "--gen") gen = atoi(val().c_str());
         else if (a == "--chunk") chunk = atoi(val().c_str());
@@ -212,6 +213,7 @@ int main(int argc, char** argv)
     o.cap = cap / 64 * 64;
     o.nc = std::max(nc, 1);
     o.layers = layers;
+    o.variant = variant;
     o.whole_image = true;
     // Image input (GR8_INK2_VISION, default 0, opt-in): with --serve the vision tower of the checkpoint is bound here, with
     // its workspace and a pool of image rows for one prefill step, so the ready memory counts it. Every rank runs the

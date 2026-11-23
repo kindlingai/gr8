@@ -54,3 +54,11 @@ knobs:
       tensor cores, each key tile read once for all rows. 0 (the default) = the per-row kernels at every size. The
       scores are sums in another order and the probabilities are rounded for the product with V, so the rows agree
       within rounding, not bit for bit; decode and verify steps never take this path. Every rank must agree.
+  GR8_INK2_VARIANT:
+    scope: agree
+    kind: text
+    unset: "auto-detect an exlr8 manifest when native experts are absent, else native"
+    legacy: []
+    doc: >-
+      Optional exlr8 width-manifest variant name or path (manifests/exlr8-manifest-NAME.json) used when --variant is
+      not passed on the command line. Every rank must agree.

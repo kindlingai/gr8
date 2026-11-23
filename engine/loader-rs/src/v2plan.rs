@@ -411,6 +411,8 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
         (4096, NH) => nroute == 288,
         (5120, 18) => nroute == 384,
         (2560, 5) => nroute == 512,
+        (2304, 9) => nroute == 128,
+        (256, 2) => nroute == 16,
         _ => false,
     };
     if !geometry || w.gate.len() != nroute || w.up.len() != nroute {

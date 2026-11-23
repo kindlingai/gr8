@@ -16,6 +16,8 @@
 #pragma once
 #include "../kernels/nvfp4.cuh"
 #include "../kernels/ink2_moe.cuh"
+#include "../kernels/ink2_loop.cuh"
+#include "../kernels/ink2_tr3_moe.cuh"
 #include "../attn/ink2_attn.cuh"
 #include "../kernels/ink2_mtp.cuh"
 #include "../kernels/ink2_head.cuh"
@@ -79,6 +81,11 @@ struct Cfg
     int H = 0, heads = 0, kv_heads = 0, hd = 0, rel_dim = 0, rel_win = 0, NE = 0, TK = 0, I = 0, vocab = 0, valid = 0, n_layers = 0;
     int window = geom::WINDOW, log_base = geom::LOG_SCALE_BASE, block = geom::ATTN_RES_BLOCK, image_token = geom::TOK_IMAGE;
     float route_scale = geom::ROUTE_SCALE;
+    // looped core (Inkling-2-Mini text_config.loop_config); loop_passes <= 1 = unlooped
+    int loop_start = 0, loop_end = 0, loop_passes = 1, loop_gate_rank = 0;
+    bool is_looped() const { return loop_passes > 1 && loop_end > loop_start; }
+    int n_loop_layers() const { return is_looped() ? (loop_end - loop_start) : 0; }
+    int n_virtual_layers() const { return is_looped() ? n_layers + (loop_passes - 1) * (loop_end - loop_start) : n_layers; }
     // the MTP drafter (mtp_config); mtp_layers 0 = the checkpoint has none
     int mtp_layers = 0, mtp_inter = 0, mtp_window = 0, mtp_block = 8, mtp_drafts = 7, markov_rank = 0;
     int mtp_H = 0, mtp_heads = 0, mtp_kv_heads = 0, mtp_hd = 0;
@@ -208,6 +215,20 @@ inline Cfg read_config(const std::string& dir)
     c.route_scale = static_cast<float>(json_num(sc, 0, "route_scale", geom::ROUTE_SCALE));
     c.valid = opt_int("unpadded_vocab_size", std::min(c.vocab, static_cast<int>(geom::VALID_VOCAB)));
     if (c.valid > c.vocab || c.valid < 1) c.valid = c.vocab;
+    if (sc.find("\"loop_config\"") != std::string::npos)
+    {
+        const std::string lc = json_section(sc, "loop_config");
+        c.loop_start = static_cast<int>(json_num(lc, 0, "core_start", 0));
+        c.loop_end = static_cast<int>(json_num(lc, 0, "core_end", 0));
+        c.loop_passes = static_cast<int>(json_num(lc, 0, "num_passes", 1));
+        c.loop_gate_rank = static_cast<int>(json_num(lc, 0, "gate_rank", 0));
+        if (c.loop_passes > 1)
+        {
+            if (c.loop_start < c.block || c.loop_end > c.n_layers || c.loop_start >= c.loop_end ||
+                c.loop_start % c.block || c.loop_end % c.block || c.loop_gate_rank < 1 || c.loop_gate_rank > ink2::LOOP_MAX_RANK)
+                die(dir + "/config.json: invalid loop_config");
+        }
+    }
     if (c.heads % c.kv_heads || c.H % 32 || c.hd % 16 || c.hd > ink2::ATTN_MAX_HD) die(dir + "/config.json: heads, hidden_size or head_dim");
     if (!mtp.empty())
     {
@@ -295,7 +316,7 @@ struct Image
         }
     };
 
-    void open(const std::string& dir, int nr, int r)
+    void open(const std::string& dir, int nr, int r, const std::string& variant = "")
     {
         rank = r;
         const std::string sfx = ".manifest.json";
@@ -304,7 +325,8 @@ struct Image
         if (fd < 0) die(p + ": " + strerror(errno));
         close(fd);
         char err[1024] = "";
-        plan = g6l_ink2_plan(dir.c_str(), static_cast<uint32_t>(nr), static_cast<uint32_t>(r), p.c_str(), err, sizeof err);
+        plan = g6l_ink2_plan_ex(dir.c_str(), static_cast<uint32_t>(nr), static_cast<uint32_t>(r),
+                                variant.empty() ? nullptr : variant.c_str(), p.c_str(), err, sizeof err);
         if (!plan)
         {
             unlink(p.c_str());
@@ -518,13 +540,27 @@ struct RankPart
     uint16_t* staging = nullptr;   // [slots][2][64][nk] on global layers, for partial-page KV state snapshots
     const uint8_t *fc1 = nullptr, *fc2 = nullptr;
     const float *s1 = nullptr, *s2 = nullptr;
+    // exlr8-v2 trellis experts (exp_fmt in {1, 2, 3})
+    const uint8_t *tr3_fc1 = nullptr, *tr3_fc2 = nullptr;
+    const __half *tr3_v1 = nullptr, *tr3_v2 = nullptr, *tr3_v3 = nullptr;
+    const long long *tr3_tab = nullptr, *tr3_kmix = nullptr;
+    int tr3_eb = 0;
+};
+struct CtrlWeights
+{
+    const uint16_t *down = nullptr, *forget = nullptr, *gain = nullptr;
 };
 struct Layer
 {
-    int l = 0;
+    int l = 0;           // physical weight layer index
+    int v = 0;           // virtual execution step index
+    int loop_pass = 0;   // 0 for prelude / core pass 0 / coda; 1..loop_passes-1 for recurrent passes
+    int loop_j = -1;     // 0..n_loop-1 for core layers, else -1
+    int exp_fmt = 5;     // 5 = nv4g, 6 = mxfp8, 1 = exlr8 mcg, 2 = exlr8 mul1, 3 = exlr8 pmcgx
     bool glob = false, mx8 = false;
     const float *attn_query = nullptr, *mlp_query = nullptr, *router_bias = nullptr;
     const uint16_t *attn_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *v_norm = nullptr, *attn_sconv = nullptr, *mlp_sconv = nullptr, *mlp_norm = nullptr, *router_w = nullptr;
+    CtrlWeights ctrl_q, ctrl_k, ctrl_v, ctrl_mlp;
     uint16_t *hist_a = nullptr, *hist_m = nullptr;   // [slots][3][H]
     uint16_t *att = nullptr, *mo = nullptr;          // [M][H]: the inputs of attn_sconv and mlp_sconv, kept until the commit
     std::vector<RankPart> rk;                        // the ranks this engine runs
@@ -610,6 +646,7 @@ struct Options
     int nc = 256;        // candidates of a row's head
     int mtp = 0;         // drafts of a round (0 = no drafter: no taps, no drafter state)
     std::string layers = "all";
+    std::string variant; // exlr8 width-manifest variant (empty = auto / GR8_INK2_VARIANT)
     bool whole_image = false;
     bool vision = false; // run the vision tower when the checkpoint has one (image input)
     // the speed paths: -1 = what the knob says (GR8_INK2_*), 0 = off, 1 = on
@@ -650,12 +687,12 @@ public:
     {
         o = opt;
         c = read_config(dir);
-        if (c.heads % o.nr || c.I % o.nr || o.nloc < 1 || o.rank0 + o.nloc > o.nr) die("TP " + std::to_string(o.nr) + " does not divide the heads or the expert columns");
+        if (c.heads % o.nr || o.nloc < 1 || o.rank0 + o.nloc > o.nr) die("TP " + std::to_string(o.nr) + " does not divide the heads");
         layer_ids = parse_layers(o.layers, c.n_layers);
         for (int i = 0; i < o.nloc; ++i)
         {
             img.push_back(std::make_unique<Image>());
-            img[i]->open(dir, o.nr, o.rank0 + i);
+            img[i]->open(dir, o.nr, o.rank0 + i, o.variant);
             if (o.whole_image) img[i]->whole();
         }
         Image& a = *img[0];
@@ -674,14 +711,39 @@ public:
         embed_norm = a.get<uint16_t>("G.embed_norm");
         final_norm = a.get<uint16_t>("G.final_norm");
         output_query = a.get<float>("G.attn_res.output_query");
-        L.resize(layer_ids.size());
-        for (size_t j = 0; j < L.size(); ++j) bind_layer(L[j], layer_ids[j]);
+        if (c.is_looped())
+        {
+            if (static_cast<int>(layer_ids.size()) != c.n_layers) die("looped Inkling-2 requires --layers all");
+            msg_queries = a.get<float>("G.loop.msg_queries");
+            L.resize(static_cast<size_t>(c.n_virtual_layers()));
+            int v = 0;
+            for (int l = 0; l < c.loop_start; ++l, ++v) bind_layer(L[v], l, v, 0, -1);
+            const int nl = c.n_loop_layers();
+            for (int pass = 0; pass < c.loop_passes; ++pass)
+                for (int j = 0; j < nl; ++j, ++v) bind_layer(L[v], c.loop_start + j, v, pass, j);
+            for (int l = c.loop_end; l < c.n_layers; ++l, ++v) bind_layer(L[v], l, v, 0, -1);
+        }
+        else
+        {
+            L.resize(layer_ids.size());
+            for (size_t j = 0; j < L.size(); ++j) bind_layer(L[j], layer_ids[j], static_cast<int>(j), 0, -1);
+        }
+        int max_tr3_eb = 0;
+        for (const Layer& y : L)
+            if (y.exp_fmt >= 1 && y.exp_fmt <= 3)
+                for (const RankPart& x : y.rk) max_tr3_eb = std::max(max_tr3_eb, x.tr3_eb);
         mw.resize(static_cast<size_t>(o.nloc));
+        const int i_work = std::max(64, (c.I / o.nr + 31) / 32 * 32);
         for (int i = 0; i < o.nloc; ++i)
         {
-            mw[i].alloc(o.max_rows, c.H, c.I / o.nr, c.NE, c.TK, false);
+            mw[i].alloc(o.max_rows, c.H, i_work, c.NE, c.TK, false);
             lm.push_back(img[i]->get<uint16_t>("G.lm_head"));
             logits.push_back(dalloc<float>(static_cast<size_t>(o.max_rows) * vr));
+            if (max_tr3_eb > 0)
+            {
+                const size_t mt = static_cast<size_t>(ink2::plan_max_tiles(o.max_rows, c.TK, c.NE));
+                tr3_a_rot.push_back(dalloc<__half>(mt * 8 * static_cast<size_t>(max_tr3_eb) * 128));
+            }
         }
         d_slot = dalloc<int>(o.max_rows);
         d_pos = dalloc<int>(o.max_rows);
@@ -689,9 +751,22 @@ public:
         toks = dalloc<int>(o.max_rows);
         acc_dev = dalloc<uint8_t>(o.max_rows);
         for (uint16_t** p : {&h, &qi, &ki, &vi, &a_, &mid, &xm, &ms, &hf, &scratch}) *p = dalloc<uint16_t>(mh);
-        const int nb = (static_cast<int>(L.size()) + c.block - 1) / c.block;
+        const int phys_layers_for_blocks = c.is_looped() ? c.n_layers : static_cast<int>(L.size());
+        const int nb = (phys_layers_for_blocks + c.block - 1) / c.block;
         if (nb + 1 > ink2::MAX_DEPTH) die("more blocks of layers than the depth attention reads");
         for (int b = 0; b < nb; ++b) states.push_back(dalloc<uint16_t>(mh));
+        if (c.is_looped())
+        {
+            pre_h = dalloc<uint16_t>(mh);
+            prev_h = dalloc<uint16_t>(mh);
+            const int n_prev = c.n_loop_layers() / c.block - 1;
+            for (int b = 0; b < n_prev; ++b) prev_states.push_back(dalloc<uint16_t>(mh));
+            for (int q = 0; q < 3; ++q) f32_attn[q] = dalloc<float>(mh);
+            for (int q = 0; q < 4; ++q) f32_msg[q] = dalloc<float>(mh);
+            f32_mlp = dalloc<float>(mh);
+            gate_cat = dalloc<uint16_t>(mh * 2);
+            gate_g = dalloc<uint16_t>(static_cast<size_t>(o.max_rows) * c.loop_gate_rank);
+        }
         part_stride = static_cast<size_t>(o.max_rows) * c.TK * c.H;
         parts = dalloc<float>(static_cast<size_t>(o.nr) * part_stride);
         host_logits.resize(static_cast<size_t>(o.max_rows) * vr);
@@ -701,8 +776,8 @@ public:
         if (o.mtp > 0) init_mtp();
         if (o.vision && a.find("V.proj_out.weight")) init_vision();
         INK2RT_CK(cudaDeviceSynchronize());
-        fprintf(stderr, "# ink2: ranks %d..%d of %d, %zu layers, H %d, %d experts top %d, vocab %d (%d rows a rank), %d slots, %d rows, cap %d\n", o.rank0,
-                o.rank0 + o.nloc - 1, o.nr, L.size(), c.H, c.NE, c.TK, c.vocab, vr, o.slots, o.max_rows, o.cap);
+        fprintf(stderr, "# ink2: ranks %d..%d of %d, %zu layers (%d phys%s), H %d, %d experts top %d, vocab %d (%d rows a rank), %d slots, %d rows, cap %d\n", o.rank0,
+                o.rank0 + o.nloc - 1, o.nr, L.size(), c.n_layers, c.is_looped() ? " looped" : "", c.H, c.NE, c.TK, c.vocab, vr, o.slots, o.max_rows, o.cap);
     }
 
     // ---- image input (ink2_vision.cuh). The tower runs on this engine's first rank; every rank computes the same rows.
@@ -800,21 +875,69 @@ public:
         const bool tc = use_tc && chunk && M >= 16;
         const BlasScope blas_scope(use_blas && chunk && M >= 32 ? blas : nullptr);
         ink2::embed_norm(toks, embed, embed_norm, vis_rows, c.image_token, h, M, c.H, 0);
+        int cur_nb = 0;
+        const int num_pre_blocks = c.is_looped() ? (c.loop_start / c.block) : 0;
         for (size_t j = 0; j < L.size(); ++j)
         {
             Layer& s = L[j];
             const int ji = static_cast<int>(j);
+            if (c.is_looped())
+            {
+                if (ji == c.loop_start) ink2::copy_bf16(h, pre_h, n, 0);
+                if (s.loop_pass >= 1 && s.loop_j == 0)
+                {
+                    for (int d = num_pre_blocks + 1; d < cur_nb; ++d)
+                        ink2::copy_bf16(states[static_cast<size_t>(d)], prev_states[static_cast<size_t>(d - (num_pre_blocks + 1))], n, 0);
+                    ink2::copy_bf16(h, prev_h, n, 0);
+                    ink2::copy_bf16(pre_h, h, n, 0);
+                    cur_nb = num_pre_blocks;
+                }
+            }
+            const int tap_id = c.is_looped() ? ji : s.l;
             for (int t = 0; t < ntaps; ++t)
-                if (c.mtp_targets[static_cast<size_t>(t)] == s.l) ink2::copy_bf16(h, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, 0);
-            const int done = (ji + c.block - 1) / c.block;   // finished blocks before the attention of this layer
-            if (!s.attn_query) ink2::rmsnorm(h, s.attn_norm, qi, M, c.H, 0);
+                if (c.mtp_targets[static_cast<size_t>(t)] == tap_id) ink2::copy_bf16(h, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, 0);
+            const bool gated = s.loop_pass >= 1;
+            if (gated)
+            {
+                // Cross-pass message retrieval (MessageAttentionResidual): prev_states..., prev_h -> [q, k, v, mlp]
+                ink2::AttnResF32Args ma{};
+                const int np = static_cast<int>(prev_states.size());
+                for (int d = 0; d < np; ++d) ma.rows[d] = prev_states[static_cast<size_t>(d)];
+                ma.rows[np] = prev_h;
+                ma.query = msg_queries + static_cast<size_t>(s.loop_j) * 4 * c.H;
+                ma.D = np + 1;
+                ma.Q = 4;
+                ma.H = c.H;
+                for (int q = 0; q < 4; ++q) ma.out[q] = f32_msg[q];
+                ink2::attn_res_f32(ma, M, 0);
+
+                // Current-pass BlockAttentionResidual in fp32 (1 query local, 3 queries global)
+                ink2::AttnResF32Args ar{};
+                for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
+                ar.rows[cur_nb] = h;
+                ar.query = s.attn_query;
+                ar.D = cur_nb + 1;
+                ar.Q = s.glob ? 3 : 1;
+                ar.H = c.H;
+                for (int q = 0; q < ar.Q; ++q) ar.out[q] = f32_attn[q];
+                ink2::attn_res_f32(ar, M, 0);
+
+                // q, k, v MessageGate + RMSNorm
+                ink2::msg_gate_norm(f32_attn[0], f32_msg[0], s.ctrl_q.down, s.ctrl_q.forget, s.ctrl_q.gain,
+                                    s.glob ? s.q_norm : s.attn_norm, gate_cat, gate_g, qi, M, c.H, c.loop_gate_rank, 0);
+                ink2::msg_gate_norm(f32_attn[s.glob ? 1 : 0], f32_msg[1], s.ctrl_k.down, s.ctrl_k.forget, s.ctrl_k.gain,
+                                    s.glob ? s.k_norm : s.attn_norm, gate_cat, gate_g, ki, M, c.H, c.loop_gate_rank, 0);
+                ink2::msg_gate_norm(f32_attn[s.glob ? 2 : 0], f32_msg[2], s.ctrl_v.down, s.ctrl_v.forget, s.ctrl_v.gain,
+                                    s.glob ? s.v_norm : s.attn_norm, gate_cat, gate_g, vi, M, c.H, c.loop_gate_rank, 0);
+            }
+            else if (!s.attn_query) ink2::rmsnorm(h, s.attn_norm, qi, M, c.H, 0);
             else
             {
                 ink2::AttnResArgs ar{};
-                for (int d = 0; d < done; ++d) ar.rows[d] = states[d];
-                ar.rows[done] = h;
+                for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
+                ar.rows[cur_nb] = h;
                 ar.query = s.attn_query;
-                ar.D = done + 1;
+                ar.D = cur_nb + 1;
                 ar.Q = s.glob ? 3 : 1;
                 ar.H = c.H;
                 ar.norm[0] = s.glob ? s.q_norm : s.attn_norm;
@@ -825,10 +948,11 @@ public:
                 ar.out[2] = vi;
                 ink2::attn_res(ar, M, 0);
             }
+            const bool split_kv = s.glob || gated;
             for (int i = 0; i < o.nloc; ++i)
             {
                 RankPart& x = s.rk[i];
-                ink2::attn_forward(x.g, x.aw, x.as, x.wk, rw, rh.max_pos, qi, s.glob ? ki : qi, s.glob ? vi : qi, M, T == 1 ? s.att : nullptr,
+                ink2::attn_forward(x.g, x.aw, x.as, x.wk, rw, rh.max_pos, qi, split_kv ? ki : qi, split_kv ? vi : qi, M, T == 1 ? s.att : nullptr,
                                    parts + static_cast<size_t>(o.rank0 + i) * n, 0, tc);
             }
             if (T > 1)
@@ -837,19 +961,38 @@ public:
                 ink2::sum_ranks(parts, T, n, s.att, 0);
             }
             ink2::sconv_static(s.att, s.hist_a, rw, s.attn_sconv, M, c.H, a_, 0);
-            ink2::attn_block_step(h, a_, ji % c.block == 0, states[ji / c.block], mid, n, 0);
-            ink2::AttnResArgs ar{};
-            const int d2 = ji / c.block + 1;
-            for (int d = 0; d < d2; ++d) ar.rows[d] = states[d];
-            ar.rows[d2] = mid;
-            ar.query = s.mlp_query;
-            ar.D = d2 + 1;
-            ar.Q = 1;
-            ar.H = c.H;
-            ar.norm[0] = s.mlp_norm;
-            ar.out[0] = xm;
-            ink2::attn_res(ar, M, 0);
-            if (s.mx8) moe<ink2::Mx8Frag>(s, ji);
+            const bool bstart = (c.is_looped() ? s.l : ji) % c.block == 0;
+            ink2::attn_block_step(h, a_, bstart, states[static_cast<size_t>(cur_nb)], mid, n, 0);
+            if (bstart) ++cur_nb;
+            if (gated)
+            {
+                ink2::AttnResF32Args ar{};
+                for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
+                ar.rows[cur_nb] = mid;
+                ar.query = s.mlp_query;
+                ar.D = cur_nb + 1;
+                ar.Q = 1;
+                ar.H = c.H;
+                ar.out[0] = f32_mlp;
+                ink2::attn_res_f32(ar, M, 0);
+                ink2::msg_gate_norm(f32_mlp, f32_msg[3], s.ctrl_mlp.down, s.ctrl_mlp.forget, s.ctrl_mlp.gain,
+                                    s.mlp_norm, gate_cat, gate_g, xm, M, c.H, c.loop_gate_rank, 0);
+            }
+            else
+            {
+                ink2::AttnResArgs ar{};
+                for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
+                ar.rows[cur_nb] = mid;
+                ar.query = s.mlp_query;
+                ar.D = cur_nb + 1;
+                ar.Q = 1;
+                ar.H = c.H;
+                ar.norm[0] = s.mlp_norm;
+                ar.out[0] = xm;
+                ink2::attn_res(ar, M, 0);
+            }
+            if (s.exp_fmt >= 1 && s.exp_fmt <= 3) moe_tr3(s, ji);
+            else if (s.mx8) moe<ink2::Mx8Frag>(s, ji);
             else moe<nv4::Frag>(s, ji);
             ink2::sconv_static(s.mo, s.hist_m, rw, s.mlp_sconv, M, c.H, ms, 0);
             ink2::add_bf16(mid, ms, h, n, 0);
@@ -861,18 +1004,17 @@ public:
             return;
         }
         ink2::AttnResArgs ar{};
-        const int nb = static_cast<int>(states.size());
-        for (int d = 0; d < nb; ++d) ar.rows[d] = states[d];
-        ar.rows[nb] = h;
+        for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
+        ar.rows[cur_nb] = h;
         ar.query = output_query;
-        ar.D = nb + 1;
+        ar.D = cur_nb + 1;
         ar.Q = 1;
         ar.H = c.H;
         ar.norm[0] = final_norm;
         ar.out[0] = hf;
         ink2::attn_res(ar, M, 0);
         for (int t = 0; t < ntaps; ++t)
-            if (c.mtp_targets[static_cast<size_t>(t)] == c.n_layers) ink2::copy_bf16(hf, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, 0);
+            if (c.mtp_targets[static_cast<size_t>(t)] == c.n_virtual_layers()) ink2::copy_bf16(hf, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, 0);
         if (!samples)
         {
             if (T > 1 && step_end) step_end();
@@ -1190,14 +1332,29 @@ private:
         g.global = glob;
         return g;
     }
-    void bind_layer(Layer& s, int l)
+    void bind_layer(Layer& s, int l, int v, int loop_pass, int loop_j)
     {
         Image& a = *img[0];
         const auto N = [l](const char* w) { return lname(l, w); };
         s.l = l;
+        s.v = v;
+        s.loop_pass = loop_pass;
+        s.loop_j = loop_j;
         s.glob = a.find(N("q_input_norm")) != nullptr;
-        s.mx8 = a.entry(N("x.fc1")).expert_format == 6;
-        if (!s.mx8 && a.entry(N("x.fc1")).expert_format != 5) die(N("x.fc1") + ": the experts are neither nv4g nor mxfp8");
+        const bool is_tr3 = a.find(N("tr3.fc1")) != nullptr;
+        if (is_tr3)
+        {
+            s.exp_fmt = a.entry(N("tr3.fc1")).expert_format;
+            if (s.exp_fmt < 1 || s.exp_fmt > 3) die(N("tr3.fc1") + ": unsupported exlr8 expert_format " + std::to_string(s.exp_fmt));
+            s.mx8 = false;
+        }
+        else
+        {
+            s.exp_fmt = a.entry(N("x.fc1")).expert_format;
+            s.mx8 = s.exp_fmt == 6;
+            if (!s.mx8 && s.exp_fmt != 5) die(N("x.fc1") + ": the experts are neither nv4g, mxfp8 nor exlr8 tr3");
+            if (c.I % o.nr != 0) die("TP " + std::to_string(o.nr) + " does not divide the expert columns");
+        }
         s.attn_query = a.opt<float>(N("attn_res.attn_query"));
         s.mlp_query = a.get<float>(N("attn_res.mlp_query"));
         s.router_bias = a.get<float>(N("router.bias"));
@@ -1213,7 +1370,20 @@ private:
         s.mlp_sconv = a.get<uint16_t>(N("mlp_sconv"));
         s.mlp_norm = a.get<uint16_t>(N("mlp_norm"));
         s.router_w = a.get<uint16_t>(N("router.w"));
-        if (a.dim(N("router.w"), 0) != c.NE || a.dim(N("x.fc1"), 1) * 16 != c.I / o.nr) die(N("x.fc1") + ": experts or columns differ from config.json");
+        if (a.dim(N("router.w"), 0) != c.NE) die(N("router.w") + ": experts differ from config.json");
+        if (!is_tr3 && a.dim(N("x.fc1"), 1) * 16 != c.I / o.nr) die(N("x.fc1") + ": columns differ from config.json");
+        if (loop_j >= 0)
+        {
+            auto bind_ctrl = [&](CtrlWeights& cw, const char* nm) {
+                cw.down = a.get<uint16_t>(N((std::string("ctrl.") + nm + ".down").c_str()));
+                cw.forget = a.get<uint16_t>(N((std::string("ctrl.") + nm + ".forget").c_str()));
+                cw.gain = a.get<uint16_t>(N((std::string("ctrl.") + nm + ".gain").c_str()));
+            };
+            bind_ctrl(s.ctrl_q, "q");
+            bind_ctrl(s.ctrl_k, "k");
+            bind_ctrl(s.ctrl_v, "v");
+            bind_ctrl(s.ctrl_mlp, "mlp");
+        }
         const size_t mh = static_cast<size_t>(o.max_rows) * c.H, sl = static_cast<size_t>(o.slots);
         s.hist_a = dalloc<uint16_t>(sl * 3 * c.H);
         s.hist_m = dalloc<uint16_t>(sl * 3 * c.H);
@@ -1271,12 +1441,27 @@ private:
             const size_t spans = static_cast<size_t>(keys + ink2::ATTN_SPAN - 1) / ink2::ATTN_SPAN + 1;
             const size_t rows = s.glob ? std::min<size_t>(16, static_cast<size_t>(o.max_rows)) : static_cast<size_t>(o.max_rows);
             x.wk.alloc(x.g, o.max_rows, rows * x.g.nh_q * spans * (x.g.hd + 2));
-            x.fc1 = im.get<uint8_t>(N("x.fc1"));
-            x.fc2 = im.get<uint8_t>(N("x.fc2"));
-            if (!s.mx8)
+            if (is_tr3)
             {
-                x.s1 = im.get<float>(N("x.s1"));
-                x.s2 = im.get<float>(N("x.s2"));
+                x.tr3_fc1 = im.get<uint8_t>(N("tr3.fc1"));
+                x.tr3_fc2 = im.get<uint8_t>(N("tr3.fc2"));
+                x.tr3_v1 = im.get<__half>(N("tr3.v1"));
+                x.tr3_v2 = im.get<__half>(N("tr3.v2"));
+                x.tr3_v3 = im.get<__half>(N("tr3.v3"));
+                x.tr3_tab = im.get<long long>(N("tr3.table"));
+                x.tr3_kmix = im.opt<long long>(N("tr3.kmix"));
+                const int nh_tot = c.I / 128;
+                x.tr3_eb = (nh_tot + o.nr - 1) / o.nr;
+            }
+            else
+            {
+                x.fc1 = im.get<uint8_t>(N("x.fc1"));
+                x.fc2 = im.get<uint8_t>(N("x.fc2"));
+                if (!s.mx8)
+                {
+                    x.s1 = im.get<float>(N("x.s1"));
+                    x.s2 = im.get<float>(N("x.s2"));
+                }
             }
         }
     }
@@ -1299,7 +1484,12 @@ private:
         if (c.mtp_inter < 1 || c.mtp_inter % T || (c.mtp_inter / T) % 16 || R < 16 || R % 16) die("mtp_config: intermediate_size or markov_rank");
         if (o.slots > o.max_rows) die("the drafter needs max_rows >= slots");
         for (int t : c.mtp_targets)
-            if (t != c.n_layers && std::find(layer_ids.begin(), layer_ids.end(), t) == layer_ids.end()) die("mtp_config: target layer " + std::to_string(t) + " is not run");
+            if (c.is_looped())
+            {
+                if (t < 0 || t > c.n_virtual_layers()) die("mtp_config: target layer " + std::to_string(t) + " out of virtual range");
+            }
+            else if (t != c.n_layers && std::find(layer_ids.begin(), layer_ids.end(), t) == layer_ids.end())
+                die("mtp_config: target layer " + std::to_string(t) + " is not run");
         if (a.entry("MTP.fuse_weight").nbytes != static_cast<size_t>(nl + 1) * ntaps * 2) die("MTP.fuse_weight: not [layers + 1][taps]");
         if (a.dim("MTP.markov_head.rnn_proj.weight", 0) != 3 * R || a.dim("MTP.markov_head.rnn_proj.weight", 1) != 2 * R + 2 * H || a.dim("MTP.markov_head.markov_w1", 1) != R ||
             a.dim("MTP.markov_head.hidden_out.weight", 0) != H || a.dim("MTP.markov_head.hidden_out.weight", 1) != R)
@@ -1468,6 +1658,42 @@ private:
         }
         ink2::k_ink2_mtp_last_taps<<<ink2::cells_grid(static_cast<size_t>(M) * ntaps * H), 256, 0, 0>>>(step_taps, tap_stride, last_taps, rw, am, M, ntaps, H);
     }
+    void moe_tr3(Layer& s, int j)
+    {
+        ink2::Work& w0 = mw[0];
+        const int T = o.nr;
+        ink2::route(xm, s.router_w, s.router_bias, M, c.H, c.NE, c.TK, c.route_scale, w0.score, w0.idx, w0.wt, w0.plan, 0);
+        const int cb = s.exp_fmt == 3 ? ink2::tr3::CB_PMCGX : s.exp_fmt == 2 ? ink2::tr3::CB_MUL1 : ink2::tr3::CB_MCG;
+        const size_t picks = static_cast<size_t>(M) * c.TK * c.H;
+        for (int i = 0; i < o.nloc; ++i)
+        {
+            const RankPart& x = s.rk[i];
+            ink2::tr3::Tr3Args ta{};
+            ta.fc1 = x.tr3_fc1;
+            ta.fc2 = x.tr3_fc2;
+            ta.v1 = x.tr3_v1;
+            ta.v2 = x.tr3_v2;
+            ta.v3 = x.tr3_v3;
+            ta.table = x.tr3_tab;
+            ta.kmix = x.tr3_kmix;
+            ta.x = xm;
+            ta.plan = w0.plan;
+            ta.a_rot = tr3_a_rot[static_cast<size_t>(i)];
+            ta.ypart = mw[i].ypart;
+            ta.out = T == 1 ? s.mo : nullptr;
+            ta.H = c.H;
+            ta.eb = x.tr3_eb;
+            ta.M = M;
+            ta.TK = c.TK;
+            ta.y_bf16 = 0;
+            ink2::tr3::moe_tr3(ta, cb, c.NE, 0);
+            if (T == 1) return;
+            PickArgs pa{static_cast<const float*>(mw[i].ypart), w0.plan, M, c.H, c.TK, parts + static_cast<size_t>(o.rank0 + i) * picks};
+            k_ink2rt_picks<<<ink2::cells_grid(picks), 256, 0, 0>>>(pa);
+        }
+        if (gather) gather(2 * j + 1, parts, picks * 4);
+        k_ink2rt_pick_sum<<<ink2::cells_grid(static_cast<size_t>(M) * c.H), 256, 0, 0>>>(parts, T, picks, M, c.H, c.TK, s.mo);
+    }
     template <class F> void moe(Layer& s, int j)
     {
         ink2::Work& w0 = mw[0];
@@ -1551,6 +1777,11 @@ private:
     bool use_far = false, use_ghp = false, use_blas = false, use_tc = false;
     const uint16_t *embed = nullptr, *embed_norm = nullptr, *final_norm = nullptr;
     const float* output_query = nullptr;
+    const float* msg_queries = nullptr;   // looped only: [n_loop][4][H] fp32
+    uint16_t *pre_h = nullptr, *prev_h = nullptr, *gate_cat = nullptr, *gate_g = nullptr;
+    std::vector<uint16_t*> prev_states;
+    float *f32_attn[3] = {}, *f32_msg[4] = {}, *f32_mlp = nullptr;
+    std::vector<__half*> tr3_a_rot;       // exlr8 tr3 per-local-rank activation scratch
     int *d_slot = nullptr, *d_pos = nullptr, *d_run0 = nullptr, *toks = nullptr;
     uint8_t* acc_dev = nullptr;
     uint16_t *h = nullptr, *qi = nullptr, *ki = nullptr, *vi = nullptr, *a_ = nullptr, *mid = nullptr, *xm = nullptr, *ms = nullptr, *hf = nullptr, *scratch = nullptr;

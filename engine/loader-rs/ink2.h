@@ -8,10 +8,14 @@ extern "C" {
 #endif
 
 // Plans rank `rank`'s device image at TP `nr` straight from the checkpoint directory `model_dir` (config.json,
-// optional hf_quant_config.json, model.safetensors.index.json + shards or model.safetensors, optional mtp.safetensors).
+// optional hf_quant_config.json, model.safetensors.index.json + shards or model.safetensors, optional mtp.safetensors,
+// and optional exlr8-v2 experts/ + index-slices/ + manifests/).
 // Writes the image's manifest (g6pack-v1, sha256 fields zero) to out_manifest. Returns a handle for g6l_plan_load,
 // g6l_plan_read and g6l_plan_free (g6load.h), or NULL with a message in err.
 void* g6l_ink2_plan(const char* model_dir, uint32_t nr, uint32_t rank, const char* out_manifest, char* err, size_t errlen);
+
+// Same as g6l_ink2_plan, with an optional exlr8 width-manifest variant name (NULL or "" = auto / GR8_INK2_VARIANT).
+void* g6l_ink2_plan_ex(const char* model_dir, uint32_t nr, uint32_t rank, const char* variant, const char* out_manifest, char* err, size_t errlen);
 
 #ifdef __cplusplus
 }

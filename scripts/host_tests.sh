@@ -78,10 +78,14 @@ run_job admit_hold_drain_asan '
   (cd "$D" && "$D/admit_hold_drain_test_asan" 2>/dev/null)
 '
 
-# Inkling-2-Small CPU reference & mini checkpoint
+# Inkling-2-Small & Inkling-2-Mini CPU reference & mini checkpoint
 run_job test_ink2_cpu_ref '
   g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_ink2_cpu_ref.cpp" -o "$D/test_ink2_cpu_ref"
   "$D/test_ink2_cpu_ref"
+'
+run_job test_ink2_loop_ref '
+  g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_ink2_loop_ref.cpp" -o "$D/test_ink2_loop_ref"
+  "$D/test_ink2_loop_ref"
 '
 run_job test_ink2_mini_ckpt '
   g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_ink2_mini_ckpt.cpp" \
