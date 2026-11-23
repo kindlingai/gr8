@@ -75,6 +75,8 @@ Thanks to:
   - Usage cache reporting for the glm dialect: the launcher now passes
     `--enable-prompt-tokens-details` to the front end, so
     `usage.prompt_tokens_details.cached_tokens` reaches clients on glm clusters.
+- [@bertholomus](https://github.com/bertholomus)
+  - Batched H2D upload and host-mirror fast path for S2 context-parallel page-table rebuilds.
 
 ## Upstream projects and research
 
