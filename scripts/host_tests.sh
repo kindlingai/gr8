@@ -518,6 +518,10 @@ run_job engram_rowstore_test '
   g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/engram" "$REPO/engine/engram/tests/test_rowstore.cpp" -o "$D/engram_rowstore_test"
   "$D/engram_rowstore_test" "$D/engram_rowstore" 262144
 '
+run_job qw38_ple_trellis_test '
+  g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/engram" "$REPO/engine/engram/tests/test_qw38_ple_trellis.cpp" -o "$D/qw38_ple_trellis_test"
+  "$D/qw38_ple_trellis_test" "$D/qw38_ple_trellis"
+'
 run_job engram_uring_test '
   g++ -std=c++17 -O2 -Wall -Wextra -pthread "$REPO/engine/engram/tests/test_uring.cpp" -o "$D/engram_uring_test"
   "$D/engram_uring_test"

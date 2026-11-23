@@ -17,8 +17,18 @@ knobs:
     values: "0..131072"
     legacy: []
     doc: >-
-      RAM LRU cache size in MiB for the Layer-1 PLE NVMe rowstore (exlr8-ple-L001.bin, 320 B rows). 0 disables caching
-      and reads every row directly from NVMe. Default: 1024 MiB.
+      RAM LRU cache size in MiB for the Layer-1 PLE NVMe rowstore (raw exlr8-ple-L001.bin or exlr8 row-trellis
+      safetensors). 0 disables caching and reads every row directly from NVMe. For row-trellis tables whose compressed
+      rows fit within this budget, the rows tensor is mmap-resident with zero NVMe I/O. Default: 1024 MiB.
+  GR8_QW38_PLE_PATH:
+    scope: local
+    kind: path
+    unset: "use <release>/ple/exlr8-ple-L001.bin if present, else auto-detect row-trellis safetensors under <release>/ple/"
+    legacy: []
+    doc: >-
+      Optional path to the Layer-1 PLE embedding table (raw BF16 .bin or exlr8 FORMAT v4 record-9 row-trellis
+      .safetensors). When unset, raw ple/exlr8-ple-L001.bin is used if present; otherwise row-trellis safetensors
+      (exlr8-ple-L001.{k5,k4p5,k4}.safetensors, exlr8-ple-L001.safetensors, rows.safetensors) are auto-detected.
   GR8_QW38_FAST_AR:
     scope: agree
     kind: flag
