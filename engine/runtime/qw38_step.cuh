@@ -1038,15 +1038,10 @@ struct Engine {
             qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
-                if (M <= 12) {
-                    if (i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
-                        qw38::launch_fp8_gemv_smallm<true>(mixed, fp8_lm_head[size_t(i)], head_logits, M, stream);
-                    } else if (M <= 8) {
-                        qw38::launch_bf16_gemv_smallm<true>(mixed, lm_head[size_t(i)], head_logits, M, v_rows[size_t(i)], geom::HID, stream);
-                    } else {
-                        cublasSetStream(blas, stream);
-                        qw38::gemm_bf16_nt_f32(blas, M, v_rows[size_t(i)], geom::HID, mixed, lm_head[size_t(i)], head_logits);
-                    }
+                if (M <= 20 && i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
+                    qw38::launch_fp8_gemv_smallm<true>(mixed, fp8_lm_head[size_t(i)], head_logits, M, stream);
+                } else if (M <= 8) {
+                    qw38::launch_bf16_gemv_smallm<true>(mixed, lm_head[size_t(i)], head_logits, M, v_rows[size_t(i)], geom::HID, stream);
                 } else {
                     cublasSetStream(blas, stream);
                     qw38::gemm_bf16_nt_f32(blas, M, v_rows[size_t(i)], geom::HID, mixed, lm_head[size_t(i)], head_logits);
@@ -1057,7 +1052,7 @@ struct Engine {
             }
         };
 
-        // Fast CUDA Graph path for decode (M <= 8, all_len1) AND MTP verify (M <= 20, all_verify)!
+        // Fast CUDA Graph path for decode (M <= 16, all_len1) AND MTP verify (M <= 64, all_verify)!
         const int V_chk = snap_k + 1;
         bool all_verify = (!all_len1 && snap_k > 0 && !segs.empty() && static_cast<int>(segs.size()) * V_chk == M);
         if (all_verify) {
@@ -1065,10 +1060,9 @@ struct Engine {
                 if (segs[s].len != V_chk || segs[s].row0 != static_cast<int>(s) * V_chk) { all_verify = false; break; }
             }
         }
-        const bool fp8_ready = !fp8_lm_head.empty() && fp8_lm_head[0].q != nullptr;
-        const bool verify_graph_ok = all_verify && (M <= 8 || (M <= 20 && fp8_ready));
+        const bool verify_graph_ok = all_verify && M <= 64;
         const bool graph_ok = o.use_graph && !o.profile && !skip_head &&
-                              ((snap_k == 0 && M <= 8 && all_len1) || verify_graph_ok) &&
+                              ((snap_k == 0 && M <= 16 && all_len1) || verify_graph_ok) &&
                               (o.nr == 1 || o.nloc == o.nr || static_cast<bool>(step_parity));
         if (graph_ok) {
             const int need_qsa = (((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS) ? 1 : 0;
@@ -1424,8 +1418,7 @@ struct Engine {
         };
 
         const int hin_kind = (hid_in == last_hyper) ? 0 : ((hid_in == mtp_hid_cur) ? 1 : -1);
-        const bool mtp_graph_ok = o.use_graph && !o.profile && M <= 5 && hin_kind >= 0 && hid_out == mtp_hid_cur &&
-                                  mtp_w.fp8_fc_hid.q != nullptr &&
+        const bool mtp_graph_ok = o.use_graph && !o.profile && M <= 16 && hin_kind >= 0 && hid_out == mtp_hid_cur &&
                                   (o.nr == 1 || o.nloc == o.nr || static_cast<bool>(step_parity));
         if (mtp_graph_ok) {
             const int need_qsa = (((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS) ? 1 : 0;
