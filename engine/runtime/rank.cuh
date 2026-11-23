@@ -1908,8 +1908,16 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
     // the last layer's MLP wait: the head's records (the MTP draft: its W_M under GR8_MTP_L2PF 1; the main model: W_H)
     else if (c / 2 + 1 == m.nl)
         l2pf_window(m, l2pf_is_draft(m) ? l2pf::W_M : l2pf::W_H, l2pf::T_HEAD, c / 2, M, &m.f, c, (size_t)M * HID * 2, st);
-    glue::k_wait_peers<<<1, 32, 0, st>>>(m.f, m.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
-    dmark(c % 2 == 0 ? DP_WAIT_A : DP_WAIT_M, st);
+    const bool split_wait = ev_prof().rec || dec_prof().on || (l2pf::cfg().armed && M >= 6);
+    if (split_wait)
+    {
+        glue::k_wait_peers<<<1, 32, 0, st>>>(m.f, m.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
+        dmark(c % 2 == 0 ? DP_WAIT_A : DP_WAIT_M, st);
+    }
+    else
+    {
+        a.wait_code = glue::ERR_AR;
+    }
     glue::k_ar_add_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
     dmark(c % 2 == 0 ? DP_NORM_A : DP_NORM_M, st);
 }
