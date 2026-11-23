@@ -18,6 +18,7 @@
 #include <cstdint>
 #include "../model_geom_qw38.h"
 #include "qw38_fp8.cuh"
+#include "qw38_mxfp8_tc.cuh"
 
 namespace qw38 {
 
@@ -26,8 +27,8 @@ struct HcWeights {
     const __nv_bfloat16* down = nullptr;    // [320, 10240] BF16
     const __nv_bfloat16* up = nullptr;      // [10240, 320] BF16
     const __nv_bfloat16* inject = nullptr;  // [4, 10240] BF16 (nullptr for final mixer)
-    Fp8Mat fp8_down;                        // optional on-load FP8 [320, 10240]
-    Fp8Mat fp8_up;                          // optional on-load FP8 [10240, 320]
+    Fp8Mat fp8_down;                        // optional on-load FP8/MXFP8 [320, 10240]
+    Fp8Mat fp8_up;                          // optional on-load FP8/MXFP8 [10240, 320]
 };
 
 struct HcScratch {
@@ -35,6 +36,7 @@ struct HcScratch {
     __nv_bfloat16* down = nullptr;    // [max_M, 320] BF16
     __nv_bfloat16* up = nullptr;      // [max_M, 10240] BF16
     float* inj = nullptr;             // [max_M, 4] FP32
+    uint8_t* x8 = nullptr;            // shared MXFP8 A-record scratch (optional)
 };
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -925,11 +927,12 @@ __global__ void k_hc_up_mix_fused(const __nv_bfloat16* __restrict__ hn,
     }
 }
 
-// Iter 6 Roofline FP8 HC Decode Kernels (M <= 8):
-//   1. k_fp8_hc_down_silu_inj<MAX_M>: Block=128 (4 warps -> 640/128 = 5 EXACT iterations, 0% idle threads!)
-template <int MAX_M>
+// Iter 6 Roofline FP8/MXFP8 HC Decode Kernels (M <= 16):
+//   1. k_fp8_hc_down_silu_inj<MAX_M, MX_SC>: Block=128 (4 warps -> 640/128 = 5 EXACT iterations, 0% idle threads!)
+template <int MAX_M, bool MX_SC = false>
 __global__ void __launch_bounds__(128) k_fp8_hc_down_silu_inj(const __nv_bfloat16* __restrict__ hn,
                                        const uint8_t* __restrict__ dq, const __half* __restrict__ dsc,
+                                       const uint8_t* __restrict__ dmx,
                                        const __nv_bfloat16* __restrict__ w_inj,
                                        __nv_bfloat16* __restrict__ down_out,
                                        float* __restrict__ inj_out,
@@ -959,12 +962,12 @@ __global__ void __launch_bounds__(128) k_fp8_hc_down_silu_inj(const __nv_bfloat1
         constexpr int K16 = geom::HC_D >> 4; // 640 = 5 * 128 EXACT!
         constexpr int NB = geom::HC_D >> 5;  // 320
         const uint4* qrow = reinterpret_cast<const uint4*>(dq + static_cast<size_t>(n) * geom::HC_D);
-        const __half* srow = dsc + static_cast<size_t>(n) * NB;
+        const size_t sbase = static_cast<size_t>(n) * NB;
         #pragma unroll
         for (int it = 0; it < K16 / 128; ++it) {
             const int i = it * 128 + threadIdx.x;
             const uint4 wv = __ldg(qrow + i);
-            const float sc = __half2float(__ldg(srow + (i >> 1)));
+            const float sc = load_fp8_scale<MX_SC>(dsc, dmx, sbase + (i >> 1));
             float2 wf[8];
             fp8x16_unpack(wv, sc, wf);
             #pragma unroll
@@ -998,12 +1001,13 @@ __global__ void __launch_bounds__(128) k_fp8_hc_down_silu_inj(const __nv_bfloat1
     }
 }
 
-//   2. k_fp8_hc_up_mix_fused<MAX_M> using contiguous transposed fp8_up [2560, 4, 320]!
+//   2. k_fp8_hc_up_mix_fused<MAX_M, MX_SC> using contiguous transposed fp8_up [2560, 4, 320]!
 //      Grid: (2560 / 2 = 1280), Block: 256 (8 warps = 2 dims x 4 streams in parallel, ZERO s-loop, 100% contiguous burst!).
-template <int MAX_M>
+template <int MAX_M, bool MX_SC = false>
 __global__ void __launch_bounds__(256) k_fp8_hc_up_mix_fused(const __nv_bfloat16* __restrict__ hn,
                                       const __nv_bfloat16* __restrict__ down,
                                       const uint8_t* __restrict__ uq, const __half* __restrict__ usc,
+                                      const uint8_t* __restrict__ umx,
                                       __nv_bfloat16* __restrict__ mixed,
                                       int M) {
     const int warp = threadIdx.x >> 5;   // 0..7 -> dim_local = warp >> 2 (0..1), s = warp & 3 (0..3)
@@ -1027,7 +1031,7 @@ __global__ void __launch_bounds__(256) k_fp8_hc_up_mix_fused(const __nv_bfloat16
     float2 wf[8];
     if (lane < R16) {
         const uint4 wv = __ldg(reinterpret_cast<const uint4*>(uq + row * geom::HC_RANK) + lane);
-        const float sc = __half2float(__ldg(usc + row * NB + (lane >> 1)));
+        const float sc = load_fp8_scale<MX_SC>(usc, umx, row * NB + (lane >> 1));
         fp8x16_unpack(wv, sc, wf);
     }
 
@@ -1051,7 +1055,33 @@ __global__ void __launch_bounds__(256) k_fp8_hc_up_mix_fused(const __nv_bfloat16
     }
 }
 
+template <bool MX_SC>
+inline void launch_fp8_hc_smallm(const HcWeights& w, __nv_bfloat16* mixed, HcScratch& sc, int M, cudaStream_t st) {
+    const int down_grid = w.inject ? (geom::HC_RANK + geom::HC) : geom::HC_RANK;
+    const int up_grid = geom::HID / 2;
+    if (M == 1) {
+        k_fp8_hc_down_silu_inj<1, MX_SC><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.fp8_down.mx_sc, w.inject, sc.down, sc.inj, 1);
+        k_fp8_hc_up_mix_fused<1, MX_SC><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, w.fp8_up.mx_sc, mixed, 1);
+    } else if (M <= 4) {
+        k_fp8_hc_down_silu_inj<4, MX_SC><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.fp8_down.mx_sc, w.inject, sc.down, sc.inj, M);
+        k_fp8_hc_up_mix_fused<4, MX_SC><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, w.fp8_up.mx_sc, mixed, M);
+    } else if (M == 5) {
+        k_fp8_hc_down_silu_inj<5, MX_SC><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.fp8_down.mx_sc, w.inject, sc.down, sc.inj, M);
+        k_fp8_hc_up_mix_fused<5, MX_SC><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, w.fp8_up.mx_sc, mixed, M);
+    } else if (M <= 8) {
+        k_fp8_hc_down_silu_inj<8, MX_SC><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.fp8_down.mx_sc, w.inject, sc.down, sc.inj, M);
+        k_fp8_hc_up_mix_fused<8, MX_SC><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, w.fp8_up.mx_sc, mixed, M);
+    } else if (M <= 12) {
+        k_fp8_hc_down_silu_inj<12, MX_SC><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.fp8_down.mx_sc, w.inject, sc.down, sc.inj, M);
+        k_fp8_hc_up_mix_fused<12, MX_SC><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, w.fp8_up.mx_sc, mixed, M);
+    } else {
+        k_fp8_hc_down_silu_inj<16, MX_SC><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.fp8_down.mx_sc, w.inject, sc.down, sc.inj, M);
+        k_fp8_hc_up_mix_fused<16, MX_SC><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, w.fp8_up.mx_sc, mixed, M);
+    }
+}
+
 // Complete GatedResidual prepare when sc.hn (and sc.inj) were already computed by k_hc_inject_rmsnorm_inj_ptrs.
+// Note: hc_down (N=320, K=10240) stays on BF16 cuBLAS (weights are only 6.5 MB vs 42 MB sc.hn activation!).
 inline void hc_prepare_from_hn(cublasHandle_t blas, const HcWeights& w, __nv_bfloat16* mixed,
                                HcScratch& sc, int M, cudaStream_t st) {
     cublasSetStream(blas, st);
@@ -1339,27 +1369,8 @@ inline void hc_prepare(cublasHandle_t blas, const HcWeights& w, const __nv_bfloa
                        __nv_bfloat16* mixed, HcScratch& sc, int M, cudaStream_t st) {
     if (M <= 16 && w.fp8_down.q && w.fp8_up.q) {
         k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(hyper_in, w.norm, sc.hn, M, geom::HC, geom::RMS_EPS);
-        const int down_grid = w.inject ? (geom::HC_RANK + geom::HC) : geom::HC_RANK;
-        const int up_grid = geom::HID / 2;
-        if (M == 1) {
-            k_fp8_hc_down_silu_inj<1><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, 1);
-            k_fp8_hc_up_mix_fused<1><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, 1);
-        } else if (M <= 4) {
-            k_fp8_hc_down_silu_inj<4><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
-            k_fp8_hc_up_mix_fused<4><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
-        } else if (M == 5) {
-            k_fp8_hc_down_silu_inj<5><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
-            k_fp8_hc_up_mix_fused<5><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
-        } else if (M <= 8) {
-            k_fp8_hc_down_silu_inj<8><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
-            k_fp8_hc_up_mix_fused<8><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
-        } else if (M <= 12) {
-            k_fp8_hc_down_silu_inj<12><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
-            k_fp8_hc_up_mix_fused<12><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
-        } else {
-            k_fp8_hc_down_silu_inj<16><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
-            k_fp8_hc_up_mix_fused<16><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
-        }
+        if (w.fp8_down.mx_sc) launch_fp8_hc_smallm<true>(w, mixed, sc, M, st);
+        else launch_fp8_hc_smallm<false>(w, mixed, sc, M, st);
         return;
     }
     if (M <= 8) {
@@ -1378,7 +1389,7 @@ inline void hc_prepare(cublasHandle_t blas, const HcWeights& w, const __nv_bfloa
         }
         return;
     }
-    // Prefill fused path: single-pass RMSNorm+W_inj, down GEMM + vec SiLU, fused TC up+sigmoid+mix (zero `up` HBM!).
+    // Prefill / Medium-M fused path: single-pass RMSNorm+W_inj, BF16 down GEMM + vec SiLU, fused TC up+sigmoid+mix.
     k_rmsnorm_1pw_inj<<<M, 320, 0, st>>>(hyper_in, w.norm, w.inject, sc.hn, sc.inj, M, geom::RMS_EPS);
     cublasSetStream(blas, st);
     gemm_bf16_nt(blas, M, geom::HC_RANK, geom::HC_D, sc.hn, w.down, sc.down);

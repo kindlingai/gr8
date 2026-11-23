@@ -37,8 +37,8 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     const int K = int(sc.mtp);
     require(sc.max_sessions == unsigned(slots) && sc.max_rows <= unsigned(max_rows),
             "qw38: --s2-sessions and --max-rows mismatch");
-    require(K == 0 || (K >= 1 && K <= 3 && c.engine.has_mtp),
-            "qw38: --mtp 1..3 requires loaded L048 MTP drafter");
+    require(K == 0 || (K >= 1 && K <= 5 && c.engine.has_mtp),
+            "qw38: --mtp 1..5 requires loaded L048 MTP drafter");
     const unsigned max_pps = unsigned(c.engine.max_pages_per_slot());
     const unsigned pages = sc.pool_rows / geom::KV_PAGE;
     RunPool pool(pages, pages, sc.pool_rows);
@@ -50,11 +50,11 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     // MTP > 0: pending verify rows of the last trunk forward, cached K drafts, and committed end per slot
     struct Pending {
         int row0 = 0, rows = 0, pos0 = 0;
-        std::array<int, 4> toks{};
+        std::array<int, 6> toks{};
         std::array<int32_t, 2> ple_ctx{geom::TOK_EOS, geom::TOK_EOS};
     };
     struct Drafts {
-        std::array<int, 4> d{};
+        std::array<int, 6> d{};
         int q = -1;
         bool valid = false;
     };
@@ -62,7 +62,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     std::array<Drafts, MAX_SESSIONS> drafts{};
     std::array<int, MAX_SESSIONS> done_end{};
 
-    const auto commit_pending = [&](int q, int kept) {
+    const auto commit_pending_meta = [&](int q, int kept, std::vector<int>& gdn_slots, std::vector<int>& gdn_kept) {
         Pending& w = pend[size_t(q)];
         if (w.rows <= 0) return;
         kept = std::max(0, std::min(w.rows, kept));
@@ -80,6 +80,10 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 c.engine.ple_ctx[size_t(q)] = w.ple_ctx;
             }
         }
+        if (kept > 0) {
+            gdn_slots.push_back(q);
+            gdn_kept.push_back(kept);
+        }
         if (kept > 1) {
             c.engine.mtp_sync_kv(q, w.row0, w.pos0, kept - 1, &w.toks[1]);
         }
@@ -90,16 +94,24 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
         w.rows = 0;
     };
 
+    const auto commit_pending = [&](int q, int kept) {
+        std::vector<int> gs, gk;
+        commit_pending_meta(q, kept, gs, gk);
+        if (!gs.empty()) c.engine.mtp_commit_gdn_batch(gs, gk);
+    };
+
     const auto settle = [&](const s2::Step* sp) {
         if (K <= 0) return;
+        std::vector<int> gs, gk;
         for (int q = 0; q < slots; ++q) {
             Pending& w = pend[size_t(q)];
             if (w.rows <= 0) continue;
             int kept = 0;
             for (size_t j = 0; sp && j < sp->sess.size(); ++j)
                 if (sp->sess[j] == q) kept = std::max(0, std::min(w.rows, sp->r[size_t(sp->row0[j])].pos - w.pos0));
-            commit_pending(q, kept);
+            commit_pending_meta(q, kept, gs, gk);
         }
+        if (!gs.empty()) c.engine.mtp_commit_gdn_batch(gs, gk);
     };
 
     std::unique_ptr<KvStateTiers> tiers;
@@ -419,7 +431,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
         }
         if (sp.kind == s2::Step::DRAFT) {
             require(K > 0, "qw38 draft step at MTP 0");
-            std::vector<int> u(size_t(M), 0), ds, dq, dg, dlast;
+            std::vector<int> u(size_t(M), 0), ds, dq, dg, dlast, gs, gk;
             std::vector<qw38rt::RowSample> dsm;
             for (size_t j = 0; j < sp.sess.size(); ++j) {
                 const int q = sp.sess[j], r0 = sp.row0[j], n = sp.rows[j];
@@ -428,7 +440,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 Pending& w = pend[size_t(q)];
                 if (w.rows > 0) {
                     require(sp.r[size_t(r0)].pos == w.pos0 && n <= w.rows, "qw38 draft rows mismatch pending verify");
-                    commit_pending(q, n);
+                    commit_pending_meta(q, n, gs, gk);
                 }
                 const s2::Row& last = sp.r[size_t(r0 + n - 1)];
                 require(last.pos < done_end[size_t(q)], "qw38 draft from uncommitted row");
@@ -441,6 +453,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 dlast.push_back(r0 + n - 1);
                 dsm.push_back(qw38rt::RowSample{sa.inv_temp, sa.top_p, sa.seed, 0u});
             }
+            if (!gs.empty()) c.engine.mtp_commit_gdn_batch(gs, gk);
             if (!ds.empty()) {
                 std::vector<int> dout;
                 c.engine.mtp_draft_k(ds, dq, dg, dsm, K, dout);
