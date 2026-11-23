@@ -1403,7 +1403,8 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
     // 2. Routed experts + 3. Combine routed + gated shared -> out_part [M, 2560] BF16
     if (w.is_tr3) {
         const int n_routes = M * geom::TOPK;
-        if (M > 8 && w.fc1_wide && w.fc2_wide && sc.x_had && sc.grp_off) {
+        constexpr int pf_min_m = (g6nr::NR == 1) ? 8 : 64;
+        if (M > pf_min_m && w.fc1_wide && w.fc2_wide && sc.x_had && sc.grp_off) {
             k_qw38_moe_pre_had_f32<<<(M * geom::HB + 3) / 4, 128, 0, st>>>(x, w.t_sg, sc.x_had, M);
             if (M >= 1536) {
                 constexpr int NG8 = 6;
