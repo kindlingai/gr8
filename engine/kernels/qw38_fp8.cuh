@@ -273,6 +273,7 @@ struct Fp8Arena {
         Fp8Mat* dst;
         int N, K;
         bool is_hc_up = false;
+        bool allow_mx = false;
     };
     std::vector<Pending> pend;
 
@@ -280,16 +281,17 @@ struct Fp8Arena {
 
     static size_t align256(size_t n) { return (n + 255) & ~size_t(255); }
 
-    void add(const __nv_bfloat16* src, Fp8Mat& dst, int N, int K, bool is_hc_up = false) {
+    void add(const __nv_bfloat16* src, Fp8Mat& dst, int N, int K, bool is_hc_up = false, bool allow_mx = false) {
         if (!src || N <= 0 || K <= 0 || (K & 31) != 0) return;
-        pend.push_back({src, &dst, N, K, is_hc_up});
+        pend.push_back({src, &dst, N, K, is_hc_up, allow_mx});
     }
 
     size_t build(cudaStream_t st, bool use_mxfp8 = false) {
         if (pend.empty()) return 0;
-        const size_t sc_elem_b = use_mxfp8 ? sizeof(uint8_t) : sizeof(__half);
         size_t total = 0;
         for (const auto& p : pend) {
+            const bool mx = use_mxfp8 && p.allow_mx;
+            const size_t sc_elem_b = mx ? sizeof(uint8_t) : sizeof(__half);
             total += align256(static_cast<size_t>(p.N) * p.K);
             total += align256(static_cast<size_t>(p.N) * (p.K >> 5) * sc_elem_b);
         }
@@ -300,12 +302,14 @@ struct Fp8Arena {
         cap = total;
         used = 0;
         for (const auto& p : pend) {
+            const bool mx = use_mxfp8 && p.allow_mx;
+            const size_t sc_elem_b = mx ? sizeof(uint8_t) : sizeof(__half);
             uint8_t* qp = base + used;
             used += align256(static_cast<size_t>(p.N) * p.K);
             uint8_t* sp_raw = base + used;
             used += align256(static_cast<size_t>(p.N) * (p.K >> 5) * sc_elem_b);
-            __half* sp = use_mxfp8 ? nullptr : reinterpret_cast<__half*>(sp_raw);
-            uint8_t* mxp = use_mxfp8 ? sp_raw : nullptr;
+            __half* sp = mx ? nullptr : reinterpret_cast<__half*>(sp_raw);
+            uint8_t* mxp = mx ? sp_raw : nullptr;
             if (p.is_hc_up) quantize_hc_up_fp8_b32(p.src, qp, sp, mxp, p.N / 4, p.K, st);
             else quantize_bf16_to_fp8_b32(p.src, qp, sp, mxp, p.N, p.K, st);
             p.dst->q = qp;

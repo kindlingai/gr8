@@ -1592,12 +1592,18 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
     const bool need_qsa = ((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS;
 
     // 1. Projections (Q+gate, K, V, and QSA index_qk)
-    if (M >= 16 && w.fp8_q.mx_sc && w.fp8_k.mx_sc && w.fp8_v.mx_sc && w.fp8_idx.mx_sc && sc.x8) {
+    // Keep QSA indexer Q/K on exact FP16-scale FP8 GEMV (M <= 20) or BF16 cuBLAS (M > 20) for exact top-k block routing.
+    if (M >= 16 && w.fp8_q.mx_sc && w.fp8_k.mx_sc && w.fp8_v.mx_sc && sc.x8) {
         qw38_bf16_to_mx8(x, sc.x8, M, geom::HID, st);
         qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_q, sc.q_gate, M, st);
         qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_k, sc.k, M, st);
         qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_v, sc.v, M, st);
-        qw38_gemm_mx8_nt<false>(sc.x8, w.fp8_idx, sc.idx_qk, M, st);
+        if (M <= 20 && w.fp8_idx.q) {
+            launch_fp8_gemv_smallm<false>(x, w.fp8_idx, sc.idx_qk, M, st);
+        } else {
+            cublasSetStream(blas, st);
+            gemm_bf16_nt(blas, M, geom::IDX_PROJ_OUT, geom::HID, x, w.idx_qk_proj, sc.idx_qk);
+        }
     } else if ((M <= 20 && w.fp8_q.q) || M <= 8) {
         if (w.fp8_q.q) {
             launch_fp8_gemv_smallm<false>(x, w.fp8_q, sc.q_gate, M, st);

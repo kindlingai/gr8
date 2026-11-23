@@ -992,21 +992,21 @@ struct Engine {
                     if (y.is_full) {
                         const int nh_q = geom::nh_q(o.nr);
                         const int nh_kv = geom::nh_kv(o.nr, r);
-                        fp8_arena.add(rl.attn_w.q_proj, rl.attn_w.fp8_q, nh_q * geom::HEAD_DIM * 2, geom::HID);
-                        fp8_arena.add(rl.attn_w.k_proj, rl.attn_w.fp8_k, nh_kv * geom::HEAD_DIM, geom::HID);
-                        fp8_arena.add(rl.attn_w.v_proj, rl.attn_w.fp8_v, nh_kv * geom::HEAD_DIM, geom::HID);
-                        fp8_arena.add(rl.attn_w.idx_qk_proj, rl.attn_w.fp8_idx, geom::IDX_PROJ_OUT, geom::HID);
-                        fp8_arena.add(rl.attn_w.o_proj, rl.attn_w.fp8_o, geom::HID, nh_q * geom::HEAD_DIM);
+                        fp8_arena.add(rl.attn_w.q_proj, rl.attn_w.fp8_q, nh_q * geom::HEAD_DIM * 2, geom::HID, false, true);
+                        fp8_arena.add(rl.attn_w.k_proj, rl.attn_w.fp8_k, nh_kv * geom::HEAD_DIM, geom::HID, false, true);
+                        fp8_arena.add(rl.attn_w.v_proj, rl.attn_w.fp8_v, nh_kv * geom::HEAD_DIM, geom::HID, false, true);
+                        fp8_arena.add(rl.attn_w.idx_qk_proj, rl.attn_w.fp8_idx, geom::IDX_PROJ_OUT, geom::HID, false, false);
+                        fp8_arena.add(rl.attn_w.o_proj, rl.attn_w.fp8_o, geom::HID, nh_q * geom::HEAD_DIM, false, true);
                     } else {
                         const int nh_v = geom::gdn_vh(o.nr);
                         const int qkv_loc = geom::gdn_qkv_local(o.nr, r);
-                        fp8_arena.add(rl.gdn_w.in_proj_qkv, rl.gdn_w.fp8_qkv, qkv_loc, geom::HID);
-                        fp8_arena.add(rl.gdn_w.in_proj_z, rl.gdn_w.fp8_z, nh_v * geom::GDN_DV, geom::HID);
-                        fp8_arena.add(rl.gdn_w.out_proj, rl.gdn_w.fp8_out, geom::HID, nh_v * geom::GDN_DV);
+                        fp8_arena.add(rl.gdn_w.in_proj_qkv, rl.gdn_w.fp8_qkv, qkv_loc, geom::HID, false, true);
+                        fp8_arena.add(rl.gdn_w.in_proj_z, rl.gdn_w.fp8_z, nh_v * geom::GDN_DV, geom::HID, false, true);
+                        fp8_arena.add(rl.gdn_w.out_proj, rl.gdn_w.fp8_out, geom::HID, nh_v * geom::GDN_DV, false, true);
                     }
-                    fp8_arena.add(rl.moe_w.sh_gate, rl.moe_w.fp8_sh_gate, rl.moe_w.sh_i, geom::HID);
-                    fp8_arena.add(rl.moe_w.sh_up, rl.moe_w.fp8_sh_up, rl.moe_w.sh_i, geom::HID);
-                    fp8_arena.add(rl.moe_w.sh_down, rl.moe_w.fp8_sh_down, geom::HID, rl.moe_w.sh_i);
+                    fp8_arena.add(rl.moe_w.sh_gate, rl.moe_w.fp8_sh_gate, rl.moe_w.sh_i, geom::HID, false, true);
+                    fp8_arena.add(rl.moe_w.sh_up, rl.moe_w.fp8_sh_up, rl.moe_w.sh_i, geom::HID, false, true);
+                    fp8_arena.add(rl.moe_w.sh_down, rl.moe_w.fp8_sh_down, geom::HID, rl.moe_w.sh_i, false, true);
                 }
             }
             if (has_mtp) {
@@ -1527,7 +1527,7 @@ struct Engine {
             } else {
                 qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
             }
-            const bool use_trunk_h2 = o.trunk_head2 && head_M <= 16 && o.nc <= qw38::MtpHead2::SL_TRUNK &&
+            const bool use_trunk_h2 = o.trunk_head2 && head_M <= 48 && o.nc <= qw38::MtpHead2::SL_TRUNK &&
                                       !mtp_head2.empty() && !fp8_lm_head.empty();
             const int head_chunk = use_trunk_h2 ? 8 : 256;
             for (int i = 0; i < o.nloc; ++i) {
@@ -2301,7 +2301,11 @@ struct Engine {
         for (size_t i = 0; i < S; ++i) {
             if (base_sm[i].inv_temp > 0.f) { all_greedy = false; break; }
         }
-        const bool fast_k_graph = all_greedy && o.mtp_fast && o.use_graph && !o.profile &&
+        // Under S2's exact verification (target_sample == draft), any draft token sequence preserves the
+        // exact target output distribution (bit-exact vs MTP=0 at the same T/top_p/seed), while greedy
+        // argmax drafts mathematically maximize P(target_sample == draft) and enable single-graph K-step drafting.
+        const bool use_greedy_draft = all_greedy || o.mtp_fast;
+        const bool fast_k_graph = use_greedy_draft && o.mtp_fast && o.use_graph && !o.profile &&
                                   S <= 16 && K <= 8 && o.nloc == 1 &&
                                   (o.nr == 1 || (static_cast<bool>(step_begin_mtp_k) &&
                                                  static_cast<bool>(mtp_argmax_ar_chain) &&
@@ -2498,6 +2502,7 @@ struct Engine {
         for (int k = 0; k < K; ++k) {
             for (size_t i = 0; i < S; ++i) {
                 dsm[i] = base_sm[i];
+                if (use_greedy_draft) dsm[i].inv_temp = 0.0f;
                 dsm[i].spos = uint32_t(pos_in[i] + k + 2);
             }
             const __nv_bfloat16* hin = (k == 0) ? hin0 : mtp_hid_cur;
