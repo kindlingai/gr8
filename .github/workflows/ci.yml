@@ -275,9 +275,10 @@ jobs:
           if-no-files-found: error
 
   engine:
-    # The seven parts (GLM fp8 KV, GLM int4 KV, Flash, Flash int4 KV, DeepSeek-V4.1-Flash, Inkling-2-Small, and the
-    # test binaries) share no CUDA compilation, so they get a runner each. All legs consume rust-dist built once by the
-    # rust job via --build-context rust-dist, so Rust crates are never compiled redundantly across runners.
+    # The parts (GLM fp8 KV, GLM int4 KV, Flash, Flash int4 KV, DeepSeek-V4.1-Flash, Inkling-2-Small, Qwen3.8-Flash-Next,
+    # and the two test binaries the image ships) share no CUDA compilation, so they get a runner each. All legs consume
+    # rust-dist built once by the rust job via --build-context rust-dist, so Rust crates are never compiled redundantly
+    # across runners. engine-tests runs these steps for the other test binaries, which the image does not wait for.
     name: Engine build (${{ matrix.label }}, arm64, CUDA 13, sm_121a)
     needs: [changes, rust]
     if: needs.changes.outputs.engine == 'true'
@@ -324,11 +325,11 @@ jobs:
             label: Qwen3.8-Flash-Next
             target: dist-qw38
             scope: gr8-qw38
-          - leg: tests
-            label: tests
+          - leg: tests-ship
+            label: shipped tests
             target: dist-tests
-            scope: gr8-tests
-    steps:
+            scope: gr8-tests-ship
+    steps: &engine-steps
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
@@ -406,6 +407,7 @@ jobs:
             ink2)       echo "Inkling-2-Small, TP widths ${widths:-1 4 6}" ;;
             qw38)       echo "Qwen3.8-Flash-Next, TP widths ${widths:-1 2 3 4}" ;;
             tests)      echo "test binaries, dtr_test at TP4, ptab widths ${widths:-1 2 3 4 5 6 8}" ;;
+            tests-ship) echo "the shipped test binaries: tr3_e4m3_test and gpuprobe" ;;
             *)          echo "${{ matrix.label }}, TP widths ${widths:-1 2 3 4 5 6 8}" ;;
           esac >> "$GITHUB_STEP_SUMMARY"
       - name: Build the binaries (Dockerfile target ${{ matrix.target }})
@@ -417,15 +419,39 @@ jobs:
           build-contexts: rust-dist=${{ runner.temp }}/rust-dist
           build-args: |
             GR8_WIDTHS=${{ steps.w.outputs.widths }}
-          outputs: type=local,dest=dist
+          # a dist-* target exports its binaries; engine-tests only checks that the test binaries compile
+          outputs: ${{ startsWith(matrix.target, 'dist-') && 'type=local,dest=dist' || 'type=cacheonly' }}
           cache-from: ${{ steps.nvcc.outputs.cache_from }}
           cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && format('type=registry,ref={0}:{1},mode=max', steps.nvcc.outputs.cache_repo, matrix.scope) || '' }}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+      - if: startsWith(matrix.target, 'dist-')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: engine-bin-arm64-${{ matrix.leg }}
           path: dist/
           retention-days: 7
           if-no-files-found: error
+
+  # every test binary build.sh makes (GR8_TESTS=only), with the engine job's steps: a compile check on its own runner.
+  # The image ships none of them (the tests-ship leg builds the two it does), so a PR's image does not wait for it.
+  engine-tests:
+    name: Engine build (${{ matrix.label }}, arm64, CUDA 13, sm_121a)
+    needs: [changes, rust]
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      NVCC_SAVE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    strategy:
+      matrix:
+        include:
+          - leg: tests
+            label: tests
+            target: engine-tests
+            scope: gr8-tests
+    steps: *engine-steps
 
   # every environment read goes through the knob table (engine/knobs-rs): no bare getenv or std::env::var, every knob
   # read somewhere, the launcher's and recipes' values accepted, the generated header and docs/ENV.md current. On every
@@ -498,9 +524,10 @@ jobs:
     name: Container image (linux/arm64, push)
     # The runtime image around the rust and engine jobs' binaries: the Dockerfile's dist stage is replaced by them (a
     # named build context), so nothing is compiled here. This job runs on pushes to main and tags and pushes to ghcr.io
-    # only after the CPU tests pass; image-pr runs the same steps for pull requests and manual runs, which never push.
-    needs: [cpu, rust, engine]
-    if: ${{ github.event_name == 'push' && !cancelled() && needs.engine.result == 'success' && needs.rust.result == 'success' && needs.cpu.result != 'failure' }}
+    # only after the CPU tests and the test binaries' compile check (engine-tests) pass; image-pr runs the same steps
+    # for pull requests and manual runs, which never push.
+    needs: [cpu, rust, engine, engine-tests]
+    if: ${{ github.event_name == 'push' && !cancelled() && needs.engine.result == 'success' && needs.engine-tests.result == 'success' && needs.rust.result == 'success' && needs.cpu.result != 'failure' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     # main's runs overlap, so their pushes take turns, and latest and main move only to main's head (below)
@@ -626,8 +653,9 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
-  # image's steps on pull requests and manual runs, which push nothing: it starts once the binaries are built instead of
-  # also waiting for the CPU tests, which finish about five minutes after them. Finalize still needs both to pass.
+  # image's steps on pull requests and manual runs, which push nothing: it starts once the shipped binaries are built
+  # instead of also waiting for the CPU tests and engine-tests, which finish minutes after them. Finalize still needs
+  # all of them to pass.
   image-pr:
     name: Container image (linux/arm64)
     needs: [rust, engine]
@@ -650,7 +678,7 @@ jobs:
     # The label counts only if it was added after GitHub first saw the head commit. pr-ready.yml removes it on a push,
     # but a run with only changes and zip-check can reach this step before that removal.
     if: always()
-    needs: [changes, cpu, cpu-macos, rust, engine, env-lint, zip-check, zip, image, image-pr]
+    needs: [changes, cpu, cpu-macos, rust, engine, engine-tests, env-lint, zip-check, zip, image, image-pr]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

@@ -34,9 +34,10 @@ knobs:
   GR8_TESTS:
     kind: text
     default: "1"
-    values: "0|1|only"
+    values: "0|1|only|ship"
     doc: >-
-      Whether scripts/build.sh builds the test binaries: 0 skips them, only builds them alone.
+      Whether scripts/build.sh builds the test binaries: 0 skips them, only builds them alone, ship builds only the two
+      the image ships (tr3_e4m3_test, gpuprobe).
   GR8_WIDTHS:
     kind: text
     unset: "unset"

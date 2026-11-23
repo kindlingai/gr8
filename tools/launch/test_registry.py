@@ -182,6 +182,7 @@ chmod +x "$2"
             nvcc.chmod(0o755)
             cases = [(models.GLM53, 'fp8', {}), (models.GLM53, 'int4', {}),
                      (models.GLM53, 'fp8', {'GR8_TESTS': 'only'}),
+                     (models.GLM53, 'fp8', {'GR8_TESTS': 'ship'}),
                      (models.GLM53F, 'fp8', {}), (models.GLM53F, 'int4', {}),
                      (models.DS41, 'fp8', {}), (models.DS41, 'fp8', {'DS41_WHAT': 'sim'}),
                      (models.DS41, 'int4', {}),
@@ -209,6 +210,12 @@ chmod +x "$2"
                 if changes.get('GR8_TESTS') == 'only':
                     self.assertFalse((out / model.engine).exists())
                     self.assertTrue((out / 'sampler_u01_test').exists())
+                    return
+                if changes.get('GR8_TESTS') == 'ship':
+                    self.assertFalse((out / model.engine).exists())
+                    self.assertTrue((out / 'gpuprobe').exists())
+                    self.assertTrue((out / 'tr3_e4m3_test').exists())
+                    self.assertFalse((out / 'sampler_u01_test').exists())
                     return
                 sim_only = bool(model.build_what_env and changes.get(model.build_what_env) == 'sim')
                 binary = model.simulator if sim_only else model.engine + ('-int4' if fmt == 'int4' else '')

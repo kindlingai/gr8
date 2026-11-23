@@ -48,9 +48,9 @@ directory when it gets large, or delete what no build used lately: `find ~/.cach
 ## In the image build and CI
 
 Each engine stage of the `Dockerfile` mounts the cache at `/var/cache/gr8-nvcc` (`GR8_NVCC_CACHE_DIR`), as a BuildKit
-cache mount with one id a stage: `gr8-nvcc-fp8`, `-int4`, `-flash`, `-flash-int4`, `-ds41`, `-ink2` and `-tests`. After its
-build the stage deletes the entries older than the build's start, the ones it did not read, so the mount holds one
-build. A local `docker buildx build` keeps the mount between builds on the same builder.
+cache mount with one id a stage: `gr8-nvcc-fp8`, `-int4`, `-flash`, `-flash-int4`, `-ds41`, `-ink2`, `-tests` and
+`-tests-ship`. After its build the stage deletes the entries older than the build's start, the ones it did not read, so
+the mount holds one build. A local `docker buildx build` keeps the mount between builds on the same builder.
 
 CI (`.github/workflows/ci.yml`, the engine job) keeps each leg's mount in the Actions cache, while BuildKit layer caches
 live in a separate GHCR package (`ghcr.io/<repo>-cache`) so they do not exhaust the 10 GB Actions cache quota. Every run
