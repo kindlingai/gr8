@@ -282,22 +282,39 @@ __global__ void k_hc_inject_act(float* __restrict__ inj, int N) {
 }
 
 // mixed[m, d] = bf16(0.25f * sum_{s=0..3} sigmoid(up[m, s, d]) * hn[m, s, d])
+// Multi-CTA vectorized uint4: Grid (M * 5), Block 64 -> 5 * 64 * 8 = 2560 EXACT (100% coalesced, bit-exact!).
 __global__ void k_hc_mix(const __nv_bfloat16* __restrict__ hn, const __nv_bfloat16* __restrict__ up,
                          __nv_bfloat16* __restrict__ mixed, int M) {
-    const int m = blockIdx.x;
+    const int m = blockIdx.x / 5;
+    const int blk = blockIdx.x % 5;
     if (m >= M) return;
+    const int d8 = blk * 64 + threadIdx.x; // 0..319 (each uint4 = 8 BF16s)
     const __nv_bfloat16* h = hn + static_cast<size_t>(m) * geom::HC_D;
     const __nv_bfloat16* u = up + static_cast<size_t>(m) * geom::HC_D;
-    __nv_bfloat16* out = mixed + static_cast<size_t>(m) * geom::HID;
-    for (int d = threadIdx.x; d < geom::HID; d += blockDim.x) {
-        float acc = 0.0f;
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    #pragma unroll
+    for (int s = 0; s < geom::HC; ++s) {
+        const uint4 uv = reinterpret_cast<const uint4*>(u + s * geom::HID)[d8];
+        const uint4 hv = reinterpret_cast<const uint4*>(h + s * geom::HID)[d8];
+        const __nv_bfloat162* up2 = reinterpret_cast<const __nv_bfloat162*>(&uv);
+        const __nv_bfloat162* hp2 = reinterpret_cast<const __nv_bfloat162*>(&hv);
         #pragma unroll
-        for (int s = 0; s < geom::HC; ++s) {
-            const float mw = __bfloat162float(__float2bfloat16(sigmoid_f(__bfloat162float(u[s * geom::HID + d]))));
-            acc += mw * __bfloat162float(h[s * geom::HID + d]);
+        for (int k = 0; k < 4; ++k) {
+            const float2 fu = __bfloat1622float2(up2[k]);
+            const float2 fh = __bfloat1622float2(hp2[k]);
+            const float mw0 = __bfloat162float(__float2bfloat16(sigmoid_f(fu.x)));
+            const float mw1 = __bfloat162float(__float2bfloat16(sigmoid_f(fu.y)));
+            acc[2 * k] += mw0 * fh.x;
+            acc[2 * k + 1] += mw1 * fh.y;
         }
-        out[d] = __float2bfloat16(acc * 0.25f);
     }
+    uint4 out;
+    __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&out);
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        op[k] = __floats2bfloat162_rn(acc[2 * k] * 0.25f, acc[2 * k + 1] * 0.25f);
+    }
+    reinterpret_cast<uint4*>(mixed + static_cast<size_t>(m) * geom::HID)[d8] = out;
 }
 
 // Residual injection (multi-CTA vectorized uint4): hyper[m, s, d] += bf16(y[m, d] * inj[m, s])
@@ -1050,7 +1067,7 @@ inline void hc_prepare_from_hn(cublasHandle_t blas, const HcWeights& w, __nv_bfl
 // Full GatedResidual prepare: hyper_in [M, 10240] -> mixed [M, 2560] (+ optional inj [M, 4]).
 inline void hc_prepare(cublasHandle_t blas, const HcWeights& w, const __nv_bfloat16* hyper_in,
                        __nv_bfloat16* mixed, HcScratch& sc, int M, cudaStream_t st) {
-    if (M <= 12 && w.fp8_down.q && w.fp8_up.q) {
+    if (M <= 16 && w.fp8_down.q && w.fp8_up.q) {
         k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(hyper_in, w.norm, sc.hn, M, geom::HC, geom::RMS_EPS);
         const int down_grid = w.inject ? (geom::HC_RANK + geom::HC) : geom::HC_RANK;
         const int up_grid = geom::HID / 2;
@@ -1066,9 +1083,12 @@ inline void hc_prepare(cublasHandle_t blas, const HcWeights& w, const __nv_bfloa
         } else if (M <= 8) {
             k_fp8_hc_down_silu_inj<8><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
             k_fp8_hc_up_mix_fused<8><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
-        } else {
+        } else if (M <= 12) {
             k_fp8_hc_down_silu_inj<12><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
             k_fp8_hc_up_mix_fused<12><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
+        } else {
+            k_fp8_hc_down_silu_inj<16><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
+            k_fp8_hc_up_mix_fused<16><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
         }
         return;
     }
