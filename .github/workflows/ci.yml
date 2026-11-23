@@ -320,6 +320,10 @@ jobs:
             label: Inkling-2-Small
             target: dist-ink2
             scope: gr8-ink2
+          - leg: qw38
+            label: Qwen3.8-Flash-Next
+            target: dist-qw38
+            scope: gr8-qw38
           - leg: tests
             label: tests
             target: dist-tests
@@ -390,6 +394,7 @@ jobs:
           if [ "${{ github.event_name }}" = pull_request ]; then
             case "${{ matrix.leg }}" in
               flash|flash-int4) widths='1 4' ;;
+              qw38)             widths='1 2' ;;
               fp8|int4|tests)   widths='1 4 8' ;;
             esac
           fi
@@ -399,6 +404,7 @@ jobs:
             flash-int4) echo "Flash int4 KV, TP widths ${widths:-1 2 3 4}" ;;
             ds41)       echo "DeepSeek-V4.1-Flash, TP width 4" ;;
             ink2)       echo "Inkling-2-Small, TP widths ${widths:-1 4 6}" ;;
+            qw38)       echo "Qwen3.8-Flash-Next, TP widths ${widths:-1 2 3 4}" ;;
             tests)      echo "test binaries, dtr_test at TP4, ptab widths ${widths:-1 2 3 4 5 6 8}" ;;
             *)          echo "${{ matrix.label }}, TP widths ${widths:-1 2 3 4 5 6 8}" ;;
           esac >> "$GITHUB_STEP_SUMMARY"
