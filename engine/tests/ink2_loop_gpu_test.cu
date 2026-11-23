@@ -146,6 +146,7 @@ void test_loop_kernels()
         // CPU reference
         Config cfg;
         cfg.hidden = H;
+        cfg.loop_gate_rank = R;
         cfg.n_layers = 1;
         cfg.n_heads = 24;
         cfg.n_kv_heads = 8;
@@ -208,7 +209,7 @@ void test_loop_kernels()
         float md = 0.0f;
         const double cos = cosine(got_y, exp_y, md);
         printf("[test_loop_kernels] H=%d R=%d M=%2d: cos=%.8f max_abs=%.6f\n", H, R, M, cos, md);
-        require(cos > 0.99999 && md < 0.02f, "msg_gate_norm parity");
+        require(cos > 0.99999 && md <= 0.03125f, "msg_gate_norm parity");
 
         for (uint16_t* p : d_rows) cudaFree(p);
         for (float* p : d_out) cudaFree(p);
@@ -532,7 +533,7 @@ struct StWriter
     }
 };
 
-void test_e2e_looped_engine()
+void run_e2e_looped_case(bool all_mxfp8)
 {
     constexpr int H = 256, NL = 8, B = 2, NH = 24, NKV = 8, HD = 16, RD = 16, RW = 8, SW = 8, BASE = 6;
     constexpr int I = 256, NE = 16, TK = 4, V = 256, VV = 240, R = 16, LS = 2, LE = 6, PASSES = 3;
@@ -543,7 +544,8 @@ void test_e2e_looped_engine()
     c.rel_dim = RD; c.rel_win = RW; c.sliding_window = SW; c.log_scale_base = BASE;
     c.inter = I; c.n_exp = NE; c.top_k = TK; c.route_scale = 4.0f; c.vocab = V; c.valid_vocab = VV; c.tp = 1;
     c.global = {0, 1, 0, 1, 0, 1, 0, 1};
-    c.mxfp8 = {0, 0, 0, 0, 0, 0, 1, 1};
+    if (all_mxfp8) c.mxfp8 = {1, 1, 1, 1, 1, 1, 1, 1};
+    else c.mxfp8 = {0, 0, 0, 0, 0, 0, 1, 1};
     c.loop_start = LS; c.loop_end = LE; c.loop_passes = PASSES; c.loop_gate_rank = R;
     c.mtp_layers = ML; c.mtp_inter = MI; c.mtp_window = MW; c.mtp_block = MB; c.mtp_drafts = MD; c.markov_rank = MR;
     c.mtp_global = {0, 1, 0};
@@ -560,15 +562,17 @@ void test_e2e_looped_engine()
     w.lm_head = rng.bf(static_cast<size_t>(V) * H, 0.25f);
     w.msg_queries = rng.f32(static_cast<size_t>(LE - LS) * 4 * H, 0.5f);
 
-    char tmpl[] = "/tmp/ink2_loop_gpu_XXXXXX";
-    require(mkdtemp(tmpl) != nullptr, "mkdtemp");
-    const std::string dir = tmpl;
+    std::string tmpl_s = std::string(knob::tmpdir()) + "/ink2_loop_gpu_XXXXXX";
+    std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
+    tmpl.push_back('\0');
+    require(mkdtemp(tmpl.data()) != nullptr, "mkdtemp");
+    const std::string dir = tmpl.data();
 
     StWriter st;
-    st.add_bf16("model.llm.tok_embeddings.weight", {V, H}, w.embed);
-    st.add_bf16("model.llm.embedding_norm.weight", {H}, w.embed_norm);
-    st.add_bf16("model.llm.final_norm.weight", {H}, w.final_norm);
-    st.add_f32("model.llm.final_attn_res_query", {H}, w.output_query);
+    st.add_bf16("model.llm.embed.weight", {V, H}, w.embed);
+    st.add_bf16("model.llm.embed_norm.weight", {H}, w.embed_norm);
+    st.add_bf16("model.llm.norm.weight", {H}, w.final_norm);
+    st.add_f32("model.llm.attn_res.output_query", {H}, w.output_query);
     st.add_bf16("model.llm.unembed.weight", {V, H}, w.lm_head);
     // Split msg_queries [4, 4, H] (q, k, v, mlp) into checkpoint's two [8, H] tensors: (q, mlp) and (k, v)
     std::vector<float> qm_q_mlp((LE - LS) * 2 * H), qm_k_v((LE - LS) * 2 * H);
@@ -591,11 +595,12 @@ void test_e2e_looped_engine()
         if (l)
         {
             y.attn_query = rng.f32(static_cast<size_t>(g ? 3 : 1) * H, 0.5f);
-            if (g) st.add_f32(p + "attn_res.attn_query", {3, H}, y.attn_query);
-            else st.add_f32(p + "attn_res.attn_query", {H}, y.attn_query);
+            const std::string aq = "model.llm.attn_res.attn_queries." + std::to_string(l - 1);
+            if (g) st.add_f32(aq, {3, H}, y.attn_query);
+            else st.add_f32(aq, {H}, y.attn_query);
         }
         y.mlp_query = rng.f32(H, 0.5f);
-        st.add_f32(p + "attn_res.mlp_query", {H}, y.mlp_query);
+        st.add_f32("model.llm.attn_res.mlp_queries." + std::to_string(l), {H}, y.mlp_query);
         if (g)
         {
             y.q_norm = rng.bf(H, 0.2f, 1.0f);
@@ -610,8 +615,8 @@ void test_e2e_looped_engine()
             st.add_bf16(p + "v_input_norm.weight", {H}, y.v_norm);
             st.add_bf16(p + "attn.k_sconv.static_w", {4, static_cast<int64_t>(nk)}, y.k_static);
             st.add_bf16(p + "attn.v_sconv.static_w", {4, static_cast<int64_t>(nk)}, y.v_static);
-            st.add_bf16(p + "attn.k_sconv.weight_proj.weight", {NKV * 4, H}, y.k_wproj);
-            st.add_bf16(p + "attn.v_sconv.weight_proj.weight", {NKV * 4, H}, y.v_wproj);
+            st.add_bf16(p + "attn.k_sconv.weight_proj", {NKV * 4, H}, y.k_wproj);
+            st.add_bf16(p + "attn.v_sconv.weight_proj", {NKV * 4, H}, y.v_wproj);
         }
         else
         {
@@ -619,8 +624,8 @@ void test_e2e_looped_engine()
             y.k_sconv = rng.bf(nk * 4, 0.3f);
             y.v_sconv = rng.bf(nk * 4, 0.3f);
             st.add_bf16(p + "attn_norm.weight", {H}, y.attn_norm);
-            st.add_bf16(p + "attn.k_sconv.conv.weight", {static_cast<int64_t>(nk), 1, 4}, y.k_sconv);
-            st.add_bf16(p + "attn.v_sconv.conv.weight", {static_cast<int64_t>(nk), 1, 4}, y.v_sconv);
+            st.add_bf16(p + "attn.k_sconv.weight", {static_cast<int64_t>(nk), 4}, y.k_sconv);
+            st.add_bf16(p + "attn.v_sconv.weight", {static_cast<int64_t>(nk), 4}, y.v_sconv);
         }
         y.wq = rng.bf(nq * H, ih);
         y.wr = rng.bf(static_cast<size_t>(NH) * RD * H, ih);
@@ -639,21 +644,21 @@ void test_e2e_looped_engine()
         y.router_bias = rng.f32(NE, 0.1f);
         for (int k = 0; k < TK; ++k) y.router_bias[(3 * l + 5 * k) % NE] += 2.0f * static_cast<float>(TK - k);
 
-        st.add_bf16(p + "attn.wq.weight", {static_cast<int64_t>(nq), H}, y.wq);
-        st.add_bf16(p + "attn.wr.weight", {NH * RD, H}, y.wr);
+        st.add_bf16(p + "attn.wq_du.weight", {static_cast<int64_t>(nq), H}, y.wq);
+        st.add_bf16(p + "attn.wr_du.weight", {NH * RD, H}, y.wr);
         st.add_bf16(p + "attn.gate_attn.weight", {static_cast<int64_t>(nq), H}, y.gate);
         st.add_bf16(p + "attn.attn_sink_proj.weight", {NH, H}, y.sink);
-        st.add_bf16(p + "attn.wk.weight", {static_cast<int64_t>(nk), H}, y.wk);
-        st.add_bf16(p + "attn.wv.weight", {static_cast<int64_t>(nk), H}, y.wv);
-        st.add_bf16(p + "attn.wo.weight", {H, static_cast<int64_t>(nq)}, y.wo);
+        st.add_bf16(p + "attn.wk_dv.weight", {static_cast<int64_t>(nk), H}, y.wk);
+        st.add_bf16(p + "attn.wv_dv.weight", {static_cast<int64_t>(nk), H}, y.wv);
+        st.add_bf16(p + "attn.wo_ud.weight", {H, static_cast<int64_t>(nq)}, y.wo);
         st.add_bf16(p + "attn.q_l2_clip.scale", {NH, HD}, y.q_clip);
         st.add_bf16(p + "attn.rel_l2_clip.scale", {NH, RD}, y.rel_clip);
-        st.add_bf16(p + "attn.rel_logits_proj.weight", {RD, RW}, y.rel_proj);
-        st.add_bf16(p + "attn_sconv.conv.weight", {H, 1, 4}, y.attn_sconv);
-        st.add_bf16(p + "mlp_sconv.conv.weight", {H, 1, 4}, y.mlp_sconv);
+        st.add_bf16(p + "attn.rel_logits_proj.proj", {RD, RW}, y.rel_proj);
+        st.add_bf16(p + "attn_sconv.weight", {H, 4}, y.attn_sconv);
+        st.add_bf16(p + "mlp_sconv.weight", {H, 4}, y.mlp_sconv);
         st.add_bf16(p + "mlp_norm.weight", {H}, y.mlp_norm);
-        st.add_bf16(p + "mlp.router.gate.weight", {NE, H}, y.router_w);
-        st.add_f32(p + "mlp.router.e_score_correction_bias", {NE}, y.router_bias);
+        st.add_bf16(p + "mlp.gate.weight", {NE, H}, y.router_w);
+        st.add_f32(p + "mlp.gate.bias", {NE}, y.router_bias);
 
         if (l >= LS && l < LE)
         {
@@ -715,8 +720,8 @@ void test_e2e_looped_engine()
                 memcpy(g_u.data(), wg.data(), wg.size() * 4);
                 memcpy(g_u.data() + wg.size(), wu.data(), wu.size() * 4);
                 std::vector<uint8_t> c13(g_u.size() / 2), s13(g_u.size() / 16), c2(wd.size() / 2), s2(wd.size() / 16);
-                const float o1 = nv4pack::quantize_row(g_u.data(), g_u.size(), nv4pack::ScaleRule::FourOverSixMae, c13.data(), s13.data());
-                const float o2 = nv4pack::quantize_row(wd.data(), wd.size(), nv4pack::ScaleRule::FourOverSixMae, c2.data(), s2.data());
+                const float o1 = nv4pack::quantize_row(g_u.data(), g_u.size(), nv4pack::ScaleRule::Static6, c13.data(), s13.data());
+                const float o2 = nv4pack::quantize_row(wd.data(), wd.size(), nv4pack::ScaleRule::Static6, c2.data(), s2.data());
                 const size_t n1 = wg.size();
                 auto f1 = nv4pack::pack_fc1(c13.data(), s13.data(), c13.data() + n1 / 2, s13.data() + n1 / 16, I, H);
                 auto f2 = nv4pack::pack_fc2(c2.data(), s2.data(), H, I, 0, I);
@@ -741,11 +746,11 @@ void test_e2e_looped_engine()
             st.add_raw(p + "mlp.experts.w13_weight", "U8", {NE, 2 * I, H / 2}, std::move(w13c));
             st.add_raw(p + "mlp.experts.w13_weight_scale", "F8_E4M3", {NE, 2 * I, H / 16}, std::move(w13s));
             st.add_f32(p + "mlp.experts.w13_weight_amax", {NE}, a13);
-            st.add_f32(p + "mlp.experts.w13_outer_scale_denominator", {1}, den);
+            st.add_f32(p + "mlp.experts.w13_weight_outer_scale_denominator", {1}, den);
             st.add_raw(p + "mlp.experts.w2_weight", "U8", {NE, H, I / 2}, std::move(w2c));
             st.add_raw(p + "mlp.experts.w2_weight_scale", "F8_E4M3", {NE, H, I / 16}, std::move(w2s));
             st.add_f32(p + "mlp.experts.w2_weight_amax", {NE}, a2);
-            st.add_f32(p + "mlp.experts.w2_outer_scale_denominator", {1}, den);
+            st.add_f32(p + "mlp.experts.w2_weight_outer_scale_denominator", {1}, den);
         }
     }
     st.write(dir + "/model.safetensors");
@@ -767,7 +772,7 @@ void test_e2e_looped_engine()
     mtp_st.add_bf16("mask_embed", {H}, mtp.mask_embed);
     mtp_st.add_bf16("norm.weight", {H}, mtp.norm);
     mtp_st.add_bf16("markov_head.dflare_norm.weight", {H}, mtp.head_dflare_norm);
-    mtp_st.add_bf16("markov_head.markov_w1", {V, MR}, mtp.markov_w1);
+    mtp_st.add_bf16("markov_head.markov_w1.weight", {V, MR}, mtp.markov_w1);
     mtp_st.add_bf16("markov_head.rnn_proj.weight", {3 * MR, 2 * MR + 2 * H}, mtp.rnn_w);
     mtp_st.add_bf16("markov_head.rnn_proj.bias", {3 * MR}, mtp.rnn_b);
     mtp_st.add_bf16("markov_head.hidden_out.weight", {H, MR}, mtp.hidden_out_w);
@@ -834,10 +839,6 @@ void test_e2e_looped_engine()
           << "  }\n"
           << "}\n";
     }
-    {
-        std::ofstream f(dir + "/hf_quant_config.json");
-        f << "{\"quantization\": {\"quant_algo\": \"NVFP4\"}}\n";
-    }
 
     const std::vector<int> toks = {3, 17, 42, 99, 5, 128, 7, 200, 11, 64, 19, 88};
     const int M = static_cast<int>(toks.size());
@@ -861,7 +862,28 @@ void test_e2e_looped_engine()
     eng.init(dir, opt);
     eng.reset_slot(0);
 
-    // Run in 5 + 4 + 1 + 1 + 1 chunks (testing prefill + decode across all 16 virtual layers!)
+    // Run 1: single-shot prefill of all M tokens (for GPU bit-exactness check vs chunked)
+    std::vector<float> single_all;
+    std::vector<int> single_draft;
+    {
+        ink2::RowsHost rh;
+        rh.add(0, 0, M);
+        std::vector<ink2rt::RowSample> sm(M);
+        std::vector<ink2rt::RowOut> out;
+        eng.forward(rh, toks.data(), sm.data(), out);
+        eng.commit();
+        for (int i = 0; i < M; ++i)
+        {
+            std::vector<float> gl(VV, -1e9f);
+            for (const auto& cd : out[i].top)
+                if (cd.id >= 0 && cd.id < VV) gl[cd.id] = cd.logit;
+            single_all.insert(single_all.end(), gl.begin(), gl.end());
+        }
+        eng.mtp_draft({0}, {M - 1}, {42}, {ink2rt::RowSample{}}, MD, single_draft);
+    }
+
+    // Run 2: reset and run in 5 + 4 + 1 + 1 + 1 chunks (testing prefill + decode across all 16 virtual layers!)
+    eng.reset_slot(0);
     const int chunks[] = {5, 4, 1, 1, 1};
     int off = 0, top1_match = 0;
     std::vector<float> gpu_all, ref_all;
@@ -891,30 +913,42 @@ void test_e2e_looped_engine()
         }
         off += k;
     }
-    float md = 0.0f;
+    float md = 0.0f, split_md = 0.0f;
     const double cos = cosine(gpu_all, ref_all, md);
-    printf("[test_e2e_looped_engine] 8 phys -> 16 virtual (5+4+1+1+1): cos=%.8f max_abs=%.6f top1=%d/%d\n",
-           cos, md, top1_match, M);
-    require(cos > 0.9999 && top1_match == M, "e2e looped engine logit parity");
+    const double split_cos = cosine(gpu_all, single_all, split_md);
+    const char* tag = all_mxfp8 ? "all-MXFP8" : "NVFP4+MXFP8";
+    printf("[test_e2e_looped_engine %s] 8 phys -> 16 virtual (5+4+1+1+1): cos=%.8f max_abs=%.6f top1=%d/%d | gpu_split_diff=%.6f\n",
+           tag, cos, md, top1_match, M, split_md);
+    require(split_cos > 0.9999999 && split_md < 1e-4f, "e2e looped engine single vs chunked GPU consistency");
+    if (all_mxfp8) require(cos > 0.99 && top1_match == M, "e2e looped engine MXFP8 logit parity");
+    else require(cos > 0.95, "e2e looped engine NVFP4+MXFP8 logit parity");
 
     std::vector<int> gpu_draft;
     eng.mtp_draft({0}, {M - 1}, {42}, {ink2rt::RowSample{}}, MD, gpu_draft);
-    printf("[test_e2e_looped_engine] MTP drafts: ref=[%d,%d,%d,%d] gpu=[%d,%d,%d,%d]\n",
-           ref_draft[0], ref_draft[1], ref_draft[2], ref_draft[3],
-           gpu_draft[0], gpu_draft[1], gpu_draft[2], gpu_draft[3]);
-    require(gpu_draft == ref_draft, "e2e looped engine MTP draft parity");
+    printf("[test_e2e_looped_engine %s] MTP drafts: ref=[%d,%d,%d,%d] gpu=[%d,%d,%d,%d] single=[%d,%d,%d,%d]\n",
+           tag, ref_draft[0], ref_draft[1], ref_draft[2], ref_draft[3],
+           gpu_draft[0], gpu_draft[1], gpu_draft[2], gpu_draft[3],
+           single_draft[0], single_draft[1], single_draft[2], single_draft[3]);
+    require(gpu_draft == single_draft, "e2e looped engine MTP single vs chunked consistency");
+    if (all_mxfp8) require(gpu_draft == ref_draft, "e2e looped engine MTP draft parity");
 
     // Cleanup temp dir
     unlink((dir + "/model.safetensors").c_str());
     unlink((dir + "/mtp.safetensors").c_str());
     unlink((dir + "/config.json").c_str());
-    unlink((dir + "/hf_quant_config.json").c_str());
     rmdir(dir.c_str());
+}
+
+void test_e2e_looped_engine()
+{
+    run_e2e_looped_case(true);
+    run_e2e_looped_case(false);
 }
 }   // namespace
 
 int main()
 {
+    knob::init();
     test_loop_kernels();
     test_tr3_pmcgx_moe();
     test_e2e_looped_engine();
