@@ -241,6 +241,213 @@ __global__ void k_ple_dilated_conv_add_verify_batch(const __nv_bfloat16* __restr
     }
 }
 
+// Fused norm_key + norm_query + signed-sqrt gate + norm_conv in ONE 320-thread kernel per (m, s).
+// Eliminates global write/read of key_norm and query_norm; directly outputs gv and gv_norm.
+__global__ void __launch_bounds__(320) k_ple_fused_norm_gate_norm(
+    const __nv_bfloat16* __restrict__ key_raw,
+    const __nv_bfloat16* __restrict__ hyper_in,
+    const __nv_bfloat16* __restrict__ val,
+    const __nv_bfloat16* __restrict__ w_nk,
+    const __nv_bfloat16* __restrict__ w_nq,
+    const __nv_bfloat16* __restrict__ w_nc,
+    __nv_bfloat16* __restrict__ gv_out,
+    __nv_bfloat16* __restrict__ gv_norm_out,
+    int M, float eps) {
+    const int ms = blockIdx.x;
+    const int m = ms >> 2, s = ms & 3;
+    if (m >= M) return;
+    const int tid = threadIdx.x; // 0..319 -> 1 uint4 = 8 BF16s exact (HID = 2560)
+    const int lane = tid & 31, warp = tid >> 5;
+
+    const uint4 kv = reinterpret_cast<const uint4*>(key_raw + static_cast<size_t>(ms) * geom::HID)[tid];
+    const uint4 qv = reinterpret_cast<const uint4*>(hyper_in + static_cast<size_t>(ms) * geom::HID)[tid];
+    const uint4 wkv = __ldg(reinterpret_cast<const uint4*>(w_nk + static_cast<size_t>(s) * geom::HID) + tid);
+    const uint4 wqv = __ldg(reinterpret_cast<const uint4*>(w_nq + static_cast<size_t>(s) * geom::HID) + tid);
+
+    float kf[8], qf[8], wkf[8], wqf[8];
+    float ssk = 0.0f, ssq = 0.0f;
+    const __nv_bfloat162* kp = reinterpret_cast<const __nv_bfloat162*>(&kv);
+    const __nv_bfloat162* qp = reinterpret_cast<const __nv_bfloat162*>(&qv);
+    const __nv_bfloat162* wkp = reinterpret_cast<const __nv_bfloat162*>(&wkv);
+    const __nv_bfloat162* wqp = reinterpret_cast<const __nv_bfloat162*>(&wqv);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 fk = __bfloat1622float2(kp[i]);
+        const float2 fq = __bfloat1622float2(qp[i]);
+        const float2 fwk = __bfloat1622float2(wkp[i]);
+        const float2 fwq = __bfloat1622float2(wqp[i]);
+        kf[2 * i] = fk.x; kf[2 * i + 1] = fk.y;
+        qf[2 * i] = fq.x; qf[2 * i + 1] = fq.y;
+        wkf[2 * i] = 1.0f + fwk.x; wkf[2 * i + 1] = 1.0f + fwk.y;
+        wqf[2 * i] = 1.0f + fwq.x; wqf[2 * i + 1] = 1.0f + fwq.y;
+        ssk = fmaf(fk.x, fk.x, fmaf(fk.y, fk.y, ssk));
+        ssq = fmaf(fq.x, fq.x, fmaf(fq.y, fq.y, ssq));
+    }
+    ssk = warp_sum(ssk);
+    ssq = warp_sum(ssq);
+    __shared__ float smk[10], smq[10];
+    if (lane == 0) { smk[warp] = ssk; smq[warp] = ssq; }
+    __syncthreads();
+    if (warp == 0) {
+        const float tk = warp_sum((lane < 10) ? smk[lane] : 0.0f);
+        const float tq = warp_sum((lane < 10) ? smq[lane] : 0.0f);
+        if (lane == 0) {
+            smk[0] = rsqrtf(tk / float(geom::HID) + eps);
+            smq[0] = rsqrtf(tq / float(geom::HID) + eps);
+        }
+    }
+    __syncthreads();
+    const float ik = smk[0], iq = smq[0];
+
+    float dot = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const float kn = __bfloat162float(__float2bfloat16(kf[i] * ik * wkf[i]));
+        const float qn = __bfloat162float(__float2bfloat16(qf[i] * iq * wqf[i]));
+        dot = fmaf(kn, qn, dot);
+    }
+    dot = warp_sum(dot);
+    if (lane == 0) smk[warp] = dot;
+    __syncthreads();
+    if (warp == 0) {
+        const float tot = warp_sum((lane < 10) ? smk[lane] : 0.0f);
+        if (lane == 0) {
+            constexpr float inv_sqrt_h = 0.01976423537605237f; // 1 / sqrt(2560)
+            const float g = tot * inv_sqrt_h;
+            const float ag = fmaxf(fabsf(g), 1e-6f);
+            const float sgn = (g > 0.0f) ? 1.0f : ((g < 0.0f) ? -1.0f : 0.0f);
+            smk[0] = sigmoid_f(sqrtf(ag) * sgn);
+        }
+    }
+    __syncthreads();
+    const float gw = smk[0];
+
+    const uint4 vv = reinterpret_cast<const uint4*>(val + static_cast<size_t>(m) * geom::HID)[tid];
+    const __nv_bfloat162* vp = reinterpret_cast<const __nv_bfloat162*>(&vv);
+    uint4 gvv;
+    __nv_bfloat162* gvp = reinterpret_cast<__nv_bfloat162*>(&gvv);
+    float gvf[8], ssg = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 fv = __bfloat1622float2(vp[i]);
+        const __nv_bfloat162 b2 = __floats2bfloat162_rn(gw * fv.x, gw * fv.y);
+        gvp[i] = b2;
+        const float2 fb = __bfloat1622float2(b2);
+        gvf[2 * i] = fb.x; gvf[2 * i + 1] = fb.y;
+        ssg = fmaf(fb.x, fb.x, fmaf(fb.y, fb.y, ssg));
+    }
+    reinterpret_cast<uint4*>(gv_out + static_cast<size_t>(ms) * geom::HID)[tid] = gvv;
+
+    ssg = warp_sum(ssg);
+    if (lane == 0) smk[warp] = ssg;
+    __syncthreads();
+    if (warp == 0) {
+        const float tg = warp_sum((lane < 10) ? smk[lane] : 0.0f);
+        if (lane == 0) smk[0] = rsqrtf(tg / float(geom::HID) + eps);
+    }
+    __syncthreads();
+    const float ig = smk[0];
+    const uint4 wcv = __ldg(reinterpret_cast<const uint4*>(w_nc + static_cast<size_t>(s) * geom::HID) + tid);
+    const __nv_bfloat162* wcp = reinterpret_cast<const __nv_bfloat162*>(&wcv);
+    uint4 gnv;
+    __nv_bfloat162* gnp = reinterpret_cast<__nv_bfloat162*>(&gnv);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 fwc = __bfloat1622float2(wcp[i]);
+        gnp[i] = __floats2bfloat162_rn(gvf[2 * i] * ig * (1.0f + fwc.x),
+                                       gvf[2 * i + 1] * ig * (1.0f + fwc.y));
+    }
+    reinterpret_cast<uint4*>(gv_norm_out + static_cast<size_t>(ms) * geom::HID)[tid] = gnv;
+}
+
+// 2D vectorized prefill dilated-3 conv1d + residual add (4 channels/thread uint2, 16 rows/CTA).
+__global__ void __launch_bounds__(256) k_ple_dilated_conv_add_pf(
+    const __nv_bfloat16* __restrict__ gv,
+    const __nv_bfloat16* __restrict__ gv_norm,
+    const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ conv_hist,
+    __nv_bfloat16* __restrict__ hyper_in,
+    int slot, int row0, int pos0, int len) {
+    const int c4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c4 >= (geom::HC_D >> 2)) return;
+    const int c = c4 << 2;
+    const int t0 = blockIdx.y * 16;
+    const int t1 = min(len, t0 + 16);
+
+    float w0[4], w1[4], w2[4], w3[4];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint2 wv = *reinterpret_cast<const uint2*>(w + static_cast<size_t>(c + k) * 4);
+        const float2 f0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wv.x));
+        const float2 f1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wv.y));
+        w0[k] = f0.x; w1[k] = f0.y; w2[k] = f1.x; w3[k] = f1.y;
+    }
+    const __nv_bfloat16* hbase = conv_hist + static_cast<size_t>(slot) * geom::PLE_NHIST * geom::HC_D;
+    auto load4 = [&](int t, float (&dst)[4]) {
+        uint2 v;
+        if (t >= 0) v = reinterpret_cast<const uint2*>(gv_norm + static_cast<size_t>(row0 + t) * geom::HC_D)[c4];
+        else if (pos0 > 0) v = reinterpret_cast<const uint2*>(hbase + static_cast<size_t>(geom::PLE_NHIST + t) * geom::HC_D)[c4];
+        else { dst[0] = dst[1] = dst[2] = dst[3] = 0.0f; return; }
+        const float2 f0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v.x));
+        const float2 f1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v.y));
+        dst[0] = f0.x; dst[1] = f0.y; dst[2] = f1.x; dst[3] = f1.y;
+    };
+
+    float h[geom::PLE_NHIST][4];
+    #pragma unroll
+    for (int k = 0; k < geom::PLE_NHIST; ++k) load4(t0 - geom::PLE_NHIST + k, h[k]);
+
+    for (int t = t0; t < t1; ++t) {
+        float x[4];
+        load4(t, x);
+        const size_t ri4 = static_cast<size_t>(row0 + t) * (geom::HC_D >> 2) + c4;
+        const uint2 gvv = reinterpret_cast<const uint2*>(gv)[ri4];
+        const uint2 hv  = reinterpret_cast<const uint2*>(hyper_in)[ri4];
+        const float2 gv0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gvv.x));
+        const float2 gv1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gvv.y));
+        const float2 h0  = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&hv.x));
+        const float2 h1  = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&hv.y));
+        const float gva[4] = {gv0.x, gv0.y, gv1.x, gv1.y};
+        const float ha[4]  = {h0.x, h0.y, h1.x, h1.y};
+        float out[4];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float conv = h[0][k] * w0[k] + h[3][k] * w1[k] + h[6][k] * w2[k] + x[k] * w3[k];
+            const float conv_act = __bfloat162float(__float2bfloat16(silu_f(conv)));
+            out[k] = ha[k] + (gva[k] + conv_act);
+            #pragma unroll
+            for (int r = 0; r < geom::PLE_NHIST - 1; ++r) h[r][k] = h[r + 1][k];
+            h[geom::PLE_NHIST - 1][k] = x[k];
+        }
+        uint2 ov;
+        *reinterpret_cast<__nv_bfloat162*>(&ov.x) = __floats2bfloat162_rn(out[0], out[1]);
+        *reinterpret_cast<__nv_bfloat162*>(&ov.y) = __floats2bfloat162_rn(out[2], out[3]);
+        reinterpret_cast<uint2*>(hyper_in)[ri4] = ov;
+    }
+}
+
+// Vectorized 9-slot PLE conv history tail update for prefill segments.
+__global__ void __launch_bounds__(256) k_ple_conv_hist_pf(
+    const __nv_bfloat16* __restrict__ gv_norm,
+    __nv_bfloat16* __restrict__ conv_hist,
+    int slot, int row0, int pos0, int len) {
+    const int c4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c4 >= (geom::HC_D >> 2)) return;
+    __nv_bfloat16* hbase = conv_hist + static_cast<size_t>(slot) * geom::PLE_NHIST * geom::HC_D;
+    uint2 vals[geom::PLE_NHIST];
+    #pragma unroll
+    for (int k = 0; k < geom::PLE_NHIST; ++k) {
+        const int t = len - geom::PLE_NHIST + k;
+        if (t >= 0) vals[k] = reinterpret_cast<const uint2*>(gv_norm + static_cast<size_t>(row0 + t) * geom::HC_D)[c4];
+        else if (pos0 > 0) vals[k] = reinterpret_cast<const uint2*>(hbase + static_cast<size_t>(geom::PLE_NHIST + t) * geom::HC_D)[c4];
+        else vals[k] = make_uint2(0, 0);
+    }
+    #pragma unroll
+    for (int k = 0; k < geom::PLE_NHIST; ++k) {
+        reinterpret_cast<uint2*>(hbase + static_cast<size_t>(k) * geom::HC_D)[c4] = vals[k];
+    }
+}
+
 // Run Layer-1 PLE in place on `hyper_in` [M, 10240] BF16, assuming `sc.emb` [M, 2560] BF16 is already populated.
 // Graph-safe when M <= 20 and d_slot/d_pos are provided for decode or MTP verify steps!
 inline void ple_forward(cublasHandle_t blas, const PleWeights& w, PleState& st_buf, PleScratch& sc,
@@ -256,10 +463,8 @@ inline void ple_forward(cublasHandle_t blas, const PleWeights& w, PleState& st_b
         gemm_bf16_nt(blas, M, geom::HID, geom::PLE_DIM, sc.emb, w.value_proj, sc.val);
     }
 
-    k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(sc.key, w.norm_key, sc.key, M, geom::HC, geom::RMS_EPS);
-    k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(hyper_in, w.norm_query, sc.query, M, geom::HC, geom::RMS_EPS);
-    k_ple_gate<<<M * geom::HC, 256, 0, st>>>(sc.key, sc.query, sc.val, sc.gv, M);
-    k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(sc.gv, w.norm_conv, sc.gv_norm, M, geom::HC, geom::RMS_EPS);
+    k_ple_fused_norm_gate_norm<<<M * geom::HC, 320, 0, st>>>(
+        sc.key, hyper_in, sc.val, w.norm_key, w.norm_query, w.norm_conv, sc.gv, sc.gv_norm, M, geom::RMS_EPS);
 
     bool all_len1 = (d_slot != nullptr && d_pos != nullptr && nsegs == M);
     if (all_len1) {
@@ -284,9 +489,19 @@ inline void ple_forward(cublasHandle_t blas, const PleWeights& w, PleState& st_b
     } else {
         for (int s = 0; s < nsegs; ++s) {
             if (segs[s].len <= 0) continue;
-            k_ple_dilated_conv_add_seg<<<(geom::HC_D + 255) / 256, 256, 0, st>>>(
-                sc.gv, sc.gv_norm, w.conv1d, st_buf.conv_hist, snap_k > 0 ? st_buf.conv_hist_snap : nullptr, hyper_in,
-                segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, snap_k, update_state);
+            if (segs[s].len >= 16 && snap_k == 0) {
+                k_ple_dilated_conv_add_pf<<<dim3(((geom::HC_D >> 2) + 255) / 256, (segs[s].len + 15) / 16), 256, 0, st>>>(
+                    sc.gv, sc.gv_norm, w.conv1d, st_buf.conv_hist, hyper_in,
+                    segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len);
+                if (update_state) {
+                    k_ple_conv_hist_pf<<<((geom::HC_D >> 2) + 255) / 256, 256, 0, st>>>(
+                        sc.gv_norm, st_buf.conv_hist, segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len);
+                }
+            } else {
+                k_ple_dilated_conv_add_seg<<<(geom::HC_D + 255) / 256, 256, 0, st>>>(
+                    sc.gv, sc.gv_norm, w.conv1d, st_buf.conv_hist, snap_k > 0 ? st_buf.conv_hist_snap : nullptr, hyper_in,
+                    segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, snap_k, update_state);
+            }
         }
     }
 }

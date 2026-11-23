@@ -362,6 +362,14 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             std::vector<qw38::StepSeg> segs = {{q, 0, int(at), n}};
             c.engine.forward(segs, &p.prompt[at], nullptr, out, true);
             at = step_lim;
+            if (at < limit) {
+                uint32_t next_lim = std::min<uint32_t>(limit, at + uint32_t(max_rows));
+                if (stash) {
+                    const uint32_t ck = store_slots[size_t(q)].ckpt;
+                    if (ck > at && ck < next_lim) next_lim = ck;
+                }
+                c.engine.ple_prefetch_next(q, int(at), &p.prompt[at], int(next_lim - at));
+            }
             if (stash && store_slots[size_t(q)].ckpt && at == store_slots[size_t(q)].ckpt) {
                 sync_ple_ctx_to_dev(q);
                 QW38_CK(cudaStreamSynchronize(c.engine.stream));
