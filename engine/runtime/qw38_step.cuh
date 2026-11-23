@@ -436,6 +436,7 @@ struct Engine {
     // Fabric callbacks (set by g6m4_qw38; nullptr on m4sim_qw38 where all ranks are already in `parts`)
     std::function<void(int M, bool skip_head, int n_layers_override)> step_begin;
     std::function<void(int c, __nv_bfloat16* parts, size_t bytes)> gather_dev;
+    std::function<void(int c, __nv_bfloat16* hyper, const __nv_bfloat16* parts, const float* inj, int M)> gather_inject;
     std::function<void(int c, uint8_t* host_parts, size_t bytes)> gather_host;
     std::function<void()> step_end;
     std::function<int()> step_parity;     // returns 0 or 1 for double-buffered multi-box graph capture
@@ -1132,9 +1133,13 @@ struct Engine {
                                       segs.data(), int(segs.size()), M, o.nr, r, true, stream, d_slot, d_pos, snap_k);
                 }
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
             for (int i = 0; i < o.nloc; ++i) {
@@ -1143,9 +1148,13 @@ struct Engine {
                 __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
                 qw38::moe_forward(blas, rl.moe_w, moe_sc, mixed, p_dst, M, stream);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
         };
 
         auto run_head_gpu = [&]() {
@@ -1322,14 +1331,20 @@ struct Engine {
             }
             t_end(y.is_full ? prof.attn_ms : prof.gdn_ms);
 
-            t_start();
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            t_end(prof.ar_ms);
+            if (o.nr > 1 && gather_inject) {
+                t_start();
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+                t_end(prof.ar_ms);
+            } else {
+                t_start();
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                t_end(prof.ar_ms);
 
-            t_start();
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
-            t_end(prof.hc_ms);
+                t_start();
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                t_end(prof.hc_ms);
+            }
 
             t_start();
             qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
@@ -1344,14 +1359,20 @@ struct Engine {
             }
             t_end(prof.moe_ms);
 
-            t_start();
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            t_end(prof.ar_ms);
+            if (o.nr > 1 && gather_inject) {
+                t_start();
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+                t_end(prof.ar_ms);
+            } else {
+                t_start();
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                t_end(prof.ar_ms);
 
-            t_start();
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
-            t_end(prof.hc_ms);
+                t_start();
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                t_end(prof.hc_ms);
+            }
         }
 
         if (skip_head) {
@@ -1516,9 +1537,13 @@ struct Engine {
                 qw38::full_attn_forward(blas, mtp_w.attn[size_t(i)], mtp_w.kv[size_t(i)], attn_sc, mixed, p_dst,
                                         d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r, max_pps, max_blocks, stream, 0, d_rope);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, mtp_sc.mtp_hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             // L048 MoE (GPU-native FP8/BF16!) + AR + Inject
             qw38::hc_prepare(blas, mtp_w.mlp_hc, mtp_sc.mtp_hyper, mixed, hc_sc, M, stream);
@@ -1528,9 +1553,13 @@ struct Engine {
                 qw38::mtp_moe_forward(blas, mtp_w.moe[size_t(i)], mtp_w.fp8_exp_gu[size_t(i)], mtp_w.fp8_exp_dn[size_t(i)],
                                       moe_sc, mtp_sc, mixed, p_dst, M, stream);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, mtp_sc.mtp_hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             if (hid_out) {
                 QW38_CK(cudaMemcpyAsync(hid_out, mtp_sc.mtp_hyper, size_t(M) * geom::HC_D * sizeof(__nv_bfloat16),
