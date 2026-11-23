@@ -11,6 +11,7 @@
 #include "ds41_vision_plan.h"
 #include "flash_vision_plan.h"
 #include "ink2_vision_plan.h"
+#include "qw38_vision_plan.h"
 #include "../engram/sha256.h"
 
 #include <array>
@@ -25,6 +26,7 @@ namespace g6rt {
 constexpr int TOK_IMAGE = 129264;    // [cfg] DS41 image_token_id: <｜deepseek_image｜>, and every row of an image span
 constexpr int TOK_IMAGE_GLM5V = 154854;   // [cfg] GLM-5.3-Flash image_token_id: <|image|>, every row of an image span
 constexpr int TOK_IMAGE_INK2 = 200054;    // [cfg] Inkling-2-Small image_token_id: <|unused_200054|>, every row of an image span
+constexpr int TOK_IMAGE_QW38 = 248056;    // [cfg] Qwen3.8-Flash-Next image_token_id: <|image_pad|>, every row of an image span
 constexpr int IMAGES_MAX = 16;       // per request (the front end's limit)
 constexpr int IMAGE_PATCH = 14;      // the DS41 and GLM-5.3-Flash patch size: their rgb is (vit_h * 14) x (vit_w * 14)
 
@@ -39,14 +41,18 @@ struct ImageModel {
 inline int ds41_span(int vit_h, int vit_w) { const ds41v::Grid g = ds41v::grid_of(vit_h, vit_w); return g.ok ? g.span() : 0; }
 inline int glm5v_span(int vit_h, int vit_w) { return glm5v::span_of(vit_h, vit_w); }
 inline int ink2_span(int vit_h, int vit_w) { return ink2v::span_of(vit_h, vit_w); }
+inline int qw38_span(int vit_h, int vit_w) { return qw38v::span_of(vit_h, vit_w); }
 constexpr ImageModel DS41_IMAGES{"ds41", TOK_IMAGE, IMAGE_PATCH, ds41_span};
 constexpr ImageModel GLM5V_IMAGES{"glm5v", TOK_IMAGE_GLM5V, IMAGE_PATCH, glm5v_span};
 constexpr ImageModel INK2_IMAGES{"ink2", TOK_IMAGE_INK2, ink2v::PATCH, ink2_span};
+constexpr ImageModel QW38_IMAGES{"qw38", TOK_IMAGE_QW38, qw38v::PATCH, qw38_span};
 // the build's model (a host test that runs both models sets it)
 #if defined(G6_MODEL_FLASH) && G6_MODEL_FLASH
 inline ImageModel& image_model() { static ImageModel m = GLM5V_IMAGES; return m; }
 #elif defined(G6_MODEL_INK2) && G6_MODEL_INK2
 inline ImageModel& image_model() { static ImageModel m = INK2_IMAGES; return m; }
+#elif defined(G6_MODEL_QW38) && G6_MODEL_QW38
+inline ImageModel& image_model() { static ImageModel m = QW38_IMAGES; return m; }
 #else
 inline ImageModel& image_model() { static ImageModel m = DS41_IMAGES; return m; }
 #endif

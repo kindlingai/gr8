@@ -745,6 +745,7 @@ fn image_model(st: &State) -> crate::vision::Model {
     match st.dialect {
         Dialect::Ds41 => crate::vision::Model::Ds41,
         Dialect::Inkling => crate::vision::Model::Ink2,
+        Dialect::Qwen => crate::vision::Model::Qw38,
         _ => crate::vision::Model::Glm5v,
     }
 }
