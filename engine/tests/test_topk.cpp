@@ -162,6 +162,13 @@ int main()
         check(r.id[2][3] == -1 && r.lp[2][3] == -INFINITY && r.rank[2] == 2 && r.rank_t[2] == 3, "pad entries", "3-token vocabulary");
         tk_result(&r, 2, small, 3.f, 1.5f, 2.f, -INFINITY);
         check(r.rank_t[2] == -1, "no target -> rank_t -1", "");
+        // all-masked row (mx == -inf, sm == 0): logprobs must stay -inf, never NaN
+        TkEnt masked[LP_K];
+        for (int k = 0; k < LP_K; ++k) masked[k] = TkEnt{-INFINITY, k};
+        tk_result(&r, 3, masked, -INFINITY, 0.f, -INFINITY, -INFINITY);
+        bool masked_ok = true;
+        for (int k = 0; k < LP_K; ++k) masked_ok &= !std::isnan(r.lp[3][k]) && r.lp[3][k] == -INFINITY;
+        check(masked_ok, "all-masked tk_result produces -inf (no NaN)", "");
     }
     printf("%d checks, %d failed\n%s\n", checks, fails, fails ? "FAILED" : "ALL PASS");
     return fails ? 1 : 0;

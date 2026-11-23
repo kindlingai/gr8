@@ -446,6 +446,9 @@ struct Engine {
     }
     void set_slot_idx_raw_thw(int slot, int3 thw) {
         if (slot < 0 || slot >= o.slots) return;
+        // Engine::stream is cudaStreamNonBlocking, so drain prior async slot resets on stream
+        // before the synchronous H2D updates below.
+        QW38_CK(cudaStreamSynchronize(stream));
         for (auto& y : L) {
             if (!y.is_full) continue;
             for (int i = 0; i < o.nloc; ++i)

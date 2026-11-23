@@ -92,7 +92,7 @@ TK_HD void tk_result(TkRes* o, int m, const TkEnt* top, float mx, float sm, floa
     {
         const bool ok = top[i].id != TK_PAD_ID;
         o->id[m][i] = ok ? top[i].id : -1;
-        o->lp[m][i] = ok ? top[i].logit - mx - logf(sm) : -INFINITY;
+        o->lp[m][i] = (ok && top[i].logit != -INFINITY && mx != -INFINITY) ? top[i].logit - mx - logf(sm) : -INFINITY;
     }
     o->rank[m] = tk_rank(top, ls);
     o->rank_t[m] = lt == -INFINITY ? -1 : tk_rank(top, lt);
