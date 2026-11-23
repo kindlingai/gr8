@@ -102,11 +102,45 @@ __device__ __forceinline__ void fp8x16_unpack(uint4 wv, float scale, float2 (&wf
     fp8x4_unpack(wv.w, scale, wf[6], wf[7]);
 }
 
+// Quantize HC up [4, 2560, 320] BF16 -> transposed [2560, 4, 320] block-32 FP8 E4M3 so all 4 streams of dim d are contiguous!
+__global__ void k_quantize_hc_up_fp8_b32(const __nv_bfloat16* __restrict__ W,
+                                         uint8_t* __restrict__ q,
+                                         __half* __restrict__ sc,
+                                         int HID, int RANK) {
+    const int nb_row = RANK >> 5;
+    const size_t total_blks = static_cast<size_t>(4) * HID * nb_row;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const size_t blk = static_cast<size_t>(blockIdx.x) * 8 + warp;
+    if (blk >= total_blks) return;
+
+    const int b_in_row = static_cast<int>(blk % nb_row);
+    const size_t row_dst = blk / nb_row; // [0 .. HID*4 - 1] = d * 4 + s
+    const int s = static_cast<int>(row_dst & 3);
+    const int d = static_cast<int>(row_dst >> 2);
+    const size_t row_src = static_cast<size_t>(s) * HID + d;
+
+    const float w = __bfloat162float(W[row_src * RANK + b_in_row * 32 + lane]);
+    const float mx = fp8_warp_max(fabsf(w));
+    const float s_raw = (mx > 1e-12f) ? (mx / 448.0f) : 1.0f;
+    const __half sh = __float2half_rn(s_raw);
+    const float sv = __half2float(sh);
+    const float inv_s = (sv > 0.0f) ? (1.0f / sv) : 0.0f;
+    if (lane == 0) sc[blk] = sh;
+    q[blk * 32 + lane] = static_cast<uint8_t>(__nv_cvt_float_to_fp8(w * inv_s, __NV_SATFINITE, __NV_E4M3));
+}
+
+inline void quantize_hc_up_fp8_b32(const __nv_bfloat16* W, uint8_t* q, __half* sc,
+                                   int HID, int RANK, cudaStream_t st) {
+    const size_t total_blks = static_cast<size_t>(4) * HID * (RANK >> 5);
+    k_quantize_hc_up_fp8_b32<<<static_cast<unsigned>((total_blks + 7) / 8), 256, 0, st>>>(W, q, sc, HID, RANK);
+}
+
 // Coalesced 128-bit FP8 E4M3 GEMV for small decode batches (M <= 8):
 //   C[M, N] = A[M, K] (BF16) @ B[N, K]^T (FP8 b32).
 // 4 warps/CTA = 4 output rows/CTA, zero smem, zero __syncthreads(), 16 FP8 weights per uint4 load!
 template <int MAX_M, bool OUT_F32 = false>
-__global__ void k_fp8_gemv_1warp(const __nv_bfloat16* __restrict__ A,
+__global__ void __launch_bounds__(128) k_fp8_gemv_1warp(const __nv_bfloat16* __restrict__ A,
                                  const uint8_t* __restrict__ Bq,
                                  const __half* __restrict__ Bsc,
                                  void* __restrict__ C,
@@ -159,6 +193,7 @@ inline void launch_fp8_gemv_smallm(const __nv_bfloat16* A, const Fp8Mat& B, void
     const int grid = (B.N + 3) / 4;
     if (M == 1) k_fp8_gemv_1warp<1, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
     else if (M <= 4) k_fp8_gemv_1warp<4, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
+    else if (M == 5) k_fp8_gemv_1warp<5, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
     else k_fp8_gemv_1warp<8, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
 }
 
@@ -171,6 +206,7 @@ struct Fp8Arena {
         const __nv_bfloat16* src;
         Fp8Mat* dst;
         int N, K;
+        bool is_hc_up = false;
     };
     std::vector<Pending> pend;
 
@@ -178,9 +214,9 @@ struct Fp8Arena {
 
     static size_t align256(size_t n) { return (n + 255) & ~size_t(255); }
 
-    void add(const __nv_bfloat16* src, Fp8Mat& dst, int N, int K) {
+    void add(const __nv_bfloat16* src, Fp8Mat& dst, int N, int K, bool is_hc_up = false) {
         if (!src || N <= 0 || K <= 0 || (K & 31) != 0) return;
-        pend.push_back({src, &dst, N, K});
+        pend.push_back({src, &dst, N, K, is_hc_up});
     }
 
     size_t build(cudaStream_t st) {
@@ -201,7 +237,8 @@ struct Fp8Arena {
             used += align256(static_cast<size_t>(p.N) * p.K);
             __half* sp = reinterpret_cast<__half*>(base + used);
             used += align256(static_cast<size_t>(p.N) * (p.K >> 5) * sizeof(__half));
-            quantize_bf16_to_fp8_b32(p.src, qp, sp, p.N, p.K, st);
+            if (p.is_hc_up) quantize_hc_up_fp8_b32(p.src, qp, sp, p.N / 4, p.K, st);
+            else quantize_bf16_to_fp8_b32(p.src, qp, sp, p.N, p.K, st);
             p.dst->q = qp;
             p.dst->sc = sp;
             p.dst->N = p.N;

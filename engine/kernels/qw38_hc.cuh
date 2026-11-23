@@ -191,7 +191,7 @@ __global__ void k_embed_hc4(const int* __restrict__ tok, const __nv_bfloat16* __
     }
 }
 
-// Grouped zero-centered RMSNorm: x[M, G, D] -> out[M, G, D] BF16, weight[G*D] BF16.
+// Grouped zero-centered RMSNorm (vectorized uint4): x[M, G, D] -> out[M, G, D] BF16, weight[G*D] BF16.
 // One CTA per (m, g). Exact match to Qwen4ExpTextRMSNorm: rsqrt(mean(x^2)+eps) * x * (1 + w) -> bf16.
 template <int D>
 __global__ void k_rmsnorm_1pw(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
@@ -200,14 +200,20 @@ __global__ void k_rmsnorm_1pw(const __nv_bfloat16* __restrict__ x, const __nv_bf
     const int m = mg / G;
     const int g = mg % G;
     if (m >= M) return;
-    const __nv_bfloat16* xr = x + (static_cast<size_t>(m) * G + g) * D;
-    const __nv_bfloat16* wr = w + static_cast<size_t>(g) * D;
-    __nv_bfloat16* yr = out + (static_cast<size_t>(m) * G + g) * D;
+    const uint4* xr = reinterpret_cast<const uint4*>(x + (static_cast<size_t>(m) * G + g) * D);
+    const uint4* wr = reinterpret_cast<const uint4*>(w + static_cast<size_t>(g) * D);
+    uint4* yr = reinterpret_cast<uint4*>(out + (static_cast<size_t>(m) * G + g) * D);
+    constexpr int D8 = D >> 3;
 
     float ss = 0.0f;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        const float v = __bfloat162float(xr[i]);
-        ss += v * v;
+    for (int i = threadIdx.x; i < D8; i += blockDim.x) {
+        const uint4 xv = xr[i];
+        const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 f = __bfloat1622float2(xp[k]);
+            ss = fmaf(f.x, f.x, fmaf(f.y, f.y, ss));
+        }
     }
     ss = warp_sum(ss);
     __shared__ float sm[32];
@@ -222,9 +228,20 @@ __global__ void k_rmsnorm_1pw(const __nv_bfloat16* __restrict__ x, const __nv_bf
     }
     __syncthreads();
     const float inv = sm[0];
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        const float v = __bfloat162float(xr[i]) * inv * (1.0f + __bfloat162float(wr[i]));
-        yr[i] = __float2bfloat16(v);
+    for (int i = threadIdx.x; i < D8; i += blockDim.x) {
+        const uint4 xv = xr[i];
+        const uint4 wv = __ldg(wr + i);
+        const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+        const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&wv);
+        uint4 yv;
+        __nv_bfloat162* yp = reinterpret_cast<__nv_bfloat162*>(&yv);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 fx = __bfloat1622float2(xp[k]);
+            const float2 fw = __bfloat1622float2(wp[k]);
+            yp[k] = __floats2bfloat162_rn(fx.x * inv * (1.0f + fw.x), fx.y * inv * (1.0f + fw.y));
+        }
+        yr[i] = yv;
     }
 }
 
@@ -262,37 +279,51 @@ __global__ void k_hc_mix(const __nv_bfloat16* __restrict__ hn, const __nv_bfloat
     }
 }
 
-// Residual injection (vectorized uint4): hyper[m, s, d] += bf16(y[m, d] * inj[m, s])
-// When parts != nullptr and nr > 1, sums rank-ordered BF16 partials parts[r][m][d] in FP32 -> BF16 first.
+// Residual injection (multi-CTA vectorized uint4): hyper[m, s, d] += bf16(y[m, d] * inj[m, s])
+// Grid: (M * 5), Block: 64 -> 5 * 64 * 8 = 2560 EXACT (zero loop, 100% coalesced uint4!).
 __global__ void k_hc_inject(__nv_bfloat16* __restrict__ hyper, const __nv_bfloat16* __restrict__ y_or_parts,
                             const float* __restrict__ inj, int M, int nr, size_t rank_stride_elems) {
-    const int m = blockIdx.x;
+    const int m = blockIdx.x / 5;
+    const int blk = blockIdx.x % 5;
     if (m >= M) return;
-    __nv_bfloat16* h = hyper + static_cast<size_t>(m) * geom::HC_D;
+    const int d8 = blk * 64 + threadIdx.x; // 0..319 (each uint4 = 8 BF16s)
+
     float w[geom::HC];
     #pragma unroll
     for (int s = 0; s < geom::HC; ++s) w[s] = inj[m * geom::HC + s];
 
-    constexpr int D2 = geom::HID / 2;
-    for (int d2 = threadIdx.x; d2 < D2; d2 += blockDim.x) {
-        float y0 = 0.0f, y1 = 0.0f;
-        for (int r = 0; r < nr; ++r) {
-            const __nv_bfloat162 pv = reinterpret_cast<const __nv_bfloat162*>(
-                y_or_parts + static_cast<size_t>(r) * rank_stride_elems + static_cast<size_t>(m) * geom::HID)[d2];
-            const float2 pf = __bfloat1622float2(pv);
-            y0 += pf.x;
-            y1 += pf.y;
-        }
-        const float ybf0 = __bfloat162float(__float2bfloat16(y0));
-        const float ybf1 = __bfloat162float(__float2bfloat16(y1));
+    float y[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int r = 0; r < nr; ++r) {
+        const uint4 pv = reinterpret_cast<const uint4*>(
+            y_or_parts + static_cast<size_t>(r) * rank_stride_elems + static_cast<size_t>(m) * geom::HID)[d8];
+        const __nv_bfloat162* pp = reinterpret_cast<const __nv_bfloat162*>(&pv);
         #pragma unroll
-        for (int s = 0; s < geom::HC; ++s) {
-            __nv_bfloat162* hp = reinterpret_cast<__nv_bfloat162*>(h + s * geom::HID) + d2;
-            const float2 prev = __bfloat1622float2(*hp);
-            const float a0 = __bfloat162float(__float2bfloat16(ybf0 * w[s]));
-            const float a1 = __bfloat162float(__float2bfloat16(ybf1 * w[s]));
-            *hp = __floats2bfloat162_rn(prev.x + a0, prev.y + a1);
+        for (int k = 0; k < 4; ++k) {
+            const float2 f = __bfloat1622float2(pp[k]);
+            y[2 * k] += f.x;
+            y[2 * k + 1] += f.y;
         }
+    }
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) y[k] = __bfloat162float(__float2bfloat16(y[k]));
+
+    __nv_bfloat16* h = hyper + static_cast<size_t>(m) * geom::HC_D;
+    #pragma unroll
+    for (int s = 0; s < geom::HC; ++s) {
+        uint4* hp = reinterpret_cast<uint4*>(h + s * geom::HID) + d8;
+        const uint4 prev = *hp;
+        const __nv_bfloat162* pr = reinterpret_cast<const __nv_bfloat162*>(&prev);
+        uint4 out;
+        __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&out);
+        const float ws = w[s];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 fp = __bfloat1622float2(pr[k]);
+            const float a0 = __bfloat162float(__float2bfloat16(y[2 * k] * ws));
+            const float a1 = __bfloat162float(__float2bfloat16(y[2 * k + 1] * ws));
+            op[k] = __floats2bfloat162_rn(fp.x + a0, fp.y + a1);
+        }
+        *hp = out;
     }
 }
 
@@ -411,9 +442,10 @@ __global__ void k_hc_up_mix_fused(const __nv_bfloat16* __restrict__ hn,
     }
 }
 
-// Iter 3 Fused FP8 HC Decode Kernels (M <= 8): 2x lower weight bandwidth + 640-CTA up_mix!
+// Iter 6 Roofline FP8 HC Decode Kernels (M <= 8):
+//   1. k_fp8_hc_down_silu_inj<MAX_M>: Block=128 (4 warps -> 640/128 = 5 EXACT iterations, 0% idle threads!)
 template <int MAX_M>
-__global__ void k_fp8_hc_down_silu_inj(const __nv_bfloat16* __restrict__ hn,
+__global__ void __launch_bounds__(128) k_fp8_hc_down_silu_inj(const __nv_bfloat16* __restrict__ hn,
                                        const uint8_t* __restrict__ dq, const __half* __restrict__ dsc,
                                        const __nv_bfloat16* __restrict__ w_inj,
                                        __nv_bfloat16* __restrict__ down_out,
@@ -427,10 +459,10 @@ __global__ void k_fp8_hc_down_silu_inj(const __nv_bfloat16* __restrict__ hn,
 
     if (is_inj) {
         const uint4* wrow = reinterpret_cast<const uint4*>(w_inj + static_cast<size_t>(n - geom::HC_RANK) * geom::HC_D);
-        constexpr int K8 = geom::HC_D / 8; // 1280 = 5 * 256
+        constexpr int K8 = geom::HC_D / 8; // 1280 = 10 * 128
         #pragma unroll
-        for (int it = 0; it < K8 / 256; ++it) {
-            const int i = it * 256 + threadIdx.x;
+        for (int it = 0; it < K8 / 128; ++it) {
+            const int i = it * 128 + threadIdx.x;
             const uint4 wv = __ldg(wrow + i);
             #pragma unroll
             for (int m = 0; m < MAX_M; ++m) {
@@ -441,11 +473,13 @@ __global__ void k_fp8_hc_down_silu_inj(const __nv_bfloat16* __restrict__ hn,
             }
         }
     } else {
-        constexpr int K16 = geom::HC_D >> 4; // 640
+        constexpr int K16 = geom::HC_D >> 4; // 640 = 5 * 128 EXACT!
         constexpr int NB = geom::HC_D >> 5;  // 320
         const uint4* qrow = reinterpret_cast<const uint4*>(dq + static_cast<size_t>(n) * geom::HC_D);
         const __half* srow = dsc + static_cast<size_t>(n) * NB;
-        for (int i = threadIdx.x; i < K16; i += 256) {
+        #pragma unroll
+        for (int it = 0; it < K16 / 128; ++it) {
+            const int i = it * 128 + threadIdx.x;
             const uint4 wv = __ldg(qrow + i);
             const float sc = __half2float(__ldg(srow + (i >> 1)));
             float2 wf[8];
@@ -461,7 +495,7 @@ __global__ void k_fp8_hc_down_silu_inj(const __nv_bfloat16* __restrict__ hn,
     }
 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    __shared__ float sm[8][MAX_M];
+    __shared__ float sm[4][MAX_M];
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
         if (m < M) {
@@ -471,9 +505,7 @@ __global__ void k_fp8_hc_down_silu_inj(const __nv_bfloat16* __restrict__ hn,
     }
     __syncthreads();
     if (warp == 0 && lane < M) {
-        float tot = 0.0f;
-        #pragma unroll
-        for (int w = 0; w < 8; ++w) tot += sm[w][lane];
+        const float tot = sm[0][lane] + sm[1][lane] + sm[2][lane] + sm[3][lane];
         if (is_inj) {
             inj_out[lane * geom::HC + (n - geom::HC_RANK)] = 2.0f * sigmoid_f(tot * 0.25f);
         } else {
@@ -483,59 +515,56 @@ __global__ void k_fp8_hc_down_silu_inj(const __nv_bfloat16* __restrict__ hn,
     }
 }
 
-// Grid: (2560 / 4 = 640), Block: 128 (4 warps, 1 warp per hidden dim d).
+//   2. k_fp8_hc_up_mix_fused<MAX_M> using contiguous transposed fp8_up [2560, 4, 320]!
+//      Grid: (2560 / 2 = 1280), Block: 256 (8 warps = 2 dims x 4 streams in parallel, ZERO s-loop, 100% contiguous burst!).
 template <int MAX_M>
-__global__ void k_fp8_hc_up_mix_fused(const __nv_bfloat16* __restrict__ hn,
+__global__ void __launch_bounds__(256) k_fp8_hc_up_mix_fused(const __nv_bfloat16* __restrict__ hn,
                                       const __nv_bfloat16* __restrict__ down,
                                       const uint8_t* __restrict__ uq, const __half* __restrict__ usc,
                                       __nv_bfloat16* __restrict__ mixed,
                                       int M) {
-    const int warp = threadIdx.x >> 5;   // 0..3
-    const int lane = threadIdx.x & 31;   // 0..31
-    const int d = blockIdx.x * 4 + warp;
+    const int warp = threadIdx.x >> 5;   // 0..7 -> dim_local = warp >> 2 (0..1), s = warp & 3 (0..3)
+    const int lane = threadIdx.x & 31;
+    const int dl = warp >> 2;
+    const int s = warp & 3;
+    const int d = blockIdx.x * 2 + dl;
     if (d >= geom::HID) return;
 
     __shared__ uint4 s_down[MAX_M][geom::HC_RANK / 8]; // [MAX_M][40]
     constexpr int R8 = geom::HC_RANK / 8;              // 40
     const int tot_u4 = M * R8;
-    for (int i = threadIdx.x; i < tot_u4; i += blockDim.x) {
+    for (int i = threadIdx.x; i < tot_u4; i += 256) {
         s_down[i / R8][i % R8] = reinterpret_cast<const uint4*>(down + static_cast<size_t>(i / R8) * geom::HC_RANK)[i % R8];
     }
     __syncthreads();
 
-    float mix_acc[MAX_M];
-    #pragma unroll
-    for (int m = 0; m < MAX_M; ++m) mix_acc[m] = 0.0f;
-
     constexpr int R16 = geom::HC_RANK >> 4; // 20
     constexpr int NB = geom::HC_RANK >> 5;  // 10
+    const size_t row = static_cast<size_t>(d) * 4 + s; // contiguous [2560, 4, 320]!
+    float2 wf[8];
+    if (lane < R16) {
+        const uint4 wv = __ldg(reinterpret_cast<const uint4*>(uq + row * geom::HC_RANK) + lane);
+        const float sc = __half2float(__ldg(usc + row * NB + (lane >> 1)));
+        fp8x16_unpack(wv, sc, wf);
+    }
+
+    __shared__ float s_contrib[2][4][MAX_M];
     #pragma unroll
-    for (int s = 0; s < geom::HC; ++s) {
-        const size_t row = static_cast<size_t>(s * geom::HID + d);
-        float2 wf[8];
-        if (lane < R16) {
-            const uint4 wv = __ldg(reinterpret_cast<const uint4*>(uq + row * geom::HC_RANK) + lane);
-            const float sc = __half2float(__ldg(usc + row * NB + (lane >> 1)));
-            fp8x16_unpack(wv, sc, wf);
-        }
-        #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (m < M) {
-                const float p = (lane < R16) ? dot_bf16x16_f2x8(s_down[m][2 * lane], s_down[m][2 * lane + 1], wf) : 0.0f;
-                const float u_val = warp_sum(p);
-                if (lane == 0) {
-                    const float u_bf = __bfloat162float(__float2bfloat16(u_val));
-                    const float mw = __bfloat162float(__float2bfloat16(sigmoid_f(u_bf)));
-                    mix_acc[m] += mw * __bfloat162float(hn[static_cast<size_t>(m) * geom::HC_D + s * geom::HID + d]);
-                }
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            const float p = (lane < R16) ? dot_bf16x16_f2x8(s_down[m][2 * lane], s_down[m][2 * lane + 1], wf) : 0.0f;
+            const float u_val = warp_sum(p);
+            if (lane == 0) {
+                const float u_bf = __bfloat162float(__float2bfloat16(u_val));
+                const float mw = __bfloat162float(__float2bfloat16(sigmoid_f(u_bf)));
+                s_contrib[dl][s][m] = mw * __bfloat162float(hn[static_cast<size_t>(m) * geom::HC_D + s * geom::HID + d]);
             }
         }
     }
-    if (lane == 0) {
-        #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (m < M) mixed[static_cast<size_t>(m) * geom::HID + d] = __float2bfloat16(mix_acc[m] * 0.25f);
-        }
+    __syncthreads();
+    if (s == 0 && lane < M) {
+        const float acc = s_contrib[dl][0][lane] + s_contrib[dl][1][lane] + s_contrib[dl][2][lane] + s_contrib[dl][3][lane];
+        mixed[static_cast<size_t>(lane) * geom::HID + d] = __float2bfloat16(acc * 0.25f);
     }
 }
 
@@ -546,16 +575,19 @@ inline void hc_prepare(cublasHandle_t blas, const HcWeights& w, const __nv_bfloa
     if (M <= 8) {
         const int down_grid = w.inject ? (geom::HC_RANK + geom::HC) : geom::HC_RANK;
         if (w.fp8_down.q && w.fp8_up.q) {
-            const int up_grid = geom::HID / 4;
+            const int up_grid = geom::HID / 2;
             if (M == 1) {
-                k_fp8_hc_down_silu_inj<1><<<down_grid, 256, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, 1);
-                k_fp8_hc_up_mix_fused<1><<<up_grid, 128, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, 1);
+                k_fp8_hc_down_silu_inj<1><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, 1);
+                k_fp8_hc_up_mix_fused<1><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, 1);
             } else if (M <= 4) {
-                k_fp8_hc_down_silu_inj<4><<<down_grid, 256, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
-                k_fp8_hc_up_mix_fused<4><<<up_grid, 128, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
+                k_fp8_hc_down_silu_inj<4><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
+                k_fp8_hc_up_mix_fused<4><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
+            } else if (M == 5) {
+                k_fp8_hc_down_silu_inj<5><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
+                k_fp8_hc_up_mix_fused<5><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
             } else {
-                k_fp8_hc_down_silu_inj<8><<<down_grid, 256, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
-                k_fp8_hc_up_mix_fused<8><<<up_grid, 128, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
+                k_fp8_hc_down_silu_inj<8><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
+                k_fp8_hc_up_mix_fused<8><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
             }
             return;
         }

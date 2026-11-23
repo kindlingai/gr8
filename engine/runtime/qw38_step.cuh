@@ -19,6 +19,7 @@
 #include "../engram/qw38_ple.cuh"
 #include "../kernels/qw38_moe.cuh"
 #include "../kernels/qw38_mtp.cuh"
+#include "../kernels/qw38_head.cuh"
 #include "../kernels/ink2_head.cuh"
 #include "../kernels/ptab.cuh"
 #include "../loader/g6pack.h"
@@ -293,6 +294,7 @@ struct Engine {
     const __nv_bfloat16* embed = nullptr;
     qw38::HcWeights final_hc;
     std::vector<const __nv_bfloat16*> lm_head;
+    std::vector<qw38::Fp8Mat> fp8_lm_head;
     std::vector<int> v_lo, v_rows;
 
     // Weight paging pool (GR8_PTAB=1|2) and on-load FP8 dense arena (GR8_QW38_DENSE_FP8=1)
@@ -333,6 +335,7 @@ struct Engine {
     qw38::GdnScratch gdn_sc;
     qw38::FullAttnScratch attn_sc;
     qw38::MoeScratch moe_sc;
+    qw38::HeadPackScratch head_sc;
     float* head_logits = nullptr;         // [max_rows, max_v_rows] FP32
     uint8_t* head_dev_pkt = nullptr;      // [max_rows * head_row_bytes(nc)]
     std::vector<uint8_t> head_host_parts; // [nr * max_rows * head_row_bytes(nc)]
@@ -585,13 +588,17 @@ struct Engine {
 
         // 3b. On-load block-32 FP8 E4M3 quantization of dense decode projections (GR8_QW38_DENSE_FP8=1)
         if (o.dense_fp8) {
+            fp8_lm_head.resize(size_t(o.nloc));
+            for (int i = 0; i < o.nloc; ++i) {
+                fp8_arena.add(lm_head[size_t(i)], fp8_lm_head[size_t(i)], v_rows[size_t(i)], geom::HID);
+            }
             fp8_arena.add(final_hc.down, final_hc.fp8_down, geom::HC_RANK, geom::HC_D);
-            fp8_arena.add(final_hc.up, final_hc.fp8_up, geom::HC_D, geom::HC_RANK);
+            fp8_arena.add(final_hc.up, final_hc.fp8_up, geom::HC_D, geom::HC_RANK, true);
             for (auto& y : L) {
                 fp8_arena.add(y.attn_hc.down, y.attn_hc.fp8_down, geom::HC_RANK, geom::HC_D);
-                fp8_arena.add(y.attn_hc.up, y.attn_hc.fp8_up, geom::HC_D, geom::HC_RANK);
+                fp8_arena.add(y.attn_hc.up, y.attn_hc.fp8_up, geom::HC_D, geom::HC_RANK, true);
                 fp8_arena.add(y.mlp_hc.down, y.mlp_hc.fp8_down, geom::HC_RANK, geom::HC_D);
-                fp8_arena.add(y.mlp_hc.up, y.mlp_hc.fp8_up, geom::HC_D, geom::HC_RANK);
+                fp8_arena.add(y.mlp_hc.up, y.mlp_hc.fp8_up, geom::HC_D, geom::HC_RANK, true);
                 for (int i = 0; i < o.nloc; ++i) {
                     const int r = o.rank0 + i;
                     auto& rl = y.rk[size_t(i)];
@@ -677,6 +684,14 @@ struct Engine {
         moe_sc.sh_scalar_gate = dalloc<float>(M);
 
         head_logits = dalloc<float>(M * size_t(max_vr));
+        head_sc.blk_max = dalloc<float>(M * qw38::HEAD_BLKS);
+        head_sc.blk_cnt = dalloc<int>(M * qw38::HEAD_BLKS);
+        head_sc.blk_dsum = dalloc<double>(M * qw38::HEAD_BLKS);
+        head_sc.row_max = dalloc<float>(M);
+        head_sc.row_fin = dalloc<int>(M);
+        head_sc.surv_cnt = dalloc<int>(M);
+        head_sc.surv_val = dalloc<float>(M * qw38::HEAD_MAX_SURV);
+        head_sc.surv_id = dalloc<int>(M * qw38::HEAD_MAX_SURV);
         const size_t hrb = head_row_bytes(o.nc);
         head_dev_pkt = dalloc<uint8_t>(M * hrb);
         head_host_parts.assign(size_t(o.nr) * M * hrb, 0);
@@ -797,7 +812,7 @@ struct Engine {
 
             // Sum rank-ordered partials + HC inject
             t_start();
-            qw38::k_hc_inject<<<M, 256, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
             t_end(prof.hc_ms);
 
             // MLP hyper-connection prepare
@@ -823,7 +838,7 @@ struct Engine {
 
             // Sum rank-ordered partials + HC inject
             t_start();
-            qw38::k_hc_inject<<<M, 256, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
             t_end(prof.hc_ms);
         }
 
@@ -840,8 +855,16 @@ struct Engine {
         cublasSetStream(blas, stream);
         for (int i = 0; i < o.nloc; ++i) {
             const int r = o.rank0 + i;
-            qw38::gemm_bf16_nt_f32(blas, M, v_rows[size_t(i)], geom::HID, mixed, lm_head[size_t(i)], head_logits);
-            ink2::k_ink2_head_pack<<<M, 256, 0, stream>>>(head_logits, v_rows[size_t(i)], v_lo[size_t(i)], o.nc, head_dev_pkt, hrb);
+            if (M <= 8) {
+                if (i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
+                    qw38::launch_fp8_gemv_smallm<true>(mixed, fp8_lm_head[size_t(i)], head_logits, M, stream);
+                } else {
+                    qw38::launch_bf16_gemv_smallm<true>(mixed, lm_head[size_t(i)], head_logits, M, v_rows[size_t(i)], geom::HID, stream);
+                }
+            } else {
+                qw38::gemm_bf16_nt_f32(blas, M, v_rows[size_t(i)], geom::HID, mixed, lm_head[size_t(i)], head_logits);
+            }
+            qw38::head_pack_fast(head_logits, M, v_rows[size_t(i)], v_lo[size_t(i)], o.nc, head_sc, head_dev_pkt, hrb, stream);
             QW38_CK(cudaMemcpyAsync(head_host_parts.data() + size_t(r) * rank_pkt_bytes,
                                     head_dev_pkt, rank_pkt_bytes, cudaMemcpyDeviceToHost, stream));
         }
