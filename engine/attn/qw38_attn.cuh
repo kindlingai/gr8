@@ -370,6 +370,106 @@ __global__ void k_qsa_k_update_dec_batch(const __nv_bfloat16* __restrict__ idx_q
     }
 }
 
+// Parallel QSA K-pool update for prefill segments (bit-exact with k_qsa_k_update_seg).
+// Computes all newly completed 4-token blocks in parallel (1 CTA per block), then updates idx_raw tail.
+__global__ void k_qsa_k_update_pf_blocks(const __nv_bfloat16* __restrict__ idx_qk,
+                                         const __nv_bfloat16* __restrict__ k_norm_w,
+                                         const __nv_bfloat16* __restrict__ idx_raw,
+                                         __nv_bfloat16* __restrict__ idx_pages,
+                                         int max_pages, int slot, int row0, int pos0, int len,
+                                         int first_blk, int n_blks, float eps,
+                                         const int3* __restrict__ idx_raw_thw = nullptr,
+                                         const int3* __restrict__ row_rope = nullptr) {
+    const int bi = blockIdx.x;
+    if (bi >= n_blks) return;
+    const int blk = first_blk + bi;
+    const int d = threadIdx.x; // 0..127
+    const __nv_bfloat16* raw_slot = idx_raw + static_cast<size_t>(slot) * 4 * 128;
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int sub = 0; sub < 4; ++sub) {
+        const int p = blk * 4 + sub;
+        __nv_bfloat16 kv;
+        if (p < pos0) kv = raw_slot[sub * 128 + d];
+        else kv = idx_qk[static_cast<size_t>(row0 + (p - pos0)) * geom::IDX_PROJ_OUT + geom::IDX_HEADS * 128 + d];
+        sum += __bfloat162float(kv);
+    }
+    const float avg_bf = __bfloat162float(__float2bfloat16(0.25f * sum));
+    const float ss = warp_sum(avg_bf * avg_bf);
+    __shared__ float sm[4];
+    __shared__ float kf[128];
+    if ((d & 31) == 0) sm[d >> 5] = ss;
+    __syncthreads();
+    const float inv = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / 128.0f + eps);
+    const float normed = __bfloat162float(__float2bfloat16(avg_bf * inv * (1.0f + __bfloat162float(k_norm_w[d]))));
+    kf[d] = normed;
+    __syncthreads();
+
+    const int page = blk >> 4;
+    const int boff = blk & 15;
+    __nv_bfloat16* dst = idx_pages + ((static_cast<size_t>(slot) * max_pages + page) * 16 + boff) * 128;
+    if (d < geom::ROPE_DIM / 2) {
+        float x0 = kf[d], x1 = kf[d + geom::ROPE_DIM / 2];
+        const int p0 = blk * 4;
+        const int3 bthw = !idx_raw_thw
+                              ? make_int3(p0, p0, p0)
+                              : ((p0 < pos0) ? idx_raw_thw[slot]
+                                             : (row_rope ? row_rope[row0 + (p0 - pos0)] : make_int3(p0, p0, p0)));
+        apply_partial_rope_pair(x0, x1, mrope_coord(bthw, d), d);
+        dst[d] = __float2bfloat16(x0);
+        dst[d + geom::ROPE_DIM / 2] = __float2bfloat16(x1);
+    } else if (d >= geom::ROPE_DIM) {
+        dst[d] = __float2bfloat16(normed);
+    }
+}
+
+__global__ void k_qsa_k_update_pf_tail(const __nv_bfloat16* __restrict__ idx_qk,
+                                       __nv_bfloat16* __restrict__ idx_raw,
+                                       int slot, int row0, int pos0, int len,
+                                       int3* __restrict__ idx_raw_thw = nullptr,
+                                       const int3* __restrict__ row_rope = nullptr) {
+    const int d = threadIdx.x;
+    const int end_pos = pos0 + len;
+    const int copy_start = max(pos0, end_pos - 4);
+    __nv_bfloat16* raw_slot = idx_raw + static_cast<size_t>(slot) * 4 * 128;
+    for (int p = copy_start; p < end_pos; ++p) {
+        raw_slot[(p & 3) * 128 + d] =
+            idx_qk[static_cast<size_t>(row0 + (p - pos0)) * geom::IDX_PROJ_OUT + geom::IDX_HEADS * 128 + d];
+    }
+    if (idx_raw_thw && d == 0) {
+        const int last_blk_start = (end_pos - 1) & ~3;
+        if (last_blk_start >= pos0) {
+            idx_raw_thw[slot] = row_rope ? row_rope[row0 + (last_blk_start - pos0)]
+                                         : make_int3(last_blk_start, last_blk_start, last_blk_start);
+        }
+    }
+}
+
+inline void qsa_k_update_seg_fast(const __nv_bfloat16* idx_qk, const __nv_bfloat16* k_norm_w,
+                                  __nv_bfloat16* idx_raw, __nv_bfloat16* idx_raw_snap, __nv_bfloat16* idx_pages,
+                                  int max_pages, int slot, int row0, int pos0, int len, int snap_k, float eps,
+                                  cudaStream_t st, int3* idx_raw_thw = nullptr,
+                                  int3* idx_raw_thw_snap = nullptr, const int3* row_rope = nullptr) {
+    if (len <= 0) return;
+    if (snap_k == 0 && len >= 16) {
+        const int first_blk = pos0 >> 2;
+        const int end_blk = (pos0 + len) >> 2;
+        const int n_blks = end_blk - first_blk;
+        if (n_blks > 0) {
+            k_qsa_k_update_pf_blocks<<<n_blks, 128, 0, st>>>(
+                idx_qk, k_norm_w, idx_raw, idx_pages, max_pages, slot, row0, pos0, len, first_blk, n_blks, eps,
+                idx_raw_thw, row_rope);
+        }
+        k_qsa_k_update_pf_tail<<<1, 128, 0, st>>>(idx_qk, idx_raw, slot, row0, pos0, len, idx_raw_thw, row_rope);
+    } else {
+        k_qsa_k_update_seg<<<1, 128, 0, st>>>(
+            idx_qk, k_norm_w, idx_raw, snap_k > 0 ? idx_raw_snap : nullptr, idx_pages,
+            max_pages, slot, row0, pos0, len, snap_k, eps,
+            idx_raw_thw, snap_k > 0 ? idx_raw_thw_snap : nullptr, row_rope);
+    }
+}
+
 // QSA Indexer scoring + top-512 block selection per query row m.
 // Only runs work when num_complete_blocks = (pos + 1) / 4 > 512; otherwise sets sel_counts[m] = -1 (dense).
 // Grid: (M), Block: 256 threads.
@@ -1523,10 +1623,9 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
     } else {
         for (int s = 0; s < nsegs; ++s) {
             if (segs[s].len <= 0) continue;
-            k_qsa_k_update_seg<<<1, 128, 0, st>>>(sc.idx_qk, w.idx_k_norm, kv.idx_raw,
-                                                  snap_k > 0 ? kv.idx_raw_snap : nullptr, kv.idx_pages,
-                                                  max_pages, segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, snap_k, geom::RMS_EPS,
-                                                  kv.idx_raw_thw, snap_k > 0 ? kv.idx_raw_thw_snap : nullptr, row_rope_dev);
+            qsa_k_update_seg_fast(sc.idx_qk, w.idx_k_norm, kv.idx_raw, kv.idx_raw_snap, kv.idx_pages,
+                                  max_pages, segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, snap_k, geom::RMS_EPS, st,
+                                  kv.idx_raw_thw, kv.idx_raw_thw_snap, row_rope_dev);
         }
     }
     if (need_qsa) {
