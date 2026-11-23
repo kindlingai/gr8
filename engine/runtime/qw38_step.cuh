@@ -373,6 +373,11 @@ struct Engine {
     std::function<void(int c, __nv_bfloat16* hyper, const float* inj, int M)> direct_hc_inject;
     std::function<void(int c, __nv_bfloat16* hyper, const __nv_bfloat16* w_norm, const __nv_bfloat16* w_inj,
                        __nv_bfloat16* hn_out, float* inj_io, int M)> direct_hc_inject_norm;
+    // Optional sequence-parallel HC callbacks (multi-rank prefill): RS(M/nr) -> local HC(M/nr) -> AG(M/nr).
+    std::function<void(int M, int n_layers, int slice_rows)> step_begin_sp;
+    std::function<void(int c, __nv_bfloat16* hyper_loc, const __nv_bfloat16* w_norm, const __nv_bfloat16* w_inj,
+                       __nv_bfloat16* hn_loc, float* inj_loc, int r0, int m_loc)> direct_hc_rs_inject_norm;
+    std::function<void(int c, __nv_bfloat16* mixed, int M, int slice_rows)> direct_ag_assemble;
     std::function<void()> step_end;
     std::function<int()> step_parity;     // returns 0 or 1 for double-buffered multi-box graph capture
 
@@ -963,8 +968,16 @@ struct Engine {
         QW38_CK(cudaMemcpyAsync(d_slot, h_slot_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
         QW38_CK(cudaMemcpyAsync(d_pos, h_pos_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
 
-        // 0a. Notify multi-collective fabric step start (single enqueue_step for all 2*L+1 collectives on TP>=2)
-        if (step_begin) step_begin(M, skip_head, -1);
+        const bool use_direct_ar = (o.nr > 1 && o.nloc == 1 && direct_send_dst && direct_ar_wait && direct_hc_inject);
+        const bool use_sp_hc = (use_direct_ar && skip_head && !has_mtp && M >= 64 && L.size() >= 2 &&
+                                step_begin_sp && direct_hc_rs_inject_norm && direct_ag_assemble);
+        const int sp_slice = use_sp_hc ? ((M + o.nr - 1) / o.nr) : M;
+        const int sp_r0 = use_sp_hc ? std::min(o.rank0 * sp_slice, M) : 0;
+        const int sp_m = use_sp_hc ? std::min(sp_slice, M - sp_r0) : M;
+
+        // 0a. Notify multi-collective fabric step start (single enqueue_step for all collectives on TP>=2)
+        if (use_sp_hc) step_begin_sp(M, int(L.size()), sp_slice);
+        else if (step_begin) step_begin(M, skip_head, -1);
 
         // 0b. Kick off async PLE NVMe fetch BEFORE Layer 0 GPU compute so it overlaps completely behind Layer 0!
         bool ple_in_flight = false;
@@ -1010,8 +1023,6 @@ struct Engine {
         const size_t part_stride = size_t(M) * geom::HID;
         const size_t hrb = head_row_bytes(o.nc);
         const size_t rank_pkt_bytes = size_t(M) * hrb;
-
-        const bool use_direct_ar = (o.nr > 1 && o.nloc == 1 && direct_send_dst && direct_ar_wait && direct_hc_inject);
 
         auto run_layer_gpu = [&](size_t li, int& coll) {
             Layer& y = L[li];
@@ -1196,6 +1207,123 @@ struct Engine {
             cudaEventElapsedTime(&ms, ev0, ev1);
             acc += ms;
         };
+
+        if (use_sp_hc) {
+            // Sequence-Parallel HC prefill (skip_head && !has_mtp, M >= 64, L >= 2):
+            // Layer 0 runs replicated so Layer-1 PLE sees full hyper[0..M-1].
+            // Layers 1..L-1 shard hyper/HC across ranks (RS -> local M/nr HC -> AG), cutting HC HBM+compute by TP!
+            int coll = 0;
+            const size_t wire_rs = size_t(sp_m) * geom::HID * 2;
+            const size_t wire_ag = size_t(sp_slice) * geom::HID * 2;
+            __nv_bfloat16* hyper_loc = hyper + size_t(sp_r0) * geom::HC_D;
+            const int r = o.rank0;
+
+            // --- Layer 0 (replicated) ---
+            {
+                Layer& y = L[0];
+                RankLayer& rl = y.rk[0];
+                t_start();
+                qw38::hc_prepare(blas, y.attn_hc, hyper, mixed, hc_sc, M, stream);
+                t_end(prof.hc_ms);
+
+                t_start();
+                __nv_bfloat16* p_dst = direct_send_dst(coll);
+                if (y.is_full) {
+                    qw38::full_attn_forward(blas, rl.attn_w, rl.kv, attn_sc, mixed, p_dst,
+                                            d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r,
+                                            max_pps, max_blocks, stream, snap_k);
+                } else {
+                    qw38::gdn_forward(blas, rl.gdn_w, rl.gdn_st, gdn_sc, mixed, p_dst,
+                                      segs.data(), int(segs.size()), M, o.nr, r, true, stream, d_slot, d_pos, snap_k);
+                }
+                t_end(y.is_full ? prof.attn_ms : prof.gdn_ms);
+
+                t_start(); direct_ar_wait(coll, part_stride * 2); t_end(prof.ar_ms);
+                t_start();
+                if (direct_hc_inject_norm) {
+                    direct_hc_inject_norm(coll, hyper, y.mlp_hc.norm, y.mlp_hc.inject, hc_sc.hn, hc_sc.inj, M);
+                    ++coll;
+                    qw38::hc_prepare_from_hn(blas, y.mlp_hc, mixed, hc_sc, M, stream);
+                } else {
+                    direct_hc_inject(coll++, hyper, hc_sc.inj, M);
+                    qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
+                }
+                t_end(prof.hc_ms);
+
+                t_start();
+                qw38::moe_forward(blas, rl.moe_w, moe_sc, mixed, direct_send_dst(coll), M, stream);
+                t_end(prof.moe_ms);
+
+                t_start(); direct_ar_wait(coll, part_stride * 2); t_end(prof.ar_ms);
+                t_start(); direct_hc_inject(coll++, hyper, hc_sc.inj, M); t_end(prof.hc_ms);
+            }
+
+            // --- Layer 1 PLE (on full replicated hyper) + Enter SP-HC ---
+            {
+                Layer& y1 = L[1];
+                if (geom::is_ple(y1.l) && has_ple) {
+                    finish_ple_io();
+                    t_start();
+                    QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
+                    qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream, d_slot, d_pos, snap_k);
+                    t_end(prof.ple_gpu_ms);
+                }
+                t_start();
+                qw38::hc_prepare(blas, y1.attn_hc, hyper_loc, direct_send_dst(coll), hc_sc, sp_m, stream);
+                t_end(prof.hc_ms);
+                t_start(); direct_ar_wait(coll, wire_ag); t_end(prof.ar_ms);
+                t_start(); direct_ag_assemble(coll++, mixed, M, sp_slice); t_end(prof.hc_ms);
+            }
+
+            // --- Layers 1 .. L-1 (Sequence-Parallel HC!) ---
+            for (size_t li = 1; li < L.size(); ++li) {
+                Layer& y = L[li];
+                RankLayer& rl = y.rk[0];
+                const bool last_layer = (li + 1 == L.size());
+
+                t_start();
+                __nv_bfloat16* p_dst = last_layer ? parts : direct_send_dst(coll);
+                if (y.is_full) {
+                    qw38::full_attn_forward(blas, rl.attn_w, rl.kv, attn_sc, mixed, p_dst,
+                                            d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r,
+                                            max_pps, max_blocks, stream, snap_k);
+                } else {
+                    qw38::gdn_forward(blas, rl.gdn_w, rl.gdn_st, gdn_sc, mixed, p_dst,
+                                      segs.data(), int(segs.size()), M, o.nr, r, true, stream, d_slot, d_pos, snap_k);
+                }
+                t_end(y.is_full ? prof.attn_ms : prof.gdn_ms);
+
+                // Last layer of a skip_head && !has_mtp chunk: KV/GDN state is written; MoE/hyper output is dead.
+                if (last_layer) break;
+
+                // Attn RS -> local fused inject+norm -> local MLP HC -> MLP AG
+                t_start(); direct_ar_wait(coll, wire_rs); t_end(prof.ar_ms);
+                t_start();
+                direct_hc_rs_inject_norm(coll++, hyper_loc, y.mlp_hc.norm, y.mlp_hc.inject, hc_sc.hn, hc_sc.inj, sp_r0, sp_m);
+                qw38::hc_prepare_from_hn(blas, y.mlp_hc, direct_send_dst(coll), hc_sc, sp_m, stream);
+                t_end(prof.hc_ms);
+                t_start(); direct_ar_wait(coll, wire_ag); t_end(prof.ar_ms);
+                t_start(); direct_ag_assemble(coll++, mixed, M, sp_slice); t_end(prof.hc_ms);
+
+                // MoE -> MoE RS -> local fused inject+norm -> local next-Attn HC -> next-Attn AG
+                t_start();
+                qw38::moe_forward(blas, rl.moe_w, moe_sc, mixed, direct_send_dst(coll), M, stream);
+                t_end(prof.moe_ms);
+
+                t_start(); direct_ar_wait(coll, wire_rs); t_end(prof.ar_ms);
+                t_start();
+                const qw38::HcWeights& next_hc = L[li + 1].attn_hc;
+                direct_hc_rs_inject_norm(coll++, hyper_loc, next_hc.norm, next_hc.inject, hc_sc.hn, hc_sc.inj, sp_r0, sp_m);
+                qw38::hc_prepare_from_hn(blas, next_hc, direct_send_dst(coll), hc_sc, sp_m, stream);
+                t_end(prof.hc_ms);
+                t_start(); direct_ar_wait(coll, wire_ag); t_end(prof.ar_ms);
+                t_start(); direct_ag_assemble(coll++, mixed, M, sp_slice); t_end(prof.hc_ms);
+            }
+
+            if (step_end) step_end();
+            if (o.profile) { ++prof.steps; prof.tokens += M; }
+            return;
+        }
 
         const bool fuse_inj_hc = (M > 12) && (!use_direct_ar || static_cast<bool>(direct_hc_inject_norm));
         auto inject_or_fuse = [&](int c, const qw38::HcWeights* next_hc) -> bool {

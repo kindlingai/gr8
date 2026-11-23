@@ -384,6 +384,26 @@ __global__ void k_hc_inject_ptrs(__nv_bfloat16* __restrict__ hyper,
     }
 }
 
+// Assemble full mixed[M, 2560] from per-rank sequence-parallel slices p0..p3 (each [slice_rows, 2560]).
+// Grid: (M * 5), Block: 64 -> 5 * 64 * 8 = 2560 exact. Uses __ldcv on peer slices (owner != own_rank).
+__global__ void k_sp_ag_assemble(__nv_bfloat16* __restrict__ mixed,
+                                 const __nv_bfloat16* __restrict__ p0,
+                                 const __nv_bfloat16* __restrict__ p1,
+                                 const __nv_bfloat16* __restrict__ p2,
+                                 const __nv_bfloat16* __restrict__ p3,
+                                 int M, int slice_rows, int own_rank) {
+    const int m = blockIdx.x / 5;
+    const int blk = blockIdx.x % 5;
+    if (m >= M) return;
+    const int d8 = blk * 64 + threadIdx.x; // 0..319
+    const int owner = m / slice_rows;
+    const int loc_m = m - owner * slice_rows;
+    const __nv_bfloat16* ptrs[4] = {p0, p1, p2, p3};
+    const uint4* src = reinterpret_cast<const uint4*>(ptrs[owner] + static_cast<size_t>(loc_m) * geom::HID) + d8;
+    const uint4 v = (owner == own_rank) ? (*src) : __ldcv(src);
+    reinterpret_cast<uint4*>(mixed + static_cast<size_t>(m) * geom::HID)[d8] = v;
+}
+
 // Fused residual injection + next HC grouped RMSNorm + next W_inj GEMV (for prefill M > 12).
 // Grid: M, Block: 320 (10 warps; 320 * 8 = 2560 exact). Reads hyper ONCE, updates hyper in-place,
 // computes hn_next and inj_next in registers (eliminates 42 MB hyper re-read + 1 kernel launch per sublayer!).

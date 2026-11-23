@@ -103,6 +103,60 @@ struct Wire {
         QW38_CK(cudaMemcpyAsync(d_step, &step, sizeof(step), cudaMemcpyHostToDevice, st));
     }
 
+    // Sequence-parallel HC prefill step: L0 (2 ARs) + L1 pre-Attn AG + (L-2) * (Attn RS, MLP AG, MoE RS, Next-Attn AG).
+    void fast_begin_sp(int M, int nl, int slice_rows, cudaStream_t st) {
+        const uint32_t wire_part = static_cast<uint32_t>((size_t(M) * geom::HID * 2 + 15) / 16 * 16);
+        const uint32_t wire_ag = static_cast<uint32_t>((size_t(slice_rows) * geom::HID * 2 + 15) / 16 * 16);
+        const int n_colls = 3 + 4 * (nl - 2);
+        std::vector<uint32_t> sizes(static_cast<size_t>(n_colls), wire_ag);
+        sizes[0] = wire_part;
+        sizes[1] = wire_part;
+        sizes[2] = wire_ag;
+        g6::Fabric::Rs rs;
+        rs.ss = size_t(slice_rows) * geom::HID * 2;
+        rs.bytes.resize(static_cast<size_t>(nr));
+        for (int p = 0; p < nr; ++p) {
+            const int rp0 = std::min(p * slice_rows, M);
+            const int rm = std::min(slice_rows, M - rp0);
+            rs.bytes[size_t(p)] = static_cast<uint32_t>(size_t(rm) * geom::HID * 2);
+        }
+        for (int li = 1; li < nl - 1; ++li) {
+            const int cb = 3 + 4 * (li - 1);
+            rs.mask.set(size_t(cb));
+            rs.flat.set(size_t(cb));
+            rs.mask.set(size_t(cb + 2));
+            rs.flat.set(size_t(cb + 2));
+        }
+        fab.enqueue_step(step, sizes, rs);
+        QW38_CK(cudaMemcpyAsync(d_step, &step, sizeof(step), cudaMemcpyHostToDevice, st));
+    }
+
+    void fast_hc_rs_inject_norm(int c, __nv_bfloat16* hyper_loc, const __nv_bfloat16* w_norm, const __nv_bfloat16* w_inj,
+                                __nv_bfloat16* hn_loc, float* inj_loc, int r0, int m_loc, cudaStream_t st) const {
+        const int par = static_cast<int>(step & 1);
+        const __nv_bfloat16* pt[4] = {nullptr, nullptr, nullptr, nullptr};
+        for (int p = 0; p < nr; ++p) {
+            if (p == rank) {
+                pt[p] = reinterpret_cast<const __nv_bfloat16*>(
+                    f.send + g6::fab_send_off(f, par, c) + size_t(r0) * geom::HID * 2);
+            } else {
+                pt[p] = reinterpret_cast<const __nv_bfloat16*>(f.recv + g6::fab_recv_off(f, par, c, p));
+            }
+        }
+        qw38::k_hc_inject_rmsnorm_inj_ptrs<<<m_loc, 320, 0, st>>>(
+            hyper_loc, pt[0], pt[1], pt[2], pt[3], w_norm, w_inj, hn_loc, inj_loc, m_loc, nr, rank, geom::RMS_EPS);
+    }
+
+    void fast_ag_assemble(int c, __nv_bfloat16* mixed, int M, int slice_rows, cudaStream_t st) const {
+        const int par = static_cast<int>(step & 1);
+        const __nv_bfloat16* pt[4] = {nullptr, nullptr, nullptr, nullptr};
+        for (int p = 0; p < nr; ++p) {
+            if (p == rank) pt[p] = reinterpret_cast<const __nv_bfloat16*>(f.send + g6::fab_send_off(f, par, c));
+            else pt[p] = reinterpret_cast<const __nv_bfloat16*>(f.recv + g6::fab_recv_off(f, par, c, p));
+        }
+        qw38::k_sp_ag_assemble<<<M * 5, 64, 0, st>>>(mixed, pt[0], pt[1], pt[2], pt[3], M, slice_rows, rank);
+    }
+
     void fast_dev(int c, __nv_bfloat16* parts, size_t bytes, cudaStream_t st) {
         const size_t wire = (bytes + 15) / 16 * 16;
         qw38_ar_exchange(f, d_step, static_cast<int>(step & 1), c, reinterpret_cast<char*>(parts), wire, st);
@@ -284,7 +338,7 @@ int main(int argc, char** argv) {
     Wire wire;
     if (G6_NR > 1) {
         wire.fast = knob::qw38_fast_ar();
-        const size_t max_part_b = (size_t(o.max_rows) * geom::HID * 2 + 15) / 16 * 16;
+        const size_t max_part_b = (size_t((o.max_rows + G6_NR - 1) / G6_NR) * G6_NR * geom::HID * 2 + 8 * G6_NR + 15) / 16 * 16;
         const size_t max_head_b = (size_t(o.max_rows) * head_row_bytes(o.nc) + 15) / 16 * 16;
         const size_t slot_b = std::max(max_part_b, max_head_b);
         g6::FabricConfig cfg;
@@ -292,15 +346,16 @@ int main(int argc, char** argv) {
         cfg.ips = peers;
         if (!ips2.empty()) cfg.ips2 = split_csv(ips2);
         cfg.proxy_cpu = proxy_cpu;
-        cfg.ncoll = wire.fast ? static_cast<int>(2 * e.L.size() + 1) : 1;
+        cfg.ncoll = wire.fast ? static_cast<int>(4 * e.L.size() + 1) : 1;
         cfg.stripe_min = cfg.ips2.empty() ? 0 : 65536;
         cfg.slot_bytes = (slot_b + 7) / 8 * 8;
         if (wire.fast && !e.L.empty()) {
-            cfg.run1 = static_cast<int>(2 * e.L.size());
+            cfg.run1 = static_cast<int>(4 * e.L.size());
             cfg.run2 = cfg.ncoll;
             cfg.slot_bytes1 = (max_head_b + 7) / 8 * 8;
             cfg.pool = std::min(4, cfg.run1);
             cfg.compact = true;
+            cfg.sge2 = true;
         }
         wire.fab.init(cfg);
         wire.f = wire.fab.dev();
@@ -322,6 +377,14 @@ int main(int argc, char** argv) {
             e.direct_hc_inject_norm = [&](int c, __nv_bfloat16* h, const __nv_bfloat16* wn, const __nv_bfloat16* wi,
                                           __nv_bfloat16* hn, float* inj_io, int M) {
                 wire.fast_hc_inject_norm(c, h, wn, wi, hn, inj_io, M, e.stream);
+            };
+            e.step_begin_sp = [&](int M, int nl, int sr) { wire.fast_begin_sp(M, nl, sr, e.stream); };
+            e.direct_hc_rs_inject_norm = [&](int c, __nv_bfloat16* hl, const __nv_bfloat16* wn, const __nv_bfloat16* wi,
+                                             __nv_bfloat16* hnl, float* il, int r0, int ml) {
+                wire.fast_hc_rs_inject_norm(c, hl, wn, wi, hnl, il, r0, ml, e.stream);
+            };
+            e.direct_ag_assemble = [&](int c, __nv_bfloat16* mx, int M, int sr) {
+                wire.fast_ag_assemble(c, mx, M, sr, e.stream);
             };
             e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.fast_host(c, p, b); };
             e.step_end = [&]() { wire.fast_end(e.stream); };

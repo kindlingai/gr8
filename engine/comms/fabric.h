@@ -94,19 +94,27 @@ struct FabricDev {
   int pool = 0;                // FabricConfig::pool
 };
 
-// A set of collectives (Fabric::Rs mask / skip / p2p / flat): bit c for c in [0, 128). It converts from a 32-bit
-// `unsigned`, so callers that pass 0x5 compile unchanged. DS41's 40 layers need more than 32 collectives.
+// A set of collectives (Fabric::Rs mask / skip / p2p / flat): bit c for c in [0, 256). It converts from a 32-bit
+// `unsigned`, so callers that pass 0x5 compile unchanged. 48-layer SP-HC prefill uses up to 192 collectives.
 struct CollMask {
-  uint64_t w[2] = {0, 0};
+  uint64_t w[4] = {0, 0, 0, 0};
   CollMask() = default;
   CollMask(unsigned m) { w[0] = m; }
-  static constexpr size_t kBits = 128;
+  static constexpr size_t kBits = 256;
   bool bit(size_t c) const { return c < kBits && (w[c >> 6] >> (c & 63) & 1u); }
   void set(size_t c) { if (c < kBits) w[c >> 6] |= uint64_t(1) << (c & 63); }
-  bool any() const { return w[0] || w[1]; }
+  bool any() const { return w[0] || w[1] || w[2] || w[3]; }
   explicit operator bool() const { return any(); }
-  CollMask operator&(const CollMask& o) const { CollMask r; r.w[0] = w[0] & o.w[0]; r.w[1] = w[1] & o.w[1]; return r; }
-  CollMask operator~() const { CollMask r; r.w[0] = ~w[0]; r.w[1] = ~w[1]; return r; }
+  CollMask operator&(const CollMask& o) const {
+    CollMask r;
+    for (int i = 0; i < 4; ++i) r.w[i] = w[i] & o.w[i];
+    return r;
+  }
+  CollMask operator~() const {
+    CollMask r;
+    for (int i = 0; i < 4; ++i) r.w[i] = ~w[i];
+    return r;
+  }
   bool operator!() const { return !any(); }
 };
 
