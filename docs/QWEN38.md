@@ -73,5 +73,18 @@ Every `GR8_QW38_*` knob is registered in `knobs/qw38.yaml` (documented in [ENV.m
 | `GR8_QW38_PLE_CACHE_MIB` | `1024` | Host LRU cache size (MiB) for PLE rows (`0` disables caching). |
 | `GR8_QW38_WIDTHS` | *(unset)* | Optional path to a width manifest JSON when `--widths` is not passed on the command line. |
 | `GR8_QW38_FAST_AR` | `1` | Single-step multi-collective device-driven RDMA all-reduce (`ncoll = 2*L+1 = 97` on `TP>=2`). Set `=0` for per-collective fallback. |
+| `GR8_QW38_VISION` | `0` | Opt-in multimodal image input (`--serve` only). Loads `dense/vision-bf16.safetensors` (27-layer BF16 ViT, ~898 MB per rank) with interleaved 3D MRoPE (`mrope_section=[11,11,10]`). Set `=0` (default) for text-only serving. |
 | `GR8_PTAB` | `0` | Fixed-address device piece table (`0`=off, `1`=paged, `2`=paged+slab pool) for minimal-move live scaling. |
 | `MTP` (`--mtp`) | `0` | Layer-48 MTP speculative draft depth (`0..3`). |
+
+## Image input (vision)
+
+Pass `GR8_QW38_VISION=1` at launch when the release directory includes `dense/vision-bf16.safetensors` (`v0.2` and later):
+
+```bash
+GR8_QW38_VISION=1 ./gr8 qw38 up --model /path/to/qwen38-flash-next-exlr8 --tp 2 --peers HOST0,HOST1 --variant bit300
+GR8_QW38_VISION_SMOKE=1 ./gr8 qw38 smoke
+```
+
+- **Vision tower**: 27-layer BF16 ViT (`1152` hidden, `16 × 72` heads, axial 2D RoPE `theta=10000`, `48 × 48` bilinear `align_corners=True` position embeddings, `16 × 16` patches, `2 × 2` spatial merger to `2560`, `64..16384` tokens per image). Every TP rank runs the tower locally (~898 MB weights).
+- **Text integration**: Interleaved 3D MRoPE (`mrope_section=[11, 11, 10]` across the 32 partial-RoPE pairs, including QSA block-4 keys) during prefill, and isotropic post-image `mrope_delta` shift during decode and MTP so CUDA-graphed decode and MTP stay active and bit-exact after image turns. Text-only requests are unaffected.

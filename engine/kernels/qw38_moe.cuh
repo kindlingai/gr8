@@ -56,7 +56,7 @@ struct MoeScratch {
     float* router_logits = nullptr;    // [max_M, 512] FP32
     int* topk_idx = nullptr;           // [max_M, 10] INT32
     float* topk_w = nullptr;           // [max_M, 10] FP32
-    // Grouped routing buffers for PMCGX routed experts (up to max_M * 10 groups of <= 8 tokens):
+    // Grouped routing buffers for PMCGX routed experts:
     int* d_n_groups = nullptr;         // [1] INT32
     int* grp_exp = nullptr;            // [max_M * 10] INT32
     int* grp_cnt = nullptr;            // [max_M * 10] INT32

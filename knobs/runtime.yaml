@@ -53,6 +53,15 @@ knobs:
       1 = g6m4 prints every fabric's config (one line each, every field) where it would create it, then exits with code
       4 before the first: no file, fabric, network or GPU work. The fabrics the built model completes show what the options set.
       Compares the fabric bring-up of two builds (docs/HOST-CORE.md, R6c).
+  GR8_FABRIC_POOL:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..65535"
+    doc: >-
+      EL6 (#154): build g6m4's fabrics and S2 control bootstrap from a g6::FabricPool group (mesh only, at least 2 ranks)
+      and tear down the group's fabrics cleanly via Fabric::close() at exit. 0 = off (direct Fabric::init, unchanged),
+      1 = on with the default pool control port (18800), 1024..65535 = on with that explicit pool control port.
   GR8_GEN_CACHE:
     scope: local
     kind: path
