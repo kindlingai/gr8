@@ -445,6 +445,11 @@ run_job flash_rewidth_test '
   g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_rewidth_test.cpp" -o "$D/flash_rewidth_test" "${KVLIB[@]}"
   TMPDIR="$D" "$D/flash_rewidth_test" "$REPO/engine/target/release/kvman-peer"
 '
+# EL4d (#161): canonical head-split, DFlash2 ring, KDA linear-attention + conv state (vs kda::heads) and session envelope C FFI
+run_job canon_state_test '
+  g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/canon_state_test.cpp" -o "$D/canon_state_test" "${KVLIB[@]}"
+  "$D/canon_state_test"
+'
 run_job kda_carry_cpu_test '
   g++ -std=c++17 -O2 -ffp-contract=off -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/kda_carry_cpu_test.cpp" -o "$D/kda_carry_cpu_test" "${KNOBS[@]}"
   "$D/kda_carry_cpu_test"
