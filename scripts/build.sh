@@ -23,6 +23,7 @@
 #                                         scripts/ds41_build_flags.sh)
 #   GR8_TESTS=0 / GR8_TESTS=only        the GLM engine without the test binaries below it, or the tests alone (CI
 #                                         builds them on separate runners)
+#   GR8_TESTS=ship                      only the test binaries the image ships: tr3_e4m3_test and gpuprobe
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
 #                                         without the CUDA toolkit (the engine finds it there at any TP)
 # These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
@@ -58,7 +59,7 @@ done
 # Needs cmake; GLM-5.3 and Flash
 GR_OFF=""
 if [ "${MODEL:-glm}" = ds41 ] || [ "${MODEL:-glm}" = ink2 ] || [ "${MODEL:-glm}" = qw38 ]; then GR_OFF="MODEL=${MODEL}"
-elif [ "${GR8_TESTS:-1}" = only ]; then GR_OFF="GR8_TESTS=only builds no engine"
+elif [ "${GR8_TESTS:-1}" = only ] || [ "${GR8_TESTS:-1}" = ship ]; then GR_OFF="GR8_TESTS=${GR8_TESTS} builds no engine"
 elif [ "${GR8_XGRAMMAR:-}" = 0 ]; then GR_OFF="GR8_XGRAMMAR=0"
 fi
 if [ -n "$GR_OFF" ]; then
@@ -175,8 +176,8 @@ if [ -n "$BUILD_DEFINE" ]; then
   done <<< "$BUILD_MARKERS"
   exit 0
 fi
-case "${GR8_TESTS:-1}" in 0|1|only) ;; *) echo "GR8_TESTS=$GR8_TESTS: 0, 1 or only"; exit 2 ;; esac
-if [ "${GR8_TESTS:-1}" != only ]; then
+case "${GR8_TESTS:-1}" in 0|1|only|ship) ;; *) echo "GR8_TESTS=$GR8_TESTS: 0, 1, only or ship"; exit 2 ;; esac
+if [ "${GR8_TESTS:-1}" != only ] && [ "${GR8_TESTS:-1}" != ship ]; then
   WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
   if [ "${BUNDLE_LIBS:-0}" = 1 ]; then
     mkdir -p "$OUT/lib"
@@ -203,6 +204,28 @@ build() {   # build <bin> <command..>: in the background, at most J at once; a f
   while [ "$(jobs -rp | wc -l)" -ge "$J" ]; do wait -n || true; done
   { "${@:2}" > "$TL/$1.log" 2>&1 || touch "$TL/$1.failed"; } &
 }
+built() {   # wait for the compiles, print their logs, and stop if one failed
+  wait
+  cat "$TL"/*.log
+  if ls "$TL"/*.failed > /dev/null 2>&1; then echo "test builds failed: $(cd "$TL" && ls -- *.failed | sed 's/\.failed$//')"; exit 1; fi
+}
+check() {   # check <test>: run $OUT/<test>; print its last line, named, or all of it and fail
+  local t
+  t=$("$OUT/$1") || { echo "$t"; echo "$1 FAILED"; exit 1; }
+  t=$(echo "$t" | tail -1)
+  case "$t" in "$1"*) echo "$t" ;; *) echo "$1: $t" ;; esac
+}
+# The two the image ships first: GR8_TESTS=ship (CI's image) stops after them.
+# TR3 / exlr8-e4m3 decode unit test; runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
+build tr3_e4m3_test $NVCC -O2 -std=c++17 $GEN -o "$OUT/tr3_e4m3_test" "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" \
+  -lcublas "${KNOBS[@]}"
+# gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py)
+build gpuprobe $NVCC -O2 -std=c++17 $GEN -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
+if [ "${GR8_TESTS:-1}" = ship ]; then
+  built
+  if nvidia-smi -L > /dev/null 2>&1; then check tr3_e4m3_test; else echo "tr3_e4m3_test: compiled; no GPU visible, not run"; fi
+  exit 0
+fi
 # The compiles run first, the longest first. The tests run after them, in order.
 # GR8_L2PF (paced side-stream L2 prefetch in the step's idle-DRAM windows): byte-exact check + per-layer timing of the
 # decode layer sequence (real attention, x_in / q_b / o_proj / router GEMVs, wait and MoE stand-ins); build only (needs
@@ -260,11 +283,6 @@ for t in $DS41_V2_TESTS; do
   # shellcheck disable=SC2086
   build "${t##*/}" $NVCC -O2 -std=c++17 $GEN -o "$OUT/${t##*/}" "$REPO/engine/$t.cu" "${x[@]}" "${KNOBS[@]}"
 done
-# TR3 / exlr8-e4m3 decode unit test; runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
-build tr3_e4m3_test $NVCC -O2 -std=c++17 $GEN -o "$OUT/tr3_e4m3_test" "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" \
-  -lcublas "${KNOBS[@]}"
-# gpuprobe: the GPU part of the rank health probe (tools/health/rank_probe.py)
-build gpuprobe $NVCC -O2 -std=c++17 $GEN -o "$OUT/gpuprobe" "$REPO/tools/health/gpuprobe.cu"
 # the prefetch queues (GR8_L2PF targets, GR8_MTP_L2PF's draft eh_proj / head targets): order and capacity, CPU
 # shellcheck disable=SC2086
 build l2pf_queue_test $NVCC -O2 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR} -I "$REPO/engine/kernels" \
@@ -281,15 +299,7 @@ build dfl_topk_test $NVCC -O2 -std=c++17 $GEN -o "$OUT/dfl_topk_test" "$REPO/eng
 # flat reduce-scatter slices (Fabric::Rs::flat) over real verbs, mesh or ring: built here, run on the cluster (see its header)
 build fabric_rs_flat_test $NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_rs_flat_test" \
   "$REPO/engine/comms/tests/fabric_rs_flat_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs "${KNOBS[@]}"
-wait
-cat "$TL"/*.log
-if ls "$TL"/*.failed > /dev/null 2>&1; then echo "test builds failed: $(cd "$TL" && ls -- *.failed | sed 's/\.failed$//')"; exit 1; fi
-check() {   # check <test>: run $OUT/<test>; print its last line, named, or all of it and fail
-  local t
-  t=$("$OUT/$1") || { echo "$t"; echo "$1 FAILED"; exit 1; }
-  t=$(echo "$t" | tail -1)
-  case "$t" in "$1"*) echo "$t" ;; *) echo "$1: $t" ;; esac
-}
+built
 check l2pf_queue_test
 check k1_split_test
 check sampler_u01_test
