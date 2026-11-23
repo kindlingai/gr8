@@ -917,6 +917,13 @@ struct Engine {
         gdn_sc.a = dalloc<__nv_bfloat16>(M * size_t(max_nh_v));
         gdn_sc.b = dalloc<__nv_bfloat16>(M * size_t(max_nh_v));
         gdn_sc.core = dalloc<__nv_bfloat16>(M * size_t(max_nh_v) * geom::GDN_DV);
+        const size_t max_wy_chunks = (M + qw38::GDN_WY_CH - 1) / qw38::GDN_WY_CH;
+        gdn_sc.wy_qe = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DK);
+        gdn_sc.wy_kd = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DK);
+        gdn_sc.wy_w = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DK);
+        gdn_sc.wy_u = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DV);
+        gdn_sc.wy_aq = dalloc<uint16_t>(size_t(max_nh_v) * M * qw38::GDN_WY_CH);
+        gdn_sc.wy_glast = dalloc<float>(size_t(max_nh_v) * max_wy_chunks);
 
         const int max_nh_q = geom::nh_q(o.nr);
         const int max_nh_kv = geom::nh_kv_max(o.nr);
