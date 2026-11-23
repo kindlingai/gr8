@@ -425,6 +425,97 @@ template <bool QO = false> __global__ void __launch_bounds__(256) k_own_unpack(O
     const int r0 = pf_r0(M, p, f.nr), n16 = pf_rows(M, p, f.nr) * R16;
     for (int i = blockIdx.x * 256 + threadIdx.x; i < n16; i += gridDim.x * 256) *own_at<QO>(r, r0 + i / R16, i % R16) = __ldcv(s16 + i);
 }
+// Pair-private OWN=4 all-gather helpers (c3 = common [kv_a (+ idx_k)] for all peers + QA suffix for pair peer only;
+// idx_w stays local; c4 = selected IDs to pair peer only when every consumer layer is pair-owned).
+__global__ void __launch_bounds__(32) k_wait_ag1(g6::FabricDev f, const u64* stepp, int c, int M, int row_bytes, int peer)
+{
+    if (threadIdx.x != 0) return;
+    const u64 step = *stepp;
+    const u64 seq = g6::coll_seq(step, c, f.ncoll);
+    const u64* tail = reinterpret_cast<const u64*>(glue::peer_slot(f, step, c, peer) + (size_t)pf_rows(M, peer, f.nr) * row_bytes);
+    const long long t0 = clock64();
+    unsigned it = 0;
+    while (glue::ld_acquire_sys(tail) != seq)
+        if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > G6_SPIN_TIMEOUT_CYC))
+        {
+            atomicCAS(f.error, 0u, glue::ERR_AR | ((unsigned)c << 8) | (unsigned)peer);
+            break;
+        }
+}
+__global__ void __launch_bounds__(256) k_ag_copy1(g6::FabricDev f, const u64* stepp, int c, int M, int row_bytes, int peer, char* dst)
+{
+    const uint4* s16 = reinterpret_cast<const uint4*>(glue::peer_slot(f, *stepp, c, peer));
+    uint4* d16 = reinterpret_cast<uint4*>(dst + (size_t)pf_r0(M, peer, f.nr) * row_bytes);
+    const size_t n16 = (size_t)pf_rows(M, peer, f.nr) * row_bytes / 16;
+    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n16; i += (size_t)gridDim.x * 256) d16[i] = __ldcv(s16 + i);
+}
+__global__ void __launch_bounds__(32) k_wait_ag_pair(g6::FabricDev f, const u64* stepp, int c, int M, int common_row, int qa_row, int pair_peer)
+{
+    const u64 step = *stepp;
+    const int p = threadIdx.x;
+    if (p < f.nr && p != f.rank)
+    {
+        const u64 seq = g6::coll_seq(step, c, f.ncoll);
+        const size_t rows = (size_t)pf_rows(M, p, f.nr);
+        const size_t off = (p == pair_peer) ? (rows * (size_t)(common_row + qa_row) + 16) : (rows * (size_t)common_row);
+        const u64* tail = reinterpret_cast<const u64*>(glue::peer_slot(f, step, c, p) + off);
+        const long long t0 = clock64();
+        unsigned it = 0;
+        while (glue::ld_acquire_sys(tail) != seq)
+            if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > G6_SPIN_TIMEOUT_CYC))
+            {
+                atomicCAS(f.error, 0u, glue::ERR_AR | ((unsigned)c << 8) | (unsigned)p);
+                break;
+            }
+    }
+}
+template <bool HAS_IX> __global__ void __launch_bounds__(128) k_own_put_pair(OwnRec r, g6::FabricDev f, const u64* stepp, int c, int M, unsigned* ticket)
+{
+    const u64 step = *stepp;
+    uint4* dst = reinterpret_cast<uint4*>(glue::send_slot(f, step, c));
+    constexpr int K16 = KVA * 2 / 16, I16 = HAS_IX ? (IDXK * 2 / 16) : 0, COM16 = K16 + I16, QA16 = QA * 2 / 16;
+    const int r0 = pf_r0(M, f.rank, f.nr), rows = pf_rows(M, f.rank, f.nr);
+    const int n_com = rows * COM16, n_qa = rows * QA16;
+    for (int i = blockIdx.x * 128 + threadIdx.x; i < n_com; i += gridDim.x * 128)
+    {
+        const int row = r0 + i / COM16, k = i % COM16;
+        dst[i] = (k < K16) ? reinterpret_cast<const uint4*>(r.kv_a + (size_t)row * KVA)[k]
+                           : reinterpret_cast<const uint4*>(r.idx_k + (size_t)row * IDXK)[k - K16];
+    }
+    uint4* dst_qa = dst + n_com + 1;   // +1 uint4 (16 B) reserves the common-prefix tail word + 8-B alignment pad
+    for (int i = blockIdx.x * 128 + threadIdx.x; i < n_qa; i += gridDim.x * 128)
+    {
+        const int row = r0 + i / QA16, k = i % QA16;
+        dst_qa[i] = reinterpret_cast<const uint4*>(r.q_a_n + (size_t)row * QA)[k];
+    }
+    glue::publish(f, c, g6::coll_seq(step, c, f.ncoll), ticket);
+}
+template <bool HAS_IX> __global__ void __launch_bounds__(256) k_own_unpack_pair(OwnRec r, g6::FabricDev f, const u64* stepp, int c, int M, int pair_peer)
+{
+    const int p = blockIdx.y;
+    if (p == f.rank) return;
+    const uint4* s16 = reinterpret_cast<const uint4*>(glue::peer_slot(f, *stepp, c, p));
+    constexpr int K16 = KVA * 2 / 16, I16 = HAS_IX ? (IDXK * 2 / 16) : 0, COM16 = K16 + I16, QA16 = QA * 2 / 16;
+    const int r0 = pf_r0(M, p, f.nr), rows = pf_rows(M, p, f.nr);
+    const int n_com = rows * COM16;
+    for (int i = blockIdx.x * 256 + threadIdx.x; i < n_com; i += gridDim.x * 256)
+    {
+        const int row = r0 + i / COM16, k = i % COM16;
+        uint4* out = (k < K16) ? (reinterpret_cast<uint4*>(r.kv_a + (size_t)row * KVA) + k)
+                               : (reinterpret_cast<uint4*>(r.idx_k + (size_t)row * IDXK) + (k - K16));
+        *out = __ldcv(s16 + i);
+    }
+    if (p == pair_peer)
+    {
+        const uint4* s_qa = s16 + n_com + 1;
+        const int n_qa = rows * QA16;
+        for (int i = blockIdx.x * 256 + threadIdx.x; i < n_qa; i += gridDim.x * 256)
+        {
+            const int row = r0 + i / QA16, k = i % QA16;
+            reinterpret_cast<uint4*>(r.q_a_n + (size_t)row * QA)[k] = __ldcv(s_qa + i);
+        }
+    }
+}
 
 struct Prefill
 {
@@ -1406,6 +1497,21 @@ inline void pf_consume(Prefill& P, int c, int M, const __nv_bfloat16* w, __half*
 inline bool pf_own_next(const Model& m, const Prefill& P, int i) { return P.own && i + 1 < m.nl; }
 inline int pf_x_row_bytes(const Model& m, const Prefill& P, int i) { return pf_own_next(m, P, i) ? (P.qo ? QO_REC : OWN_REC) : HID * 2; }
 inline OwnRec pf_own_rec(Prefill& P) { return OwnRec{P.q_a_n, P.kv_a, P.idx_k, P.idx_w}; }
+inline int pf_c3_common_row(bool has_ix) { return (KVA + (has_ix ? IDXK : 0)) * 2; }
+inline bool pf_c3_pair_only(const Prefill& P, int i, int nl, int M)
+{
+    return P.qp && !P.qo && !P.loop && P.f.nr == 4 && i + 1 < nl && (int)P.qpl.size() >= nl && (int)P.ixl.size() >= nl &&
+           P.qpl[i + 1] && (M > 0) && (M % 64 == 0);
+}
+inline bool pf_ix_pair_only(const Prefill& P, int i, int nl)
+{
+    if (!P.qp || P.qo || P.loop || P.f.nr != 4 || !P.ownix || i + 1 >= nl || (int)P.qpl.size() < nl || (int)P.ixl.size() < nl)
+        return false;
+    if (!P.ixl[i + 1] || !P.qpl[i + 1]) return false;
+    for (int j = i + 2; j < nl && !P.ixl[j]; ++j)
+        if (!P.qpl[j]) return false;
+    return true;
+}
 // RS half: owner rows of x; GR8_PF_OWN: then layer i + 1's projections on those rows and their records into c3
 inline void pf_consume_x_rs(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 {
@@ -1424,13 +1530,27 @@ inline void pf_consume_x_rs(Model& m, Prefill& P, int i, int M, cudaStream_t st)
                                                            P.q_a_n + (size_t)r0 * QA, QA);
     }
     pf_mark(0, st);
-    if (P.qo) k_own_put<true><<<PF_PUT, 128, 0, st>>>(pf_own_rec(P), P.f, P.stepp, 3, M, P.tickets + 3);
+    if (pf_c3_pair_only(P, i, m.nl, M))
+    {
+        if (P.ixl[i + 1]) k_own_put_pair<true><<<PF_PUT, 128, 0, st>>>(pf_own_rec(P), P.f, P.stepp, 3, M, P.tickets + 3);
+        else k_own_put_pair<false><<<PF_PUT, 128, 0, st>>>(pf_own_rec(P), P.f, P.stepp, 3, M, P.tickets + 3);
+    }
+    else if (P.qo) k_own_put<true><<<PF_PUT, 128, 0, st>>>(pf_own_rec(P), P.f, P.stepp, 3, M, P.tickets + 3);
     else k_own_put<<<PF_PUT, 128, 0, st>>>(pf_own_rec(P), P.f, P.stepp, 3, M, P.tickets + 3);
 }
 // gather half: every row of x, or (GR8_PF_OWN) every row's q_a_n / kv_a / idx_k / idx_w of layer i + 1
 inline void pf_consume_x_ag(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 {
     if (!pf_own_next(m, P, i)) { pf_consume_ag(P, 1, M, P.x, st); return; }
+    if (pf_c3_pair_only(P, i, m.nl, M))
+    {
+        const bool has_ix = P.ixl[i + 1] != 0;
+        const int pair_peer = P.f.rank ^ 2;
+        k_wait_ag_pair<<<1, 32, 0, st>>>(P.f, P.stepp, 3, M, pf_c3_common_row(has_ix), QA * 2, pair_peer);
+        if (has_ix) k_own_unpack_pair<true><<<dim3(PF_AG, P.f.nr), 256, 0, st>>>(pf_own_rec(P), P.f, P.stepp, 3, M, pair_peer);
+        else k_own_unpack_pair<false><<<dim3(PF_AG, P.f.nr), 256, 0, st>>>(pf_own_rec(P), P.f, P.stepp, 3, M, pair_peer);
+        return;
+    }
     k_wait_ag<<<1, 32, 0, st>>>(P.f, P.stepp, 3, M, P.qo ? QO_REC : OWN_REC);
     if (P.qo) k_own_unpack<true><<<dim3(PF_AG, P.f.nr), 256, 0, st>>>(pf_own_rec(P), P.f, P.stepp, 3, M);
     else k_own_unpack<<<dim3(PF_AG, P.f.nr), 256, 0, st>>>(pf_own_rec(P), P.f, P.stepp, 3, M);
@@ -1478,11 +1598,17 @@ inline void pf_ix_score(Model& m, Prefill& P, int i, int M, int context, cudaStr
                                             (r1 - r0) * (IX_ROW / 16), P.tickets + 4);
     pf_mark(8, st);
 }
-// every owner's IDs of full-index layer i + 1 -> idx_all
+// every owner's IDs of full-index layer i + 1 -> idx_all (pair-private when every consumer layer is pair-owned)
 inline void pf_ix_gather(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 {
     if (!pf_ix_next(m, P, i)) return;
-    pf_ag(P.f, P.stepp, 4, M, IX_ROW, reinterpret_cast<char*>(P.idx_all), st);
+    if (pf_ix_pair_only(P, i, m.nl))
+    {
+        const int pair_peer = P.f.rank ^ 2;
+        k_wait_ag1<<<1, 32, 0, st>>>(P.f, P.stepp, 4, M, IX_ROW, pair_peer);
+        k_ag_copy1<<<PF_AG, 256, 0, st>>>(P.f, P.stepp, 4, M, IX_ROW, pair_peer, reinterpret_cast<char*>(P.idx_all));
+    }
+    else pf_ag(P.f, P.stepp, 4, M, IX_ROW, reinterpret_cast<char*>(P.idx_all), st);
     pf_mark(4, st);
 }
 inline void pf_ix(Model& m, Prefill& P, int i, int M, int context, cudaStream_t st, cudaEvent_t wait_ix = nullptr)
@@ -1537,12 +1663,18 @@ inline void pf_enqueue(Fab& fab, const Prefill& P, u64 ls0, int nl, int M)
     const uint32_t mine = (uint32_t)(pf_rows(M, me, nr) * HID * 2);
     for (int i = 0; i < nl; ++i)
     {
-        const uint32_t c3 = P.own && i < nl - 1 ? (uint32_t)(pf_rows(M, me, nr) * (P.qo ? QO_REC : OWN_REC)) : mine;
+        const bool c3_pair = pf_c3_pair_only(P, i, nl, M);
+        const bool c4_pair = pf_ix_pair_only(P, i, nl);
+        const uint32_t c3_com = c3_pair ? (uint32_t)(pf_rows(M, me, nr) * pf_c3_common_row(P.ixl[i + 1] != 0)) : 0;
+        const uint32_t c3 = c3_pair ? (uint32_t)(c3_com + 16 + pf_rows(M, me, nr) * (QA * 2))
+                          : (P.own && i < nl - 1 ? (uint32_t)(pf_rows(M, me, nr) * (P.qo ? QO_REC : OWN_REC)) : mine);
         std::vector<uint32_t> sizes{0, mine, 0, c3};
         if (i == nl - 1) sizes.push_back(2 * mine);                  // c4: FP32 residual rows
         else if (P.ownix && P.ixl[i + 1]) sizes.push_back((uint32_t)(pf_rows(M, me, nr) * IX_ROW));   // c4: owner IDs
         typename Fab::Rs ri = rs;
-        if (P.qp && P.qpl[i]) { ri.p2p = 0x1; ri.peer = me ^ 2; }   // GR8_PF_OWN=4: c0 = O_c's partial, to c only
+        if (P.qp && P.qpl[i]) { ri.p2p.set(0); ri.peer = me ^ 2; }   // GR8_PF_OWN=4: c0 = O_c's partial, to c only
+        if (c3_pair) { ri.pair_split.set(3); ri.pair_common = c3_com; ri.peer = me ^ 2; }
+        if (c4_pair) { ri.p2p.set(4); ri.peer = me ^ 2; }
         fab.enqueue_step(ls0 + i, sizes, ri);
     }
 }

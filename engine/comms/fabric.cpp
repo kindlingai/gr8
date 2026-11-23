@@ -290,7 +290,7 @@ void relay_loop(int cpu) {
   }
 }
 struct Job { unsigned long long step; std::vector<uint32_t> sizes; CollMask rs_mask; size_t rs_ss = 0; std::vector<uint32_t> rs_bytes; CollMask skip;
-             CollMask rs_flat; CollMask p2p; int peer = -1; std::vector<int> order; bool bulk = false; Fabric::BulkJob b;
+             CollMask rs_flat; CollMask p2p; CollMask pair_split; uint32_t pair_common = 0; int peer = -1; std::vector<int> order; bool bulk = false; Fabric::BulkJob b;
              std::vector<int> credit; };   // fab_pool_credits of this step (empty = pool off)
 }  // namespace
 
@@ -774,18 +774,23 @@ void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& 
     for (size_t c = 0; c < sizes.size(); c++) if (mask_bit(rs.flat, c)) FCHECK(rs.ss * nranks() + 8 * (size_t)nranks() <= fab_slot_stride(dev_, (int)c));
     for (size_t c = 0; c < sizes.size(); c++) if (mask_bit(rs.mask, c) && !mask_bit(rs.flat, c)) FCHECK(rs.ss * nranks() <= fab_slot_stride(dev_, (int)c));
   }
-  FCHECK(!(rs.p2p & ~rs.mask) && (!rs.p2p || (rs.peer >= 0 && rs.peer < nranks() && rs.peer != cfg_.rank)));
+  FCHECK(!(rs.pair_split & rs.mask) && !(rs.pair_split & rs.p2p));
+  if (rs.pair_split) {
+    FCHECK(rs.pair_common % 16 == 0);
+    for (size_t c = 0; c < sizes.size(); c++) if (mask_bit(rs.pair_split, c)) FCHECK(rs.pair_common + 16 <= sizes[c]);
+  }
+  FCHECK(!(rs.p2p || rs.pair_split) || (rs.peer >= 0 && rs.peer < nranks() && rs.peer != cfg_.rank));
   if (const char* e = order_error(rs.order, sizes.size())) { fprintf(stderr, "[fabric r%d] enqueue_step %llu: %s\n", cfg_.rank, step, e); FCHECK(!e); }
   std::vector<int> credit;                            // the credit collective of each pooled c (fab_pool_credits)
   if (dev_.pool) {
-    FCHECK(!rs.p2p);                                  // a p2p collective reaches one peer: no credit tail from the others
+    FCHECK(!rs.p2p && !rs.pair_split);                // a p2p/pair_split collective reaches one peer or asymmetric lengths
     std::vector<int> walk;
     const size_t n = rs.order.empty() ? sizes.size() : rs.order.size();
     for (size_t k = 0; k < n; k++) { const int c = rs.order.empty() ? (int)k : rs.order[k]; if (!mask_bit(rs.skip, (size_t)c)) walk.push_back(c); }
     if (!fab_pool_credits(dev_, walk, &credit)) { fprintf(stderr, "[fabric r%d] enqueue_step %llu: slot pool %d has no credit collective (two users of one slot back to back)\n", cfg_.rank, step, dev_.pool); FCHECK(false); }
   }
   if (impl_->solo) return;
-  { std::lock_guard<std::mutex> lk(impl_->mu); { Job j{step, sizes, rs.mask, rs.ss, rs.bytes, rs.skip}; j.rs_flat = rs.flat; j.p2p = rs.p2p; j.peer = rs.peer; j.order = rs.order; j.credit = std::move(credit); impl_->q.push_back(std::move(j)); } impl_->pending++; }
+  { std::lock_guard<std::mutex> lk(impl_->mu); { Job j{step, sizes, rs.mask, rs.ss, rs.bytes, rs.skip}; j.rs_flat = rs.flat; j.p2p = rs.p2p; j.pair_split = rs.pair_split; j.pair_common = rs.pair_common; j.peer = rs.peer; j.order = rs.order; j.credit = std::move(credit); impl_->q.push_back(std::move(j)); } impl_->pending++; }
   impl_->cv.notify_one();
 }
 
@@ -1030,14 +1035,16 @@ void Fabric::start_proxy() {
           std::atomic_thread_fence(std::memory_order_acquire);
         }
         char* src = dev_.send + fab_send_off(dev_, par, (int)c);
+        const bool psplit = !rs && mask_bit(job.pair_split, c);
         if (!rs) *(volatile unsigned long long*)(src + bytes) = seq;  // tail travels with the payload in one write
+        if (psplit) *(volatile unsigned long long*)(src + job.pair_common) = seq;  // common-prefix tail for non-pair peers
         if (xr) xr[1] = xr[5] = xt_tick();
         StripeW sw[8]; int ns = 0;
         for (int p = 0; p < nr; p++) {
-          if (p == me || (rs && mask_bit(job.p2p, c) && p != job.peer)) continue;   // p2p: one peer only
+          if (p == me || (mask_bit(job.p2p, c) && p != job.peer)) continue;   // p2p: one peer only (RS or AG)
           Rail& R = I.rails[I.rail_of(p, me)];
           char* sp = rs ? src + fab_rs_slice_off(job.rs_ss, p) : src;   // reduce-scatter: peer p gets slice p only
-          const uint32_t nb = rs ? job.rs_bytes[p] : bytes;
+          const uint32_t nb = rs ? job.rs_bytes[p] : (psplit && p != job.peer ? job.pair_common : bytes);
           // flat slice: sp + nb is the next slice's first row, so the tail word sits after the NR slices (Fabric::Rs::flat)
           char* tw = rs ? src + fab_rs_tail_off(job.rs_ss, p, nb, flat, nr) : sp + nb;
           if (rs) *(volatile unsigned long long*)tw = seq;
