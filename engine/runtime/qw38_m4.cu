@@ -242,6 +242,64 @@ inline void qw38_ar_exchange_inject(const g6::FabricDev& f, const unsigned long 
     }
 }
 
+// Single-kernel device-driven RDMA AllGather of 8-byte/row HeadArgmax + on-GPU MTP draft token chain!
+// Eliminates ALL host syncs, D2H/H2D round-trips, and head_merge between K MTP draft steps on TP >= 2.
+// Grid: 1, Block: 32 (supports S <= 32).
+template <int NR>
+__global__ void __launch_bounds__(32) k_qw38_mtp_chain_ar(
+    g6::FabricDev f, const unsigned long long* d_step, int par, int c, size_t wire_bytes, unsigned code,
+    const qw38::HeadArgmax* __restrict__ local_arg,
+    int* __restrict__ d_draft_out,
+    int* __restrict__ d_tok,
+    int* __restrict__ d_pos,
+    int3* __restrict__ d_rope,
+    int S, int K, int k) {
+    const int lane = threadIdx.x;
+    uint2* send_p = reinterpret_cast<uint2*>(f.send + g6::fab_send_off(f, par, c));
+    if (lane < S) {
+        const qw38::HeadArgmax la = local_arg[lane];
+        send_p[lane] = *reinterpret_cast<const uint2*>(&la);
+    }
+    __syncwarp();
+    const unsigned long long seq = g6::coll_seq(*d_step, c, f.ncoll);
+    if (lane == 0) {
+        __threadfence_system();
+        ink2::ar_st_release_sys(f.doorbell + c, seq);
+    }
+    if (lane < NR && lane != f.rank) {
+        const unsigned long long* tail = reinterpret_cast<const unsigned long long*>(
+            f.recv + g6::fab_recv_off(f, par, c, lane) + wire_bytes);
+        const long long t0 = clock64();
+        unsigned it = 0;
+        while (ink2::ar_ld_acquire_sys(tail) != seq) {
+            if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > INK2_SPIN_TIMEOUT_CYC)) {
+                atomicCAS(f.error, 0u, code | static_cast<unsigned>(lane));
+                break;
+            }
+        }
+    }
+    __syncwarp();
+    if (lane < S) {
+        qw38::HeadArgmax best = local_arg[lane];
+        #pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            if (r != f.rank) {
+                const uint2 rv = __ldcv(reinterpret_cast<const uint2*>(f.recv + g6::fab_recv_off(f, par, c, r)) + lane);
+                const qw38::HeadArgmax cand = *reinterpret_cast<const qw38::HeadArgmax*>(&rv);
+                qw38::head_better(best.logit, best.id, cand.logit, cand.id);
+            }
+        }
+        d_draft_out[lane * K + k] = best.id;
+        if (k + 1 < K) {
+            d_tok[lane] = best.id;
+            d_pos[lane] += 1;
+            int3 rp = d_rope[lane];
+            rp.x += 1; rp.y += 1; rp.z += 1;
+            d_rope[lane] = rp;
+        }
+    }
+}
+
 struct Wire {
     g6::Fabric fab;
     g6::FabricDev f{};
@@ -280,6 +338,27 @@ struct Wire {
         if (!skip_head) sizes.back() = wire_head;
         fab.enqueue_step(step, sizes);
         QW38_CK(cudaMemcpyAsync(d_step, &step, sizeof(step), cudaMemcpyHostToDevice, st));
+    }
+
+    // Single-step multi-collective arming for K chained greedy MTP drafts (3*K collectives, zero host sync!).
+    void fast_begin_mtp_k(int S, int K, cudaStream_t st) {
+        const uint32_t wire_part = static_cast<uint32_t>((size_t(S) * geom::HID * 2 + 15) / 16 * 16);
+        const uint32_t wire_arg = static_cast<uint32_t>((size_t(S) * sizeof(qw38::HeadArgmax) + 15) / 16 * 16);
+        std::vector<uint32_t> sizes(static_cast<size_t>(3 * K), wire_part);
+        for (int k = 0; k < K; ++k) sizes[size_t(3 * k + 2)] = wire_arg;
+        fab.enqueue_step(step, sizes);
+        QW38_CK(cudaMemcpyAsync(d_step, &step, sizeof(step), cudaMemcpyHostToDevice, st));
+    }
+
+    void fast_mtp_chain_ar(int c, const qw38::HeadArgmax* local_arg, int* d_draft_out,
+                           int* d_tok, int* d_pos, int3* d_rope, int S, int K, int k, cudaStream_t st) const {
+        if constexpr (G6_NR > 1) {
+            const size_t wire_arg = (size_t(S) * sizeof(qw38::HeadArgmax) + 15) / 16 * 16;
+            const unsigned code = ink2::INK2_ERR_AR | (static_cast<unsigned>(c) << 8);
+            k_qw38_mtp_chain_ar<G6_NR><<<1, 32, 0, st>>>(
+                f, d_step, static_cast<int>(step & 1), c, wire_arg, code,
+                local_arg, d_draft_out, d_tok, d_pos, d_rope, S, K, k);
+        }
     }
 
     // Sequence-parallel HC prefill step: L0 (2 ARs) + L1 pre-Attn AG + (L-2) * (Attn RS, MLP AG, MoE RS, Next-Attn AG).
@@ -585,6 +664,11 @@ int main(int argc, char** argv) {
         if (wire.fast) {
             wire.d_step = qw38rt::dalloc<unsigned long long>(1);
             e.step_begin = [&](int M, bool skip_head, int nl, int hm) { wire.fast_begin(M, skip_head, nl, hm, e.stream); };
+            e.step_begin_mtp_k = [&](int S, int K) { wire.fast_begin_mtp_k(S, K, e.stream); };
+            e.mtp_argmax_ar_chain = [&](int c, const qw38::HeadArgmax* la, int* dout,
+                                        int* dtok, int* dpos, int3* drope, int S, int K, int k) {
+                wire.fast_mtp_chain_ar(c, la, dout, dtok, dpos, drope, S, K, k, e.stream);
+            };
             e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.fast_dev(c, p, b, e.stream); };
             e.gather_inject = [&](int c, __nv_bfloat16* h, const __nv_bfloat16* p, const float* inj, int M) {
                 wire.fast_dev_inject(c, h, p, inj, M, e.stream);
