@@ -371,6 +371,8 @@ struct Engine {
     std::function<__nv_bfloat16*(int c)> direct_send_dst;
     std::function<void(int c, size_t bytes)> direct_ar_wait;
     std::function<void(int c, __nv_bfloat16* hyper, const float* inj, int M)> direct_hc_inject;
+    std::function<void(int c, __nv_bfloat16* hyper, const __nv_bfloat16* w_norm, const __nv_bfloat16* w_inj,
+                       __nv_bfloat16* hn_out, float* inj_io, int M)> direct_hc_inject_norm;
     std::function<void()> step_end;
     std::function<int()> step_parity;     // returns 0 or 1 for double-buffered multi-box graph capture
 
@@ -1055,8 +1057,9 @@ struct Engine {
             }
         };
 
-        auto run_head_gpu = [&]() {
-            qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
+        auto run_head_gpu = [&](bool hn_ready = false) {
+            if (hn_ready) qw38::hc_prepare_from_hn(blas, final_hc, mixed, hc_sc, M, stream);
+            else qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
             constexpr int HEAD_CHUNK = 256;
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
@@ -1194,7 +1197,29 @@ struct Engine {
             acc += ms;
         };
 
+        const bool fuse_inj_hc = (M > 12) && (!use_direct_ar || static_cast<bool>(direct_hc_inject_norm));
+        auto inject_or_fuse = [&](int c, const qw38::HcWeights* next_hc) -> bool {
+            if (fuse_inj_hc && next_hc != nullptr) {
+                if (use_direct_ar) {
+                    direct_hc_inject_norm(c, hyper, next_hc->norm, next_hc->inject, hc_sc.hn, hc_sc.inj, M);
+                } else {
+                    const __nv_bfloat16* p0 = parts;
+                    const __nv_bfloat16* p1 = (o.nr > 1) ? (parts + part_stride) : nullptr;
+                    const __nv_bfloat16* p2 = (o.nr > 2) ? (parts + 2 * part_stride) : nullptr;
+                    const __nv_bfloat16* p3 = (o.nr > 3) ? (parts + 3 * part_stride) : nullptr;
+                    qw38::k_hc_inject_rmsnorm_inj_ptrs<<<M, 320, 0, stream>>>(
+                        hyper, p0, p1, p2, p3, next_hc->norm, next_hc->inject, hc_sc.hn, hc_sc.inj,
+                        M, o.nr, -1, geom::RMS_EPS);
+                }
+                return true;
+            }
+            if (use_direct_ar) direct_hc_inject(c, hyper, hc_sc.inj, M);
+            else qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            return false;
+        };
+
         int coll = 0;
+        bool hn_ready = false;
         for (size_t li = 0; li < L.size(); ++li) {
             Layer& y = L[li];
             if (geom::is_ple(y.l) && has_ple) {
@@ -1202,11 +1227,13 @@ struct Engine {
                 t_start();
                 QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
                 qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream, d_slot, d_pos, snap_k);
+                hn_ready = false;
                 t_end(prof.ple_gpu_ms);
             }
 
             t_start();
-            qw38::hc_prepare(blas, y.attn_hc, hyper, mixed, hc_sc, M, stream);
+            if (hn_ready) { qw38::hc_prepare_from_hn(blas, y.attn_hc, mixed, hc_sc, M, stream); hn_ready = false; }
+            else qw38::hc_prepare(blas, y.attn_hc, hyper, mixed, hc_sc, M, stream);
             t_end(prof.hc_ms);
 
             t_start();
@@ -1231,13 +1258,13 @@ struct Engine {
             t_end(prof.ar_ms);
 
             t_start();
-            if (use_direct_ar) direct_hc_inject(coll, hyper, hc_sc.inj, M);
-            else qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            hn_ready = inject_or_fuse(coll, &y.mlp_hc);
             ++coll;
             t_end(prof.hc_ms);
 
             t_start();
-            qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
+            if (hn_ready) { qw38::hc_prepare_from_hn(blas, y.mlp_hc, mixed, hc_sc, M, stream); hn_ready = false; }
+            else qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
             t_end(prof.hc_ms);
 
             t_start();
@@ -1254,9 +1281,14 @@ struct Engine {
             else if (o.nr > 1 && gather_dev) gather_dev(coll, parts, part_stride * 2);
             t_end(prof.ar_ms);
 
+            const qw38::HcWeights* next_hc = nullptr;
+            if (li + 1 < L.size()) {
+                if (!(geom::is_ple(L[li + 1].l) && has_ple)) next_hc = &L[li + 1].attn_hc;
+            } else if (!skip_head) {
+                next_hc = &final_hc;
+            }
             t_start();
-            if (use_direct_ar) direct_hc_inject(coll, hyper, hc_sc.inj, M);
-            else qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            hn_ready = inject_or_fuse(coll, next_hc);
             ++coll;
             t_end(prof.hc_ms);
         }
@@ -1268,7 +1300,7 @@ struct Engine {
         }
 
         t_start();
-        run_head_gpu();
+        run_head_gpu(hn_ready);
         QW38_CK(cudaStreamSynchronize(stream));
         if (o.nr > 1 && gather_host) gather_host(coll++, head_host_parts, rank_pkt_bytes);
         if (step_end) step_end();

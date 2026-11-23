@@ -384,6 +384,124 @@ __global__ void k_hc_inject_ptrs(__nv_bfloat16* __restrict__ hyper,
     }
 }
 
+// Fused residual injection + next HC grouped RMSNorm + next W_inj GEMV (for prefill M > 12).
+// Grid: M, Block: 320 (10 warps; 320 * 8 = 2560 exact). Reads hyper ONCE, updates hyper in-place,
+// computes hn_next and inj_next in registers (eliminates 42 MB hyper re-read + 1 kernel launch per sublayer!).
+// own_rank >= 0 uses __ldcv for peer ranks r != own_rank (direct-fabric); own_rank < 0 uses normal loads.
+__global__ void __launch_bounds__(320) k_hc_inject_rmsnorm_inj_ptrs(
+    __nv_bfloat16* __restrict__ hyper,
+    const __nv_bfloat16* __restrict__ p0,
+    const __nv_bfloat16* __restrict__ p1,
+    const __nv_bfloat16* __restrict__ p2,
+    const __nv_bfloat16* __restrict__ p3,
+    const __nv_bfloat16* __restrict__ w_norm_next,
+    const __nv_bfloat16* __restrict__ w_inj_next,
+    __nv_bfloat16* __restrict__ hn_next,
+    float* __restrict__ inj_io,
+    int M, int nr, int own_rank, float eps) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int tid = threadIdx.x; // 0..319
+    const int lane = tid & 31;
+    const int warp = tid >> 5;   // 0..9
+
+    const __nv_bfloat16* ptrs[4] = {p0, p1, p2, p3};
+    float y[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int r = 0; r < nr; ++r) {
+        const uint4* src = reinterpret_cast<const uint4*>(ptrs[r] + static_cast<size_t>(m) * geom::HID) + tid;
+        const uint4 pv = (own_rank >= 0 && r != own_rank) ? __ldcv(src) : (*src);
+        const __nv_bfloat162* pp = reinterpret_cast<const __nv_bfloat162*>(&pv);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 f = __bfloat1622float2(pp[k]);
+            y[2 * k] += f.x;
+            y[2 * k + 1] += f.y;
+        }
+    }
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) y[k] = __bfloat162float(__float2bfloat16(y[k]));
+
+    float w_prev[geom::HC];
+    #pragma unroll
+    for (int s = 0; s < geom::HC; ++s) w_prev[s] = inj_io[static_cast<size_t>(m) * geom::HC + s];
+
+    __shared__ float sm[16];
+    float inj_acc[4] = {0.f, 0.f, 0.f, 0.f};
+
+    #pragma unroll
+    for (int s = 0; s < geom::HC; ++s) {
+        const size_t off_u4 = (static_cast<size_t>(m) * geom::HC + s) * (geom::HID / 8) + tid;
+        uint4* hp = reinterpret_cast<uint4*>(hyper) + off_u4;
+        const uint4 prev = *hp;
+        const __nv_bfloat162* pr = reinterpret_cast<const __nv_bfloat162*>(&prev);
+        uint4 hnew;
+        __nv_bfloat162* np = reinterpret_cast<__nv_bfloat162*>(&hnew);
+        const float ws = w_prev[s];
+
+        float2 fx[4];
+        float ss = 0.f;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 fp = __bfloat1622float2(pr[k]);
+            const float a0 = __bfloat162float(__float2bfloat16(y[2 * k] * ws));
+            const float a1 = __bfloat162float(__float2bfloat16(y[2 * k + 1] * ws));
+            np[k] = __floats2bfloat162_rn(fp.x + a0, fp.y + a1);
+            fx[k] = __bfloat1622float2(np[k]);
+            ss = fmaf(fx[k].x, fx[k].x, fmaf(fx[k].y, fx[k].y, ss));
+        }
+        *hp = hnew;
+
+        ss = warp_sum(ss);
+        if (lane == 0) sm[warp] = ss;
+        __syncthreads();
+        if (warp == 0) {
+            float tot = (lane < 10) ? sm[lane] : 0.f;
+            tot = warp_sum(tot);
+            if (lane == 0) sm[0] = rsqrtf(tot / float(geom::HID) + eps);
+        }
+        __syncthreads();
+        const float inv = sm[0];
+
+        const uint4 wv = __ldg(reinterpret_cast<const uint4*>(w_norm_next + static_cast<size_t>(s) * geom::HID) + tid);
+        const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&wv);
+        uint4 yv;
+        __nv_bfloat162* yp = reinterpret_cast<__nv_bfloat162*>(&yv);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 fw = __bfloat1622float2(wp[k]);
+            yp[k] = __floats2bfloat162_rn(fx[k].x * inv * (1.0f + fw.x), fx[k].y * inv * (1.0f + fw.y));
+        }
+        reinterpret_cast<uint4*>(hn_next)[off_u4] = yv;
+
+        if (w_inj_next) {
+            const size_t wi_col = static_cast<size_t>(s) * (geom::HID / 8) + tid;
+            #pragma unroll
+            for (int r = 0; r < geom::HC; ++r) {
+                const uint4 wiv = __ldg(reinterpret_cast<const uint4*>(w_inj_next + static_cast<size_t>(r) * geom::HC_D) + wi_col);
+                inj_acc[r] += dot_bf16x8(yv, wiv);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (w_inj_next) {
+        __shared__ float sm_inj[4][16];
+        #pragma unroll
+        for (int r = 0; r < geom::HC; ++r) {
+            const float v = warp_sum(inj_acc[r]);
+            if (lane == 0) sm_inj[r][warp] = v;
+        }
+        __syncthreads();
+        if (warp < 4) {
+            float tot = (lane < 10) ? sm_inj[warp][lane] : 0.f;
+            tot = warp_sum(tot);
+            if (lane == 0) {
+                inj_io[static_cast<size_t>(m) * geom::HC + warp] = 2.0f * sigmoid_f(tot * 0.25f);
+            }
+        }
+    }
+}
+
 // Fused Grouped RMSNorm + W_inj GEMV + Inject Activation for prefill (M > 8 / M > 12):
 // Grid: M, Block: 320 (10 warps; 320 * 8 = 2560 exact). Reads hyper ONCE, writes hn ONCE,
 // and computes dot(hn, W_inj[0..3]) in registers (eliminates 42 MB W_inj GEMM + k_hc_inject_act).
@@ -847,6 +965,19 @@ __global__ void __launch_bounds__(256) k_fp8_hc_up_mix_fused(const __nv_bfloat16
         const float acc = s_contrib[dl][0][lane] + s_contrib[dl][1][lane] + s_contrib[dl][2][lane] + s_contrib[dl][3][lane];
         mixed[static_cast<size_t>(lane) * geom::HID + d] = __float2bfloat16(acc * 0.25f);
     }
+}
+
+// Complete GatedResidual prepare when sc.hn (and sc.inj) were already computed by k_hc_inject_rmsnorm_inj_ptrs.
+inline void hc_prepare_from_hn(cublasHandle_t blas, const HcWeights& w, __nv_bfloat16* mixed,
+                               HcScratch& sc, int M, cudaStream_t st) {
+    cublasSetStream(blas, st);
+    gemm_bf16_nt(blas, M, geom::HC_RANK, geom::HC_D, sc.hn, w.down, sc.down);
+    {
+        const int n8 = (M * geom::HC_RANK) >> 3;
+        k_div4_silu_bf16_vec<<<(n8 + 255) / 256, 256, 0, st>>>(sc.down, n8);
+    }
+    const int up_grid = ((M + 31) / 32) * (geom::HID / 64);
+    k_hc_up_mix_tc<<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.up, mixed, M);
 }
 
 // Full GatedResidual prepare: hyper_in [M, 10240] -> mixed [M, 2560] (+ optional inj [M, 4]).

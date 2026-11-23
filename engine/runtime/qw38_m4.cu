@@ -128,6 +128,18 @@ struct Wire {
         qw38::k_hc_inject_ptrs<<<M * 5, 64, 0, st>>>(hyper, pt[0], pt[1], pt[2], pt[3], inj, M, nr, rank);
     }
 
+    void fast_hc_inject_norm(int c, __nv_bfloat16* hyper, const __nv_bfloat16* w_norm, const __nv_bfloat16* w_inj,
+                             __nv_bfloat16* hn_out, float* inj_io, int M, cudaStream_t st) const {
+        const int par = static_cast<int>(step & 1);
+        const __nv_bfloat16* pt[4] = {nullptr, nullptr, nullptr, nullptr};
+        for (int p = 0; p < nr; ++p) {
+            if (p == rank) pt[p] = reinterpret_cast<const __nv_bfloat16*>(f.send + g6::fab_send_off(f, par, c));
+            else pt[p] = reinterpret_cast<const __nv_bfloat16*>(f.recv + g6::fab_recv_off(f, par, c, p));
+        }
+        qw38::k_hc_inject_rmsnorm_inj_ptrs<<<M, 320, 0, st>>>(
+            hyper, pt[0], pt[1], pt[2], pt[3], w_norm, w_inj, hn_out, inj_io, M, nr, rank, geom::RMS_EPS);
+    }
+
     void fast_host(int c, uint8_t* parts, size_t bytes) {
         const int par = static_cast<int>(step & 1);
         const size_t wire = (bytes + 7) / 8 * 8;
@@ -306,6 +318,10 @@ int main(int argc, char** argv) {
             e.direct_ar_wait = [&](int c, size_t b) { wire.fast_ar_wait(c, b, e.stream); };
             e.direct_hc_inject = [&](int c, __nv_bfloat16* h, const float* inj, int M) {
                 wire.fast_hc_inject(c, h, inj, M, e.stream);
+            };
+            e.direct_hc_inject_norm = [&](int c, __nv_bfloat16* h, const __nv_bfloat16* wn, const __nv_bfloat16* wi,
+                                          __nv_bfloat16* hn, float* inj_io, int M) {
+                wire.fast_hc_inject_norm(c, h, wn, wi, hn, inj_io, M, e.stream);
             };
             e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.fast_host(c, p, b); };
             e.step_end = [&]() { wire.fast_end(e.stream); };
