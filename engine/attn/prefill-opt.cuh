@@ -184,6 +184,179 @@ static inline cudaError_t launch_idx_n64(
 }
 
 // ============================================================================
+// 2b. Native E4M3 x E4M3 mma.m16n8k32 N=64 indexer score (direct paged E4M3)
+// ============================================================================
+__device__ __forceinline__ void mma16832_e4(
+    float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t f2_e4m3x2_idx(float a, float b) {
+    uint32_t r;
+    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, %2, %1; cvt.u32.u16 %0, t; }" : "=r"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+// Quantize q [n, 32, 128] FP16 -> q_e4 [n, 32, 128] E4M3 + w_eff [n, 32] = weight * (amax / 448).
+// Since q_scale >= 0, ReLU(q_scale * dot) * weight == ReLU(dot) * (q_scale * weight) identically.
+__global__ void __launch_bounds__(128) quant_idx_q_e4m3(
+    int n, const half* __restrict__ q, const float* __restrict__ weight,
+    uint8_t* __restrict__ q_e4, float* __restrict__ w_eff)
+{
+    const int row = blockIdx.x, h = blockIdx.y * 4 + (threadIdx.x >> 5), l = threadIdx.x & 31;
+    if (row >= n || h >= 32) return;
+    const half* src = q + ((int64_t)row * 32 + h) * 128;
+    const uint2 raw = *reinterpret_cast<const uint2*>(src + l * 4);
+    const __half2 h0 = *reinterpret_cast<const __half2*>(&raw.x);
+    const __half2 h1 = *reinterpret_cast<const __half2*>(&raw.y);
+    const float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
+    float am = fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)), fmaxf(fabsf(f1.x), fabsf(f1.y)));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float qscale = am * (1.f / 448.f);
+    const float inv = qscale > 0.f ? (448.f / am) : 0.f;
+    const uint32_t p0 = f2_e4m3x2_idx(f0.x * inv, f0.y * inv);
+    const uint32_t p1 = f2_e4m3x2_idx(f1.x * inv, f1.y * inv);
+    reinterpret_cast<uint32_t*>(q_e4 + ((int64_t)row * 32 + h) * 128)[l] = p0 | (p1 << 16);
+    if (l == 0) w_eff[(int64_t)row * 32 + h] = weight[(int64_t)row * 32 + h] * qscale;
+}
+
+struct alignas(32) IdxSmem64E4 {
+    uint8_t B[64 * 128];   // 8 KB (half of FP16!)
+    float2 O[8][32][16];   // 32 KB
+    float scales[64];      // 256 B
+};
+static_assert(sizeof(IdxSmem64E4) <= 45056, "IdxSmem64E4 fits 2 CTAs/SM");
+
+__global__ void __launch_bounds__(256, 2) idx_score_ptx_n64_e4m3(
+    G6Attn fixed, int start, int n, int RG,
+    const uint8_t* __restrict__ q_e4, const float* __restrict__ w_eff,
+    float* __restrict__ scores)
+{
+    extern __shared__ __align__(32) unsigned char raw_smem[];
+    IdxSmem64E4& sm = *reinterpret_cast<IdxSmem64E4*>(raw_smem);
+    auto a = ga::resolve(fixed);
+    const int rbeg = blockIdx.y * RG, rend = min(n, rbeg + RG);
+    const int t0 = blockIdx.x * 64;
+    const int t = threadIdx.x, w = t >> 5, l = t & 31, g = l >> 2, c = l & 3;
+
+    const int live = min(64, max(0, a.context - t0));
+    float s_dummy = 0.f;
+    const uint8_t* src = live > 0 ? ga::ik_at(a, t0, s_dummy) : nullptr;
+    const float* sc_ptr = src
+        ? reinterpret_cast<const float*>(src - (t0 % a.page_size) * 128 + a.page_size * 128) + (t0 % a.page_size)
+        : nullptr;
+
+    #pragma unroll
+    for (int u = 0; u < 2; ++u) {
+        const int i = t + u * 256;
+        const int krow = i >> 3, ch = i & 7;
+        const int4 v = (src && krow < live)
+            ? __ldg(reinterpret_cast<const int4*>(src + (int64_t)krow * 128 + ch * 16))
+            : make_int4(0, 0, 0, 0);
+        *reinterpret_cast<int4*>(sm.B + (krow * 8 + (ch ^ (krow & 7))) * 16) = v;
+    }
+    if (t < 64) {
+        sm.scales[t] = (sc_ptr && t < live) ? __ldg(sc_ptr + t) : 0.f;
+    }
+    __syncthreads();
+
+    const uint32_t b_base = saddr(sm.B);
+    const int b_krow_lo = (l & 7) + ((l >> 4) & 1) * 8;
+    const int b_ch_bit = (l >> 3) & 1, b_xor = l & 7;
+
+    for (int row = rbeg + w; row < rend; row += 8) {
+        const int pos = __ldg(a.positions + start + row);
+        float* sc_row = scores + (int64_t)row * a.context + t0;
+        if (t0 > pos) {
+            if (t0 + l < a.context) sc_row[l] = -INFINITY;
+            if (t0 + 32 + l < a.context) sc_row[32 + l] = -INFINITY;
+            continue;
+        }
+        const float w_mine = __ldg(w_eff + (int64_t)row * 32 + l);
+        const uint8_t* q0_base = q_e4 + ((int64_t)row * 32) * 128;
+        const uint8_t* q1_base = q0_base + 16 * 128;
+
+        float C0[8][4], C1[8][4];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            C0[j][0] = C0[j][1] = C0[j][2] = C0[j][3] = 0.f;
+            C1[j][0] = C1[j][1] = C1[j][2] = C1[j][3] = 0.f;
+        }
+        #pragma unroll
+        for (int k = 0; k < 128; k += 32) {
+            const uint32_t a0_0 = __ldg(reinterpret_cast<const uint32_t*>(q0_base + g * 128 + k + 4 * c));
+            const uint32_t a0_1 = __ldg(reinterpret_cast<const uint32_t*>(q0_base + (g + 8) * 128 + k + 4 * c));
+            const uint32_t a0_2 = __ldg(reinterpret_cast<const uint32_t*>(q0_base + g * 128 + k + 4 * c + 16));
+            const uint32_t a0_3 = __ldg(reinterpret_cast<const uint32_t*>(q0_base + (g + 8) * 128 + k + 4 * c + 16));
+            const uint32_t a1_0 = __ldg(reinterpret_cast<const uint32_t*>(q1_base + g * 128 + k + 4 * c));
+            const uint32_t a1_1 = __ldg(reinterpret_cast<const uint32_t*>(q1_base + (g + 8) * 128 + k + 4 * c));
+            const uint32_t a1_2 = __ldg(reinterpret_cast<const uint32_t*>(q1_base + g * 128 + k + 4 * c + 16));
+            const uint32_t a1_3 = __ldg(reinterpret_cast<const uint32_t*>(q1_base + (g + 8) * 128 + k + 4 * c + 16));
+            const int ch_sw = ((k >> 4) + b_ch_bit) ^ b_xor;
+            #pragma unroll
+            for (int jp = 0; jp < 4; ++jp) {
+                uint32_t b[4];
+                ldsm4(b, b_base + (((jp * 16 + b_krow_lo) * 8) + ch_sw) * 16u);
+                mma16832_e4(C0[2 * jp],     a0_0, a0_1, a0_2, a0_3, b[0], b[1]);
+                mma16832_e4(C1[2 * jp],     a1_0, a1_1, a1_2, a1_3, b[0], b[1]);
+                mma16832_e4(C0[2 * jp + 1], a0_0, a0_1, a0_2, a0_3, b[2], b[3]);
+                mma16832_e4(C1[2 * jp + 1], a1_0, a1_1, a1_2, a1_3, b[2], b[3]);
+            }
+        }
+        #pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int col2 = (j * 4 + c) ^ g, jj = hf * 4 + j;
+                sm.O[w][g][col2]      = make_float2(C0[jj][0], C0[jj][1]);
+                sm.O[w][g + 8][col2]  = make_float2(C0[jj][2], C0[jj][3]);
+                sm.O[w][g + 16][col2] = make_float2(C1[jj][0], C1[jj][1]);
+                sm.O[w][g + 24][col2] = make_float2(C1[jj][2], C1[jj][3]);
+            }
+            __syncwarp();
+            const int k_local = hf * 32 + l, key = t0 + k_local, col2 = l >> 1, sub = l & 1;
+            float x = 0.f;
+            #pragma unroll
+            for (int h = 0; h < 32; ++h) {
+                const float wh = __shfl_sync(0xffffffffu, w_mine, h);
+                const float2 fv = sm.O[w][h][col2 ^ (h & 7)];
+                x += fmaxf(sub ? fv.y : fv.x, 0.f) * wh;
+            }
+            if (key < a.context) {
+                x *= sm.scales[k_local];
+                if (key > pos) x = -INFINITY;
+                else if (!isfinite(x)) { ga::error(a, 4); x = -INFINITY; }
+                sc_row[k_local] = x;
+            }
+            __syncwarp();
+        }
+    }
+}
+
+static inline cudaError_t launch_idx_n64_e4m3(
+    G6Attn a, int start, int n,
+    const half* q, const float* weight,
+    uint8_t* q_e4_buf, float* w_eff_buf,
+    float* scores, cudaStream_t st)
+{
+    if (n <= 0 || a.context <= 0) return cudaSuccess;
+    static const bool once =
+        cudaFuncSetAttribute(idx_score_ptx_n64_e4m3, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(IdxSmem64E4)) == cudaSuccess;
+    (void)once;
+    quant_idx_q_e4m3<<<dim3(n, 8), 128, 0, st>>>(n, q, weight, q_e4_buf, w_eff_buf);
+    const int RG = (a.context >= 65536) ? 128 : 64;
+    idx_score_ptx_n64_e4m3<<<dim3((a.context + 63) / 64, (n + RG - 1) / RG), 256, sizeof(IdxSmem64E4), st>>>(
+        a, start, n, RG, q_e4_buf, w_eff_buf, scores);
+    return cudaGetLastError();
+}
+
+// ============================================================================
 // 3. Indexer Select v2: FP32 fast-reject + 1-pass sample bound + smem cand + CUB sort
 // ============================================================================
 namespace selopt2 {
