@@ -166,6 +166,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DTR_PF_COPY` | flag | `0` |  | Prefill runs o_proj on an exact FP8 copy of its trellis tiles too, as q_b and the dense MLP do, about 25 MB more per layer at TP4. Same bits. |
 | `GR8_DTR_PF_KDA_COPY` | flag | `1` |  | Flash prefill makes exact FP8 copies of the KDA q, k and v trellis matrices for the prefill GEMMs. 0 = no copies. |
 | `GR8_DTR_PF_SHARE_SUH` | flag | `0` |  | Flash prefill dense MLP: up reuses gate's rotated input instead of rotating with its own suh vector. |
+| `GR8_FABRIC_POOL` | int | `0` | 0..65535 | EL6 (#154): build g6m4's fabrics and S2 control bootstrap from a g6::FabricPool group (mesh only, at least 2 ranks) and tear down the group's fabrics cleanly via Fabric::close() at exit. 0 = off (direct Fabric::init, unchanged), 1 = on with the default pool control port (18800), 1024..65535 = on with that explicit pool control port. |
 | `GR8_FPF_ATTN_P1` | flag | `0` |  | Flash prefill attention runs the P1 bodies instead of the GEMM bodies. |
 | `GR8_FPF_DSA_P1` | flag | `0` |  | Flash prefill DSA layers run the P1 bodies instead of the GEMM bodies. |
 | `GR8_FPF_P1` | flag | `0` |  | Flash prefill runs the P1 bodies everywhere, the reference the GEMM bodies are checked against. |

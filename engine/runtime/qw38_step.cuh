@@ -369,7 +369,9 @@ struct Engine {
     std::mutex ple_mu;
     std::condition_variable ple_cv, ple_done_cv;
     bool ple_stop = false, ple_has_job = false, ple_job_done = true, ple_job_ok = true;
+    bool ple_job_is_prefetch = false;
     std::vector<uint64_t> ple_job_ids;
+    std::vector<uint64_t> ple_next_pf_ids;
 
     struct RankLayer {
         qw38::GdnWeights gdn_w;
@@ -436,6 +438,7 @@ struct Engine {
     // Fabric callbacks (set by g6m4_qw38; nullptr on m4sim_qw38 where all ranks are already in `parts`)
     std::function<void(int M, bool skip_head, int n_layers_override)> step_begin;
     std::function<void(int c, __nv_bfloat16* parts, size_t bytes)> gather_dev;
+    std::function<void(int c, __nv_bfloat16* hyper, const __nv_bfloat16* parts, const float* inj, int M)> gather_inject;
     std::function<void(int c, uint8_t* host_parts, size_t bytes)> gather_host;
     std::function<void()> step_end;
     std::function<int()> step_parity;     // returns 0 or 1 for double-buffered multi-box graph capture
@@ -483,7 +486,12 @@ struct Engine {
         }
         mtp_graphs.clear();
         if (ple_thr.joinable()) {
-            { std::lock_guard<std::mutex> lk(ple_mu); ple_stop = true; ple_has_job = true; }
+            {
+                std::unique_lock<std::mutex> lk(ple_mu);
+                ple_done_cv.wait(lk, [&]() { return ple_job_done; });
+                ple_stop = true;
+                ple_has_job = true;
+            }
             ple_cv.notify_one();
             ple_thr.join();
         }
@@ -624,9 +632,12 @@ struct Engine {
                         ple_cv.wait(lk, [&]() { return ple_has_job; });
                         if (ple_stop) return;
                         ple_has_job = false;
+                        const bool is_pf = ple_job_is_prefetch;
                         lk.unlock();
-                        const bool ok = ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
-                                                             reinterpret_cast<uint8_t*>(ple_pinned));
+                        const bool ok = is_pf
+                            ? ple_store.prefetch_rows(ple_job_ids.data(), ple_job_ids.size())
+                            : ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
+                                                   reinterpret_cast<uint8_t*>(ple_pinned));
                         lk.lock();
                         ple_job_ok = ok;
                         ple_job_done = true;
@@ -1016,6 +1027,14 @@ struct Engine {
         }
     }
 
+    // Stage next prefill chunk's PLE row IDs so ple_thr warms PleRowCache during Layers 1..47 of this chunk.
+    void stage_ple_prefetch(const int* toks, int n, int32_t ctx0, int32_t ctx1) {
+        if (!has_ple || !o.ple_async || !ple_thr.joinable() || n <= 0) return;
+        int32_t c[2] = {ctx0, ctx1};
+        ple_next_pf_ids.resize(size_t(n) * geom::PLE_HEADS);
+        ple_store.compute_ids(toks, n, c, false, ple_next_pf_ids.data());
+    }
+
     // Forward one step over `segs` (`M` total rows), optionally skipping lm_head (prefill chunks).
     // When `snap_k > 0` (MTP verify step), saves post-token-t recurrent/conv/idx_raw snapshots for t in 0..snap_k-1!
     // When `vis_n > 0` (multimodal prefill), splices staged vision embeddings into HC streams and masks image tokens in PLE.
@@ -1074,6 +1093,11 @@ struct Engine {
         // 0b. Kick off async PLE NVMe fetch BEFORE Layer 0 GPU compute so it overlaps completely behind Layer 0!
         bool ple_in_flight = false;
         if (has_ple && o.ple_async && ple_thr.joinable()) {
+            {
+                // Drain any prior chunk's background cross-chunk prefetch before overwriting ple_job_ids.
+                std::unique_lock<std::mutex> lk(ple_mu);
+                ple_done_cv.wait(lk, [&]() { return ple_job_done; });
+            }
             ple_job_ids.resize(size_t(M) * geom::PLE_HEADS);
             for (const auto& g : segs) {
                 if (g.len <= 0) continue;
@@ -1083,6 +1107,7 @@ struct Engine {
             }
             {
                 std::lock_guard<std::mutex> lk(ple_mu);
+                ple_job_is_prefetch = false;
                 ple_job_done = false;
                 ple_has_job = true;
             }
@@ -1097,6 +1122,15 @@ struct Engine {
                 ple_done_cv.wait(lk, [&]() { return ple_job_done; });
                 if (!ple_job_ok) die("PLE async fetch_rows failed");
                 ple_in_flight = false;
+                if (!ple_next_pf_ids.empty()) {
+                    ple_job_ids.swap(ple_next_pf_ids);
+                    ple_next_pf_ids.clear();
+                    ple_job_is_prefetch = true;
+                    ple_job_done = false;
+                    ple_has_job = true;
+                    lk.unlock();
+                    ple_cv.notify_one();
+                }
             } else {
                 std::vector<uint64_t> all_ids(size_t(M) * geom::PLE_HEADS);
                 for (const auto& g : segs) {
@@ -1132,9 +1166,13 @@ struct Engine {
                                       segs.data(), int(segs.size()), M, o.nr, r, true, stream, d_slot, d_pos, snap_k);
                 }
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
             for (int i = 0; i < o.nloc; ++i) {
@@ -1143,9 +1181,13 @@ struct Engine {
                 __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
                 qw38::moe_forward(blas, rl.moe_w, moe_sc, mixed, p_dst, M, stream);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
         };
 
         auto run_head_gpu = [&](bool fuse_prev_inject = false) {
@@ -1340,17 +1382,23 @@ struct Engine {
             }
             t_end(y.is_full ? prof.attn_ms : prof.gdn_ms);
 
-            t_start();
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            t_end(prof.ar_ms);
-
-            if (M > 12) {
-                pending_inject = true;
+            if (o.nr > 1 && gather_inject) {
+                t_start();
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+                t_end(prof.ar_ms);
             } else {
                 t_start();
-                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
-                t_end(prof.hc_ms);
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                t_end(prof.ar_ms);
+
+                if (M > 12) {
+                    pending_inject = true;
+                } else {
+                    t_start();
+                    qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                    t_end(prof.hc_ms);
+                }
             }
 
             t_start();
@@ -1372,17 +1420,23 @@ struct Engine {
             }
             t_end(prof.moe_ms);
 
-            t_start();
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            t_end(prof.ar_ms);
-
-            if (M > 12) {
-                pending_inject = true;
+            if (o.nr > 1 && gather_inject) {
+                t_start();
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+                t_end(prof.ar_ms);
             } else {
                 t_start();
-                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
-                t_end(prof.hc_ms);
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                t_end(prof.ar_ms);
+
+                if (M > 12) {
+                    pending_inject = true;
+                } else {
+                    t_start();
+                    qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                    t_end(prof.hc_ms);
+                }
             }
         }
 
@@ -1555,9 +1609,13 @@ struct Engine {
                 qw38::full_attn_forward(blas, mtp_w.attn[size_t(i)], mtp_w.kv[size_t(i)], attn_sc, mixed, p_dst,
                                         d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r, max_pps, max_blocks, stream, 0, d_rope);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, mtp_sc.mtp_hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             // L048 MoE (GPU-native FP8/BF16!) + AR + Inject
             qw38::hc_prepare(blas, mtp_w.mlp_hc, mtp_sc.mtp_hyper, mixed, hc_sc, M, stream);
@@ -1567,9 +1625,13 @@ struct Engine {
                 qw38::mtp_moe_forward(blas, mtp_w.moe[size_t(i)], mtp_w.fp8_exp_gu[size_t(i)], mtp_w.fp8_exp_dn[size_t(i)],
                                       moe_sc, mtp_sc, mixed, p_dst, M, stream);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, mtp_sc.mtp_hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             if (hid_out) {
                 QW38_CK(cudaMemcpyAsync(hid_out, mtp_sc.mtp_hyper, size_t(M) * geom::HC_D * sizeof(__nv_bfloat16),
