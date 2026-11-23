@@ -724,7 +724,7 @@ engine_args() {
   # Qwen3.8-Flash-Next: exlr8 v2 indexed release (--packs), width manifest (--widths), optional --layout, and KV_STORE.
   if [ "$_engine_profile" = qw38 ]; then
     a="--layers all --packs ${V2_DENSE:-${V2:-$rp}} ${V2_WIDTHS:+--widths $V2_WIDTHS} ${LAYOUT:+--layout $LAYOUT} \
---top-p-cands 256 --chunk $CHUNK --prefill 256 --temp 0.7 --cap $CAP --graph --mtp $MTP \
+--top-p-cands 256 --chunk $CHUNK --prefill ${PREFILL:-2048} --temp 0.7 --cap $CAP --graph --mtp $MTP \
 --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
     [ "${EAGER:-0}" = 1 ] && a=${a/ --graph / }
     [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"

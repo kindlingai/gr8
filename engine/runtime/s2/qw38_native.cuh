@@ -34,8 +34,11 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     const Config& sc = bc.scheduler;
     const int slots = c.engine.o.slots;
     const int max_rows = c.engine.o.max_rows;
+    const int K = int(sc.mtp);
     require(sc.max_sessions == unsigned(slots) && sc.max_rows <= unsigned(max_rows),
             "qw38: --s2-sessions and --max-rows mismatch");
+    require(K == 0 || (K >= 1 && K <= 3 && c.engine.has_mtp),
+            "qw38: --mtp 1..3 requires loaded L048 MTP drafter");
     const unsigned max_pps = unsigned(c.engine.max_pages_per_slot());
     const unsigned pages = sc.pool_rows / geom::KV_PAGE;
     RunPool pool(pages, pages, sc.pool_rows);
@@ -43,6 +46,61 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     std::vector<qw38rt::RowOut> out;
     std::vector<int> targets;
     int lp_rows = 0;
+
+    // MTP > 0: pending verify rows of the last trunk forward, cached K drafts, and committed end per slot
+    struct Pending {
+        int row0 = 0, rows = 0, pos0 = 0;
+        std::array<int, 4> toks{};
+        std::array<int32_t, 2> ple_ctx{geom::TOK_EOS, geom::TOK_EOS};
+    };
+    struct Drafts {
+        std::array<int, 4> d{};
+        int q = -1;
+        bool valid = false;
+    };
+    std::array<Pending, MAX_SESSIONS> pend{};
+    std::array<Drafts, MAX_SESSIONS> drafts{};
+    std::array<int, MAX_SESSIONS> done_end{};
+
+    const auto commit_pending = [&](int q, int kept) {
+        Pending& w = pend[size_t(q)];
+        if (w.rows <= 0) return;
+        kept = std::max(0, std::min(w.rows, kept));
+        if (kept < w.rows) {
+            if (kept > 0) {
+                c.engine.mtp_rollback_slot(q, kept - 1);
+                if (kept >= 2) {
+                    c.engine.ple_ctx[size_t(q)][0] = w.toks[size_t(kept - 2)];
+                    c.engine.ple_ctx[size_t(q)][1] = w.toks[size_t(kept - 1)];
+                } else {
+                    c.engine.ple_ctx[size_t(q)][0] = w.ple_ctx[1];
+                    c.engine.ple_ctx[size_t(q)][1] = w.toks[0];
+                }
+            } else {
+                c.engine.ple_ctx[size_t(q)] = w.ple_ctx;
+            }
+        }
+        if (kept > 1) {
+            c.engine.mtp_sync_kv(q, w.row0, w.pos0, kept - 1, &w.toks[1]);
+        }
+        if (kept > 0) {
+            c.engine.mtp_save_last_hyper(q, w.row0 + kept - 1);
+        }
+        done_end[size_t(q)] = w.pos0 + kept;
+        w.rows = 0;
+    };
+
+    const auto settle = [&](const s2::Step* sp) {
+        if (K <= 0) return;
+        for (int q = 0; q < slots; ++q) {
+            Pending& w = pend[size_t(q)];
+            if (w.rows <= 0) continue;
+            int kept = 0;
+            for (size_t j = 0; sp && j < sp->sess.size(); ++j)
+                if (sp->sess[j] == q) kept = std::max(0, std::min(w.rows, sp->r[size_t(sp->row0[j])].pos - w.pos0));
+            commit_pending(q, kept);
+        }
+    };
 
     std::unique_ptr<KvStateTiers> tiers;
     std::unique_ptr<StashPool> stash;
@@ -84,6 +142,15 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                     reinterpret_cast<uint8_t*>(rl.gdn_st.conv),
                 });
             }
+        }
+        if (K > 0 && c.engine.has_mtp) {
+            const auto& mkv = c.engine.mtp_w.kv[0];
+            fl.push_back(Qw38FullKvLayer{
+                reinterpret_cast<uint8_t*>(mkv.kv_pages),
+                reinterpret_cast<uint8_t*>(mkv.kv_staging),
+                reinterpret_cast<uint8_t*>(mkv.idx_pages),
+                reinterpret_cast<uint8_t*>(mkv.idx_staging),
+            });
         }
         const int nr = c.engine.o.nr, r = c.rank;
         const uint32_t nh_kv = uint32_t(geom::nh_kv(nr, r));
@@ -146,6 +213,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             const std::string compat = "qw38 set " + c.set_id + " nr " + std::to_string(nr) +
                                        " slots " + std::to_string(slots) + " pages " + std::to_string(max_pps) +
                                        " layers " + c.engine.o.layers +
+                                       " mtp " + std::to_string(K > 0 ? 1 : 0) +
                                        " format " + std::to_string(desc.format_hash()) +
                                        " state " + std::to_string(desc.state_blocks()) +
                                        " blocks " + std::to_string(blocks) +
@@ -232,6 +300,9 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 if (bound_live[size_t(i)] && bound[size_t(i)] == r) { q = i; break; }
             require(q >= 0, "qw38 retain: run has no bound slot");
             const uint32_t p = uint32_t(std::max(0, st.valid));
+            if (K > 0 && pend[size_t(q)].rows > 0) {
+                commit_pending(q, int(p) - pend[size_t(q)].pos0);
+            }
             if (p > 0) {
                 sync_ple_ctx_to_dev(q);
                 QW38_CK(cudaStreamSynchronize(c.engine.stream));
@@ -290,6 +361,9 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             c.engine.set_slot_idx_raw_thw(q, blk_thw);
         }
         QW38_CK(cudaDeviceSynchronize());
+        pend[size_t(q)] = Pending{};
+        drafts[size_t(q)] = Drafts{};
+        done_end[size_t(q)] = int(g.reuse);
         bound[size_t(q)] = g.run;
         bound_live[size_t(q)] = true;
         if (stash) {
@@ -320,6 +394,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
 
     h.retire = [&](const Slot& s) {
         if (!stash && int(s.key.slot) >= 0 && int(s.key.slot) < slots) bound_live[s.key.slot] = false;
+        if (int(s.key.slot) >= 0 && int(s.key.slot) < slots) { pend[s.key.slot] = Pending{}; drafts[s.key.slot] = Drafts{}; }
         QW38_CK(cudaDeviceSynchronize());
     };
     h.fence = []() { QW38_CK(cudaDeviceSynchronize()); };
@@ -330,12 +405,66 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
         const s2::Step& sp = l.step;
         const int M = sp.M();
         require(M >= 1 && M <= max_rows && l.samples.size() >= size_t(M), "qw38 launch: bad M");
+        if (sp.kind == s2::Step::CHAIN) {
+            std::vector<int> u(size_t(M), 0);
+            for (size_t j = 0; j < sp.sess.size(); ++j) {
+                const Drafts& d = drafts[size_t(sp.sess[j])];
+                const s2::Row& x = sp.r[size_t(sp.row0[j])];
+                const int i = x.pos - d.q;
+                require(K > 0 && sp.rows[j] == 1 && d.valid && i >= 1 && i < K && x.tok == d.d[size_t(i - 1)],
+                        "qw38 chain step does not continue cached draft");
+                u[size_t(sp.row0[j])] = d.d[size_t(i)];
+            }
+            return u;
+        }
+        if (sp.kind == s2::Step::DRAFT) {
+            require(K > 0, "qw38 draft step at MTP 0");
+            std::vector<int> u(size_t(M), 0), ds, dq, dg, dlast;
+            std::vector<qw38rt::RowSample> dsm;
+            for (size_t j = 0; j < sp.sess.size(); ++j) {
+                const int q = sp.sess[j], r0 = sp.row0[j], n = sp.rows[j];
+                for (int i = 1; i < n; ++i)
+                    require(sp.r[size_t(r0 + i)].pos == sp.r[size_t(r0)].pos + i, "qw38 draft rows are not consecutive");
+                Pending& w = pend[size_t(q)];
+                if (w.rows > 0) {
+                    require(sp.r[size_t(r0)].pos == w.pos0 && n <= w.rows, "qw38 draft rows mismatch pending verify");
+                    commit_pending(q, n);
+                }
+                const s2::Row& last = sp.r[size_t(r0 + n - 1)];
+                require(last.pos < done_end[size_t(q)], "qw38 draft from uncommitted row");
+                const int ev = j < sp.ev.size() ? sp.ev[j] : int(sp.event);
+                if (sp.round < 0 && ev != s2::Step::TAIL) continue;
+                const Sampling& sa = l.samples[size_t(r0 + n - 1)];
+                ds.push_back(q);
+                dq.push_back(last.pos);
+                dg.push_back(last.tok);
+                dlast.push_back(r0 + n - 1);
+                dsm.push_back(qw38rt::RowSample{sa.inv_temp, sa.top_p, sa.seed, 0u});
+            }
+            if (!ds.empty()) {
+                std::vector<int> dout;
+                c.engine.mtp_draft_k(ds, dq, dg, dsm, K, dout);
+                require(dout.size() == ds.size() * size_t(K), "qw38 draft: bad output size");
+                for (size_t i = 0; i < ds.size(); ++i) {
+                    Drafts& d = drafts[size_t(ds[i])];
+                    d = Drafts{};
+                    for (int t = 0; t < K; ++t) d.d[size_t(t)] = dout[i * size_t(K) + size_t(t)];
+                    d.q = dq[i];
+                    d.valid = true;
+                    u[size_t(dlast[i])] = d.d[0];
+                }
+            }
+            return u;
+        }
+        if (K > 0) settle(&sp);
         std::vector<qw38::StepSeg> segs;
         std::vector<int> toks(static_cast<size_t>(M));
         std::vector<qw38rt::RowSample> sm(static_cast<size_t>(M));
         targets.assign(static_cast<size_t>(M), -1);
+        bool has_verify = false;
         for (size_t j = 0; j < sp.sess.size(); ++j) {
             const int q = sp.sess[j], r0 = sp.row0[j], n = sp.rows[j];
+            if (K > 0 && sp.round >= 0 && n > 1) has_verify = true;
             segs.push_back({q, r0, sp.r[size_t(r0)].pos, n});
             for (int r = r0; r < r0 + n; ++r) {
                 const s2::Row& x = sp.r[size_t(r)];
@@ -345,7 +474,28 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 sm[size_t(r)] = qw38rt::RowSample{s.inv_temp, s.top_p, s.seed, uint32_t(x.spos)};
             }
         }
-        c.engine.forward(segs, toks.data(), sm.data(), out, false);
+        const auto saved_ple_ctx = has_verify ? c.engine.ple_ctx : std::vector<std::array<int32_t, 2>>{};
+        c.engine.forward(segs, toks.data(), sm.data(), out, false, has_verify ? K : 0);
+        if (K > 0) {
+            for (size_t j = 0; j < sp.sess.size(); ++j) {
+                const int q = sp.sess[j], r0 = sp.row0[j], n = sp.rows[j];
+                const int pos0 = sp.r[size_t(r0)].pos;
+                if (sp.round < 0 || n == 1) {
+                    if (n > 1) c.engine.mtp_sync_kv(q, r0, pos0, n - 1, &toks[size_t(r0 + 1)]);
+                    c.engine.mtp_save_last_hyper(q, r0 + n - 1);
+                    done_end[size_t(q)] = pos0 + n;
+                } else {
+                    require(n <= K + 1, "qw38 verify: n > K + 1");
+                    Pending w{};
+                    w.row0 = r0;
+                    w.rows = n;
+                    w.pos0 = pos0;
+                    for (int i = 0; i < n; ++i) w.toks[size_t(i)] = toks[size_t(r0 + i)];
+                    w.ple_ctx = saved_ple_ctx[size_t(q)];
+                    pend[size_t(q)] = w;
+                }
+            }
+        }
         lp_rows = M;
         std::vector<int> ids(static_cast<size_t>(M));
         for (int r = 0; r < M; ++r) ids[size_t(r)] = out[size_t(r)].tok;
@@ -379,6 +529,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 if (ck > at && ck < step_lim) step_lim = ck;
             }
             const int n = int(step_lim - at);
+            if (K > 0) settle(nullptr);
             std::vector<qw38::StepSeg> segs = {{q, 0, int(at), n}};
             if (!p.images.empty()) {
                 const int vis_n = c.engine.vision.stage(p.images, int(at), n, c.engine.stream, c.rank, s.req.id);
@@ -387,6 +538,11 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 c.engine.forward(segs, &p.prompt[at], nullptr, out, true, 0, vis_n, mrope_thw.data());
             } else {
                 c.engine.forward(segs, &p.prompt[at], nullptr, out, true);
+            }
+            if (K > 0 && c.engine.has_mtp) {
+                const int sync_n = std::min(n, int(p.prompt.size()) - 1 - int(at));
+                if (sync_n > 0) c.engine.mtp_sync_kv(q, 0, int(at), sync_n, &p.prompt[at + 1]);
+                done_end[size_t(q)] = int(at) + n;
             }
             at = step_lim;
             if (at < limit && p.images.empty()) {

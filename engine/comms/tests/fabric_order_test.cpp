@@ -138,18 +138,18 @@ int main()
         const std::vector<int> hi = iota_v(32, 83);                                // skip = all 32 bits: c >= 32 is never skipped
         expect_pass("skip mask 0xFFFFFFFF, c>=32 still waited      ", run_plan(83, 83, hi, {}, 0xFFFFFFFFu, steps), hi, steps);
     }
-    // 4b. the mask is 128 bits (CollMask). The 32-bit form converts unchanged; bits 32..127 work (DS41 reduce-scatter + all-gather: the
-    //     big collectives 0..41 and the AG collectives 83..124 of ncoll 125); c >= 128 reads as 0.
+    // 4b. the mask is 256 bits (CollMask). The 32-bit form converts unchanged; bits 32..255 work (DS41 & QW38
+    //     reduce-scatter + all-gather); c >= 256 reads as 0.
     {
         CollMask m(0x5u);
         CHECK(m.bit(0) && !m.bit(1) && m.bit(2) && !m.bit(32), "unsigned 0x5 converts to bits 0, 2");
-        CollMask h; for (int c = 32; c < 128; c += 3) h.set((size_t)c);
+        CollMask h; for (int c = 32; c < 256; c += 3) h.set((size_t)c);
         bool ok = true;
-        for (int c = 0; c < 160; ++c) ok = ok && (mask_bit(h, (size_t)c) == (c >= 32 && c < 128 && (c - 32) % 3 == 0));
-        CHECK(ok, "bits 32..127 set and read back; c >= 128 reads 0");
-        h.set(200); CHECK(!h.bit(200), "set(c >= 128) is a no-op");
-        CollMask a; a.set(5); a.set(100); CollMask b; b.set(100);
-        CHECK(!(b & ~a) && (a & ~b).bit(5) && !(a & ~b).bit(100), "p2p & ~mask over 128 bits");
+        for (int c = 0; c < 280; ++c) ok = ok && (mask_bit(h, (size_t)c) == (c >= 32 && c < 256 && (c - 32) % 3 == 0));
+        CHECK(ok, "bits 32..255 set and read back; c >= 256 reads 0");
+        h.set(260); CHECK(!h.bit(260), "set(c >= 256) is a no-op");
+        CollMask a; a.set(5); a.set(190); CollMask b; b.set(190);
+        CHECK(!(b & ~a) && (a & ~b).bit(5) && !(a & ~b).bit(190), "p2p & ~mask over 256 bits");
         CHECK(!CollMask() && CollMask(1u) && a.any(), "bool form");
         std::vector<int> all = iota_v(0, 125), want;
         CollMask sk; for (int c = 83; c < 125; c += 2) sk.set((size_t)c);
