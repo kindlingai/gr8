@@ -108,6 +108,26 @@ struct Wire {
         qw38_ar_exchange(f, d_step, static_cast<int>(step & 1), c, reinterpret_cast<char*>(parts), wire, st);
     }
 
+    __nv_bfloat16* fast_send_dst(int c) const {
+        return reinterpret_cast<__nv_bfloat16*>(f.send + g6::fab_send_off(f, static_cast<int>(step & 1), c));
+    }
+
+    void fast_ar_wait(int c, size_t bytes, cudaStream_t st) const {
+        const size_t wire = (bytes + 15) / 16 * 16;
+        Qw38ArWait a{f, wire, d_step, ink2::INK2_ERR_AR | (static_cast<unsigned>(c) << 8), static_cast<int>(step & 1), c};
+        k_qw38_ar_ring_wait<<<1, 32, 0, st>>>(a);
+    }
+
+    void fast_hc_inject(int c, __nv_bfloat16* hyper, const float* inj, int M, cudaStream_t st) const {
+        const int par = static_cast<int>(step & 1);
+        const __nv_bfloat16* pt[4] = {nullptr, nullptr, nullptr, nullptr};
+        for (int p = 0; p < nr; ++p) {
+            if (p == rank) pt[p] = reinterpret_cast<const __nv_bfloat16*>(f.send + g6::fab_send_off(f, par, c));
+            else pt[p] = reinterpret_cast<const __nv_bfloat16*>(f.recv + g6::fab_recv_off(f, par, c, p));
+        }
+        qw38::k_hc_inject_ptrs<<<M * 5, 64, 0, st>>>(hyper, pt[0], pt[1], pt[2], pt[3], inj, M, nr, rank);
+    }
+
     void fast_host(int c, uint8_t* parts, size_t bytes) {
         const int par = static_cast<int>(step & 1);
         const size_t wire = (bytes + 7) / 8 * 8;
@@ -282,6 +302,11 @@ int main(int argc, char** argv) {
             wire.d_step = qw38rt::dalloc<unsigned long long>(1);
             e.step_begin = [&](int M, bool skip_head, int nl) { wire.fast_begin(M, skip_head, nl, e.stream); };
             e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.fast_dev(c, p, b, e.stream); };
+            e.direct_send_dst = [&](int c) { return wire.fast_send_dst(c); };
+            e.direct_ar_wait = [&](int c, size_t b) { wire.fast_ar_wait(c, b, e.stream); };
+            e.direct_hc_inject = [&](int c, __nv_bfloat16* h, const float* inj, int M) {
+                wire.fast_hc_inject(c, h, inj, M, e.stream);
+            };
             e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.fast_host(c, p, b); };
             e.step_end = [&]() { wire.fast_end(e.stream); };
             e.step_parity = [&]() -> int { return static_cast<int>(wire.step & 1); };

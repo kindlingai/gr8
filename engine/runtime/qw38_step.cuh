@@ -366,6 +366,11 @@ struct Engine {
     std::function<void(int M, bool skip_head, int n_layers_override)> step_begin;
     std::function<void(int c, __nv_bfloat16* parts, size_t bytes)> gather_dev;
     std::function<void(int c, uint8_t* host_parts, size_t bytes)> gather_host;
+    // Optional zero-copy direct-fabric AR callbacks (g6m4_qw38 fast AR): write directly into f.send,
+    // wait on ring/tail, and inject directly from f.send + __ldcv(f.recv) without staging copies.
+    std::function<__nv_bfloat16*(int c)> direct_send_dst;
+    std::function<void(int c, size_t bytes)> direct_ar_wait;
+    std::function<void(int c, __nv_bfloat16* hyper, const float* inj, int M)> direct_hc_inject;
     std::function<void()> step_end;
     std::function<int()> step_parity;     // returns 0 or 1 for double-buffered multi-box graph capture
 
@@ -829,7 +834,7 @@ struct Engine {
 
         hc_sc.hn = dalloc<__nv_bfloat16>(M * geom::HC_D);
         hc_sc.down = dalloc<__nv_bfloat16>(M * geom::HC_RANK);
-        hc_sc.up = dalloc<__nv_bfloat16>(M * geom::HC_D);
+        hc_sc.up = nullptr;
         hc_sc.inj = dalloc<float>(M * geom::HC);
 
         const int max_nh_v = geom::gdn_vh(o.nr);
@@ -1004,13 +1009,15 @@ struct Engine {
         const size_t hrb = head_row_bytes(o.nc);
         const size_t rank_pkt_bytes = size_t(M) * hrb;
 
+        const bool use_direct_ar = (o.nr > 1 && o.nloc == 1 && direct_send_dst && direct_ar_wait && direct_hc_inject);
+
         auto run_layer_gpu = [&](size_t li, int& coll) {
             Layer& y = L[li];
             qw38::hc_prepare(blas, y.attn_hc, hyper, mixed, hc_sc, M, stream);
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
                 RankLayer& rl = y.rk[size_t(i)];
-                __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
+                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 if (y.is_full) {
                     qw38::full_attn_forward(blas, rl.attn_w, rl.kv, attn_sc, mixed, p_dst,
                                             d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r,
@@ -1020,20 +1027,32 @@ struct Engine {
                                       segs.data(), int(segs.size()), M, o.nr, r, true, stream, d_slot, d_pos, snap_k);
                 }
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (use_direct_ar) {
+                direct_ar_wait(coll, part_stride * 2);
+                direct_hc_inject(coll, hyper, hc_sc.inj, M);
+                ++coll;
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
                 RankLayer& rl = y.rk[size_t(i)];
-                __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
+                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 qw38::moe_forward(blas, rl.moe_w, moe_sc, mixed, p_dst, M, stream);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (use_direct_ar) {
+                direct_ar_wait(coll, part_stride * 2);
+                direct_hc_inject(coll, hyper, hc_sc.inj, M);
+                ++coll;
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
         };
 
         auto run_head_gpu = [&]() {
@@ -1194,7 +1213,7 @@ struct Engine {
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
                 RankLayer& rl = y.rk[size_t(i)];
-                __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
+                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 if (y.is_full) {
                     qw38::full_attn_forward(blas, rl.attn_w, rl.kv, attn_sc, mixed, p_dst,
                                             d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r,
@@ -1207,12 +1226,14 @@ struct Engine {
             t_end(y.is_full ? prof.attn_ms : prof.gdn_ms);
 
             t_start();
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
+            if (use_direct_ar) direct_ar_wait(coll, part_stride * 2);
+            else if (o.nr > 1 && gather_dev) gather_dev(coll, parts, part_stride * 2);
             t_end(prof.ar_ms);
 
             t_start();
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (use_direct_ar) direct_hc_inject(coll, hyper, hc_sc.inj, M);
+            else qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            ++coll;
             t_end(prof.hc_ms);
 
             t_start();
@@ -1223,18 +1244,20 @@ struct Engine {
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
                 RankLayer& rl = y.rk[size_t(i)];
-                __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
+                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 qw38::moe_forward(blas, rl.moe_w, moe_sc, mixed, p_dst, M, stream);
             }
             t_end(prof.moe_ms);
 
             t_start();
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
+            if (use_direct_ar) direct_ar_wait(coll, part_stride * 2);
+            else if (o.nr > 1 && gather_dev) gather_dev(coll, parts, part_stride * 2);
             t_end(prof.ar_ms);
 
             t_start();
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (use_direct_ar) direct_hc_inject(coll, hyper, hc_sc.inj, M);
+            else qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            ++coll;
             t_end(prof.hc_ms);
         }
 
@@ -1382,31 +1405,44 @@ struct Engine {
             }
             qw38::k_mtp_fuse_stream4<<<M, 256, 0, stream>>>(mtp_sc.hid_proj, mtp_sc.emb_proj, mtp_sc.mtp_hyper, M);
 
+            const bool use_direct_ar = (o.nr > 1 && o.nloc == 1 && direct_send_dst && direct_ar_wait && direct_hc_inject);
             int coll = 0;
 
             // L048 Full Attention + AR + Inject
             qw38::hc_prepare(blas, mtp_w.attn_hc, mtp_sc.mtp_hyper, mixed, hc_sc, M, stream);
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
-                __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
+                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 qw38::full_attn_forward(blas, mtp_w.attn[size_t(i)], mtp_w.kv[size_t(i)], attn_sc, mixed, p_dst,
                                         d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r, max_pps, max_blocks, stream, 0);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (use_direct_ar) {
+                direct_ar_wait(coll, part_stride * 2);
+                direct_hc_inject(coll, mtp_sc.mtp_hyper, hc_sc.inj, M);
+                ++coll;
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             // L048 MoE (GPU-native FP8/BF16!) + AR + Inject
             qw38::hc_prepare(blas, mtp_w.mlp_hc, mtp_sc.mtp_hyper, mixed, hc_sc, M, stream);
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
-                __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
+                __nv_bfloat16* p_dst = use_direct_ar ? direct_send_dst(coll) : (parts + size_t(r) * part_stride);
                 qw38::mtp_moe_forward(blas, mtp_w.moe[size_t(i)], mtp_w.fp8_exp_gu[size_t(i)], mtp_w.fp8_exp_dn[size_t(i)],
                                       moe_sc, mtp_sc, mixed, p_dst, M, stream);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (use_direct_ar) {
+                direct_ar_wait(coll, part_stride * 2);
+                direct_hc_inject(coll, mtp_sc.mtp_hyper, hc_sc.inj, M);
+                ++coll;
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             if (hid_out) {
                 QW38_CK(cudaMemcpyAsync(hid_out, mtp_sc.mtp_hyper, size_t(M) * geom::HC_D * sizeof(__nv_bfloat16),
