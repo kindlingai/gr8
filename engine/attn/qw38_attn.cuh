@@ -378,13 +378,20 @@ __global__ void k_qsa_score_blocks(const __nv_bfloat16* __restrict__ idx_q,
     }
 }
 
-// Select top-512 blocks from idx_scores[m, 0..nblk) using binary search on threshold + compaction.
-// Exact tie-breaking matches top-512 selection. Grid: (M), Block: 256 threads.
-__global__ void k_qsa_select_top512(const float* __restrict__ idx_scores,
-                                    const int* __restrict__ row_pos,
-                                    int* __restrict__ sel_blocks,
-                                    int* __restrict__ sel_counts,
-                                    int max_blocks, int M) {
+__device__ __forceinline__ uint32_t qsa_score_key(float v) {
+    return (v > 0.0f) ? __float_as_uint(v) : 0u;
+}
+
+// Deterministic, exact top-512 block selection from non-negative idx_scores[m, 0..nblk)
+// via 3-pass IEEE-754 radix histogram (11 + 10 + 10 bits) + CTA prefix-sum compaction.
+// Ties are broken deterministically by smallest block index, and sel_blocks is emitted
+// in strictly ascending block-index order (zero atomicAdd on output -> bit-exact across runs
+// and sequential KV-page locality). Grid: (M), Block: 256 threads.
+__global__ void __launch_bounds__(256) k_qsa_select_top512(const float* __restrict__ idx_scores,
+                                                           const int* __restrict__ row_pos,
+                                                           int* __restrict__ sel_blocks,
+                                                           int* __restrict__ sel_counts,
+                                                           int max_blocks, int M) {
     const int m = blockIdx.x;
     if (m >= M) return;
     const int pos = row_pos[m];
@@ -396,68 +403,215 @@ __global__ void k_qsa_select_top512(const float* __restrict__ idx_scores,
     const float* sc = idx_scores + static_cast<size_t>(m) * max_blocks;
     int* dst = sel_blocks + static_cast<size_t>(m) * geom::IDX_TOP_BLOCKS;
 
-    // 1. Find min/max score
-    __shared__ float s_lo, s_hi;
-    __shared__ int s_cnt;
-    float lo = 1e30f, hi = -1e30f;
-    for (int b = threadIdx.x; b < nblk; b += blockDim.x) {
-        const float v = sc[b];
-        lo = fminf(lo, v);
-        hi = fmaxf(hi, v);
-    }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        lo = fminf(lo, __shfl_xor_sync(0xffffffffu, lo, off));
-        hi = fmaxf(hi, __shfl_xor_sync(0xffffffffu, hi, off));
-    }
-    __shared__ float rlo[8], rhi[8];
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (lane == 0) { rlo[warp] = lo; rhi[warp] = hi; }
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    __shared__ int hist[2048];
+    __shared__ int w_tot[8];
+    __shared__ int s_p1, s_need1, s_cnt1;
+    __shared__ int s_p2, s_need2, s_cnt2;
+    __shared__ uint32_t s_strict_thr, s_eq_thr;
+    __shared__ int s_eq_need;
+    __shared__ int s_out_pos, s_eq_used;
+
+    // Pass 1: 11-bit histogram on bits [30:20]
+    for (int i = tid; i < 2048; i += 256) hist[i] = 0;
     __syncthreads();
-    if (threadIdx.x == 0) {
-        float ml = rlo[0], mh = rhi[0];
-        for (int w = 1; w < 8; ++w) { ml = fminf(ml, rlo[w]); mh = fmaxf(mh, rhi[w]); }
-        s_lo = ml;
-        s_hi = mh;
+    for (int b = tid; b < nblk; b += 256) {
+        atomicAdd(&hist[(qsa_score_key(sc[b]) >> 20) & 2047], 1);
     }
     __syncthreads();
 
-    // 2. Binary search for threshold where count(score > mid) <= 512
-    for (int it = 0; it < 28; ++it) {
-        const float mid = 0.5f * (s_lo + s_hi);
-        int c = 0;
-        for (int b = threadIdx.x; b < nblk; b += blockDim.x) c += (sc[b] > mid) ? 1 : 0;
-        c = static_cast<int>(warp_sum(static_cast<float>(c)));
-        if (threadIdx.x == 0) s_cnt = 0;
-        __syncthreads();
-        if (lane == 0) atomicAdd(&s_cnt, c);
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            if (s_cnt > geom::IDX_TOP_BLOCKS) s_lo = mid;
-            else s_hi = mid;
+    {
+        int my_sum = 0;
+        const int b_hi = 2047 - tid * 8;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) my_sum += hist[b_hi - k];
+        int ws = my_sum;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const int n = __shfl_up_sync(0xffffffffu, ws, off);
+            if (lane >= off) ws += n;
         }
+        if (lane == 31) w_tot[warp] = ws;
         __syncthreads();
+        if (tid == 0) {
+            int run = 0, target_w = 7;
+            for (int w = 0; w < 8; ++w) {
+                if (run + w_tot[w] >= geom::IDX_TOP_BLOCKS) { target_w = w; break; }
+                run += w_tot[w];
+            }
+            int p1 = 0;
+            for (int b = 2047 - target_w * 256; b >= 0; --b) {
+                if (run + hist[b] >= geom::IDX_TOP_BLOCKS) { p1 = b; break; }
+                run += hist[b];
+            }
+            s_p1 = p1;
+            s_need1 = geom::IDX_TOP_BLOCKS - run;
+            s_cnt1 = hist[p1];
+            if (s_cnt1 == s_need1) {
+                s_strict_thr = static_cast<uint32_t>(p1) << 20;
+                s_eq_thr = 0u;
+                s_eq_need = 0;
+            }
+        }
     }
-    const float thr = s_hi;
+    __syncthreads();
 
-    // 3. Emit all strictly > thr, then fill ties == thr up to 512
-    if (threadIdx.x == 0) s_cnt = 0;
-    __syncthreads();
-    for (int b = threadIdx.x; b < nblk; b += blockDim.x) {
-        if (sc[b] > thr) {
-            const int p = atomicAdd(&s_cnt, 1);
-            if (p < geom::IDX_TOP_BLOCKS) dst[p] = b;
+    // Pass 2: 10-bit histogram on bits [19:10] within pivot bin p1 (only if needed)
+    if (s_cnt1 > s_need1) {
+        const uint32_t p1 = static_cast<uint32_t>(s_p1);
+        for (int i = tid; i < 1024; i += 256) hist[i] = 0;
+        __syncthreads();
+        for (int b = tid; b < nblk; b += 256) {
+            const uint32_t u = qsa_score_key(sc[b]);
+            if ((u >> 20) == p1) atomicAdd(&hist[(u >> 10) & 1023], 1);
+        }
+        __syncthreads();
+
+        int my_sum = 0;
+        const int b_hi = 1023 - tid * 4;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) my_sum += hist[b_hi - k];
+        int ws = my_sum;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const int n = __shfl_up_sync(0xffffffffu, ws, off);
+            if (lane >= off) ws += n;
+        }
+        if (lane == 31) w_tot[warp] = ws;
+        __syncthreads();
+        if (tid == 0) {
+            int run = 0, target_w = 7;
+            for (int w = 0; w < 8; ++w) {
+                if (run + w_tot[w] >= s_need1) { target_w = w; break; }
+                run += w_tot[w];
+            }
+            int p2 = 0;
+            for (int b = 1023 - target_w * 128; b >= 0; --b) {
+                if (run + hist[b] >= s_need1) { p2 = b; break; }
+                run += hist[b];
+            }
+            s_p2 = p2;
+            s_need2 = s_need1 - run;
+            s_cnt2 = hist[p2];
+            if (s_cnt2 == s_need2) {
+                s_strict_thr = (p1 << 20) | (static_cast<uint32_t>(p2) << 10);
+                s_eq_thr = 0u;
+                s_eq_need = 0;
+            }
+        }
+        __syncthreads();
+
+        // Pass 3: low 10-bit histogram on bits [9:0] within (p1, p2) (only if needed)
+        if (s_cnt2 > s_need2) {
+            const uint32_t p12 = (p1 << 10) | static_cast<uint32_t>(s_p2);
+            for (int i = tid; i < 1024; i += 256) hist[i] = 0;
+            __syncthreads();
+            for (int b = tid; b < nblk; b += 256) {
+                const uint32_t u = qsa_score_key(sc[b]);
+                if ((u >> 10) == p12) atomicAdd(&hist[u & 1023], 1);
+            }
+            __syncthreads();
+
+            int my_sum3 = 0;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) my_sum3 += hist[b_hi - k];
+            int ws3 = my_sum3;
+            #pragma unroll
+            for (int off = 1; off < 32; off <<= 1) {
+                const int n = __shfl_up_sync(0xffffffffu, ws3, off);
+                if (lane >= off) ws3 += n;
+            }
+            if (lane == 31) w_tot[warp] = ws3;
+            __syncthreads();
+            if (tid == 0) {
+                int run = 0, target_w = 7;
+                for (int w = 0; w < 8; ++w) {
+                    if (run + w_tot[w] >= s_need2) { target_w = w; break; }
+                    run += w_tot[w];
+                }
+                int p3 = 0;
+                for (int b = 1023 - target_w * 128; b >= 0; --b) {
+                    if (run + hist[b] >= s_need2) { p3 = b; break; }
+                    run += hist[b];
+                }
+                const int need3 = s_need2 - run;
+                const uint32_t thr_u = (p12 << 10) | static_cast<uint32_t>(p3);
+                if (hist[p3] == need3) {
+                    s_strict_thr = thr_u;
+                    s_eq_thr = 0u;
+                    s_eq_need = 0;
+                } else {
+                    s_strict_thr = thr_u + 1u;
+                    s_eq_thr = thr_u;
+                    s_eq_need = need3;
+                }
+            }
+            __syncthreads();
         }
     }
-    __syncthreads();
-    for (int b = threadIdx.x; b < nblk; b += blockDim.x) {
-        if (sc[b] <= thr && sc[b] >= s_lo) {
-            const int p = atomicAdd(&s_cnt, 1);
-            if (p < geom::IDX_TOP_BLOCKS) dst[p] = b;
-        }
+
+    // Deterministic ascending-b compaction using CTA prefix sums (zero atomicAdd on output)
+    const uint32_t strict_thr = s_strict_thr;
+    const uint32_t eq_thr = s_eq_thr;
+    const int eq_need = s_eq_need;
+    const uint32_t lane_mask = (1u << lane) - 1u;
+    if (tid == 0) {
+        s_out_pos = 0;
+        s_eq_used = 0;
     }
     __syncthreads();
-    if (threadIdx.x == 0) sel_counts[m] = min(s_cnt, geom::IDX_TOP_BLOCKS);
+
+    for (int base = 0; base < nblk; base += 256) {
+        if (s_out_pos >= geom::IDX_TOP_BLOCKS) break;
+        const int b = base + tid;
+        const bool valid = (b < nblk);
+        const uint32_t u = valid ? qsa_score_key(sc[b]) : 0u;
+        const bool is_gt = valid && (u >= strict_thr);
+        const bool is_eq = valid && (eq_need > 0) && (u == eq_thr);
+
+        bool take_eq = false;
+        if (__syncthreads_or(is_eq)) {
+            const uint32_t m_eq = __ballot_sync(0xffffffffu, is_eq);
+            const int lp_eq = __popc(m_eq & lane_mask);
+            if (lane == 31) w_tot[warp] = __popc(m_eq);
+            __syncthreads();
+            int w_off = 0, c_tot = 0;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w < warp) w_off += w_tot[w];
+                c_tot += w_tot[w];
+            }
+            if (is_eq && (s_eq_used + w_off + lp_eq < eq_need)) take_eq = true;
+            __syncthreads();
+            if (tid == 0) s_eq_used += c_tot;
+            __syncthreads();
+        }
+
+        const bool take = is_gt || take_eq;
+        if (__syncthreads_or(take)) {
+            const uint32_t m_tk = __ballot_sync(0xffffffffu, take);
+            const int lp_tk = __popc(m_tk & lane_mask);
+            if (lane == 31) w_tot[warp] = __popc(m_tk);
+            __syncthreads();
+            int w_off = 0, c_tot = 0;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                if (w < warp) w_off += w_tot[w];
+                c_tot += w_tot[w];
+            }
+            if (take) {
+                const int p = s_out_pos + w_off + lp_tk;
+                if (p < geom::IDX_TOP_BLOCKS) dst[p] = b;
+            }
+            __syncthreads();
+            if (tid == 0) s_out_pos += c_tot;
+            __syncthreads();
+        }
+    }
+    if (tid == 0) sel_counts[m] = min(s_out_pos, geom::IDX_TOP_BLOCKS);
 }
 
 // GQA-12 Tiled FlashAttention + Split-KV (works for ALL TP=1..4, both dense & QSA sparse!).
