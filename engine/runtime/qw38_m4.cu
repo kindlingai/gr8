@@ -180,7 +180,7 @@ int main(int argc, char** argv) {
     using namespace qw38rt;
     std::string dir, widths, layout, layers = "all", tokens, s2dir, set_id, ips, ips2, kv_keep = "all";
     std::vector<std::string> kv_tiers;
-    int rank = -1, proxy_cpu = -1, gen = 16, chunk = 8, prefill = 256, nc = 256, cap = 65536, mtp = 0;
+    int rank = -1, proxy_cpu = -1, gen = 16, chunk = 8, prefill = 2048, nc = 256, cap = 65536, mtp = 0;
     int s2port = 7341, s2sess = 1, s2epoch = 0, kv_sys_after = 2;
     double kv_wlim = 0.0;
     bool reuse = false;
@@ -263,6 +263,13 @@ int main(int argc, char** argv) {
         cfg.ncoll = wire.fast ? static_cast<int>(2 * e.L.size() + 1) : 1;
         cfg.stripe_min = cfg.ips2.empty() ? 0 : 65536;
         cfg.slot_bytes = (slot_b + 7) / 8 * 8;
+        if (wire.fast && !e.L.empty()) {
+            cfg.run1 = static_cast<int>(2 * e.L.size());
+            cfg.run2 = cfg.ncoll;
+            cfg.slot_bytes1 = (max_head_b + 7) / 8 * 8;
+            cfg.pool = std::min(4, cfg.run1);
+            cfg.compact = true;
+        }
         wire.fab.init(cfg);
         wire.f = wire.fab.dev();
         wire.fab.start_proxy();

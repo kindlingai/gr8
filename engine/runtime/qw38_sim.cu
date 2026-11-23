@@ -42,8 +42,8 @@ int main(int argc, char** argv) {
     }
     if (nc < 0 || nc > 2048 / G6_NR) die("--top-p-cands must be 0.." + std::to_string(2048 / G6_NR));
     if (dir.empty()) die("name the release directory: --packs DIR");
-    if (sessions < 1 || sessions > 8 || chunk < 1 || chunk > 1024 || gen < 0 || cap < 64)
-        die("--sessions 1..8, --chunk 1..1024, --gen >= 0, --cap >= 64");
+    if (sessions < 1 || sessions > 8 || chunk < 1 || chunk > 4096 || gen < 0 || cap < 64)
+        die("--sessions 1..8, --chunk 1..4096, --gen >= 0, --cap >= 64");
     knob::init();
 
     Options o;
