@@ -17,6 +17,7 @@
 #include "../attn/qw38_attn.cuh"
 #include "../engram/qw38_ple.h"
 #include "../engram/qw38_ple.cuh"
+#include "../engram/qw38_ple_trellis.cuh"
 #include "../kernels/qw38_moe.cuh"
 #include "../kernels/qw38_mtp.cuh"
 #include "../kernels/qw38_head.cuh"
@@ -258,6 +259,7 @@ struct Options {
     std::string layers = "all";
     std::string widths_path;    // defaults to <release>/exlr8-manifest-bit300.json
     std::string layout_path;    // optional bin/g6layout file
+    std::string ple_path;       // optional PLE table path (.bin or exlr8 row-trellis .safetensors)
     size_t ple_cache_mib = 4096;
     int ple_uring = 128;
     bool ple_direct = true;
@@ -313,7 +315,12 @@ struct Engine {
     qw38::PleState ple_st;
     qw38::PleScratch ple_sc;
     std::vector<std::array<int32_t, 2>> ple_ctx; // [slots][2] prior tokens (init to TOK_EOS)
-    __nv_bfloat16* ple_pinned = nullptr;         // [max_rows * 2560] pinned host staging
+    __nv_bfloat16* ple_pinned = nullptr;         // [max_rows * 2560] pinned host staging (raw BF16 mode)
+    uint8_t* ple_codes_pinned = nullptr;         // [max_rows * 16 * row_bytes] pinned staging (row-trellis mode)
+    uint16_t* ple_svh_pinned = nullptr;          // [max_rows * 16] pinned row scales (row-trellis mode)
+    uint8_t* d_ple_codes = nullptr;              // device staging for compressed row-trellis rows
+    __half* d_ple_svh = nullptr;                 // device staging for row scales
+    __half* d_ple_suh = nullptr;                 // device column scales [nc] (uploaded once at init)
     // Persistent background thread to overlap PLE NVMe fetch with Layer-0 GPU compute (GR8_QW38_PLE_ASYNC=1)
     std::thread ple_thr;
     std::mutex ple_mu;
@@ -417,6 +424,11 @@ struct Engine {
             ple_thr.join();
         }
         if (ple_pinned) cudaFreeHost(ple_pinned);
+        if (ple_codes_pinned) cudaFreeHost(ple_codes_pinned);
+        if (ple_svh_pinned) cudaFreeHost(ple_svh_pinned);
+        if (d_ple_codes) cudaFree(d_ple_codes);
+        if (d_ple_svh) cudaFree(d_ple_svh);
+        if (d_ple_suh) cudaFree(d_ple_suh);
         if (head_host_parts) cudaFreeHost(head_host_parts);
         if (h_meta_pinned) cudaFreeHost(h_meta_pinned);
         if (blas) cublasDestroy(blas);
@@ -472,6 +484,10 @@ struct Engine {
         o.use_graph = knob::qw38_graph();
         o.profile = knob::qw38_profile();
         if (knob::qw38_ple_cache_mib() >= 0) o.ple_cache_mib = size_t(knob::qw38_ple_cache_mib());
+        if (o.ple_path.empty()) {
+            const std::optional<std::string>& env_ple = knob::qw38_ple_path();
+            if (env_ple && !env_ple->empty()) o.ple_path = *env_ple;
+        }
 
         QW38_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         cublasCreate(&blas);
@@ -524,16 +540,29 @@ struct Engine {
                 die("L001.ple hash tables have unexpected sizes");
             ple_store.set_hash_params(mult.data(), offs.data(), vs.data(), geom::TOK_EOS);
 
-            const std::string ple_bin = release_dir + "/ple/exlr8-ple-L001.bin";
+            const std::string ple_bin = qw38::resolve_ple_path(release_dir, o.ple_path);
             qw38::PleStoreOpts po;
             po.cache_bytes = o.ple_cache_mib << 20;
             po.io_uring = o.ple_uring;
             po.direct = o.ple_direct;
             std::string perr;
             if (!ple_store.open(ple_bin, po, &perr)) die(perr);
-            std::fprintf(stderr, "# rank %d: qw38 PLE opened %s (%llu rows, direct=%d, uring=%d, cache=%zu MiB)\n",
-                         o.rank0, ple_bin.c_str(), (unsigned long long)ple_store.total_rows(),
-                         int(ple_store.is_direct()), int(ple_store.has_uring()), o.ple_cache_mib);
+            if (ple_store.is_row_trellis()) {
+                const auto& rt = ple_store.trellis_info();
+                if (rt.nc < geom::PLE_HEAD_DIM)
+                    die("L001.ple row-trellis nc=" + std::to_string(rt.nc) + " < PLE_HEAD_DIM");
+                std::fprintf(stderr,
+                             "# rank %d: qw38 PLE opened %s (row-trellis %s %s, %llu rows x %d cols, %zu B/row, "
+                             "resident=%d, direct=%d, uring=%d, cache=%zu MiB)\n",
+                             o.rank0, ple_bin.c_str(), rt.codebook.c_str(), rt.width_name.c_str(),
+                             (unsigned long long)ple_store.total_rows(), rt.nc, rt.row_bytes,
+                             int(ple_store.is_resident()), int(ple_store.is_direct()), int(ple_store.has_uring()),
+                             o.ple_cache_mib);
+            } else {
+                std::fprintf(stderr, "# rank %d: qw38 PLE opened %s (%llu rows, direct=%d, uring=%d, cache=%zu MiB)\n",
+                             o.rank0, ple_bin.c_str(), (unsigned long long)ple_store.total_rows(),
+                             int(ple_store.is_direct()), int(ple_store.has_uring()), o.ple_cache_mib);
+            }
 
             ple_st.conv_hist = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::PLE_NHIST * geom::HC_D);
             if (o.mtp > 0)
@@ -544,7 +573,19 @@ struct Engine {
             ple_sc.val = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HID);
             ple_sc.gv = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
             ple_sc.gv_norm = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
-            QW38_CK(cudaHostAlloc(&ple_pinned, size_t(o.max_rows) * geom::PLE_DIM * 2, cudaHostAllocDefault));
+            if (ple_store.is_row_trellis()) {
+                const size_t max_ple_rows = size_t(o.max_rows) * geom::PLE_HEADS;
+                const size_t rb = ple_store.row_bytes();
+                QW38_CK(cudaHostAlloc(&ple_codes_pinned, max_ple_rows * rb, cudaHostAllocDefault));
+                QW38_CK(cudaHostAlloc(&ple_svh_pinned, max_ple_rows * sizeof(uint16_t), cudaHostAllocDefault));
+                d_ple_codes = dalloc<uint8_t>(max_ple_rows * rb);
+                d_ple_svh = dalloc<__half>(max_ple_rows);
+                d_ple_suh = dalloc<__half>(ple_store.suh().size());
+                QW38_CK(cudaMemcpy(d_ple_suh, ple_store.suh().data(), ple_store.suh().size() * sizeof(uint16_t),
+                                   cudaMemcpyHostToDevice));
+            } else {
+                QW38_CK(cudaHostAlloc(&ple_pinned, size_t(o.max_rows) * geom::PLE_DIM * 2, cudaHostAllocDefault));
+            }
             if (o.ple_async) {
                 ple_thr = std::thread([this]() {
                     for (;;) {
@@ -553,8 +594,11 @@ struct Engine {
                         if (ple_stop) return;
                         ple_has_job = false;
                         lk.unlock();
-                        const bool ok = ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
-                                                             reinterpret_cast<uint8_t*>(ple_pinned));
+                        const bool ok = ple_store.is_row_trellis()
+                            ? ple_store.fetch_trellis_rows(ple_job_ids.data(), ple_job_ids.size(),
+                                                           ple_codes_pinned, ple_svh_pinned)
+                            : ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
+                                                   reinterpret_cast<uint8_t*>(ple_pinned));
                         lk.lock();
                         ple_job_ok = ok;
                         ple_job_done = true;
@@ -991,11 +1035,39 @@ struct Engine {
                     ple_store.compute_ids(toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
                                           all_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
                 }
-                if (!ple_store.fetch_rows(all_ids.data(), all_ids.size(), reinterpret_cast<uint8_t*>(ple_pinned)))
-                    die("PLE fetch_rows failed");
+                if (ple_store.is_row_trellis()) {
+                    if (!ple_store.fetch_trellis_rows(all_ids.data(), all_ids.size(), ple_codes_pinned, ple_svh_pinned))
+                        die("PLE fetch_trellis_rows failed");
+                } else {
+                    if (!ple_store.fetch_rows(all_ids.data(), all_ids.size(), reinterpret_cast<uint8_t*>(ple_pinned)))
+                        die("PLE fetch_rows failed");
+                }
             }
             const auto p1 = std::chrono::steady_clock::now();
             if (o.profile) prof.ple_io_ms += std::chrono::duration<double, std::milli>(p1 - p0).count();
+        };
+
+        auto upload_ple_to_dev = [&]() {
+            if (ple_store.is_row_trellis()) {
+                const size_t n_ple_rows = size_t(M) * geom::PLE_HEADS;
+                QW38_CK(cudaMemcpyAsync(d_ple_codes, ple_codes_pinned, n_ple_rows * ple_store.row_bytes(),
+                                        cudaMemcpyHostToDevice, stream));
+                QW38_CK(cudaMemcpyAsync(d_ple_svh, ple_svh_pinned, n_ple_rows * sizeof(uint16_t),
+                                        cudaMemcpyHostToDevice, stream));
+            } else {
+                QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2,
+                                        cudaMemcpyHostToDevice, stream));
+            }
+        };
+
+        auto run_ple_gpu = [&]() {
+            if (ple_store.is_row_trellis()) {
+                const auto& rt = ple_store.trellis_info();
+                qw38::ple_rowtrellis_decode(d_ple_codes, d_ple_svh, d_ple_suh, ple_sc.emb,
+                                            M * geom::PLE_HEADS, rt.n_tiles, geom::PLE_HEAD_DIM,
+                                            rt.k_bits, rt.e4m3, stream);
+            }
+            qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream, d_slot, d_pos, snap_k);
         };
 
         const size_t part_stride = size_t(M) * geom::HID;
@@ -1092,11 +1164,11 @@ struct Engine {
                     QW38_CK(cudaGraphLaunch(gp.exec_a, stream));
 
                     finish_ple_io();
-                    QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
+                    upload_ple_to_dev();
 
                     cudaGraph_t gb = nullptr;
                     QW38_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
-                    qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream, d_slot, d_pos, snap_k);
+                    run_ple_gpu();
                     for (size_t li = 1; li < L.size(); ++li) run_layer_gpu(li, coll);
                     run_head_gpu();
                     QW38_CK(cudaStreamEndCapture(stream, &gb));
@@ -1106,14 +1178,14 @@ struct Engine {
                 } else {
                     if (has_ple) {
                         finish_ple_io();
-                        QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
+                        upload_ple_to_dev();
                     }
                     cudaGraph_t gb = nullptr;
                     QW38_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
                     qw38::k_embed_hc4<<<M, 256, 0, stream>>>(d_tok, embed, hyper, M);
                     for (size_t li = 0; li < L.size(); ++li) {
                         if (geom::is_ple(L[li].l) && has_ple)
-                            qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream, d_slot, d_pos, snap_k);
+                            run_ple_gpu();
                         run_layer_gpu(li, coll);
                     }
                     run_head_gpu();
@@ -1128,10 +1200,10 @@ struct Engine {
                 if (gp.exec_a) {
                     QW38_CK(cudaGraphLaunch(gp.exec_a, stream));
                     finish_ple_io();
-                    QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
+                    upload_ple_to_dev();
                 } else if (has_ple) {
                     finish_ple_io();
-                    QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
+                    upload_ple_to_dev();
                 }
                 QW38_CK(cudaGraphLaunch(gp.exec_b, stream));
             }
@@ -1173,8 +1245,8 @@ struct Engine {
             if (geom::is_ple(y.l) && has_ple) {
                 finish_ple_io();
                 t_start();
-                QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
-                qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream, d_slot, d_pos, snap_k);
+                upload_ple_to_dev();
+                run_ple_gpu();
                 t_end(prof.ple_gpu_ms);
             }
 
