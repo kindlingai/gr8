@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +40,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -261,6 +263,7 @@ struct Options {
     ptab::Mode ptab_mode = ptab::OFF;
     bool wide = true;
     bool dense_fp8 = true;
+    bool ple_async = true;
     bool profile = false;
 };
 
@@ -309,6 +312,12 @@ struct Engine {
     qw38::PleScratch ple_sc;
     std::vector<std::array<int32_t, 2>> ple_ctx; // [slots][2] prior tokens (init to TOK_EOS)
     __nv_bfloat16* ple_pinned = nullptr;         // [max_rows * 2560] pinned host staging
+    // Persistent background thread to overlap PLE NVMe fetch with Layer-0 GPU compute (GR8_QW38_PLE_ASYNC=1)
+    std::thread ple_thr;
+    std::mutex ple_mu;
+    std::condition_variable ple_cv, ple_done_cv;
+    bool ple_stop = false, ple_has_job = false, ple_job_done = true, ple_job_ok = true;
+    std::vector<uint64_t> ple_job_ids;
 
     struct RankLayer {
         qw38::GdnWeights gdn_w;
@@ -351,6 +360,11 @@ struct Engine {
     cudaEvent_t ev0 = nullptr, ev1 = nullptr;
 
     ~Engine() {
+        if (ple_thr.joinable()) {
+            { std::lock_guard<std::mutex> lk(ple_mu); ple_stop = true; ple_has_job = true; }
+            ple_cv.notify_one();
+            ple_thr.join();
+        }
         if (ple_pinned) cudaFreeHost(ple_pinned);
         if (blas) cublasDestroy(blas);
         if (ev0) cudaEventDestroy(ev0);
@@ -398,6 +412,7 @@ struct Engine {
         if (o.ptab_mode == ptab::OFF) o.ptab_mode = ptab::mode_env();
         if (const char* we = std::getenv("GR8_QW38_WIDE")) o.wide = (std::atoi(we) != 0);
         if (const char* fe = std::getenv("GR8_QW38_DENSE_FP8")) o.dense_fp8 = (std::atoi(fe) != 0);
+        if (const char* ae = std::getenv("GR8_QW38_PLE_ASYNC")) o.ple_async = (std::atoi(ae) != 0);
         if (const char* pe = std::getenv("GR8_QW38_PROFILE")) o.profile = (std::atoi(pe) != 0);
         if (const char* cm = std::getenv("GR8_QW38_PLE_CACHE_MIB")) {
             long v = std::atol(cm);
@@ -473,6 +488,23 @@ struct Engine {
             ple_sc.gv = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
             ple_sc.gv_norm = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
             QW38_CK(cudaHostAlloc(&ple_pinned, size_t(o.max_rows) * geom::PLE_DIM * 2, cudaHostAllocDefault));
+            if (o.ple_async) {
+                ple_thr = std::thread([this]() {
+                    for (;;) {
+                        std::unique_lock<std::mutex> lk(ple_mu);
+                        ple_cv.wait(lk, [&]() { return ple_has_job; });
+                        if (ple_stop) return;
+                        ple_has_job = false;
+                        lk.unlock();
+                        const bool ok = ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
+                                                             reinterpret_cast<uint8_t*>(ple_pinned));
+                        lk.lock();
+                        ple_job_ok = ok;
+                        ple_job_done = true;
+                        ple_done_cv.notify_one();
+                    }
+                });
+            }
         }
 
         // 3. Bind layers + allocate per-layer KV / GDN states + build ptab::Table (GR8_PTAB=1|2)
@@ -742,7 +774,26 @@ struct Engine {
         QW38_CK(cudaMemcpyAsync(d_slot, h_slot.data(), size_t(M) * 4, cudaMemcpyHostToDevice, stream));
         QW38_CK(cudaMemcpyAsync(d_pos, h_pos.data(), size_t(M) * 4, cudaMemcpyHostToDevice, stream));
 
-        // 0. Token embed -> 4-stream hyper state
+        // 0. Kick off async PLE NVMe fetch BEFORE Layer 0 GPU compute so it overlaps completely behind Layer 0!
+        bool ple_in_flight = false;
+        if (has_ple && o.ple_async && ple_thr.joinable()) {
+            ple_job_ids.resize(size_t(M) * geom::PLE_HEADS);
+            for (const auto& g : segs) {
+                if (g.len <= 0) continue;
+                if (g.pos0 == 0) ple_ctx[size_t(g.slot)] = {geom::TOK_EOS, geom::TOK_EOS};
+                ple_store.compute_ids(toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
+                                      ple_job_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
+            }
+            {
+                std::lock_guard<std::mutex> lk(ple_mu);
+                ple_job_done = false;
+                ple_has_job = true;
+            }
+            ple_cv.notify_one();
+            ple_in_flight = true;
+        }
+
+        // 0b. Token embed -> 4-stream hyper state
         qw38::k_embed_hc4<<<M, 256, 0, stream>>>(d_tok, embed, hyper, M);
 
         auto t_start = [&]() { if (o.profile) cudaEventRecord(ev0, stream); };
@@ -764,15 +815,22 @@ struct Engine {
             // Layer-1 PLE before attn_hyper_connection
             if (geom::is_ple(y.l) && has_ple) {
                 const auto p0 = std::chrono::steady_clock::now();
-                std::vector<uint64_t> all_ids(size_t(M) * geom::PLE_HEADS);
-                for (const auto& g : segs) {
-                    if (g.len <= 0) continue;
-                    if (g.pos0 == 0) ple_ctx[size_t(g.slot)] = {geom::TOK_EOS, geom::TOK_EOS};
-                    ple_store.compute_ids(toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
-                                          all_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
+                if (ple_in_flight) {
+                    std::unique_lock<std::mutex> lk(ple_mu);
+                    ple_done_cv.wait(lk, [&]() { return ple_job_done; });
+                    if (!ple_job_ok) die("PLE async fetch_rows failed");
+                    ple_in_flight = false;
+                } else {
+                    std::vector<uint64_t> all_ids(size_t(M) * geom::PLE_HEADS);
+                    for (const auto& g : segs) {
+                        if (g.len <= 0) continue;
+                        if (g.pos0 == 0) ple_ctx[size_t(g.slot)] = {geom::TOK_EOS, geom::TOK_EOS};
+                        ple_store.compute_ids(toks + g.row0, g.len, ple_ctx[size_t(g.slot)].data(), true,
+                                              all_ids.data() + size_t(g.row0) * geom::PLE_HEADS);
+                    }
+                    if (!ple_store.fetch_rows(all_ids.data(), all_ids.size(), reinterpret_cast<uint8_t*>(ple_pinned)))
+                        die("PLE fetch_rows failed");
                 }
-                if (!ple_store.fetch_rows(all_ids.data(), all_ids.size(), reinterpret_cast<uint8_t*>(ple_pinned)))
-                    die("PLE fetch_rows failed");
                 const auto p1 = std::chrono::steady_clock::now();
                 if (o.profile) prof.ple_io_ms += std::chrono::duration<double, std::milli>(p1 - p0).count();
 

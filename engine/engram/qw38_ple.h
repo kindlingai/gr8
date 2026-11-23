@@ -14,8 +14,10 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +30,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 #include "uring_reader.h"
@@ -123,6 +126,7 @@ private:
 class PleStore {
 public:
     ~PleStore() {
+        stop_pool();
         uring_.reset();
         if (iobuf_) ::free(iobuf_);
         if (fd_ >= 0) ::close(fd_);
@@ -187,6 +191,7 @@ public:
                 iobuf_slots_ = opts.io_uring;
             }
         }
+        if (!uring_) start_pool(8);
         return true;
     }
 
@@ -259,7 +264,6 @@ public:
         PleStats s{};
         s.req = n_ids;
 
-        struct Miss { uint64_t id; size_t dst_idx; };
         std::vector<Miss> misses;
         misses.reserve(n_ids);
 
@@ -308,6 +312,13 @@ public:
                     std::fprintf(stderr, "# qw38 PLE io_uring error rc=%d err=%d\n", rc, first_err);
                     return false;
                 }
+            } else if (!pool_.empty() && misses.size() >= 4) {
+                // Parallel 8-thread O_DIRECT pread across NVMe queues (lock-free scatter to distinct dst slots)
+                if (!run_pool_pread(misses.data(), misses.size(), dst)) return false;
+                for (const Miss& m : misses) {
+                    cache_.insert(m.id, dst + m.dst_idx * PLE_ROW_BYTES);
+                    ++s.reads;
+                }
             } else {
                 alignas(4096) uint8_t tmp[8192];
                 for (const Miss& m : misses) {
@@ -333,6 +344,86 @@ public:
     }
 
 private:
+    struct Miss { uint64_t id; size_t dst_idx; };
+
+    void start_pool(int nthreads) {
+        pool_stop_ = false;
+        pool_gen_ = 0;
+        pool_.reserve(size_t(nthreads));
+        for (int i = 0; i < nthreads; ++i) {
+            pool_.emplace_back([this]() { pool_worker(); });
+        }
+    }
+
+    void stop_pool() {
+        if (pool_.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(pool_mu_);
+            pool_stop_ = true;
+            ++pool_gen_;
+        }
+        pool_cv_.notify_all();
+        for (auto& t : pool_) if (t.joinable()) t.join();
+        pool_.clear();
+    }
+
+    void pool_worker() {
+        alignas(4096) uint8_t tmp[8192];
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(pool_mu_);
+                pool_cv_.wait(lk, [&]() { return pool_gen_ != seen; });
+                seen = pool_gen_;
+                if (pool_stop_) return;
+            }
+            const Miss* misses = pool_misses_;
+            const size_t n = pool_n_;
+            uint8_t* dst = pool_dst_;
+            for (;;) {
+                const size_t idx = pool_next_.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= n) break;
+                const Miss& m = misses[idx];
+                const uint64_t byte_off = m.id * PLE_ROW_BYTES;
+                const uint64_t aligned_off = direct_ ? (byte_off & ~(uint64_t(align_) - 1)) : byte_off;
+                const size_t len = direct_
+                    ? size_t(((byte_off + PLE_ROW_BYTES + align_ - 1) & ~(uint64_t(align_) - 1)) - aligned_off)
+                    : PLE_ROW_BYTES;
+                const ssize_t got = ::pread(fd_, tmp, len, off_t(aligned_off));
+                if (got < ssize_t(PLE_ROW_BYTES)) {
+                    pool_err_.store(1, std::memory_order_relaxed);
+                } else {
+                    std::memcpy(dst + m.dst_idx * PLE_ROW_BYTES, tmp + (byte_off - aligned_off), PLE_ROW_BYTES);
+                }
+            }
+            if (pool_rem_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard<std::mutex> lk(pool_mu_);
+                pool_done_ = true;
+                pool_done_cv_.notify_one();
+            }
+        }
+    }
+
+    bool run_pool_pread(const Miss* misses, size_t n, uint8_t* dst) {
+        pool_misses_ = misses;
+        pool_n_ = n;
+        pool_dst_ = dst;
+        pool_next_.store(0, std::memory_order_relaxed);
+        pool_err_.store(0, std::memory_order_relaxed);
+        pool_rem_.store(int(pool_.size()), std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(pool_mu_);
+            pool_done_ = false;
+            ++pool_gen_;
+        }
+        pool_cv_.notify_all();
+        {
+            std::unique_lock<std::mutex> lk(pool_mu_);
+            pool_done_cv_.wait(lk, [&]() { return pool_done_; });
+        }
+        return pool_err_.load(std::memory_order_relaxed) == 0;
+    }
+
     int fd_ = -1;
     bool direct_ = false;
     bool has_hash_ = false;
@@ -349,6 +440,18 @@ private:
     int64_t vsizes_[16] = {};
     int32_t eos_tok_ = geom::TOK_EOS;
     std::mutex mu_;
+    // Persistent pread worker pool (used when io_uring is unavailable)
+    std::vector<std::thread> pool_;
+    std::mutex pool_mu_;
+    std::condition_variable pool_cv_, pool_done_cv_;
+    uint64_t pool_gen_ = 0;
+    bool pool_stop_ = false, pool_done_ = true;
+    const Miss* pool_misses_ = nullptr;
+    size_t pool_n_ = 0;
+    uint8_t* pool_dst_ = nullptr;
+    std::atomic<size_t> pool_next_{0};
+    std::atomic<int> pool_rem_{0};
+    std::atomic<int> pool_err_{0};
 };
 
 } // namespace qw38
