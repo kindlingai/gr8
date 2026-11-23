@@ -272,10 +272,10 @@ struct Wire {
     }
 
     // Multi-collective single-step device-driven AR (ncoll = 2*L + 1, ZERO syncs across all layer collectives!)
-    void fast_begin(int M, bool skip_head, int n_layers_override, cudaStream_t st) {
+    void fast_begin(int M, bool skip_head, int n_layers_override, int head_M, cudaStream_t st) {
         const int nl = (n_layers_override > 0) ? n_layers_override : n_layers;
         const uint32_t wire_part = static_cast<uint32_t>((size_t(M) * geom::HID * 2 + 15) / 16 * 16);
-        const uint32_t wire_head = static_cast<uint32_t>((size_t(M) * head_rb + 7) / 8 * 8);
+        const uint32_t wire_head = static_cast<uint32_t>((size_t(head_M) * head_rb + 7) / 8 * 8);
         std::vector<uint32_t> sizes(static_cast<size_t>(2 * nl + (skip_head ? 0 : 1)), wire_part);
         if (!skip_head) sizes.back() = wire_head;
         fab.enqueue_step(step, sizes);
@@ -584,7 +584,7 @@ int main(int argc, char** argv) {
         wire.head_rb = head_row_bytes(o.nc);
         if (wire.fast) {
             wire.d_step = qw38rt::dalloc<unsigned long long>(1);
-            e.step_begin = [&](int M, bool skip_head, int nl) { wire.fast_begin(M, skip_head, nl, e.stream); };
+            e.step_begin = [&](int M, bool skip_head, int nl, int hm) { wire.fast_begin(M, skip_head, nl, hm, e.stream); };
             e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.fast_dev(c, p, b, e.stream); };
             e.gather_inject = [&](int c, __nv_bfloat16* h, const __nv_bfloat16* p, const float* inj, int M) {
                 wire.fast_dev_inject(c, h, p, inj, M, e.stream);
@@ -680,7 +680,7 @@ int main(int argc, char** argv) {
             std::vector<qw38::StepSeg> segs = {{s, 0, p, n}};
             std::vector<RowSample> sm(static_cast<size_t>(n));
             for (int i = 0; i < n; ++i) sm[size_t(i)] = RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};
-            e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last);
+            e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last, 0, 0, nullptr, true);
             if (!last) {
                 const int next_p = p + n;
                 const int next_n = std::min(prefill, P - next_p);

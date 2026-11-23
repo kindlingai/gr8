@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
             std::vector<qw38::StepSeg> segs = {{s, 0, p, n}};
             std::vector<RowSample> sm(static_cast<size_t>(n));
             for (int i = 0; i < n; ++i) sm[size_t(i)] = RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};
-            e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last_chunk);
+            e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last_chunk, 0, 0, nullptr, true);
             if (e.has_mtp) {
                 const int sync_n = std::min(n, P - 1 - p);
                 if (sync_n > 0) e.mtp_sync_kv(s, 0, p, sync_n, &prompt[size_t(p + 1)]);

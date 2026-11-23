@@ -341,6 +341,7 @@ struct ProfileAccum {
 struct Engine {
     Options o;
     cublasHandle_t blas = nullptr;
+    void* cublas_ws = nullptr;
     cudaStream_t stream = 0;
     std::vector<std::unique_ptr<Image>> img;
     std::vector<int> layer_ids;
@@ -454,7 +455,7 @@ struct Engine {
     __nv_bfloat16* mtp_hid_cur = nullptr;        // [slots, 10240] BF16 (chained MTP draft hidden state)
 
     // Fabric callbacks (set by g6m4_qw38; nullptr on m4sim_qw38 where all ranks are already in `parts`)
-    std::function<void(int M, bool skip_head, int n_layers_override)> step_begin;
+    std::function<void(int M, bool skip_head, int n_layers_override, int head_M)> step_begin;
     std::function<void(int c, __nv_bfloat16* parts, size_t bytes)> gather_dev;
     std::function<void(int c, __nv_bfloat16* hyper, const __nv_bfloat16* parts, const float* inj, int M)> gather_inject;
     std::function<void(int c, uint8_t* host_parts, size_t bytes)> gather_host;
@@ -539,6 +540,7 @@ struct Engine {
         if (h_meta_pinned) cudaFreeHost(h_meta_pinned);
         if (h_rope_pinned) cudaFreeHost(h_rope_pinned);
         if (blas) cublasDestroy(blas);
+        if (cublas_ws) cudaFree(cublas_ws);
         if (ev0) cudaEventDestroy(ev0);
         if (ev1) cudaEventDestroy(ev1);
         if (stream) cudaStreamDestroy(stream);
@@ -598,6 +600,11 @@ struct Engine {
 
         QW38_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         cublasCreate(&blas);
+        {
+            constexpr size_t CUBLAS_WS_BYTES = 32ull << 20;
+            QW38_CK(cudaMalloc(&cublas_ws, CUBLAS_WS_BYTES));
+            cublasSetWorkspace(blas, cublas_ws, CUBLAS_WS_BYTES);
+        }
         QW38_CK(cudaEventCreate(&ev0));
         QW38_CK(cudaEventCreate(&ev1));
         layer_ids = parse_layers(o.layers);
@@ -1079,6 +1086,16 @@ struct Engine {
         d_pos = dalloc<int>(M);
         d_rope = dalloc<int3>(M);
         slot_mrope_delta.assign(size_t(o.slots), 0);
+
+        // Warm up cuBLAS handles/heuristics at init so step 0 does not pay ~500 ms lazy-init latency.
+        {
+            const int warm_m = std::min(o.max_rows, 16);
+            const int warm_v = std::min(v_rows[0], 256);
+            cublasSetStream(blas, stream);
+            qw38::gemm_bf16_nt(blas, warm_m, geom::HC_RANK, geom::HC_D, hc_sc.hn, final_hc.down, hc_sc.down);
+            qw38::gemm_bf16_nt_f32(blas, warm_m, warm_v, geom::HID, mixed, lm_head[0], head_logits);
+            QW38_CK(cudaStreamSynchronize(stream));
+        }
     }
 
     void reset_slot(int slot) {
@@ -1177,9 +1194,10 @@ struct Engine {
     // When `snap_k > 0` (MTP verify step), saves post-token-t recurrent/conv/idx_raw snapshots for t in 0..snap_k-1!
     // When `vis_n > 0` (multimodal prefill), splices staged vision embeddings into HC streams and masks image tokens in PLE.
     // When `rope_thw != nullptr`, uses per-row 3D MRoPE (t, h, w) coords; else uses isotropic (pos + slot_mrope_delta[slot]).
+    // When `head_last_only` is true (prefill final chunk), runs final HC + lm_head only on row `M - 1` into `out[M - 1]`.
     void forward(const std::vector<qw38::StepSeg>& segs, const int* toks, const RowSample* samples,
                  std::vector<RowOut>& out, bool skip_head = false, int snap_k = 0,
-                 int vis_n = 0, const int3* rope_thw = nullptr) {
+                 int vis_n = 0, const int3* rope_thw = nullptr, bool head_last_only = false) {
         int M = 0;
         int max_pos = 0;
         bool all_len1 = true;
@@ -1223,10 +1241,12 @@ struct Engine {
         const int sp_slice = use_sp_hc ? ((M + o.nr - 1) / o.nr) : M;
         const int sp_r0 = use_sp_hc ? std::min(o.rank0 * sp_slice, M) : 0;
         const int sp_m = use_sp_hc ? std::min(sp_slice, M - sp_r0) : M;
+        const bool last_only = head_last_only && !skip_head && M > 1;
+        const int head_M = last_only ? 1 : M;
 
         // 0a. Notify multi-collective fabric step start (single enqueue_step for all collectives on TP>=2)
         if (use_sp_hc) step_begin_sp(M, int(L.size()), sp_slice);
-        else if (step_begin) step_begin(M, skip_head, -1);
+        else if (step_begin) step_begin(M, skip_head, -1, head_M);
 
         // Mask <|image_pad|> -> TOK_EOS for Layer-1 PLE n-gram hashing (matches Qwen4ExpTextModel conv_mask).
         std::vector<int> ple_tok_buf;
@@ -1351,7 +1371,7 @@ struct Engine {
 
         const size_t part_stride = size_t(M) * geom::HID;
         const size_t hrb = head_row_bytes(o.nc);
-        const size_t rank_pkt_bytes = size_t(M) * hrb;
+        const size_t rank_pkt_bytes = size_t(head_M) * hrb;
 
         auto run_layer_gpu = [&](size_t li, int& coll) {
             Layer& y = L[li];
@@ -1412,17 +1432,22 @@ struct Engine {
         };
 
         auto run_head_gpu = [&](bool hn_ready = false) {
-            if (hn_ready) qw38::hc_prepare_from_hn(blas, final_hc, mixed, hc_sc, M, stream);
-            else qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
+            if (last_only) {
+                qw38::hc_prepare(blas, final_hc, hyper + size_t(M - 1) * geom::HC_D, mixed, hc_sc, 1, stream);
+            } else if (hn_ready) {
+                qw38::hc_prepare_from_hn(blas, final_hc, mixed, hc_sc, M, stream);
+            } else {
+                qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
+            }
             constexpr int HEAD_CHUNK = 256;
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
-                for (int r0 = 0; r0 < M; r0 += HEAD_CHUNK) {
-                    const int mc = std::min(M - r0, HEAD_CHUNK);
+                for (int r0 = 0; r0 < head_M; r0 += HEAD_CHUNK) {
+                    const int mc = std::min(head_M - r0, HEAD_CHUNK);
                     const __nv_bfloat16* mx_ptr = mixed + size_t(r0) * geom::HID;
-                    if (M <= 20 && i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
+                    if (head_M <= 20 && i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
                         qw38::launch_fp8_gemv_smallm<true>(mx_ptr, fp8_lm_head[size_t(i)], head_logits, mc, stream);
-                    } else if (M <= 8) {
+                    } else if (head_M <= 8) {
                         qw38::launch_bf16_gemv_smallm<true>(mx_ptr, lm_head[size_t(i)], head_logits, mc, v_rows[size_t(i)], geom::HID, stream);
                     } else {
                         cublasSetStream(blas, stream);
@@ -1445,7 +1470,7 @@ struct Engine {
             }
         }
         const bool verify_graph_ok = all_verify && M <= 64;
-        const bool graph_ok = o.use_graph && !o.profile && !skip_head && vis_n == 0 && !rope_thw &&
+        const bool graph_ok = o.use_graph && !o.profile && !skip_head && !last_only && vis_n == 0 && !rope_thw &&
                               ((snap_k == 0 && M <= 16 && all_len1) || verify_graph_ok) &&
                               (o.nr == 1 || o.nloc == o.nr || static_cast<bool>(step_parity));
         if (graph_ok) {
@@ -1798,14 +1823,24 @@ struct Engine {
 
         out.resize(size_t(M));
         std::vector<uint8_t> row_parts(size_t(o.nr) * hrb);
-        for (int m = 0; m < M; ++m) {
+        if (last_only) {
             for (int r = 0; r < o.nr; ++r) {
                 std::memcpy(row_parts.data() + size_t(r) * hrb,
-                            head_host_parts + size_t(r) * rank_pkt_bytes + size_t(m) * hrb, hrb);
+                            head_host_parts + size_t(r) * rank_pkt_bytes, hrb);
             }
-            out[size_t(m)] = head_merge(row_parts.data(), hrb, o.nr, o.nc);
-            if (samples) out[size_t(m)].tok = sample_row(out[size_t(m)].top, samples[m]);
-            else if (!out[size_t(m)].top.empty()) out[size_t(m)].tok = out[size_t(m)].top[0].id;
+            out[size_t(M - 1)] = head_merge(row_parts.data(), hrb, o.nr, o.nc);
+            if (samples) out[size_t(M - 1)].tok = sample_row(out[size_t(M - 1)].top, samples[M - 1]);
+            else if (!out[size_t(M - 1)].top.empty()) out[size_t(M - 1)].tok = out[size_t(M - 1)].top[0].id;
+        } else {
+            for (int m = 0; m < M; ++m) {
+                for (int r = 0; r < o.nr; ++r) {
+                    std::memcpy(row_parts.data() + size_t(r) * hrb,
+                                head_host_parts + size_t(r) * rank_pkt_bytes + size_t(m) * hrb, hrb);
+                }
+                out[size_t(m)] = head_merge(row_parts.data(), hrb, o.nr, o.nc);
+                if (samples) out[size_t(m)].tok = sample_row(out[size_t(m)].top, samples[m]);
+                else if (!out[size_t(m)].top.empty()) out[size_t(m)].tok = out[size_t(m)].top[0].id;
+            }
         }
         t_end(prof.head_ms);
         if (o.profile) { ++prof.steps; prof.tokens += M; }
@@ -1911,7 +1946,7 @@ struct Engine {
         QW38_CK(cudaMemcpyAsync(d_rope, h_rope_pinned, size_t(M) * sizeof(int3), cudaMemcpyHostToDevice, stream));
 
         // Arm 3-collective fabric step (1 layer = 2 dev AR + 1 head AR)
-        if (step_begin) step_begin(M, false, 1);
+        if (step_begin) step_begin(M, false, 1, M);
 
         const size_t part_stride = size_t(M) * geom::HID;
         const size_t hrb = head_row_bytes(o.nc);
