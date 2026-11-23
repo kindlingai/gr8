@@ -472,6 +472,8 @@ Thanks to:
   - Usage cache reporting for the glm dialect: the launcher now passes
     `--enable-prompt-tokens-details` to the front end, so
     `usage.prompt_tokens_details.cached_tokens` reaches clients on glm clusters.
+- [@bertholomus](https://github.com/bertholomus)
+  - In-place CP-tail KV stash extension and storable-range truncation to eliminate self-hit SSD write amplification.
 
 ### Upstream projects and research
 
