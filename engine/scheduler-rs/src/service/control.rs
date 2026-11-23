@@ -18,7 +18,7 @@ use super::admit;
 use super::files::{atomic_file, exists, Command, Ingress};
 use super::status::{self, Growth, RunUse, Status};
 use super::trace::{Trace, CONTROL};
-use crate::admission::{Queue, Status as Fit, STALL_NONE, STALL_SLOTS};
+use crate::admission::{Queue, Status as Fit, STALL_CAPACITY, STALL_NONE, STALL_SLOTS};
 use crate::control::channel::{wall_us, Endpoint};
 use crate::control::wire::{self, Commit, Notice};
 use crate::control::{refused, require, Fail, R};
@@ -1100,9 +1100,18 @@ impl Control {
                     }
                 }
             }
-            // borrow-idle: a request whose worst case passes the chunks every rank has online waits for a recall
-            let short_of = if fit.why == STALL_NONE && lend.chunk_rows != 0 {
-                lend.recall(worst, self.endpoint().agreed_room())
+            // borrow-idle: a request whose worst case passes the chunks every rank has online waits for a recall.
+            // Multi-session Flash (pool.chunks() active): when lent chunks shrink the pool below what live + queued
+            // sessions need, fit.why is STALL_CAPACITY while agreed_room < lend.chunks; recall enough chunks to fit.
+            let agreed = self.endpoint().agreed_room();
+            let short_of = if lend.chunk_rows != 0 {
+                if fit.why == STALL_NONE {
+                    lend.recall(worst, agreed)
+                } else if fit.why == STALL_CAPACITY && agreed < lend.chunks {
+                    lend.chunks.min(agreed.saturating_add(lend.need(worst).max(1)))
+                } else {
+                    0
+                }
             } else {
                 0
             };

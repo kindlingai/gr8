@@ -70,6 +70,7 @@ extern "C" const G6AttnOps* g6_attn_ops(void) {
         G6_CP_OP(g6a_bind_create_pages),   // bind_create_pages
         g6a_bind_prefill_cache,   // bind_prefill_cache
         g6a_qo_create_ext,   // qo_create_ext
+        g6a_bind_create_vmm,   // bind_create_vmm
     };
     return &ops;
 }

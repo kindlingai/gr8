@@ -48,9 +48,9 @@ if [ "$WHAT" = rs ]; then
   exit 0
 fi
 nice -n 19 $GXX -O3 -std=c++20 $CPU -pthread -c ../loader/g6pack.cpp -o $O/g6pack.o
-# Flash: the kvchunks regions of GR8_GLM53F_KV_CHUNKS (runtime/flash_kv.h), one object for every width
+# GLM and Flash: the kvchunks VMM regions (GR8_KV_CHUNKS / GR8_GLM53F_KV_CHUNKS), one object for every width
 KVC=
-if [ "$ATTN_CU" = ../attn/flash_attn.cu ]; then
+if [ "$ATTN_CU" = ../attn/flash_attn.cu ] || [ "$ATTN_CU" = ../attn/attn.cu ]; then
   nice -n 19 $NVCC -O2 -std=c++17 $GEN -c ../attn/kvchunks.cu -o $O/kvchunks.o; KVC="$O/kvchunks.o"
 fi
 nice -n 19 $GXX -O3 -std=c++20 $CPU -pthread -I/usr/local/cuda/include -c ../loader/devimage.cpp -o $O/devimage.o
