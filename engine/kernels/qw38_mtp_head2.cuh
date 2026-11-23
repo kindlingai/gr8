@@ -28,7 +28,8 @@ struct HeadArgmax {
 struct MtpHead2 {
     static constexpr int NCH = geom::HID / 64; // 40
     static constexpr int NG = geom::HID / 32;  // 80
-    static constexpr int SL = 64;              // exact-rescored candidates per row
+    static constexpr int SL = 64;              // exact-rescored candidates per row (MTP draft)
+    static constexpr int SL_TRUNK = 256;       // exact-rescored candidates per row (trunk decode/verify)
     static constexpr int BINS = 2048;
     static constexpr float RANGE = 32.0f;
 
@@ -60,8 +61,10 @@ struct MtpHead2 {
 };
 
 struct MtpHead2Scratch {
-    int* cand = nullptr;    // [max_S * 64]
-    float* cl = nullptr;    // [max_S * 64]
+    int* cand = nullptr;       // [max_M * SL_TRUNK]
+    float* cl = nullptr;       // [max_M * SL_TRUNK]
+    double* tail_dsum = nullptr; // [max_M]
+    float* screen_max = nullptr; // [max_M]
 };
 
 // Boot conversion: BF16 lm_head[vr, 2560] -> 2-bit codes[vr, 40] + scales[vr, 40].
@@ -241,17 +244,21 @@ __global__ void __launch_bounds__(256) k_qw38_mtp_head2_screen(
     }
 }
 
-// Stage 2: Deterministic top-64 selection from screen logits y[M, vr] (1 CTA/row, 1024 threads).
-__global__ void __launch_bounds__(1024) k_qw38_mtp_head2_top64(
+// Stage 2: Deterministic top-SL selection from screen logits y[M, vr] (1 CTA/row, 1024 threads).
+// When CALC_TAIL is true, also accumulates sum_{v not in top-SL} exp(y[v] - screen_max) for exact full-vocab LSE.
+template <int SL, bool CALC_TAIL = false>
+__global__ void __launch_bounds__(1024) k_qw38_head2_top(
     const float* __restrict__ y,
     int vr,
-    int* __restrict__ cand) {
-    constexpr int SL = MtpHead2::SL;
+    int* __restrict__ cand,
+    double* __restrict__ tail_dsum = nullptr,
+    float* __restrict__ screen_max = nullptr) {
     constexpr int BINS = MtpHead2::BINS;
     constexpr float RANGE = MtpHead2::RANGE;
 
     __shared__ unsigned hist[BINS];
     __shared__ float s_mx[32];
+    __shared__ double s_tail[32];
     __shared__ int s_cut, s_lt;
     __shared__ int s_n[2][1024];
 
@@ -333,15 +340,36 @@ __global__ void __launch_bounds__(1024) k_qw38_mtp_head2_top64(
     int plt = s_n[0][t] - nlt;
     int peq = lt + s_n[1][t] - neq;
     int* out = cand + static_cast<size_t>(m) * SL;
+    double tail_a = 0.0;
     for (int i = i0; i < i1; ++i) {
-        const int b = bin(row[i]);
+        const float v = row[i];
+        const int b = bin(v);
         if (b < cut) out[plt++] = i;
         else if (b == cut && peq < SL) out[peq++] = i;
+        else if constexpr (CALC_TAIL) {
+            if (ink2::head_key(v) && (mx - v) < 20.0f) {
+                tail_a += static_cast<double>(expf(v - mx));
+            }
+        }
+    }
+    if constexpr (CALC_TAIL) {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) tail_a += __shfl_xor_sync(0xffffffffu, tail_a, o);
+        if (l == 0) s_tail[w] = tail_a;
+        __syncthreads();
+        if (w == 0) {
+            double ts = s_tail[l];
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) ts += __shfl_xor_sync(0xffffffffu, ts, o);
+            if (l == 0) {
+                tail_dsum[m] = ts;
+                screen_max[m] = mx;
+            }
+        }
     }
 }
 
-// Stage 3: Exact FP8 rescore of the SL=64 candidates per row (Grid dim3(M, 8), Block 256 = 8 candidates/CTA).
-// Hoists FP16 scale out of 16-weight unpack -> 1 fmaf per 16 weights!
+// Stage 3a (MTP draft): Exact FP8 rescore of SL=64 candidates (Grid dim3(M, 8), Block 256).
 __global__ void __launch_bounds__(256) k_qw38_mtp_head2_rescore_fp8(
     const uint8_t* __restrict__ Bq,
     const __half* __restrict__ Bsc,
@@ -374,6 +402,122 @@ __global__ void __launch_bounds__(256) k_qw38_mtp_head2_rescore_fp8(
     if (lane == 0) {
         cl[static_cast<size_t>(m) * MtpHead2::SL + j] = tot;
         if (write_y) y[static_cast<size_t>(m) * vr + v] = tot;
+    }
+}
+
+// Stage 3b (Trunk): Bit-exact FP8 rescore of SL=256 candidates matching k_fp8_gemv_1warp arithmetic identically!
+// Grid: dim3(M, SL_TRUNK / 8 = 32), Block: 256 (8 candidates/CTA).
+__global__ void __launch_bounds__(256) k_qw38_head2_rescore_fp8_exact(
+    const uint8_t* __restrict__ Bq,
+    const __half* __restrict__ Bsc,
+    const __nv_bfloat16* __restrict__ x,
+    const int* __restrict__ cand,
+    float* __restrict__ cl) {
+    const int m = blockIdx.x;
+    const int j = blockIdx.y * 8 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const int v = cand[static_cast<size_t>(m) * MtpHead2::SL_TRUNK + j];
+
+    constexpr int K16 = geom::HID >> 4; // 160
+    constexpr int NB = geom::HID >> 5;  // 80
+    const uint4* qrow = reinterpret_cast<const uint4*>(Bq + static_cast<size_t>(v) * geom::HID);
+    const __half* srow = Bsc + static_cast<size_t>(v) * NB;
+    const uint4* xm = reinterpret_cast<const uint4*>(x + static_cast<size_t>(m) * geom::HID);
+
+    float acc = 0.0f;
+    for (int i = lane; i < K16; i += 32) {
+        const uint4 wv = __ldg(qrow + i);
+        const float sc = __half2float(__ldg(srow + (i >> 1)));
+        float2 wf[8];
+        fp8x16_unpack(wv, sc, wf);
+        acc += dot_bf16x16_f2x8(xm[2 * i], xm[2 * i + 1], wf);
+    }
+    const float tot = fp8_warp_sum(acc);
+    if (lane == 0) {
+        cl[static_cast<size_t>(m) * MtpHead2::SL_TRUNK + j] = tot;
+    }
+}
+
+// Stage 4c (Trunk): Bitonic sort 256 exact FP8 candidates + full-vocab LSE (top-256 exact + 2-bit tail) -> wire packet!
+// Zero full-vocab head_pack_fast scans, zero 2-bit false positives in top-NC! Grid: (M), Block: 256.
+__global__ void __launch_bounds__(256) k_qw38_head2_pack_256(
+    const float* __restrict__ cl,
+    const int* __restrict__ cand,
+    const double* __restrict__ tail_dsum,
+    const float* __restrict__ screen_max,
+    int v0, int NC,
+    uint8_t* __restrict__ out, size_t rb) {
+    const int m = blockIdx.x;
+    const int t = threadIdx.x; // 0..255
+    const int lane = t & 31, warp = t >> 5;
+
+    float v = cl[static_cast<size_t>(m) * MtpHead2::SL_TRUNK + t];
+    int id = v0 + cand[static_cast<size_t>(m) * MtpHead2::SL_TRUNK + t];
+    const int fin = ink2::head_key(v) ? 1 : 0;
+    if (!fin) { v = -INFINITY; id = 0x7fffffff; }
+
+    __shared__ float sv[256];
+    __shared__ int si[256];
+    __shared__ int s_fin[8];
+    __shared__ double s_sum[8];
+
+    sv[t] = v;
+    si[t] = id;
+
+    int wf = fin;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) wf += __shfl_xor_sync(0xffffffffu, wf, o);
+    if (lane == 0) s_fin[warp] = wf;
+    __syncthreads();
+
+    // Bitonic sort 256 candidates descending by (logit, -id)
+    for (int k = 2; k <= 256; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const int ixj = t ^ j;
+            if (ixj > t) {
+                const bool want_desc = ((t & k) == 0);
+                const float vt = sv[t], vx = sv[ixj];
+                const int it = si[t], ix = si[ixj];
+                const bool a_before_b = (vt > vx) || (vt == vx && it < ix);
+                if (want_desc ? (!a_before_b) : a_before_b) {
+                    sv[t] = vx; si[t] = ix;
+                    sv[ixj] = vt; si[ixj] = it;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    const float mx = sv[0];
+    double e = (ink2::head_key(sv[t]) && ink2::head_key(mx)) ? static_cast<double>(expf(sv[t] - mx)) : 0.0;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
+    if (lane == 0) s_sum[warp] = e;
+    __syncthreads();
+
+    uint8_t* o = out + static_cast<size_t>(m) * rb;
+    int tot_fin = 0;
+    #pragma unroll
+    for (int w = 0; w < 8; ++w) tot_fin += s_fin[w];
+    const int n_out = min(NC, tot_fin);
+
+    if (t == 0) {
+        double sum256 = 0.0;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) sum256 += s_sum[w];
+        double tail = tail_dsum[m];
+        const float smx = screen_max[m];
+        if (tail > 0.0 && ink2::head_key(smx) && ink2::head_key(mx)) {
+            const double shift = static_cast<double>(smx) - static_cast<double>(mx);
+            tail *= exp(fmin(shift, 20.0));
+        }
+        *reinterpret_cast<float*>(o) = mx;
+        *reinterpret_cast<int*>(o + 4) = n_out;
+        *reinterpret_cast<double*>(o + 8) = sum256 + tail;
+    }
+    if (t < n_out) {
+        *reinterpret_cast<float*>(o + 16 + static_cast<size_t>(t) * 8) = sv[t];
+        *reinterpret_cast<int*>(o + 20 + static_cast<size_t>(t) * 8) = si[t];
     }
 }
 
@@ -487,7 +631,7 @@ inline void mtp_head2_argmax_pair(const MtpHead2& h2, const Fp8Mat& fp8_lm, cons
                                   float* head_logits, MtpHead2Scratch& sc, HeadArgmax* out_pair,
                                   int M, cudaStream_t st) {
     launch_mtp_head2_screen(h2, x, head_logits, M, st);
-    k_qw38_mtp_head2_top64<<<M, 1024, 0, st>>>(head_logits, h2.vr, sc.cand);
+    k_qw38_head2_top<MtpHead2::SL, false><<<M, 1024, 0, st>>>(head_logits, h2.vr, sc.cand);
     k_qw38_mtp_head2_rescore_fp8<<<dim3(M, 8), 256, 0, st>>>(
         fp8_lm.q, fp8_lm.sc, x, sc.cand, head_logits, sc.cl, h2.vr, false);
     k_qw38_mtp_head2_argmax_pair<<<M, 64, 0, st>>>(sc.cl, sc.cand, h2.v0, out_pair);
@@ -497,7 +641,7 @@ inline void mtp_head2_pack(const MtpHead2& h2, const Fp8Mat& fp8_lm, const __nv_
                            float* head_logits, MtpHead2Scratch& h2sc, HeadPackScratch& hsc,
                            int NC, uint8_t* out_pkt, size_t rb, int M, bool argmax_only, cudaStream_t st) {
     launch_mtp_head2_screen(h2, x, head_logits, M, st);
-    k_qw38_mtp_head2_top64<<<M, 1024, 0, st>>>(head_logits, h2.vr, h2sc.cand);
+    k_qw38_head2_top<MtpHead2::SL, false><<<M, 1024, 0, st>>>(head_logits, h2.vr, h2sc.cand);
     k_qw38_mtp_head2_rescore_fp8<<<dim3(M, 8), 256, 0, st>>>(
         fp8_lm.q, fp8_lm.sc, x, h2sc.cand, head_logits, h2sc.cl, h2.vr, !argmax_only);
     if (argmax_only) {
@@ -505,6 +649,18 @@ inline void mtp_head2_pack(const MtpHead2& h2, const Fp8Mat& fp8_lm, const __nv_
     } else {
         head_pack_fast(head_logits, M, h2.vr, h2.v0, NC, hsc, out_pkt, rb, st, false);
     }
+}
+
+inline void trunk_head2_pack(const MtpHead2& h2, const Fp8Mat& fp8_lm, const __nv_bfloat16* x,
+                             float* head_logits, MtpHead2Scratch& h2sc,
+                             int NC, uint8_t* out_pkt, size_t rb, int M, cudaStream_t st) {
+    launch_mtp_head2_screen(h2, x, head_logits, M, st);
+    k_qw38_head2_top<MtpHead2::SL_TRUNK, true><<<M, 1024, 0, st>>>(
+        head_logits, h2.vr, h2sc.cand, h2sc.tail_dsum, h2sc.screen_max);
+    k_qw38_head2_rescore_fp8_exact<<<dim3(M, MtpHead2::SL_TRUNK / 8), 256, 0, st>>>(
+        fp8_lm.q, fp8_lm.sc, x, h2sc.cand, h2sc.cl);
+    k_qw38_head2_pack_256<<<M, 256, 0, st>>>(
+        h2sc.cl, h2sc.cand, h2sc.tail_dsum, h2sc.screen_max, h2.v0, NC, out_pkt, rb);
 }
 
 } // namespace qw38

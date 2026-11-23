@@ -93,6 +93,16 @@ knobs:
       block-32 INT4 MTP L048 routed experts, and single-graph zero-host-sync K-step greedy drafting). Trunk verification
       is unchanged, preserving exact MTP=0 == MTP=K outputs. 0 = fallback to FP8 draft head and per-step host sync.
       Every rank must agree.
+  GR8_QW38_TRUNK_HEAD2:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = accelerate trunk decode/verify lm_head (M <= 16) with a 2-bit block-32 full-vocab screen
+      followed by bit-exact FP8 rescore of the top-256 candidates (reusing the MTP 2-bit head table at zero extra VRAM
+      when MTP > 0). 0 = full-vocab FP8 lm_head. Every rank must agree.
   GR8_QW38_VISION:
     scope: agree
     kind: flag

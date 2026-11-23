@@ -317,6 +317,7 @@ struct Options {
     bool wide = true;
     bool dense_fp8 = true;
     bool mtp_fast = true;
+    bool trunk_head2 = true;
     bool ple_async = true;
     bool use_graph = true;
     bool profile = false;
@@ -618,6 +619,7 @@ struct Engine {
         o.wide = knob::qw38_wide();
         o.dense_fp8 = knob::qw38_dense_fp8();
         o.mtp_fast = knob::qw38_mtp_fast();
+        o.trunk_head2 = knob::qw38_trunk_head2();
         o.ple_async = knob::qw38_ple_async();
         o.use_graph = knob::qw38_graph();
         o.profile = knob::qw38_profile();
@@ -962,8 +964,6 @@ struct Engine {
             mtp_sc.mtp_hyper = dalloc<__nv_bfloat16>(ms * geom::HC_D);
             mtp_sc.exp_mid = dalloc<__nv_bfloat16>(ms * geom::TOPK * geom::SHARED_I);
             mtp_sc.exp_dn_part = dalloc<float>(ms * geom::TOPK * geom::HID);
-            mtp_h2_sc.cand = dalloc<int>(ms * qw38::MtpHead2::SL);
-            mtp_h2_sc.cl = dalloc<float>(ms * qw38::MtpHead2::SL);
             d_mtp_argmax = dalloc<qw38::HeadArgmax>(ms);
             d_mtp_draft_out = dalloc<int>(ms * 8);
             QW38_CK(cudaHostAlloc(&h_mtp_draft_out, ms * 8 * sizeof(int), cudaHostAllocDefault));
@@ -1043,13 +1043,21 @@ struct Engine {
             const auto fp8_t0 = std::chrono::steady_clock::now();
             const size_t fp8_b = fp8_arena.build(stream);
             size_t i4_b = 0, h2_b = 0;
+            const bool need_h2 = o.trunk_head2 || (has_mtp && o.mtp_fast);
             if (has_mtp && o.mtp_fast) {
                 i4_b = mtp_i4_arena.build(stream);
+            }
+            if (need_h2) {
                 mtp_head2.resize(size_t(o.nloc));
                 for (int i = 0; i < o.nloc; ++i) {
                     h2_b += qw38::build_mtp_head2(lm_head[size_t(i)], v_rows[size_t(i)], v_lo[size_t(i)],
                                                   mtp_head2[size_t(i)], stream);
                 }
+                const size_t h2_rows = std::max<size_t>(size_t(o.slots), 8);
+                mtp_h2_sc.cand = dalloc<int>(h2_rows * qw38::MtpHead2::SL_TRUNK);
+                mtp_h2_sc.cl = dalloc<float>(h2_rows * qw38::MtpHead2::SL_TRUNK);
+                mtp_h2_sc.tail_dsum = dalloc<double>(h2_rows);
+                mtp_h2_sc.screen_max = dalloc<float>(h2_rows);
             }
             QW38_CK(cudaStreamSynchronize(stream));
             const double fp8_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fp8_t0).count();
@@ -1057,6 +1065,9 @@ struct Engine {
                 std::fprintf(stderr,
                              "# rank %d: GR8_QW38_DENSE_FP8=1 + MTP_FAST=1: dense FP8 %.2f GB + MTP INT4 %.2f GB + head2 %.2f GB in %.2f s\n",
                              o.rank0, fp8_b / 1e9, i4_b / 1e9, h2_b / 1e9, fp8_s);
+            } else if (need_h2) {
+                std::fprintf(stderr, "# rank %d: GR8_QW38_DENSE_FP8=1 + TRUNK_HEAD2=1: dense FP8 %.2f GB + head2 %.2f GB in %.2f s\n",
+                             o.rank0, fp8_b / 1e9, h2_b / 1e9, fp8_s);
             } else {
                 std::fprintf(stderr, "# rank %d: GR8_QW38_DENSE_FP8=1: quantized dense decode weights (%.2f GB in %.2f s)\n",
                              o.rank0, fp8_b / 1e9, fp8_s);
@@ -1502,22 +1513,31 @@ struct Engine {
             } else {
                 qw38::hc_prepare(blas, final_hc, hyper, mixed, hc_sc, M, stream);
             }
-            constexpr int HEAD_CHUNK = 256;
+            const bool use_trunk_h2 = o.trunk_head2 && head_M <= 16 && o.nc <= qw38::MtpHead2::SL_TRUNK &&
+                                      !mtp_head2.empty() && !fp8_lm_head.empty();
+            const int head_chunk = use_trunk_h2 ? 8 : 256;
             for (int i = 0; i < o.nloc; ++i) {
                 const int r = o.rank0 + i;
-                for (int r0 = 0; r0 < head_M; r0 += HEAD_CHUNK) {
-                    const int mc = std::min(head_M - r0, HEAD_CHUNK);
+                for (int r0 = 0; r0 < head_M; r0 += head_chunk) {
+                    const int mc = std::min(head_M - r0, head_chunk);
                     const __nv_bfloat16* mx_ptr = mixed + size_t(r0) * geom::HID;
-                    if (head_M <= 20 && i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
-                        qw38::launch_fp8_gemv_smallm<true>(mx_ptr, fp8_lm_head[size_t(i)], head_logits, mc, stream);
-                    } else if (head_M <= 8) {
-                        qw38::launch_bf16_gemv_smallm<true>(mx_ptr, lm_head[size_t(i)], head_logits, mc, v_rows[size_t(i)], geom::HID, stream);
+                    if (use_trunk_h2 && i < static_cast<int>(mtp_head2.size()) && mtp_head2[size_t(i)].ready() &&
+                        i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
+                        qw38::trunk_head2_pack(mtp_head2[size_t(i)], fp8_lm_head[size_t(i)], mx_ptr,
+                                               head_logits, mtp_h2_sc, o.nc,
+                                               head_dev_pkt + size_t(r0) * hrb, hrb, mc, stream);
                     } else {
-                        cublasSetStream(blas, stream);
-                        qw38::gemm_bf16_nt_f32(blas, mc, v_rows[size_t(i)], geom::HID, mx_ptr, lm_head[size_t(i)], head_logits);
+                        if (head_M <= 20 && i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
+                            qw38::launch_fp8_gemv_smallm<true>(mx_ptr, fp8_lm_head[size_t(i)], head_logits, mc, stream);
+                        } else if (head_M <= 8) {
+                            qw38::launch_bf16_gemv_smallm<true>(mx_ptr, lm_head[size_t(i)], head_logits, mc, v_rows[size_t(i)], geom::HID, stream);
+                        } else {
+                            cublasSetStream(blas, stream);
+                            qw38::gemm_bf16_nt_f32(blas, mc, v_rows[size_t(i)], geom::HID, mx_ptr, lm_head[size_t(i)], head_logits);
+                        }
+                        qw38::head_pack_fast(head_logits, mc, v_rows[size_t(i)], v_lo[size_t(i)], o.nc, head_sc,
+                                             head_dev_pkt + size_t(r0) * hrb, hrb, stream);
                     }
-                    qw38::head_pack_fast(head_logits, mc, v_rows[size_t(i)], v_lo[size_t(i)], o.nc, head_sc,
-                                         head_dev_pkt + size_t(r0) * hrb, hrb, stream);
                 }
                 QW38_CK(cudaMemcpyAsync(head_host_parts + size_t(r) * rank_pkt_bytes,
                                         head_dev_pkt, rank_pkt_bytes, cudaMemcpyDeviceToHost, stream));

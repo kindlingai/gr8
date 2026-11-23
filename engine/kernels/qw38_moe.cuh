@@ -1545,7 +1545,7 @@ inline void launch_moe_pf_wide(const MoeWeights& w, MoeScratch& sc, const __nv_b
     const int grid_G = std::min(n_routes, geom::NEXP + (n_routes + PF_GRP - 1) / PF_GRP);
     constexpr int N_HBG = geom::HB / HB_PER_CTA;
     const size_t fc2_smem = static_cast<size_t>(w.t_eb) * PF_GRP * 136 * sizeof(__half);
-    if (fc2_smem > 44000) {
+    if (fc2_smem > 40000) {
         cudaFuncSetAttribute(k_qw38_moe_fc2_multi_hb_dyn<PF_GRP, HB_PER_CTA>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(fc2_smem));
     }
@@ -1660,7 +1660,7 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
     // 2. Routed experts + 3. Combine routed + gated shared -> out_part [M, 2560] BF16
     if (w.is_tr3) {
         if (M >= 32 && w.fc1_wide && w.fc2_wide && sc.grp_off && sc.x_had) {
-            if (w.t_eb <= 4) launch_moe_pf_wide<32, 10>(w, sc, x, out_part, M, st);
+            if (M >= 128 && w.t_eb <= 5) launch_moe_pf_wide<32, 10>(w, sc, x, out_part, M, st);
             else launch_moe_pf_wide<16, 10>(w, sc, x, out_part, M, st);
             return;
         }
