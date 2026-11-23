@@ -1496,9 +1496,9 @@ struct Engine {
                 qw38::gemm_bf16_nt(blas, len, geom::IDX_PROJ_OUT, geom::HID, mixed, aw.idx_qk_proj, attn_sc.idx_qk);
             }
             qw38::k_qw38_kv_write<<<len * nh_kv, 256, 0, stream>>>(attn_sc.k, attn_sc.v, aw.k_norm, d_slot, d_pos, kv.kv_pages, len, nh_kv, max_pps, geom::RMS_EPS, d_rope);
-            qw38::k_qsa_k_update_seg<<<1, 128, 0, stream>>>(attn_sc.idx_qk, aw.idx_k_norm, kv.idx_raw, nullptr, kv.idx_pages,
-                                                            max_pps, seg.slot, seg.row0, seg.pos0, seg.len, 0, geom::RMS_EPS,
-                                                            kv.idx_raw_thw, nullptr, d_rope);
+            qw38::qsa_k_update_seg_fast(attn_sc.idx_qk, aw.idx_k_norm, kv.idx_raw, nullptr, kv.idx_pages,
+                                        max_pps, seg.slot, seg.row0, seg.pos0, seg.len, 0, geom::RMS_EPS, stream,
+                                        kv.idx_raw_thw, nullptr, d_rope);
         }
     }
 
