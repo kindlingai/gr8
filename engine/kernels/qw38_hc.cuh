@@ -194,6 +194,24 @@ __global__ void k_embed_hc4(const int* __restrict__ tok, const __nv_bfloat16* __
     }
 }
 
+// Replicate token or staged vision embeddings into 4 hyper-connection streams:
+// when vis_map[m] >= 0, reads vis_pool[vis_map[m], d]; otherwise reads embed[tok[m], d].
+__global__ void k_embed_hc4_vis(const int* __restrict__ tok, const __nv_bfloat16* __restrict__ embed,
+                                const int* __restrict__ vis_map, const __nv_bfloat16* __restrict__ vis_pool,
+                                __nv_bfloat16* __restrict__ out, int M) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int vr = vis_map ? vis_map[m] : -1;
+    const __nv_bfloat16* src = (vr >= 0) ? (vis_pool + static_cast<size_t>(vr) * geom::HID)
+                                         : (embed + static_cast<size_t>(tok[m]) * geom::HID);
+    __nv_bfloat16* dst = out + static_cast<size_t>(m) * geom::HC_D;
+    for (int d = threadIdx.x; d < geom::HID; d += blockDim.x) {
+        const __nv_bfloat16 v = src[d];
+        #pragma unroll
+        for (int s = 0; s < geom::HC; ++s) dst[s * geom::HID + d] = v;
+    }
+}
+
 // Grouped zero-centered RMSNorm (vectorized uint4): x[M, G, D] -> out[M, G, D] BF16, weight[G*D] BF16.
 // One CTA per (m, g). Exact match to Qwen4ExpTextRMSNorm: rsqrt(mean(x^2)+eps) * x * (1 + w) -> bf16.
 template <int D>

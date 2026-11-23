@@ -136,7 +136,7 @@ QW38 = Model('qw38', 'Qwen3.8-Flash-Next', 'https://huggingface.co/kindlingai/Qw
              dialect='qwen', served=('qwen3.8-flash-next', 'qw38'), vocab=248320, eos_ids=(248046, 248044),
              max_positions=262144, per_slot_pool=True, stage_relay=True,
              engine_profile='qw38', simulator='m4sim_qw38', smoke_script='smoketest/qw38.sh',
-             serve_options=('MTP', 'CHUNK', 'EAGER'), engine_prefixes=('GR8_QW38_',),
+             serve_options=('MTP', 'CHUNK', 'EAGER'), engine_prefixes=('GR8_QW38_',), vision_knob='GR8_QW38_VISION',
              min_free_gib=8, checkpoint_cache=True,
              build_widths=('1', '2', '3', '4'), build_define='G6_MODEL_QW38', build_fc2gl=4, build_what_env='QW38_WHAT',
              scalable=True)
