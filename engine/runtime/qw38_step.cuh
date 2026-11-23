@@ -453,10 +453,12 @@ struct Engine {
         o = opt;
         if (!geom::rank_count_ok(o.nr)) die("unsupported TP width " + std::to_string(o.nr));
         if (o.widths_path.empty()) {
-            const char* env_w = std::getenv("GR8_QW38_WIDTHS");
-            if (env_w && *env_w) o.widths_path = env_w;
+            const std::optional<std::string>& env_w = knob::qw38_widths();
+            if (env_w && !env_w->empty()) o.widths_path = *env_w;
             else {
-                for (const char* cand : {"exlr8-manifest-bit300.json", "exlr8-manifest-bit400.json", "exlr8-manifest-bit200.json"}) {
+                for (const char* cand : {"manifests/exlr8-manifest-bit300.json", "manifests/exlr8-manifest-bit400.json",
+                                         "manifests/exlr8-manifest-bit200.json", "exlr8-manifest-bit300.json",
+                                         "exlr8-manifest-bit400.json", "exlr8-manifest-bit200.json"}) {
                     const std::string p = release_dir + "/" + cand;
                     if (std::filesystem::exists(p)) { o.widths_path = p; break; }
                 }
@@ -464,15 +466,12 @@ struct Engine {
             if (o.widths_path.empty()) die("no exlr8-manifest-bit*.json found in " + release_dir);
         }
         if (o.ptab_mode == ptab::OFF) o.ptab_mode = ptab::mode_env();
-        if (const char* we = std::getenv("GR8_QW38_WIDE")) o.wide = (std::atoi(we) != 0);
-        if (const char* fe = std::getenv("GR8_QW38_DENSE_FP8")) o.dense_fp8 = (std::atoi(fe) != 0);
-        if (const char* ae = std::getenv("GR8_QW38_PLE_ASYNC")) o.ple_async = (std::atoi(ae) != 0);
-        if (const char* ge = std::getenv("GR8_QW38_GRAPH")) o.use_graph = (std::atoi(ge) != 0);
-        if (const char* pe = std::getenv("GR8_QW38_PROFILE")) o.profile = (std::atoi(pe) != 0);
-        if (const char* cm = std::getenv("GR8_QW38_PLE_CACHE_MIB")) {
-            long v = std::atol(cm);
-            if (v >= 0) o.ple_cache_mib = size_t(v);
-        }
+        o.wide = knob::qw38_wide();
+        o.dense_fp8 = knob::qw38_dense_fp8();
+        o.ple_async = knob::qw38_ple_async();
+        o.use_graph = knob::qw38_graph();
+        o.profile = knob::qw38_profile();
+        if (knob::qw38_ple_cache_mib() >= 0) o.ple_cache_mib = size_t(knob::qw38_ple_cache_mib());
 
         QW38_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         cublasCreate(&blas);

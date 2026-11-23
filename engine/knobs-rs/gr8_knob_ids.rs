@@ -2,7 +2,7 @@
 // change the table, not this file. Each knob's id in the C API of gr8_knobs.h; a NAME<n> family takes n as well.
 
 /// The hash of the table these ids are from (gr8_knobs.h knob::TABLE_HASH).
-pub const TABLE_HASH: u64 = 0x8e5f33f2d76ae508;
+pub const TABLE_HASH: u64 = 0x27283e2a8a4706c3;
 pub const ATTN_CTX2: u32 = 0;
 pub const ATTN_CTX3: u32 = 1;
 pub const ATTN_CTX3_HG: u32 = 2;
@@ -428,12 +428,12 @@ pub const QO_ROPECHK: u32 = 421;
 pub const QUIT_FAST: u32 = 422;
 pub const QW38_DENSE_FP8: u32 = 423;
 pub const QW38_FAST_AR: u32 = 424;
-pub const QW38_GDN_CHUNK: u32 = 425;
-pub const QW38_GRAPH: u32 = 426;
-pub const QW38_PLE_ASYNC: u32 = 427;
-pub const QW38_PLE_CACHE_MIB: u32 = 428;
-pub const QW38_PROFILE: u32 = 429;
-pub const QW38_WIDE: u32 = 430;
+pub const QW38_GRAPH: u32 = 425;
+pub const QW38_PLE_ASYNC: u32 = 426;
+pub const QW38_PLE_CACHE_MIB: u32 = 427;
+pub const QW38_PROFILE: u32 = 428;
+pub const QW38_WIDE: u32 = 429;
+pub const QW38_WIDTHS: u32 = 430;
 pub const REFUSAL_LINGER: u32 = 431;
 pub const RESID_DUMP: u32 = 432;
 pub const REUSE_ALIGN: u32 = 433;

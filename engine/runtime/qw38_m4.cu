@@ -251,7 +251,7 @@ int main(int argc, char** argv) {
 
     Wire wire;
     if (G6_NR > 1) {
-        if (const char* fe = std::getenv("GR8_QW38_FAST_AR")) wire.fast = (std::atoi(fe) != 0);
+        wire.fast = knob::qw38_fast_ar();
         const size_t max_part_b = (size_t(o.max_rows) * geom::HID * 2 + 15) / 16 * 16;
         const size_t max_head_b = (size_t(o.max_rows) * head_row_bytes(o.nc) + 15) / 16 * 16;
         const size_t slot_b = std::max(max_part_b, max_head_b);

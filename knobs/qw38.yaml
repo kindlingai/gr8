@@ -55,15 +55,13 @@ knobs:
     doc: >-
       1 (the default) = prefetch Layer-1 PLE n-gram rows on a background thread concurrently with Layer-0 GPU execution.
       0 = synchronous PLE fetch at Layer-1 entry.
-  GR8_QW38_GDN_CHUNK:
-    scope: agree
-    kind: flag
-    default: "1"
-    values: "0|1"
+  GR8_QW38_WIDTHS:
+    scope: local
+    kind: path
+    unset: "auto-detect manifests/exlr8-manifest-bit300.json (or bit400/bit200) in the release directory"
     legacy: []
     doc: >-
-      1 (the default) = use chunked WY Tensor Core prefill for Gated DeltaNet segments of 32 or more tokens.
-      0 = serial per-token recurrence. Every rank must agree.
+      Path to an exlr8 width manifest JSON file when --widths is not passed on the command line.
   GR8_QW38_DENSE_FP8:
     scope: agree
     kind: flag

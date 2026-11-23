@@ -222,15 +222,15 @@ void test_config(const std::string& dir)
 }
 }   // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     test_constants();
     test_layers();
     test_ranks();
-    if (const char* dir = std::getenv("GR8_TEST_QW38_METADATA_DIR"); dir && *dir)
+    if (argc > 1 && argv[1] && *argv[1])
     {
-        test_config(dir);
-        printf("test_qw38_geom: ok (config.json of %s checked)\n", dir);
+        test_config(argv[1]);
+        printf("test_qw38_geom: ok (config.json of %s checked)\n", argv[1]);
     }
     else
     {

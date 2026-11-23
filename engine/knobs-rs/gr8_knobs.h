@@ -27,7 +27,7 @@ namespace knob
 {
 
 /// The hash of the table this header was written from.
-constexpr uint64_t TABLE_HASH = 0x8e5f33f2d76ae508ull;
+constexpr uint64_t TABLE_HASH = 0x27283e2a8a4706c3ull;
 
 /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
 /// of errors. The engine stops when it is not 0.
@@ -3052,45 +3052,45 @@ inline bool qw38_fast_ar()
     return v;
 }
 
-/// GR8_QW38_GDN_CHUNK
-inline bool qw38_gdn_chunk()
-{
-    static const bool v = *detail::flag(425, 0);
-    return v;
-}
-
 /// GR8_QW38_GRAPH
 inline bool qw38_graph()
 {
-    static const bool v = *detail::flag(426, 0);
+    static const bool v = *detail::flag(425, 0);
     return v;
 }
 
 /// GR8_QW38_PLE_ASYNC
 inline bool qw38_ple_async()
 {
-    static const bool v = *detail::flag(427, 0);
+    static const bool v = *detail::flag(426, 0);
     return v;
 }
 
 /// GR8_QW38_PLE_CACHE_MIB
 inline int64_t qw38_ple_cache_mib()
 {
-    static const int64_t v = *detail::int_(428, 0);
+    static const int64_t v = *detail::int_(427, 0);
     return v;
 }
 
 /// GR8_QW38_PROFILE
 inline bool qw38_profile()
 {
-    static const bool v = *detail::flag(429, 0);
+    static const bool v = *detail::flag(428, 0);
     return v;
 }
 
 /// GR8_QW38_WIDE
 inline bool qw38_wide()
 {
-    static const bool v = *detail::flag(430, 0);
+    static const bool v = *detail::flag(429, 0);
+    return v;
+}
+
+/// GR8_QW38_WIDTHS
+inline const std::optional<std::string>& qw38_widths()
+{
+    static const std::optional<std::string> v = detail::text(430, 0);
     return v;
 }
 

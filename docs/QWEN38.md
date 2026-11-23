@@ -56,7 +56,7 @@ The front end runs with `--dialect qwen`, serves the model as `qwen3.8-flash-nex
   - **36 Gated DeltaNet (GDN)** linear-attention layers (layers `0,1,2, 4,5,6, ..., 44,45,46`), `16` K-heads / `32` V-heads × `128` dim, depthwise conv1d (`kernel=4`).
   - **12 Full GQA + QSA** layers (layers `3, 7, 11, ..., 47`), `24` Q-heads / `2` KV-heads × `256` dim (`GQA-12`), partial RoPE (`64` dims), block-4 QSA sparse indexer (`top-512` blocks = `2,048` tokens + tail, with automatic short-context bypass below `2,051` tokens).
   - **4-stream low-rank hyper-connections** (`Qwen4ExpTextGatedResidual`, `4 × 2560`, rank `320`) around every attention and MoE block plus final mixer.
-  - **Layer-1 PLE (Per-Layer Embeddings)**: `320,001,536 × 2560` BF16 NVMe rowstore (`~95.4 GiB`, 2/3-gram prime-hashed 4-head lookup), gated against the 4-stream hyper state + dilated-3 depthwise conv1d, fetched asynchronously behind Layer 0 over an 8-thread `O_DIRECT` `pread` pool with LRU host cache.
+  - **Layer-1 PLE (Per-Layer Embeddings)**: `320,001,536 × 160` BF16 NVMe rowstore (`~95.4 GiB`, 2/3-gram prime-hashed 16-head lookup summing to `2,560` dim), gated against the 4-stream hyper state + dilated-3 depthwise conv1d, fetched asynchronously behind Layer 0 over an 8-thread `O_DIRECT` `pread` pool with LRU host cache.
   - **MoE**: `512` routed `exlr8-e4m3-pmcgx` experts (`top-10`, intermediate `640`, `nh=5`) + BF16 gated shared expert (`intermediate 640`).
   - **Untied vocabulary**: `248,320 × 2560` BF16 `embed_tokens` and `lm_head`.
 
@@ -70,8 +70,8 @@ Every `GR8_QW38_*` knob is registered in `knobs/qw38.yaml` (documented in [ENV.m
 | `GR8_QW38_GRAPH` | `1` | Full 48-layer decode + MTP verify & draft CUDA Graph capture on `TP=1` and multi-box RDMA `TP>=2` (compatible with `GR8_PTAB=1\|2`). Set `=0` for eager launches. |
 | `GR8_QW38_WIDE` | `1` | Wide-load K2/K3/K4 PMCGX MoE kernels (`tr3_wide.cuh`). Set `=0` for stock-order PMCGX decode. |
 | `GR8_QW38_PLE_ASYNC` | `1` | Overlaps Layer-1 PLE NVMe `pread` pool behind Layer 0 compute. Set `=0` for synchronous PLE fetch. |
-| `GR8_QW38_PLE_DIRECT` | `1` | `O_DIRECT` aligned reads on the PLE rowstore (`=0` uses OS page cache). |
-| `GR8_QW38_PLE_CACHE_MIB` | `4096` | Host LRU cache size (MiB) for PLE rows. |
+| `GR8_QW38_PLE_CACHE_MIB` | `1024` | Host LRU cache size (MiB) for PLE rows (`0` disables caching). |
+| `GR8_QW38_WIDTHS` | *(unset)* | Optional path to a width manifest JSON when `--widths` is not passed on the command line. |
 | `GR8_QW38_FAST_AR` | `1` | Single-step multi-collective device-driven RDMA all-reduce (`ncoll = 2*L+1 = 97` on `TP>=2`). Set `=0` for per-collective fallback. |
 | `GR8_PTAB` | `0` | Fixed-address device piece table (`0`=off, `1`=paged, `2`=paged+slab pool) for minimal-move live scaling. |
 | `MTP` (`--mtp`) | `0` | Layer-48 MTP speculative draft depth (`0..3`). |
