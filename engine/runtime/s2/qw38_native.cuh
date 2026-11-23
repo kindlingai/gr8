@@ -61,6 +61,8 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     std::array<Run, MAX_SESSIONS> bound{};
     std::array<bool, MAX_SESSIONS> bound_live{};
     std::array<int64_t, MAX_SESSIONS> incoming_sys{};
+    std::array<int, MAX_SESSIONS> incoming_mrope_delta{};
+    std::array<std::vector<g6rt::ImageIn>, MAX_SESSIONS> incoming_img_geom{};
 
     int32_t* d_ple_ctx = nullptr;
     if (c.reuse) {
@@ -188,7 +190,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
 
     if (stash) {
         h.checkpoint = [&](const g6rt::ServeReq& r) -> uint32_t {
-            if (!store_shared || r.prompt.empty() || r.steering.enabled) return 0;
+            if (!store_shared || r.prompt.empty() || r.steering.enabled || !r.images.empty()) return 0;
             const uint64_t top = std::min<uint64_t>(r.prompt.size() - 1, r.sys < 0 ? r.prompt.size() - 1 : uint64_t(r.sys));
             return uint32_t(top / geom::KV_PAGE * geom::KV_PAGE);
         };
@@ -258,19 +260,35 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             did_drain = false;
             return d;
         };
-        h.bind_request = [&](unsigned slot, const g6rt::ServeReq& r) {
-            require(slot < MAX_SESSIONS, "qw38 bind_request: bad slot");
-            incoming_sys[slot] = r.sys;
+    }
+
+    h.bind_request = [&](unsigned slot, const g6rt::ServeReq& r) {
+        require(slot < MAX_SESSIONS, "qw38 bind_request: bad slot");
+        incoming_sys[slot] = r.sys;
+        incoming_mrope_delta[slot] = qw38rt::qw38_mrope_delta(r.images);
+        incoming_img_geom[slot].clear();
+        for (const auto& im : r.images) {
+            g6rt::ImageIn g;
+            g.pos = im.pos; g.vit_h = im.vit_h; g.vit_w = im.vit_w; g.span = im.span;
+            incoming_img_geom[slot].push_back(g);
+        }
+        if (stash) {
             std::lock_guard<std::mutex> lk(ck_mu);
             stash->count(r.prompt, r.sys, g6rt::steering::cache_namespace(r.steering), !claimed.empty());
             stash->io_done();
-        };
-    }
+        }
+    };
 
     h.bind = [&](const Grant& g) {
         const int q = int(g.key.slot);
         require(q >= 0 && q < slots, "qw38 bind: slot out of range");
         c.engine.reset_slot(q);
+        c.engine.set_slot_mrope_delta(q, incoming_mrope_delta[size_t(q)]);
+        if (g.reuse > 0 && (g.reuse & 3u) != 0) {
+            int3 blk_thw;
+            qw38rt::qw38_build_mrope(incoming_img_geom[size_t(q)], int(g.reuse & ~3u), 1, &blk_thw);
+            c.engine.set_slot_idx_raw_thw(q, blk_thw);
+        }
         QW38_CK(cudaDeviceSynchronize());
         bound[size_t(q)] = g.run;
         bound_live[size_t(q)] = true;
@@ -350,11 +368,13 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     h.dispatch.prefill = [&](const Slot& s, const Payload& p, uint32_t first, uint32_t rows) {
         const int q = int(s.key.slot);
         require(size_t(first) + rows <= p.prompt.size() && q >= 0 && q < slots, "qw38 prefill: out of range");
+        if (!p.images.empty()) c.engine.set_slot_mrope_delta(q, qw38rt::qw38_mrope_delta(p.images));
         uint32_t at = first;
         const uint32_t limit = first + rows;
+        std::vector<int3> mrope_thw;
         while (at < limit) {
             uint32_t step_lim = std::min<uint32_t>(limit, at + uint32_t(max_rows));
-            if (stash) {
+            if (stash && p.images.empty()) {
                 const uint32_t ck = store_slots[size_t(q)].ckpt;
                 if (ck > at && ck < step_lim) step_lim = ck;
             }
@@ -370,9 +390,16 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 c.engine.stage_ple_prefetch(&p.prompt[step_lim], int(next_lim - step_lim), c0, c1);
             }
             std::vector<qw38::StepSeg> segs = {{q, 0, int(at), n}};
-            c.engine.forward(segs, &p.prompt[at], nullptr, out, true);
+            if (!p.images.empty()) {
+                const int vis_n = c.engine.vision.stage(p.images, int(at), n, c.engine.stream, c.rank, s.req.id);
+                mrope_thw.resize(size_t(n));
+                qw38rt::qw38_build_mrope(p.images, int(at), n, mrope_thw.data());
+                c.engine.forward(segs, &p.prompt[at], nullptr, out, true, 0, vis_n, mrope_thw.data());
+            } else {
+                c.engine.forward(segs, &p.prompt[at], nullptr, out, true);
+            }
             at = step_lim;
-            if (stash && store_slots[size_t(q)].ckpt && at == store_slots[size_t(q)].ckpt) {
+            if (stash && p.images.empty() && store_slots[size_t(q)].ckpt && at == store_slots[size_t(q)].ckpt) {
                 sync_ple_ctx_to_dev(q);
                 QW38_CK(cudaStreamSynchronize(c.engine.stream));
                 std::lock_guard<std::mutex> lk(ck_mu);

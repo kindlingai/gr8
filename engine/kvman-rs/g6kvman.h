@@ -338,6 +338,43 @@ int g6kv_canon_import(const uint8_t* blob, size_t n, uint32_t mla_row, uint32_t 
                       uint32_t below_rows, const uint32_t* list, size_t n_list, uint32_t place, uint32_t rank,
                       uint8_t* const* mla, const size_t* mla_bytes, uint8_t* const* idx, const size_t* idx_bytes,
                       uint64_t* written);
+// Head-split canonical helpers (#161): gather/scatter [outer][heads][inner] across `nr` head groups using the g6nr.h
+// width rule. Size-query convention matches g6kv_canon_export: *need = required bytes, 1 when cap < *need, 0 = done,
+// -1 = error (g6kv_canon_error).
+int g6kv_canon_heads_out(const uint8_t* const* ranks, const size_t* rank_bytes, uint32_t nr, uint32_t heads,
+                         size_t outer, size_t inner, uint8_t* out, size_t cap, size_t* need);
+int g6kv_canon_heads_in(const uint8_t* canon, size_t canon_bytes, uint32_t heads, size_t outer, size_t inner,
+                        uint32_t nr, uint32_t group, uint8_t* out, size_t cap, size_t* need);
+// DFlash2 GQA drafter ring canonical export/import (#161): each rank holds [layers][nkr][ring][head_dim * elem_bytes]
+// for K and V (nkr = kv_heads when replicated != 0, else kv_heads / nr). Exports/imports logical positions [lo, hi).
+int g6kv_canon_dfl_export(uint32_t layers, uint32_t kv_heads, uint32_t head_dim, uint32_t elem_bytes, uint32_t nr,
+                          uint32_t ring, int replicated, const uint8_t* const* k_ranks, const size_t* k_bytes,
+                          const uint8_t* const* v_ranks, const size_t* v_bytes, uint64_t lo, uint64_t hi, int check,
+                          uint8_t* out, size_t cap, size_t* need);
+int g6kv_canon_dfl_import(const uint8_t* blob, size_t n, uint32_t layers, uint32_t kv_heads, uint32_t head_dim,
+                          uint32_t elem_bytes, uint32_t nr, uint32_t ring, int replicated, uint32_t rank,
+                          uint8_t* k_dst, size_t k_bytes, uint8_t* v_dst, size_t v_bytes, uint64_t* written);
+// KDA linear-attention + short-convolution canonical export/import (#161): per slot `li` (model layer `layer_ids[li]`),
+// rank buffer holds S [nhmax][dk][dv] then C [nhist * n_streams][nhmax][dk] (element size `elem_bytes`), rotated per
+// layer as kda::heads. Padding heads nh..nhmax are zeroed on import.
+size_t g6kv_canon_kda_rank_bytes(uint32_t heads, uint32_t dk, uint32_t dv, uint32_t nhist, uint32_t n_streams,
+                                 uint32_t elem_bytes, uint32_t n_layers, uint32_t nr);
+int g6kv_canon_kda_export(uint32_t heads, uint32_t dk, uint32_t dv, uint32_t nhist, uint32_t n_streams,
+                          uint32_t elem_bytes, const uint32_t* layer_ids, uint32_t n_layers, uint32_t nr,
+                          const uint8_t* const* ranks, const size_t* rank_bytes, uint8_t* out, size_t cap,
+                          size_t* need);
+int g6kv_canon_kda_import(const uint8_t* blob, size_t n, uint32_t heads, uint32_t dk, uint32_t dv, uint32_t nhist,
+                          uint32_t n_streams, uint32_t elem_bytes, const uint32_t* layer_ids, uint32_t n_layers,
+                          uint32_t nr, uint32_t rank, uint8_t* dst, size_t dst_bytes, size_t* written);
+// Canonical session envelope (`g6cses1`, #161): bundles optional KV (`g6canon1`), DFlash2 (`g6cdfl1`), KDA (`g6ckda1`)
+// and replicated opaque extra bytes (e.g. Flash raw index rings / draft scalars). pack validates every non-empty
+// sub-blob; unpack validates the envelope and every non-empty sub-blob and returns pointers into `blob`.
+int g6kv_canon_session_pack(const uint8_t* kv, size_t kv_n, const uint8_t* dfl, size_t dfl_n, const uint8_t* kda,
+                            size_t kda_n, const uint8_t* extra, size_t extra_n, uint8_t* out, size_t cap,
+                            size_t* need);
+int g6kv_canon_session_unpack(const uint8_t* blob, size_t n, const uint8_t** kv, size_t* kv_n, const uint8_t** dfl,
+                              size_t* dfl_n, const uint8_t** kda, size_t* kda_n, const uint8_t** extra,
+                              size_t* extra_n);
 // Another box's persisted store files over `kvman-peer` (src/peer.rs), for a scale's rewrite: open with HOST:PORT and
 // the hex token (NULL on failure), read len bytes of a file at off (0 or -1), a file's size (or -1). Failures name
 // their reason in g6kv_peer_error (this thread's last).

@@ -446,6 +446,7 @@ pub enum Model {
     Ds41,
     Glm5v,
     Ink2,
+    Qw38,
 }
 
 impl Model {
@@ -455,6 +456,7 @@ impl Model {
             Model::Ds41 => IMAGE_TOKEN_ID,
             Model::Glm5v => glm5v::IMAGE_TOKEN_ID,
             Model::Ink2 => ink2::IMAGE_TOKEN_ID,
+            Model::Qw38 => qw38::IMAGE_TOKEN_ID,
         }
     }
     pub fn prepare_rgb(self, im: &Rgb) -> Result<Prepared, VisionError> {
@@ -462,6 +464,7 @@ impl Model {
             Model::Ds41 => prepare_rgb(im),
             Model::Glm5v => glm5v::prepare_rgb(im),
             Model::Ink2 => ink2::prepare_rgb(im),
+            Model::Qw38 => qw38::prepare_rgb(im),
         }
     }
     /// Image bytes -> RGB as the model's processor reads them: Inkling-2-Small composites transparency on its
@@ -469,7 +472,7 @@ impl Model {
     pub fn decode(self, bytes: &[u8]) -> Result<Rgb, VisionError> {
         match self {
             Model::Ink2 => ink2::decode_ink2_rgb(bytes),
-            Model::Ds41 | Model::Glm5v => decode_rgb(bytes),
+            Model::Ds41 | Model::Glm5v | Model::Qw38 => decode_rgb(bytes),
         }
     }
     /// Base64 image data -> what the engine gets.
@@ -483,6 +486,7 @@ impl Model {
             Model::Ds41 => plan_image_grid(w, h).n_span(),
             Model::Glm5v => glm5v::plan(w, h).tokens(),
             Model::Ink2 => ink2::plan(w, h)?.tokens,
+            Model::Qw38 => qw38::plan(w, h)?.tokens(),
         })
     }
 }
@@ -602,6 +606,87 @@ pub mod glm5v {
             let o = y * p.target_w * 3;
             rgb[o..o + p.content_w * 3].copy_from_slice(&content[y * p.content_w * 3..(y + 1) * p.content_w * 3]);
         }
+        let key = content_key(p.vit_h(), p.vit_w(), &rgb);
+        Ok(Prepared { vit_h: p.vit_h(), vit_w: p.vit_w(), n_span: p.tokens(), key, rgb })
+    }
+}
+
+/// Qwen3.8-Flash-Next: transformers' `Qwen2VLImageProcessorFast` (`preprocessor_config.json`: patch 16, merge 2,
+/// factor 32, shortest_edge 65536, longest_edge 16777216, bicubic resize, no padding). engine/runtime/qw38_vision_plan.h
+/// holds the same geometry.
+pub mod qw38 {
+    use super::{content_key, resize_bicubic, verr, Prepared, Rgb, VisionError};
+
+    /// `image_token_id`: `<|image_pad|>`, the template's placeholder and every token of an image span.
+    pub const IMAGE_TOKEN_ID: u32 = 248_056;
+    pub const PATCH: usize = 16;
+    pub const MERGE: usize = 2;
+    pub const FACTOR: usize = PATCH * MERGE; // 32
+    pub const MIN_PIXELS: usize = 65_536;    // 64 tokens
+    pub const MAX_PIXELS: usize = 16_777_216; // 16384 tokens
+    pub const MIN_TOKENS: usize = MIN_PIXELS / (FACTOR * FACTOR); // 64
+    pub const MAX_TOKENS: usize = MAX_PIXELS / (FACTOR * FACTOR); // 16384
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Plan {
+        pub target_h: usize,
+        pub target_w: usize,
+    }
+
+    impl Plan {
+        pub fn vit_h(&self) -> usize {
+            self.target_h / PATCH
+        }
+        pub fn vit_w(&self) -> usize {
+            self.target_w / PATCH
+        }
+        pub fn tokens(&self) -> usize {
+            (self.vit_h() / MERGE) * (self.vit_w() / MERGE)
+        }
+    }
+
+    /// Python's `round()` (round-half-to-even) for non-negative values, matching `smart_resize`.
+    fn py_round(x: f64) -> usize {
+        x.round_ties_even().max(0.0) as usize
+    }
+
+    /// `transformers.models.qwen2_vl.image_processing_qwen2_vl.smart_resize(height, width, factor=32, min_pixels=65536, max_pixels=16777216)`.
+    pub fn smart_resize(height: usize, width: usize) -> Result<(usize, usize), VisionError> {
+        if height == 0 || width == 0 {
+            return verr("empty image");
+        }
+        let hi = height.max(width) as f64;
+        let lo = height.min(width) as f64;
+        if hi / lo > 200.0 {
+            return verr(format!("image aspect ratio {:.1} exceeds 200", hi / lo));
+        }
+        let f = FACTOR as f64;
+        let mut h_bar = py_round(height as f64 / f).max(1) * FACTOR;
+        let mut w_bar = py_round(width as f64 / f).max(1) * FACTOR;
+        if h_bar * w_bar > MAX_PIXELS {
+            let beta = ((height * width) as f64 / MAX_PIXELS as f64).sqrt();
+            h_bar = ((height as f64 / beta / f).floor() as usize).max(1) * FACTOR;
+            w_bar = ((width as f64 / beta / f).floor() as usize).max(1) * FACTOR;
+        } else if h_bar * w_bar < MIN_PIXELS {
+            let beta = (MIN_PIXELS as f64 / (height * width) as f64).sqrt();
+            h_bar = ((height as f64 * beta / f).ceil() as usize).max(1) * FACTOR;
+            w_bar = ((width as f64 * beta / f).ceil() as usize).max(1) * FACTOR;
+        }
+        Ok((h_bar, w_bar))
+    }
+
+    pub fn plan(width: usize, height: usize) -> Result<Plan, VisionError> {
+        let (target_h, target_w) = smart_resize(height, width)?;
+        Ok(Plan { target_h, target_w })
+    }
+
+    pub fn prepare_rgb(im: &Rgb) -> Result<Prepared, VisionError> {
+        let p = plan(im.w, im.h)?;
+        let rgb = if im.w == p.target_w && im.h == p.target_h {
+            im.px.clone()
+        } else {
+            resize_bicubic(&im.px, im.w, im.h, p.target_w, p.target_h)
+        };
         let key = content_key(p.vit_h(), p.vit_w(), &rgb);
         Ok(Prepared { vit_h: p.vit_h(), vit_w: p.vit_w(), n_span: p.tokens(), key, rgb })
     }
@@ -1222,6 +1307,42 @@ mod tests {
         let p = Model::Ink2.prepare_b64(&b64).unwrap();
         assert_eq!((p.vit_h, p.vit_w, p.n_span, p.rgb[0], p.rgb[50 * 3]), (4, 4, 4, 7, 0));
         assert!(Model::Ink2.prepare_b64("aGk=").is_err());
+    }
+
+    #[test]
+    fn qw38_plan_and_prepare() {
+        assert_eq!(Model::Qw38.token(), qw38::IMAGE_TOKEN_ID);
+        assert_eq!(qw38::IMAGE_TOKEN_ID, 248_056);
+        // 160x80 -> below min_pixels (65536), scaled up to factor-32 grid >= 64 tokens
+        let p = qw38::plan(160, 80).unwrap();
+        assert_eq!(p.target_h % qw38::FACTOR, 0);
+        assert_eq!(p.target_w % qw38::FACTOR, 0);
+        assert!(p.tokens() >= qw38::MIN_TOKENS && p.tokens() <= qw38::MAX_TOKENS);
+        // 512x512 -> exact 512x512 (32x32 patches = 256 tokens)
+        let p = qw38::plan(512, 512).unwrap();
+        assert_eq!((p.target_h, p.target_w, p.vit_h(), p.vit_w(), p.tokens()), (512, 512, 32, 32, 256));
+        // 640x480 -> exact 640x480 (30x40 patches = 300 tokens)
+        let p = qw38::plan(640, 480).unwrap();
+        assert_eq!((p.target_h, p.target_w, p.vit_h(), p.vit_w(), p.tokens()), (480, 640, 30, 40, 300));
+        // huge image -> capped to <= MAX_TOKENS (16384)
+        let p = qw38::plan(8000, 6000).unwrap();
+        assert!(p.tokens() <= qw38::MAX_TOKENS);
+        // extreme aspect ratio (>200) refused
+        assert!(qw38::plan(10000, 10).is_err());
+        // prepare_rgb and base64 roundtrip
+        let bytes = png(160, 80, image::ExtendedColorType::Rgb8, &vec![42u8; 160 * 80 * 3]);
+        let b64 = b64_encode(&bytes);
+        let n_span = Model::Qw38.n_span_b64(&b64).unwrap();
+        let prep = Model::Qw38.prepare_b64(&b64).unwrap();
+        assert_eq!(prep.n_span, n_span);
+        assert_eq!(prep.rgb.len(), prep.vit_h * qw38::PATCH * prep.vit_w * qw38::PATCH * 3);
+        assert_eq!(prep.key, content_key(prep.vit_h, prep.vit_w, &prep.rgb));
+        // expand <|image_pad|>
+        let t = qw38::IMAGE_TOKEN_ID;
+        let (ids, pos) = expand(&[1, 248_053, t, 248_054, 2], &[4], t).unwrap();
+        assert_eq!(ids, vec![1, 248_053, t, t, t, t, 248_054, 2]);
+        assert_eq!(pos, vec![2]);
+        assert!(Model::Qw38.prepare_b64("aGk=").is_err());
     }
 
     #[test]
