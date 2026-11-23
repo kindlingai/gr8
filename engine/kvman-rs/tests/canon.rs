@@ -527,3 +527,299 @@ fn head_split_state_regroups_for_every_width() {
     assert!(canon::heads_in(&[0u8; 10], 8, 1, 1, 2, 0).is_err());
     assert!(canon::heads_out(&[&[0u8; 3][..]], 8, 1, 1).is_err());
 }
+
+// ---- EL4d (#161): DFlash2 GQA drafter ring, KDA linear-attention + conv state, and SessionCanon ----
+
+#[allow(clippy::too_many_arguments)]
+fn dfl_write_rank(
+    spec: canon::DflSpec,
+    layout: &canon::DflLayout,
+    rank: u32,
+    lo: u64,
+    hi: u64,
+    k_all: &[u8],
+    v_all: &[u8],
+    fill: u8,
+) -> (Vec<u8>, Vec<u8>) {
+    let row = (spec.head_dim * spec.elem_bytes) as usize;
+    let nkr = if layout.replicated { spec.kv_heads as usize } else { (spec.kv_heads / layout.nr) as usize };
+    let h_base = if layout.replicated { 0 } else { rank as usize * nkr };
+    let half = spec.layers as usize * nkr * layout.ring as usize * row;
+    let mut kr = vec![fill; half];
+    let mut vr = vec![fill; half];
+    let rows = (hi - lo) as usize;
+    for l in 0..spec.layers as usize {
+        for hl in 0..nkr {
+            let h = h_base + hl;
+            for o in 0..rows {
+                let slot = ((lo + o as u64) % layout.ring as u64) as usize;
+                let s = ((l * spec.kv_heads as usize + h) * rows + o) * row;
+                let d = ((l * nkr + hl) * layout.ring as usize + slot) * row;
+                kr[d..d + row].copy_from_slice(&k_all[s..s + row]);
+                vr[d..d + row].copy_from_slice(&v_all[s..s + row]);
+            }
+        }
+    }
+    (kr, vr)
+}
+
+#[test]
+fn dflash2_ring_round_trips_across_split_and_replicated_widths() {
+    let mut rng = Rng(101);
+    let specs = [
+        canon::DflSpec { layers: 6, kv_heads: 8, head_dim: 16, elem_bytes: 2 }, // GLM-5.3 shape (scaled HD)
+        canon::DflSpec { layers: 5, kv_heads: 8, head_dim: 16, elem_bytes: 2 }, // Flash shape (scaled HD)
+    ];
+    let layouts = [
+        canon::DflLayout { nr: 1, ring: 64, replicated: false },
+        canon::DflLayout { nr: 2, ring: 64, replicated: false },
+        canon::DflLayout { nr: 3, ring: 64, replicated: true }, // dfl::REP
+        canon::DflLayout { nr: 4, ring: 64, replicated: false },
+        canon::DflLayout { nr: 6, ring: 64, replicated: true }, // dfl::REP
+        canon::DflLayout { nr: 8, ring: 64, replicated: false },
+    ];
+    for spec in specs {
+        let row = (spec.head_dim * spec.elem_bytes) as usize;
+        // includes wrap-around past ring=64 (lo=50, hi=95 -> 45 rows wrapping across slot 0)
+        for (lo, hi) in [(0u64, 0u64), (0, 29), (50, 95), (120, 184)] {
+            let rows = (hi - lo) as usize;
+            let half = spec.layers as usize * spec.kv_heads as usize * rows * row;
+            let k_all = rng.bytes(half);
+            let v_all = rng.bytes(half);
+            // Export from every layout, serialize, and import into every other layout
+            let mut first_canon: Option<canon::DflCanon> = None;
+            for src_l in &layouts {
+                let src_ranks: Vec<(Vec<u8>, Vec<u8>)> = (0..src_l.nr)
+                    .map(|r| dfl_write_rank(spec, src_l, r, lo, hi, &k_all, &v_all, 0xA5))
+                    .collect();
+                let refs: Vec<canon::DflRing<'_>> =
+                    src_ranks.iter().map(|(k, v)| canon::DflRing { k, v }).collect();
+                let c = canon::dfl_export(spec, src_l, &refs, lo, hi, true).unwrap();
+                let blob = c.to_bytes();
+                assert_eq!(blob.len(), c.byte_len());
+                let c2 = canon::DflCanon::from_bytes(&blob).unwrap();
+                assert_eq!(c2, c);
+                if let Some(ref prev) = first_canon {
+                    assert_eq!(&c, prev, "canonical DFlash2 form must not depend on source layout {src_l:?}");
+                } else {
+                    first_canon = Some(c.clone());
+                }
+                for dst_l in &layouts {
+                    for r in 0..dst_l.nr {
+                        let (want_k, want_v) = dfl_write_rank(spec, dst_l, r, lo, hi, &k_all, &v_all, 0x5A);
+                        let mut got_k = vec![0x5Au8; want_k.len()];
+                        let mut got_v = vec![0x5Au8; want_v.len()];
+                        let mut dst = canon::DflRingMut { k: &mut got_k, v: &mut got_v };
+                        let w = canon::dfl_import(&c2, spec, dst_l, r, &mut dst).unwrap();
+                        assert_eq!(w, hi - lo);
+                        assert_eq!(got_k, want_k, "k mismatch {src_l:?} -> {dst_l:?} rank {r}");
+                        assert_eq!(got_v, want_v, "v mismatch {src_l:?} -> {dst_l:?} rank {r}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn dflash2_bulk_then_tail_and_errors() {
+    let mut rng = Rng(103);
+    let spec = canon::DflSpec { layers: 5, kv_heads: 8, head_dim: 16, elem_bytes: 2 };
+    let src_l = canon::DflLayout { nr: 4, ring: 64, replicated: false };
+    let dst_l = canon::DflLayout { nr: 6, ring: 64, replicated: true };
+    let (lo, mid, hi) = (45u64, 70u64, 93u64); // crosses wrap-around in both bulk and tail
+    let rows = (hi - lo) as usize;
+    let half = spec.layers as usize * spec.kv_heads as usize * rows * (spec.head_dim * spec.elem_bytes) as usize;
+    let k_all = rng.bytes(half);
+    let v_all = rng.bytes(half);
+    let src_ranks: Vec<(Vec<u8>, Vec<u8>)> = (0..src_l.nr)
+        .map(|r| dfl_write_rank(spec, &src_l, r, lo, hi, &k_all, &v_all, 0))
+        .collect();
+    let refs: Vec<canon::DflRing<'_>> = src_ranks.iter().map(|(k, v)| canon::DflRing { k, v }).collect();
+    let bulk = canon::dfl_export(spec, &src_l, &refs, lo, mid, true).unwrap();
+    let tail = canon::dfl_export(spec, &src_l, &refs, mid, hi, true).unwrap();
+    for r in 0..dst_l.nr {
+        let (want_k, want_v) = dfl_write_rank(spec, &dst_l, r, lo, hi, &k_all, &v_all, 0x11);
+        let mut got_k = vec![0x11u8; want_k.len()];
+        let mut got_v = vec![0x11u8; want_v.len()];
+        let mut dst = canon::DflRingMut { k: &mut got_k, v: &mut got_v };
+        canon::dfl_import(&bulk, spec, &dst_l, r, &mut dst).unwrap();
+        canon::dfl_import(&tail, spec, &dst_l, r, &mut dst).unwrap();
+        assert_eq!(got_k, want_k);
+        assert_eq!(got_v, want_v);
+    }
+    // Replicated disagreement caught when check=true
+    let mut rep_ranks: Vec<(Vec<u8>, Vec<u8>)> = (0..dst_l.nr)
+        .map(|r| dfl_write_rank(spec, &dst_l, r, lo, hi, &k_all, &v_all, 0))
+        .collect();
+    let slot = (lo % dst_l.ring as u64) as usize;
+    rep_ranks[2].0[slot * 32] ^= 1;
+    let rrefs: Vec<canon::DflRing<'_>> = rep_ranks.iter().map(|(k, v)| canon::DflRing { k, v }).collect();
+    assert_eq!(
+        canon::dfl_export(spec, &dst_l, &rrefs, lo, hi, true),
+        Err(canon::Error::Disagree { binding: 0, page: lo as usize, rank: 2 })
+    );
+    assert!(canon::dfl_export(spec, &dst_l, &rrefs, lo, hi, false).is_ok());
+    // Refusals: split on non-divisible nr, span > ring, truncated/overflow blobs
+    let bad_split = canon::DflLayout { nr: 3, ring: 64, replicated: false };
+    assert!(canon::dfl_export(spec, &bad_split, &rrefs[..3], lo, hi, true).is_err());
+    assert!(canon::dfl_export(spec, &src_l, &refs, 0, 65, true).is_err());
+    let b = bulk.to_bytes();
+    assert!(canon::DflCanon::from_bytes(&b[..b.len() - 1]).is_err());
+    let mut ovf = b.clone();
+    ovf[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(canon::DflCanon::from_bytes(&ovf).is_err());
+}
+
+fn kda_write_rank(spec: &canon::KdaSpec, nr: u32, rank: u32, canon_data: &[u8]) -> Vec<u8> {
+    let heads = spec.heads as usize;
+    let nhm = canon::kda_nhmax(heads, nr as usize);
+    let s_head = (spec.dk * spec.dv * spec.elem_bytes) as usize;
+    let c_head = (spec.dk * spec.elem_bytes) as usize;
+    let c_rows = (spec.nhist * spec.n_streams) as usize;
+    let r_s = nhm * s_head;
+    let r_c = c_rows * nhm * c_head;
+    let c_s = heads * s_head;
+    let c_c = c_rows * heads * c_head;
+    let mut out = vec![0u8; spec.rank_bytes(nr).unwrap()];
+    for (li, &layer) in spec.layer_ids.iter().enumerate() {
+        let (h0, nh) = canon::kda_rank_heads(heads, nr as usize, layer as usize, rank as usize);
+        let src_base = li * (c_s + c_c);
+        let dst_base = li * (r_s + r_c);
+        out[dst_base..dst_base + nh * s_head]
+            .copy_from_slice(&canon_data[src_base + h0 * s_head..src_base + (h0 + nh) * s_head]);
+        for k in 0..c_rows {
+            let s_off = src_base + c_s + (k * heads + h0) * c_head;
+            let d_off = dst_base + r_s + k * nhm * c_head;
+            out[d_off..d_off + nh * c_head].copy_from_slice(&canon_data[s_off..s_off + nh * c_head]);
+        }
+    }
+    out
+}
+
+#[test]
+fn kda_linear_attention_and_conv_round_trip_across_all_widths() {
+    let mut rng = Rng(107);
+    // Flash KDA layer schedule (li + li / 3) with scaled dk/dv for fast exhaustive width sweeps
+    let layer_ids: Vec<u32> = (0..12u32).map(|li| li + li / 3).collect();
+    let spec = canon::KdaSpec {
+        heads: 64,
+        dk: 8,
+        dv: 8,
+        nhist: 3,
+        n_streams: 3,
+        elem_bytes: 4,
+        layer_ids,
+    };
+    let truth = rng.bytes(spec.canon_bytes().unwrap());
+    let widths = [1u32, 2, 3, 4, 5, 6, 8];
+    // Start at TP=4 and chain through every width (including uneven TP=3, 5, 6 with nhmax padding!)
+    let mut cur_nr = 4u32;
+    let mut cur_ranks: Vec<Vec<u8>> = (0..cur_nr).map(|r| kda_write_rank(&spec, cur_nr, r, &truth)).collect();
+    for &next_nr in &[3u32, 2, 1, 6, 5, 8, 4] {
+        let refs: Vec<&[u8]> = cur_ranks.iter().map(|b| &b[..]).collect();
+        let exported = canon::kda_export(&spec, cur_nr, &refs).unwrap();
+        assert_eq!(exported.data, truth, "export from TP={cur_nr} lost bytes");
+        let blob = exported.to_bytes();
+        assert_eq!(blob.len(), exported.byte_len());
+        let decoded = canon::KdaCanon::from_bytes(&blob).unwrap();
+        assert_eq!(decoded, exported);
+
+        let mut next_ranks = Vec::with_capacity(next_nr as usize);
+        for r in 0..next_nr {
+            // Fill with non-zero sentinel to verify import zeroes padding slots nh..nhmax
+            let mut dst = vec![0xEEu8; spec.rank_bytes(next_nr).unwrap()];
+            let n = canon::kda_import(&decoded, &spec, next_nr, r, &mut dst).unwrap();
+            assert_eq!(n, dst.len());
+            let want = kda_write_rank(&spec, next_nr, r, &truth);
+            assert_eq!(dst, want, "import TP={cur_nr} -> TP={next_nr} rank {r}");
+            next_ranks.push(dst);
+        }
+        cur_nr = next_nr;
+        cur_ranks = next_ranks;
+    }
+    // Truncated / mismatched blobs refused
+    let refs: Vec<&[u8]> = cur_ranks.iter().map(|b| &b[..]).collect();
+    let blob = canon::kda_export(&spec, cur_nr, &refs).unwrap().to_bytes();
+    assert!(canon::KdaCanon::from_bytes(&blob[..blob.len() - 1]).is_err());
+    let mut bad_ids = spec.clone();
+    bad_ids.layer_ids[0] = 99;
+    let mut dst = vec![0u8; bad_ids.rank_bytes(2).unwrap()];
+    assert_eq!(
+        canon::kda_import(&canon::KdaCanon::from_bytes(&blob).unwrap(), &bad_ids, 2, 0, &mut dst),
+        Err(canon::Error::Mismatch("KDA geometry"))
+    );
+    for &w in &widths {
+        assert_eq!(canon::kda_nhmax(64, w as usize), 64usize.div_ceil(w as usize));
+    }
+}
+
+#[test]
+fn session_canon_envelope_round_trips_all_combinations() {
+    let mut rng = Rng(109);
+    // Build KV (including an unsharded MTP binding), DFlash2, KDA, and replicated extra (Flash raw rings)
+    let bs = vec![Binding { index: true, cp: true }, Binding { index: false, cp: false }];
+    let l = Layout { nr: 4, below_rows: 128 };
+    let s = setup(&mut rng, l, 200);
+    let t = tokens(&mut rng, &bs, 416, 200);
+    let ranks: Vec<Rank> = (0..4).map(|r| write(&t, &bs, 416, &l, &s.views[r], r as u32, s.pages, 200, 0)).collect();
+    let cs: Vec<Vec<Cache>> = ranks.iter().map(caches).collect();
+    let kv = canon::export(416, &bs, &l, &s.views, &cs, 0, 200, true).unwrap();
+
+    let dfl_spec = canon::DflSpec { layers: 5, kv_heads: 8, head_dim: 8, elem_bytes: 2 };
+    let dfl_l = canon::DflLayout { nr: 4, ring: 32, replicated: false };
+    let dfl_k = rng.bytes(5 * 8 * 12 * 16);
+    let dfl_v = rng.bytes(5 * 8 * 12 * 16);
+    let dfl_ranks: Vec<(Vec<u8>, Vec<u8>)> = (0..4)
+        .map(|r| dfl_write_rank(dfl_spec, &dfl_l, r, 188, 200, &dfl_k, &dfl_v, 0))
+        .collect();
+    let dfl_refs: Vec<canon::DflRing<'_>> = dfl_ranks.iter().map(|(k, v)| canon::DflRing { k, v }).collect();
+    let dfl = canon::dfl_export(dfl_spec, &dfl_l, &dfl_refs, 188, 200, true).unwrap();
+
+    let kda_spec = canon::KdaSpec {
+        heads: 64,
+        dk: 4,
+        dv: 4,
+        nhist: 3,
+        n_streams: 3,
+        elem_bytes: 4,
+        layer_ids: vec![0, 1, 2, 4],
+    };
+    let kda_truth = rng.bytes(kda_spec.canon_bytes().unwrap());
+    let kda_ranks: Vec<Vec<u8>> = (0..4).map(|r| kda_write_rank(&kda_spec, 4, r, &kda_truth)).collect();
+    let kda_refs: Vec<&[u8]> = kda_ranks.iter().map(|b| &b[..]).collect();
+    let kda = canon::kda_export(&kda_spec, 4, &kda_refs).unwrap();
+
+    let ring_bytes = rng.bytes(512);
+    let extra = canon::replicated_export(&[&ring_bytes, &ring_bytes, &ring_bytes, &ring_bytes], true).unwrap();
+    let mut bad_ring = ring_bytes.clone();
+    bad_ring[7] ^= 1;
+    assert_eq!(
+        canon::replicated_export(&[&ring_bytes, &bad_ring], true),
+        Err(canon::Error::Disagree { binding: 0, page: 0, rank: 1 })
+    );
+
+    let full = canon::SessionCanon {
+        kv: Some(kv.clone()),
+        dfl: Some(dfl.clone()),
+        kda: Some(kda.clone()),
+        extra: extra.clone(),
+    };
+    let bytes = full.to_bytes();
+    assert_eq!(canon::SessionCanon::from_bytes(&bytes).unwrap(), full);
+
+    let glm_only = canon::SessionCanon { kv: Some(kv), dfl: Some(dfl), kda: None, extra: Vec::new() };
+    assert_eq!(canon::SessionCanon::from_bytes(&glm_only.to_bytes()).unwrap(), glm_only);
+
+    let empty = canon::SessionCanon::default();
+    assert_eq!(canon::SessionCanon::from_bytes(&empty.to_bytes()).unwrap(), empty);
+
+    // Truncated, trailing, and overflow envelopes refused
+    assert!(canon::SessionCanon::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert!(canon::SessionCanon::from_bytes(&longer).is_err());
+    let mut ovf = bytes.clone();
+    ovf[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(canon::SessionCanon::from_bytes(&ovf).is_err());
+}
