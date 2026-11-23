@@ -656,6 +656,9 @@ struct Engine {
         attn_sc.idx_scores = dalloc<float>(M * size_t(max_blocks));
         attn_sc.sel_blocks = dalloc<int>(M * geom::IDX_TOP_BLOCKS);
         attn_sc.sel_counts = dalloc<int>(M);
+        attn_sc.split_m = dalloc<float>(8 * size_t(max_nh_q) * 24);
+        attn_sc.split_l = dalloc<float>(8 * size_t(max_nh_q) * 24);
+        attn_sc.split_o = dalloc<float>(8 * size_t(max_nh_q) * 24 * 256);
 
         moe_sc.router_logits = dalloc<float>(M * geom::NEXP);
         moe_sc.topk_idx = dalloc<int>(M * geom::TOPK);
