@@ -8,9 +8,53 @@ Format and release rules live in [`RELEASING.md`](RELEASING.md).
 
 ## [Unreleased]
 
-Changes merged on `main` since `v1.1.1` that are not yet cut in a numbered `v*` release tag.
+Changes merged on `main` since `v1.2.0` that are not yet cut in a numbered `v*` release tag.
 
 - **Breaking changes:** None.
+
+---
+
+## [v1.2.0] — 2026-11-23
+
+- **Tag / commit:** [`v1.2.0`](https://github.com/kindlingai/gr8/releases/tag/v1.2.0) · `ab2eb95f426ff908543d5d002218cf5a2a5c5be6`
+- **Container image:** `ghcr.io/kindlingai/gr8:v1.2.0@sha256:3de05aab8cda21fd5d6b4af89ccdba6ff5abdbd704729601fd348fa638ade9fd`
+- **Version spec:** [`releases/v1.2.0.json`](releases/v1.2.0.json)
+- **Validation gate:** Full CI release build across all eight engine legs (including `Qwen3.8-Flash-Next` TP=1..4) and CPU test suite, plus live GB10 verification: `4x GB10` (`TP=4`) GLM-5.3 A/B gate (`#582`, 0.00000 KL on 6-commit 0-ULP + E4M3 DSA index MMA), `1x` & `2x GB10` (`TP=1`, `TP=2`) Qwen3.8-Flash-Next K3 (`bit300`) & K4 (`bit400`) live S2 `bench/bench.py` + 128K needle + MTP/prefix-cache/logprobs/forced-tool-choice suite (`#599`, `#600`), and `compute-sanitizer --tool memcheck` (`0 errors`) on `head_mask_test` (`NR=4/6`), `rstest` (`NR=4/6`), and `ptab_test_flash_tp4` (`#600`).
+
+### Highlights and measured numbers
+
+- **Qwen3.8-Flash-Next (`qw38`) full engine, vision, MTP, and Blackwell optimization pass (`#577`–`#581`, `#583`–`#594`, `#599`, `#600`):**
+  - Adds `bin/g6m4_qw38` and `bin/m4sim_qw38` (`TP=1..4`) supporting 48-layer Gated DeltaNet + Full GQA/QSA + 4-stream hyper-connections + Layer-1 PLE NVMe/row-trellis embeddings (`#580`, `#589`, `#591`), Layer-48 MTP speculative decoding (`MTP=0..5`, `#585`, `#599`), opt-in 27-layer BF16 ViT vision with interleaved 3D MRoPE (`GR8_QW38_VISION=1`, `#578`), and `g6load`/`g6layout` dynamic `nh` planning (`#600`).
+  - Optimization pass (`#599`) adds fast MTP drafting (`GR8_QW38_MTP_FAST=1`), trunk 2-bit head screen + exact top-256 FP8 rescore (`GR8_QW38_TRUNK_HEAD2=1`), Blackwell native MXFP8 Tensor Core dense GEMMs (`GR8_QW38_PF_MXFP8=1`), and read-only GDN verify with batched commit replay (`-2.69 GB` VRAM at `SESS=8`), freeing `~3.8 GB` VRAM per rank and unlocking full `CAP=139264` at K4 (`bit400`) on a single GB10 box.
+  - **Live S2 `bench/bench.py` (`SESS=8`, `MTP=3`, `T=0.7`, `GR8_QW38_PLE_CACHE_MIB=4096`, 2026-11-23):**
+    - **1× GB10 (`TP=1`) `bit300` (`CAP=139264`):** code **83.0 tok/s**, prose **61.5**, structured **87.4**, counting **88.8**; concurrency `c1` **72.6**, `c2` **102.1**, `c4` **121.7**, `c8` **155.2 tok/s**; cold prefill **2,258** (8K) / **2,269 tok/s** (32K); `8/8` smoke, `3/3` count-200, **128K needle PASS** (`131,572` tok). *(With `MTP=4`: code `89.5`, structured `97.2`, counting `99.1`.)*
+    - **1× GB10 (`TP=1`) `bit400` (`CAP=139264`):** code **78.4 tok/s**, prose **55.1**, structured **81.2**, counting **82.0**; concurrency `c1` **65.5**, `c2` **93.9**, `c4` **106.7**, `c8` **140.6 tok/s**; cold prefill **2,215** (8K) / **2,200 tok/s** (32K); `8/8` smoke; `5.0 GiB` UMA headroom after graph capture.
+    - **2× GB10 (`TP=2`, dual-rail RoCE) `bit300` (`CAP=262208`):** code **126.8 tok/s**, prose **89.2**, structured **135.1**, counting **135.8**; concurrency `c1` **104.1**, `c2` **151.2**, `c4` **183.5**, `c8` **254.5 tok/s**; cold prefill **3,027** (8K) / **3,142** (32K) / **2,973 tok/s** (128K); `8/8` smoke, `3/3` count-200, **128K needle PASS** (`131,069` tok).
+    - **2× GB10 (`TP=2`, dual-rail RoCE) `bit400` (`CAP=262208`):** code **122.1 tok/s**, prose **86.9**, structured **126.7**, counting **128.6**; concurrency `c1` **101.7**, `c2` **145.7**, `c4` **169.6**, `c8` **234.1 tok/s**; cold prefill **2,997** (8K) / **3,069** (32K) / **2,915 tok/s** (128K); `8/8` smoke.
+- **GLM-5.3 TP=4 throughput, concurrency, and dual-rail balance (`#582`):**
+  - Zero-spill `M<=8` trellis decode, dedicated `_nt` weight dedup, unified capped `moe_rtr_fin_opt` (`1.27x–1.69x` faster on GB10), session-grouped S2 `idx31` scoring + 1-launch `decsel2`, fused `k_wait_peers`, symmetric 1-factorization non-striped dual-rail balance (`6/6` at TP=4, `28/28` at TP=8), and native E4M3×E4M3 `mma.m16n8k32` DSA prefill index scoring.
+  - **Live `4x GB10` (`TP=4`, `MOE_UNION_CAP=48`, `KV_FORMAT=int4`, 2026-11-22):** `c1` **52.1 tok/s** (`+2.6%`), `c8` **124.2 tok/s** (`+9.1%`), post-32K decode **34.4 tok/s** (`+22.0%`), CP 4×37.4K warm decode **75.01 agg / 73.30 wall tok/s** (`+10.8%`), 32K prefill **1,678 tok/s** (`+4.6%`), 128K needle PASS, **`KL = 0.00000` / `100.0%` top-1**.
+- **Pre-release bug sweep (`#600`, fixes `#576`):**
+  - Fixes vocab-split head sampling and rejection sampling under grammar masking (`json_schema` / structured outputs) when a rank's entire vocab shard is masked to `-INFINITY` (eliminating `0 * inf = NaN`, out-of-range token ID `2147483647` / CUDA IMA, and out-of-nucleus leaks); verified with `head_mask_test` (`NR=4/6`, 10/10 modes) and `compute-sanitizer --tool memcheck` (`0 errors`).
+  - Clamps `tr3_fc1_body_nt` tail tiles for non-divisible `steps % csteps` shapes (`ptab_test_flash_tp4` `158/158`, `memcheck` `0 errors`).
+  - Fixes Qwen 3.8 unaligned prefix reuse (`stage_partial_page` + `idx_raw` state + auto-sized default `mem:` store up to `4 GiB`, cutting 97K warm TTFT from `41.1s -> 1.0s`), MTP verify rollback snapshots, concurrent prefill isolation, forced `tool_choice` with MTP, exact `logprobs` bypass when `logprobs` requested, streaming `logprobs` with thinking disabled in `g6front-rs`, and 96 MiB vision base64/RGB caps.
+- **Engine architecture & CI infrastructure (`#489`, `#558`–`#560`, `#572`–`#575`, `#595`–`#597`):**
+  - Data-driven `g6kv_layout_sizes` (`#489`), canonical DFlash2 ring / KDA session envelope (`#558`), `g6::FabricPool` (`GR8_FABRIC_POOL`, `#559`), VMM-backed resizable KV pool (`GR8_KV_CHUNKS`, `#560`), `glm-5.3-exlr8-3x-spark` recipe entry (`#572`), and faster parallel CI builds (`#573`, `#574`, `#596`, `#597`).
+
+### Breaking changes
+
+None. Existing `./gr8` CLI commands and flags, port `8100` HTTP endpoints and payloads, Hugging Face `exlr8` weight and steering profile schemas, and 128 GB GB10 runtime memory and numerical contracts remain backward-compatible with `v1.1.1`.
+
+### Default or cache-key changes
+
+- **New `qw38` default optimization knobs (`knobs/qw38.yaml`, `#599`):** `GR8_QW38_DENSE_FP8=1`, `GR8_QW38_MTP_FAST=1`, `GR8_QW38_TRUNK_HEAD2=1`, and `GR8_QW38_PF_MXFP8=1` are enabled by default on `qw38`. Roll back individually with `GR8_QW38_PF_MXFP8=0` (restores FP16-scaled FP8 decode + BF16 cuBLAS prefill; `mean KL = 0.000051`, `100.00%` top-1 vs full rollback), `GR8_QW38_TRUNK_HEAD2=0` (full-vocab FP8 `lm_head`), `GR8_QW38_MTP_FAST=0` (FP8 draft head + per-step host sync), or `GR8_QW38_DENSE_FP8=0` (pure BF16 dense decode).
+- **Qwen 3.8 default fallback prefix store (`#600`):** Auto-sizes `mem:` store to `clamp((max_pps + 2*state_blocks + 16) * slot_bytes, 512M, 4096M)` when `--reuse-prefix` is enabled without an explicit `--kv-store` (previously fixed at `512M`). Override anytime with explicit `--kv-store`.
+- **Launcher validation (`#600`):** `--shape ring` is rejected cleanly for `qw38` and `ink2` (mesh only), and `--flash-cache` is rejected for `qw38` (uses `--kv-store` directly).
+- **Persistent `KV_STORE`:** As on any engine binary upgrade, the persistent session index resets once on first boot of `v1.2.0` while preserving the preallocated SSD block file.
+
+### Toolchain / Dockerfile sync
+
+Base CUDA (`13.0.1`), OS (`ubuntu24.04`), Rust (`1.94.1`), and runtime `apt` packages are unchanged from `v1.1.1`. `Dockerfile` adds the `engine-qw38` / `dist-qw38` stages shipping `bin/g6m4_qw38` and `bin/m4sim_qw38` (`#577`) and splits shipped test binaries (`dist-tests`, `#597`). Downstream GLM-5.3, Flash, and DeepSeek recipe Dockerfiles need no toolchain changes.
 
 ---
 

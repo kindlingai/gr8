@@ -1,0 +1,684 @@
+{
+  "schema_version": 1,
+  "version": "1.2.0",
+  "tag": "v1.2.0",
+  "previous_tag": "v1.1.1",
+  "date": "2026-11-23",
+  "commit": "ab2eb95f426ff908543d5d002218cf5a2a5c5be6",
+  "release_url": "https://github.com/kindlingai/gr8/releases/tag/v1.2.0",
+  "validation_gate": "Full CI release build across all eight engine legs (including Qwen3.8-Flash-Next TP=1..4) and CPU test suite, plus live GB10 verification: 4x GB10 (TP=4) GLM-5.3 A/B gate (#582, KL=0.00000), 1x & 2x GB10 (TP=1, TP=2) Qwen3.8-Flash-Next bit300/bit400 live S2 bench/bench.py + 128K needle + prefix-cache/MTP/logprobs/forced-tool-choice suite (#599, #600), and compute-sanitizer memcheck (0 errors) on head_mask_test (NR=4/6), rstest (NR=4/6), and ptab_test_flash_tp4 (#600).",
+  "container": {
+    "image": "ghcr.io/kindlingai/gr8:v1.2.0",
+    "digest": "sha256:3de05aab8cda21fd5d6b4af89ccdba6ff5abdbd704729601fd348fa638ade9fd",
+    "pinned": "ghcr.io/kindlingai/gr8:v1.2.0@sha256:3de05aab8cda21fd5d6b4af89ccdba6ff5abdbd704729601fd348fa638ade9fd",
+    "platforms": [
+      "linux/arm64"
+    ],
+    "target_arch": "sm_121a"
+  },
+  "toolchain": {
+    "cuda": "13.0.1",
+    "base_os": "ubuntu24.04",
+    "rust": "1.94.1",
+    "runtime_apt": [
+      "libibverbs1",
+      "ibverbs-providers",
+      "ibverbs-utils",
+      "python3",
+      "python3-yaml",
+      "curl",
+      "jq"
+    ]
+  },
+  "binaries": [
+    "bin/g6m4",
+    "bin/g6m4-int4",
+    "bin/g6m4_flash",
+    "bin/g6m4_flash-int4",
+    "bin/g6m4_ds41",
+    "bin/g6m4_ink2",
+    "bin/g6m4_qw38",
+    "bin/m4sim",
+    "bin/m4sim_flash",
+    "bin/m4sim_ds41",
+    "bin/m4sim_ink2",
+    "bin/m4sim_qw38",
+    "bin/g6front-rs",
+    "bin/g6load",
+    "bin/g6layout",
+    "bin/kvman-remote",
+    "bin/kvman-peer",
+    "bin/gpuprobe",
+    "bin/tr3_e4m3_test",
+    "bin/lib/libgr8knobs.so"
+  ],
+  "api": {
+    "protocol": "openai",
+    "http_port": 8100,
+    "control_port": 7340,
+    "s2_port": 7341,
+    "endpoints": [
+      "POST /v1/chat/completions",
+      "POST /v1/completions",
+      "POST /tokenize",
+      "POST /detokenize",
+      "GET /v1/models",
+      "GET /health",
+      "GET /health?deep",
+      "GET /metrics"
+    ]
+  },
+  "models": [
+    {
+      "id": "glm53",
+      "title": "GLM-5.3",
+      "architecture": "GlmMoeDsaForCausalLM",
+      "served_names": [
+        "glm-5.3",
+        "glm53"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4",
+      "drafter": "https://huggingface.co/incoai/GLM-5.3-DFlash2",
+      "engine_binaries": [
+        "bin/g6m4",
+        "bin/g6m4-int4"
+      ],
+      "tp_supported": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "variants": [
+        "bit200",
+        "bit225",
+        "bit239",
+        "bit260",
+        "bit273",
+        "bit300",
+        "bit325",
+        "bit332",
+        "bit390",
+        "bit400"
+      ],
+      "default_variant_by_tp": {
+        "3": "bit260",
+        "4": "bit325",
+        "5": "bit325",
+        "6": "bit325"
+      },
+      "int4_kv": true,
+      "defaults_by_tp": {
+        "3": {
+          "kv_format": "fp8",
+          "cap": 307136,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "4": {
+          "kv_format": "int4",
+          "cap": 513536,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 1,
+          "share_limit": 32768,
+          "dec_bk": 2048,
+          "dec_bk_max": 2048,
+          "reuse_grid": 64,
+          "moe_union_cap": 48,
+          "exact_kernel_opts": [
+            "DEC_DENSE_OPT",
+            "DTR_EXACT_OPT",
+            "MOE_RTR_FIN_OPT",
+            "TR3_WIDE4",
+            "PF_ATTN_OPT",
+            "PF_DENSE_OPT",
+            "PF_ISGRT_CLEAN",
+            "DFL_DEDUP"
+          ],
+          "l2pf": 31,
+          "pf_gemmf32": 1,
+          "mtp_l2pf": 3,
+          "mtp_lastrow": 1,
+          "draft_head2": 1,
+          "dfl_reuse_min": 0
+        },
+        "5": {
+          "kv_format": "fp8",
+          "cap": 502848,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 32768,
+          "dec_bk_max": 2048,
+          "l2pf": 31,
+          "pf_gemmf32": 1,
+          "mtp_l2pf": 3,
+          "mtp_lastrow": 1,
+          "draft_head2": 1,
+          "moe_union_cap": 48,
+          "exact_kernel_opts": [
+            "DEC_DENSE_OPT",
+            "DTR_EXACT_OPT",
+            "MOE_RTR_FIN_OPT",
+            "TR3_WIDE4",
+            "PF_ATTN_OPT",
+            "PF_DENSE_OPT",
+            "PF_ISGRT_CLEAN"
+          ]
+        },
+        "6": {
+          "kv_format": "fp8",
+          "cap": 614400,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 131072,
+          "dec_bk_max": 2048,
+          "l2pf": 31,
+          "pf_gemmf32": 1,
+          "mtp_l2pf": 3,
+          "mtp_lastrow": 1,
+          "draft_head2": 1,
+          "moe_union_cap": 48,
+          "exact_kernel_opts": [
+            "DEC_DENSE_OPT",
+            "DTR_EXACT_OPT",
+            "MOE_RTR_FIN_OPT",
+            "TR3_WIDE4",
+            "PF_ATTN_OPT",
+            "PF_DENSE_OPT",
+            "PF_ISGRT_CLEAN"
+          ]
+        }
+      }
+    },
+    {
+      "id": "glm53f",
+      "title": "GLM-5.3-Flash",
+      "architecture": "Glm5NextForConditionalGeneration",
+      "served_names": [
+        "glm-5.3-flash",
+        "glm53f"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4",
+      "drafter": "https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2",
+      "engine_binaries": [
+        "bin/g6m4_flash",
+        "bin/g6m4_flash-int4"
+      ],
+      "tp_supported": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "variants": [
+        "k2",
+        "k3",
+        "k4"
+      ],
+      "default_variant_by_tp": {
+        "1": "k2",
+        "2": "k4",
+        "3": "k4",
+        "4": "k4"
+      },
+      "int4_kv": true,
+      "defaults_by_tp": {
+        "1": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 1,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768
+        },
+        "2": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 1,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768,
+          "int4_override_defaults": {
+            "sess": 4,
+            "mtp": 3,
+            "s2_shared_waterfill": 1,
+            "s2_shared_wf_margin": 0.02
+          }
+        },
+        "3": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 4,
+          "mtp": 1,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 8,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768
+        }
+      }
+    },
+    {
+      "id": "ds41",
+      "title": "DeepSeek-V4.1-Flash",
+      "architecture": "DeepseekV41ForCausalLM",
+      "served_names": [
+        "deepseek-v4.1-flash"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native",
+      "drafter": null,
+      "engine_binaries": [
+        "bin/g6m4_ds41"
+      ],
+      "tp_supported": [
+        4
+      ],
+      "variants": [],
+      "default_variant_by_tp": {},
+      "int4_kv": false,
+      "defaults_by_tp": {
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 5,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "exact": 0,
+          "ds_pf_v2": 1,
+          "ds_prefill_w": 12288,
+          "default_max_tokens": 32768,
+          "default_reasoning_effort": "low"
+        }
+      }
+    },
+    {
+      "id": "ink2",
+      "title": "Inkling-2-Small",
+      "architecture": "Inkling2ForConditionalGeneration",
+      "served_names": [
+        "inkling-2-small",
+        "ink2"
+      ],
+      "checkpoint": "https://huggingface.co/thinkingmachines/Inkling-2-Small",
+      "drafter": null,
+      "engine_binaries": [
+        "bin/g6m4_ink2"
+      ],
+      "tp_supported": [
+        4,
+        6
+      ],
+      "variants": [],
+      "default_variant_by_tp": {},
+      "int4_kv": false,
+      "defaults_by_tp": {
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 4,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "chunk": 8
+        },
+        "6": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 4,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "chunk": 8
+        }
+      }
+    },
+    {
+      "id": "qw38",
+      "title": "Qwen3.8-Flash-Next",
+      "architecture": "Qwen4ExpForConditionalGeneration",
+      "served_names": [
+        "qwen3.8-flash-next",
+        "qw38"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/Qwen3.8-Flash-Next-exlr8",
+      "drafter": null,
+      "engine_binaries": [
+        "bin/g6m4_qw38"
+      ],
+      "tp_supported": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "variants": [
+        "bit200",
+        "bit300",
+        "bit400"
+      ],
+      "default_variant_by_tp": {
+        "1": "bit300",
+        "2": "bit300",
+        "3": "bit300",
+        "4": "bit300"
+      },
+      "int4_kv": false,
+      "defaults_by_tp": {
+        "1": {
+          "kv_format": "fp8",
+          "cap": 65536,
+          "sess": 2,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "chunk": 8
+        },
+        "2": {
+          "kv_format": "fp8",
+          "cap": 65536,
+          "sess": 4,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "chunk": 8
+        },
+        "3": {
+          "kv_format": "fp8",
+          "cap": 65536,
+          "sess": 4,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "chunk": 8
+        },
+        "4": {
+          "kv_format": "fp8",
+          "cap": 65536,
+          "sess": 4,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "chunk": 8
+        }
+      }
+    }
+  ],
+  "breaking": false,
+  "breaking_changes": [],
+  "default_or_cache_changes": [
+    {
+      "scope": "qw38",
+      "change": "GR8_QW38_DENSE_FP8=1, GR8_QW38_MTP_FAST=1, GR8_QW38_TRUNK_HEAD2=1, and GR8_QW38_PF_MXFP8=1 are enabled by default (#599).",
+      "rollback": "Set GR8_QW38_PF_MXFP8=0 for FP16-scaled FP8 decode + BF16 cuBLAS prefill (KL=0.000051, 100.00% top-1 vs full rollback), GR8_QW38_TRUNK_HEAD2=0 for full-vocab FP8 lm_head, GR8_QW38_MTP_FAST=0 for FP8 draft head + host sync, or GR8_QW38_DENSE_FP8=0 for pure BF16 dense decode."
+    },
+    {
+      "scope": "qw38 --reuse-prefix",
+      "change": "Default fallback mem: prefix store now auto-sizes to clamp((max_pps + 2*state_blocks + 16) * slot_bytes, 512M, 4096M) instead of fixed 512M (#600).",
+      "rollback": "Pass an explicit --kv-store (e.g. --kv-store mem:,size=512M)."
+    },
+    {
+      "scope": "KV_STORE=ssd:...",
+      "change": "Persistent session index resets once on binary upgrade while preserving the preallocated SSD block file.",
+      "rollback": "None required; active sessions prefill once on first boot."
+    }
+  ],
+  "toolchain_changes": [
+    "Dockerfile adds engine-qw38 / dist-qw38 (shipping bin/g6m4_qw38 and bin/m4sim_qw38, #577) and splits shipped test binaries into dist-tests (#597); CUDA (13.0.1), base OS (ubuntu24.04), Rust (1.94.1), and runtime apt packages are unchanged."
+  ],
+  "operational_notes": [
+    "Recommended upgrade for all GLM-5.3 TP=4 and TP=6 deployments: adds TP=4 throughput/concurrency wins (#582) and fixes vocab-split grammar-masked head sampling and rejection sampling (#576 / #600).",
+    "Introduces Qwen3.8-Flash-Next (qw38) support across TP=1..4 with vision (GR8_QW38_VISION=1), Layer-48 MTP (0..5), Record 9 row-trellis PLE, and auto-sized prefix reuse.",
+    "Launcher cleanly rejects --shape ring for qw38 and ink2 (mesh only) and --flash-cache for qw38 (uses --kv-store directly)."
+  ],
+  "prs": [
+    {
+      "number": 562,
+      "commit": "15014801",
+      "summary": "Record gr8 v1.1.1 release (CHANGELOG, releases/v1.1.1.json, README)"
+    },
+    {
+      "number": 572,
+      "commit": "068a34e0",
+      "summary": "Add glm-5.3-exlr8-3x-spark recipe and move GLM-5.3-Flash below full GLM-5.3"
+    },
+    {
+      "number": 573,
+      "commit": "9233f6b7",
+      "summary": "ci: optimize workflow runtime, caching, and test parallelism"
+    },
+    {
+      "number": 489,
+      "commit": "2873810b",
+      "summary": "kvman: the page block's layout as data (g6kv_layout_sizes); the GLM sizes leave tier.rs"
+    },
+    {
+      "number": 574,
+      "commit": "921b9de8",
+      "summary": "ci: drop legacy type=gha BuildKit cache-from fallbacks"
+    },
+    {
+      "number": 575,
+      "commit": "d32a44f8",
+      "summary": "comms/tests: fabric_order_test's device thread waits longer than the proxy"
+    },
+    {
+      "number": 577,
+      "commit": "eb0ab8fb",
+      "summary": "qw38: add Qwen3.8-Flash-Next engine, kernels, multi-width runtime, MTP, and launcher support"
+    },
+    {
+      "number": 578,
+      "commit": "7eef8cbc",
+      "summary": "qw38: add vision support (27-layer BF16 ViT + interleaved 3D MRoPE)"
+    },
+    {
+      "number": 558,
+      "commit": "93c25d68",
+      "summary": "kvman: EL4d (#161) canonical DFlash2 ring, KDA state, heads FFI, and session envelope"
+    },
+    {
+      "number": 583,
+      "commit": "f1843b79",
+      "summary": "qw38: batched pipelined PMCGX MoE prefill (G=32/48) and chunked lm_head"
+    },
+    {
+      "number": 584,
+      "commit": "9578d98c",
+      "summary": "qw38: chunked WY Tensor-Core GDN prefill, 2D conv1d, and warp NormGate"
+    },
+    {
+      "number": 559,
+      "commit": "8ab1af5b",
+      "summary": "engine: EL6 (#154) wire g6m4 fabrics and S2 bootstrap onto g6::FabricPool (GR8_FABRIC_POOL)"
+    },
+    {
+      "number": 579,
+      "commit": "2ecc19c7",
+      "summary": "qw38: fix 1-based logprob rank and deterministic QSA top-512 radix select"
+    },
+    {
+      "number": 581,
+      "commit": "5903079c",
+      "summary": "qw38: add Tensor-Core QSA block scorer, GQA-12 head-MMA, and dense TC16 prefill attention"
+    },
+    {
+      "number": 587,
+      "commit": "a371680e",
+      "summary": "qw38: fuse RDMA AllReduce with HC residual injection and enable compact recv slots"
+    },
+    {
+      "number": 591,
+      "commit": "23af73c8",
+      "summary": "qw38: PLE chunk deduplication, 64-thread pread pool, 4K page coalescing, and cross-chunk prefetch"
+    },
+    {
+      "number": 588,
+      "commit": "bb586e3b",
+      "summary": "qw38: extend fused FP8 decode to M<=16, vectorize k_hc_mix, and unlock M<=64 verify / M<=16 MTP CUDA graphs"
+    },
+    {
+      "number": 592,
+      "commit": "e2e1b681",
+      "summary": "qw38: parallel QSA indexer K-pool prefill update"
+    },
+    {
+      "number": 593,
+      "commit": "b3621e11",
+      "summary": "qw38: 32-row grouped multi-HB PMCGX MoE prefill with pre-rotated x_had"
+    },
+    {
+      "number": 586,
+      "commit": "fc03c8d1",
+      "summary": "qw38: fused prefill HC96 prepare+inject pipeline (Opt #4)"
+    },
+    {
+      "number": 589,
+      "commit": "9c342c4c",
+      "summary": "qw38: fused PLE GPU kernels + double-buffered cross-chunk async PLE prefetch (Opt #5)"
+    },
+    {
+      "number": 594,
+      "commit": "befdd914",
+      "summary": "qw38: TP=1 decode and MTP=3 tuning (Split-KV NS, M<=20 FP8 GEMV, M<=32 verify / M<=8 MTP graphs)"
+    },
+    {
+      "number": 560,
+      "commit": "9f387eb2",
+      "summary": "engine: EL5 (#153) wire GLM VMM-backed resizable KV pool (GR8_KV_CHUNKS) and multi-session Flash KV chunks"
+    },
+    {
+      "number": 585,
+      "commit": "34946156",
+      "summary": "qw38: wire MTP=1..3 speculative decoding in S2 runtime and add --tokens @FILE"
+    },
+    {
+      "number": 590,
+      "commit": "7f0f96af",
+      "summary": "qw38: TP=2 direct-fabric allreduce, coalesced BM=64 TC hyper-connections, and sequence-parallel HC"
+    },
+    {
+      "number": 582,
+      "commit": "0cebeb15",
+      "summary": "tp4/glm: MoE cap/dedup, S2+CP idx31, non-striped dual-rail balance, and E4M3 DSA index MMA"
+    },
+    {
+      "number": 580,
+      "commit": "a0b8bb9f",
+      "summary": "qw38: add Record 9 row-trellis PLE decoder, RAM-mmap mode, and pad8 NVMe IRQ fix"
+    },
+    {
+      "number": 595,
+      "commit": "749eea71",
+      "summary": "docs(agents): note inline contributor credit in README feature sections"
+    },
+    {
+      "number": 596,
+      "commit": "e238d0e4",
+      "summary": "ci: start the PR image smoke test without waiting for the CPU tests"
+    },
+    {
+      "number": 597,
+      "commit": "abfc6b58",
+      "summary": "ci: stop the PR image waiting on the test-binary compile check"
+    },
+    {
+      "number": 599,
+      "commit": "9dad3f73",
+      "summary": "qw38: decode, MTP, concurrency, prefill, and VRAM optimizations (+20–45% across TP=1/TP=2, K3/K4)"
+    },
+    {
+      "number": 600,
+      "commit": "ab2eb95f",
+      "summary": "v1.2.0 pre-release fixes: tr3 NT tail clamp, grammar-masked head rejection (#576), Qwen 3.8 prefix-cache/MTP/logprobs/loader/launcher"
+    }
+  ],
+  "benchmarks": [
+    {
+      "model": "qw38",
+      "tp": 1,
+      "config": "bit300 (K3), CAP=139264, SESS=8, MTP=3, T=0.7, GR8_QW38_PLE_CACHE_MIB=4096, live S2 bench/bench.py",
+      "decode_code_tok_s": 83.0,
+      "decode_prose_tok_s": 61.5,
+      "decode_structured_tok_s": 87.4,
+      "decode_counting_tok_s": 88.8,
+      "concurrency_c1_tok_s": 72.6,
+      "concurrency_c2_tok_s": 102.1,
+      "concurrency_c4_tok_s": 121.7,
+      "concurrency_c8_tok_s": 155.2,
+      "prefill_8k_tok_s": 2258,
+      "prefill_32k_tok_s": 2269,
+      "needle_128k": "PASS (131,572 tok)"
+    },
+    {
+      "model": "qw38",
+      "tp": 1,
+      "config": "bit400 (K4), CAP=139264, SESS=8, MTP=3, T=0.7, GR8_QW38_PLE_CACHE_MIB=4096, live S2 bench/bench.py",
+      "decode_code_tok_s": 78.4,
+      "decode_prose_tok_s": 55.1,
+      "decode_structured_tok_s": 81.2,
+      "decode_counting_tok_s": 82.0,
+      "concurrency_c1_tok_s": 65.5,
+      "concurrency_c2_tok_s": 93.9,
+      "concurrency_c4_tok_s": 106.7,
+      "concurrency_c8_tok_s": 140.6,
+      "prefill_8k_tok_s": 2215,
+      "prefill_32k_tok_s": 2200
+    },
+    {
+      "model": "qw38",
+      "tp": 2,
+      "config": "bit300 (K3), CAP=262208, SESS=8, MTP=3, T=0.7, GR8_QW38_PLE_CACHE_MIB=4096, dual-rail RoCE, live S2 bench/bench.py",
+      "decode_code_tok_s": 126.8,
+      "decode_prose_tok_s": 89.2,
+      "decode_structured_tok_s": 135.1,
+      "decode_counting_tok_s": 135.8,
+      "concurrency_c1_tok_s": 104.1,
+      "concurrency_c2_tok_s": 151.2,
+      "concurrency_c4_tok_s": 183.5,
+      "concurrency_c8_tok_s": 254.5,
+      "prefill_8k_tok_s": 3027,
+      "prefill_32k_tok_s": 3142,
+      "prefill_128k_tok_s": 2973,
+      "needle_128k": "PASS (131,069 tok)"
+    },
+    {
+      "model": "qw38",
+      "tp": 2,
+      "config": "bit400 (K4), CAP=262208, SESS=8, MTP=3, T=0.7, GR8_QW38_PLE_CACHE_MIB=4096, dual-rail RoCE, live S2 bench/bench.py",
+      "decode_code_tok_s": 122.1,
+      "decode_prose_tok_s": 86.9,
+      "decode_structured_tok_s": 126.7,
+      "decode_counting_tok_s": 128.6,
+      "concurrency_c1_tok_s": 101.7,
+      "concurrency_c2_tok_s": 145.7,
+      "concurrency_c4_tok_s": 169.6,
+      "concurrency_c8_tok_s": 234.1,
+      "prefill_8k_tok_s": 2997,
+      "prefill_32k_tok_s": 3069,
+      "prefill_128k_tok_s": 2915
+    },
+    {
+      "model": "glm53",
+      "tp": 4,
+      "config": "MOE_UNION_CAP=48, KV_FORMAT=int4, 200G switch (#582 A/B gate)",
+      "concurrency_c1_tok_s": 52.1,
+      "concurrency_c8_tok_s": 124.2,
+      "post_32k_decode_tok_s": 34.4,
+      "cp_4x37k_warm_decode_agg_tok_s": 75.01,
+      "cp_4x37k_warm_decode_wall_tok_s": 73.3,
+      "prefill_32k_tok_s": 1678,
+      "kl_vs_baseline": 0.0
+    }
+  ]
+}
