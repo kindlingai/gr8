@@ -443,6 +443,7 @@ struct Engine {
     qw38::MtpWeights mtp_w;
     qw38::MtpScratch mtp_sc;
     __nv_bfloat16* last_hyper = nullptr;         // [slots, 10240] BF16 (trunk final hyper state per slot)
+    __nv_bfloat16* mtp_hid_in = nullptr;         // [slots, 10240] BF16 (gathered initial hyper for arbitrary S2 slot subsets)
     __nv_bfloat16* mtp_hid_cur = nullptr;        // [slots, 10240] BF16 (chained MTP draft hidden state)
 
     // Fabric callbacks (set by g6m4_qw38; nullptr on m4sim_qw38 where all ranks are already in `parts`)
@@ -828,7 +829,11 @@ struct Engine {
                 kv.kv_pages = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(max_pps) * 2 * geom::KV_PAGE * size_t(nh_kv) * geom::HEAD_DIM);
                 kv.idx_pages = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(max_pps) * 16 * geom::IDX_DIM);
                 kv.idx_raw = dalloc<__nv_bfloat16>(size_t(o.slots) * 4 * geom::IDX_DIM);
+                kv.idx_raw_snap = dalloc<__nv_bfloat16>(size_t(o.slots) * 4 * geom::IDX_DIM);
                 kv.idx_raw_thw = dalloc<int3>(size_t(o.slots));
+                kv.idx_raw_thw_snap = dalloc<int3>(size_t(o.slots));
+                kv.kv_staging = dalloc<__nv_bfloat16>(size_t(o.slots) * 2 * geom::KV_PAGE * size_t(nh_kv) * geom::HEAD_DIM);
+                kv.idx_staging = dalloc<__nv_bfloat16>(size_t(o.slots) * 16 * geom::IDX_DIM);
 
                 auto& mw = mtp_w.moe[size_t(i)];
                 mw.is_tr3 = false;
@@ -843,6 +848,7 @@ struct Engine {
             }
             const size_t ms = size_t(std::max(o.max_rows, o.slots));
             last_hyper = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::HC_D);
+            mtp_hid_in = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::HC_D);
             mtp_hid_cur = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::HC_D);
             mtp_sc.emb_raw = dalloc<__nv_bfloat16>(ms * geom::HID);
             mtp_sc.emb_norm = dalloc<__nv_bfloat16>(ms * geom::HID);
@@ -1757,7 +1763,7 @@ struct Engine {
             }
         };
 
-        const int hin_kind = (hid_in == last_hyper) ? 0 : ((hid_in == mtp_hid_cur) ? 1 : -1);
+        const int hin_kind = (hid_in == last_hyper) ? 0 : ((hid_in == mtp_hid_cur) ? 1 : ((hid_in == mtp_hid_in) ? 2 : -1));
         const bool mtp_graph_ok = o.use_graph && !o.profile && M <= 16 && hin_kind >= 0 && hid_out == mtp_hid_cur &&
                                   (o.nr == 1 || o.nloc == o.nr || static_cast<bool>(step_parity));
         if (mtp_graph_ok) {
@@ -1843,6 +1849,84 @@ struct Engine {
                             rl.gdn_st.conv + size_t(slot) * geom::GDN_NHIST * qkv_l,
                             rl.gdn_st.conv_snap + (size_t(slot) * size_t(o.mtp) + size_t(snap_idx)) * geom::GDN_NHIST * qkv_l,
                             cb, cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+            }
+        }
+    }
+
+    // Draft K tokens per session for an arbitrary subset of S2 `slots`, returning flat [slots.size() * K] token IDs.
+    // `pos_in[i]` is the last committed trunk position q (whose hyper state is in `last_hyper[slots[i]]`),
+    // and `tok_in[i]` is the golden token at position q + 1. Preserves L048 idx_raw across speculative k >= 1 steps.
+    void mtp_draft_k(const std::vector<int>& slots, const std::vector<int>& pos_in, const std::vector<int>& tok_in,
+                     const std::vector<RowSample>& base_sm, int K, std::vector<int>& out_flat) {
+        const size_t S = slots.size();
+        out_flat.assign(S * size_t(K), 0);
+        if (S == 0 || K <= 0) return;
+
+        bool contiguous = true;
+        for (size_t i = 0; i < S; ++i)
+            if (slots[i] != int(i)) { contiguous = false; break; }
+        const __nv_bfloat16* hin0 = last_hyper;
+        if (!contiguous) {
+            for (size_t i = 0; i < S; ++i) {
+                QW38_CK(cudaMemcpyAsync(mtp_hid_in + i * geom::HC_D,
+                                        last_hyper + size_t(slots[i]) * geom::HC_D,
+                                        geom::HC_D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+            }
+            hin0 = mtp_hid_in;
+        }
+
+        std::vector<int> cur_tok = tok_in;
+        std::vector<int> cur_pos = pos_in;
+        std::vector<RowSample> dsm(S);
+        std::vector<RowOut> dout;
+        const size_t idx_slot_b = 4 * geom::IDX_DIM * sizeof(__nv_bfloat16);
+
+        for (int k = 0; k < K; ++k) {
+            for (size_t i = 0; i < S; ++i) {
+                dsm[i] = base_sm[i];
+                dsm[i].spos = uint32_t(pos_in[i] + k + 2);
+            }
+            const __nv_bfloat16* hin = (k == 0) ? hin0 : mtp_hid_cur;
+            mtp_draft_step(slots, cur_tok.data(), cur_pos.data(), hin, mtp_hid_cur, dsm.data(), dout);
+            if (k == 0 && K > 1) {
+                // Save post-k0 (real committed pos_in) idx_raw before speculative k >= 1 steps touch it
+                for (int li = 0; li < o.nloc; ++li) {
+                    auto& kv = mtp_w.kv[size_t(li)];
+                    if (kv.idx_raw_snap) {
+                        for (size_t i = 0; i < S; ++i) {
+                            const size_t off = size_t(slots[i]) * 4 * geom::IDX_DIM;
+                            QW38_CK(cudaMemcpyAsync(kv.idx_raw_snap + off, kv.idx_raw + off, idx_slot_b, cudaMemcpyDeviceToDevice, stream));
+                        }
+                    }
+                    if (kv.idx_raw_thw_snap && kv.idx_raw_thw) {
+                        for (size_t i = 0; i < S; ++i) {
+                            QW38_CK(cudaMemcpyAsync(kv.idx_raw_thw_snap + size_t(slots[i]), kv.idx_raw_thw + size_t(slots[i]),
+                                                    sizeof(int3), cudaMemcpyDeviceToDevice, stream));
+                        }
+                    }
+                }
+            }
+            for (size_t i = 0; i < S; ++i) {
+                out_flat[i * size_t(K) + size_t(k)] = dout[i].tok;
+                cur_tok[i] = dout[i].tok;
+                cur_pos[i] += 1;
+            }
+        }
+        if (K > 1) {
+            for (int li = 0; li < o.nloc; ++li) {
+                auto& kv = mtp_w.kv[size_t(li)];
+                if (kv.idx_raw_snap) {
+                    for (size_t i = 0; i < S; ++i) {
+                        const size_t off = size_t(slots[i]) * 4 * geom::IDX_DIM;
+                        QW38_CK(cudaMemcpyAsync(kv.idx_raw + off, kv.idx_raw_snap + off, idx_slot_b, cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+                if (kv.idx_raw_thw_snap && kv.idx_raw_thw) {
+                    for (size_t i = 0; i < S; ++i) {
+                        QW38_CK(cudaMemcpyAsync(kv.idx_raw_thw + size_t(slots[i]), kv.idx_raw_thw_snap + size_t(slots[i]),
+                                                sizeof(int3), cudaMemcpyDeviceToDevice, stream));
                     }
                 }
             }
