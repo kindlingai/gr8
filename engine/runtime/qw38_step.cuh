@@ -493,13 +493,14 @@ struct Engine {
     std::map<GraphKey, GraphPair> graphs;
 
     struct MtpGraphKey {
-        int M, need_qsa, ns_attn, par, hin_kind; // hin_kind: 0 = last_hyper, 1 = mtp_hid_cur
+        int M, need_qsa, ns_attn, par, hin_kind, argmax_only; // hin_kind: 0 = last_hyper, 1 = mtp_hid_cur
         bool operator<(const MtpGraphKey& b) const {
             if (M != b.M) return M < b.M;
             if (need_qsa != b.need_qsa) return need_qsa < b.need_qsa;
             if (ns_attn != b.ns_attn) return ns_attn < b.ns_attn;
             if (par != b.par) return par < b.par;
-            return hin_kind < b.hin_kind;
+            if (hin_kind != b.hin_kind) return hin_kind < b.hin_kind;
+            return argmax_only < b.argmax_only;
         }
     };
     std::map<MtpGraphKey, cudaGraphExec_t> mtp_graphs;
@@ -1068,6 +1069,7 @@ struct Engine {
         head_logits = dalloc<float>(HM * size_t(max_vr));
         head_sc.blk_max = dalloc<float>(HM * qw38::HEAD_BLKS);
         head_sc.blk_cnt = dalloc<int>(HM * qw38::HEAD_BLKS);
+        head_sc.blk_argmax = dalloc<int>(HM * qw38::HEAD_BLKS);
         head_sc.blk_dsum = dalloc<double>(HM * qw38::HEAD_BLKS);
         head_sc.row_max = dalloc<float>(HM);
         head_sc.row_fin = dalloc<int>(HM);
@@ -1630,8 +1632,8 @@ struct Engine {
                 if (geom::is_ple(y1.l) && has_ple) {
                     finish_ple_io();
                     t_start();
-                    QW38_CK(cudaMemcpyAsync(ple_sc.emb, ple_pinned, size_t(M) * geom::PLE_DIM * 2, cudaMemcpyHostToDevice, stream));
-                    qw38::ple_forward(blas, ple_w, ple_st, ple_sc, hyper, segs.data(), int(segs.size()), M, true, stream, d_slot, d_pos, snap_k);
+                    upload_ple_to_dev();
+                    run_ple_gpu();
                     t_end(prof.ple_gpu_ms);
                 }
                 t_start();
@@ -1945,6 +1947,13 @@ struct Engine {
         QW38_CK(cudaMemcpyAsync(d_pos, h_pos_p, size_t(M) * 4, cudaMemcpyHostToDevice, stream));
         QW38_CK(cudaMemcpyAsync(d_rope, h_rope_pinned, size_t(M) * sizeof(int3), cudaMemcpyHostToDevice, stream));
 
+        bool all_greedy = true;
+        if (samples) {
+            for (int m = 0; m < M; ++m) {
+                if (samples[m].inv_temp > 0.f) { all_greedy = false; break; }
+            }
+        }
+
         // Arm 3-collective fabric step (1 layer = 2 dev AR + 1 head AR)
         if (step_begin) step_begin(M, false, 1, M);
 
@@ -2047,7 +2056,7 @@ struct Engine {
                         qw38::gemm_bf16_nt_f32(blas, mc, v_rows[size_t(i)], geom::HID, mx_ptr, lm_head[size_t(i)], head_logits);
                     }
                     qw38::head_pack_fast(head_logits, mc, v_rows[size_t(i)], v_lo[size_t(i)], o.nc, head_sc,
-                                         head_dev_pkt + size_t(r0) * hrb, hrb, stream);
+                                         head_dev_pkt + size_t(r0) * hrb, hrb, stream, all_greedy);
                 }
                 QW38_CK(cudaMemcpyAsync(head_host_parts + size_t(r) * rank_pkt_bytes,
                                         head_dev_pkt, rank_pkt_bytes, cudaMemcpyDeviceToHost, stream));
@@ -2061,7 +2070,7 @@ struct Engine {
             const int need_qsa = (((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS) ? 1 : 0;
             const int ns_attn = qw38::gqa_split_count(M, geom::nh_kv(o.nr, o.rank0), max_pos, attn_sc.split_o != nullptr);
             const int par = step_parity ? step_parity() : 0;
-            const MtpGraphKey mk{M, need_qsa, ns_attn, par, hin_kind};
+            const MtpGraphKey mk{M, need_qsa, ns_attn, par, hin_kind, all_greedy ? 1 : 0};
             auto it = mtp_graphs.find(mk);
             if (it == mtp_graphs.end()) {
                 cudaGraph_t mg = nullptr;

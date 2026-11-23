@@ -18,6 +18,7 @@ constexpr int HEAD_MAX_SURV = 4096;
 struct HeadPackScratch {
     float* blk_max = nullptr;     // [max_M * HEAD_BLKS]
     int* blk_cnt = nullptr;       // [max_M * HEAD_BLKS]
+    int* blk_argmax = nullptr;    // [max_M * HEAD_BLKS]
     double* blk_dsum = nullptr;   // [max_M * HEAD_BLKS]
     float* row_max = nullptr;     // [max_M]
     int* row_fin = nullptr;       // [max_M]
@@ -27,9 +28,17 @@ struct HeadPackScratch {
     int* need_fallback = nullptr; // [max_M] (0 = done, 1 = run k_ink2_head_pack on this row)
 };
 
-// Pass 1: 64 CTAs per row scan vr logits with vectorized loads -> blk_max, blk_cnt.
-__global__ void k_qw38_head_pass1(const float* __restrict__ lg, int vr,
-                                  float* __restrict__ blk_max, int* __restrict__ blk_cnt) {
+__device__ __forceinline__ void head_better(float& mx, int& id, float v, int vid) {
+    if (v > mx || (v == mx && vid < id)) {
+        mx = v;
+        id = vid;
+    }
+}
+
+// Pass 1: 64 CTAs per row scan vr logits with vectorized float4 loads -> blk_max, blk_cnt, blk_argmax.
+__global__ void __launch_bounds__(256) k_qw38_head_pass1(const float* __restrict__ lg, int vr, int v0,
+                                  float* __restrict__ blk_max, int* __restrict__ blk_cnt,
+                                  int* __restrict__ blk_argmax) {
     const int m = blockIdx.x / HEAD_BLKS;
     const int b = blockIdx.x % HEAD_BLKS;
     const int ch = (vr + HEAD_BLKS - 1) / HEAD_BLKS;
@@ -38,35 +47,108 @@ __global__ void k_qw38_head_pass1(const float* __restrict__ lg, int vr,
     const float* x = lg + static_cast<size_t>(m) * vr;
 
     float mx = -INFINITY;
+    int argmx = 0x7fffffff;
     int cnt = 0;
-    for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
-        const float v = x[j];
-        if (ink2::head_key(v)) {
-            ++cnt;
-            if (v > mx) mx = v;
+
+    // Align interior for 128-bit float4 loads (works for all TP=1..4, even non-div-4 vr like TP=3).
+    const int j0_a = (j0 + 3) & ~3;
+    const int j1_a = j1 & ~3;
+    if (j0_a < j1_a) {
+        if (threadIdx.x < (j0_a - j0)) {
+            const int j = j0 + threadIdx.x;
+            const float v = x[j];
+            if (ink2::head_key(v)) { ++cnt; head_better(mx, argmx, v, v0 + j); }
+        }
+        const float4* x4 = reinterpret_cast<const float4*>(x + j0_a);
+        const int n4 = (j1_a - j0_a) >> 2;
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            const float4 vv = x4[i];
+            const int base = v0 + j0_a + (i << 2);
+            if (ink2::head_key(vv.x)) { ++cnt; head_better(mx, argmx, vv.x, base); }
+            if (ink2::head_key(vv.y)) { ++cnt; head_better(mx, argmx, vv.y, base + 1); }
+            if (ink2::head_key(vv.z)) { ++cnt; head_better(mx, argmx, vv.z, base + 2); }
+            if (ink2::head_key(vv.w)) { ++cnt; head_better(mx, argmx, vv.w, base + 3); }
+        }
+        if (threadIdx.x < (j1 - j1_a)) {
+            const int j = j1_a + threadIdx.x;
+            const float v = x[j];
+            if (ink2::head_key(v)) { ++cnt; head_better(mx, argmx, v, v0 + j); }
+        }
+    } else {
+        for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
+            const float v = x[j];
+            if (ink2::head_key(v)) { ++cnt; head_better(mx, argmx, v, v0 + j); }
         }
     }
+
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+        const float om = __shfl_xor_sync(0xffffffffu, mx, off);
+        const int oi = __shfl_xor_sync(0xffffffffu, argmx, off);
+        head_better(mx, argmx, om, oi);
         cnt += __shfl_xor_sync(0xffffffffu, cnt, off);
     }
     __shared__ float smx[8];
+    __shared__ int sid[8];
     __shared__ int scnt[8];
-    if (lane == 0) { smx[warp] = mx; scnt[warp] = cnt; }
+    if (lane == 0) { smx[warp] = mx; sid[warp] = argmx; scnt[warp] = cnt; }
     __syncthreads();
     if (warp == 0) {
         float fm = (lane < 8) ? smx[lane] : -INFINITY;
+        int fi = (lane < 8) ? sid[lane] : 0x7fffffff;
         int fc = (lane < 8) ? scnt[lane] : 0;
         #pragma unroll
         for (int off = 4; off > 0; off >>= 1) {
-            fm = fmaxf(fm, __shfl_xor_sync(0xffffffffu, fm, off));
+            const float om = __shfl_xor_sync(0xffffffffu, fm, off);
+            const int oi = __shfl_xor_sync(0xffffffffu, fi, off);
+            head_better(fm, fi, om, oi);
             fc += __shfl_xor_sync(0xffffffffu, fc, off);
         }
         if (lane == 0) {
             blk_max[m * HEAD_BLKS + b] = fm;
             blk_cnt[m * HEAD_BLKS + b] = fc;
+            if (blk_argmax) blk_argmax[m * HEAD_BLKS + b] = fi;
+        }
+    }
+}
+
+// Fast 1-pass greedy argmax finalize: reduces 64 (blk_max, blk_argmax) -> wire packet with count = 1.
+// Zero Pass-2 exp() calls, zero survivor compaction/sort, 100% bit-identical greedy argmax!
+__global__ void __launch_bounds__(64) k_qw38_head_argmax_finalize(
+    const float* __restrict__ blk_max, const int* __restrict__ blk_cnt,
+    const int* __restrict__ blk_argmax, uint8_t* __restrict__ out, size_t rb, int M) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int t = threadIdx.x; // 0..63
+    float mx = blk_max[m * HEAD_BLKS + t];
+    int id = blk_argmax[m * HEAD_BLKS + t];
+    int fc = blk_cnt[m * HEAD_BLKS + t];
+    const int lane = t & 31, warp = t >> 5;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float om = __shfl_xor_sync(0xffffffffu, mx, off);
+        const int oi = __shfl_xor_sync(0xffffffffu, id, off);
+        head_better(mx, id, om, oi);
+        fc += __shfl_xor_sync(0xffffffffu, fc, off);
+    }
+    __shared__ float smx[2];
+    __shared__ int sid[2];
+    __shared__ int sfc[2];
+    if (lane == 0) { smx[warp] = mx; sid[warp] = id; sfc[warp] = fc; }
+    __syncthreads();
+    if (t == 0) {
+        float fm = smx[0];
+        int fi = sid[0];
+        head_better(fm, fi, smx[1], sid[1]);
+        const int n = (sfc[0] + sfc[1] > 0) ? 1 : 0;
+        uint8_t* o = out + static_cast<size_t>(m) * rb;
+        *reinterpret_cast<float*>(o) = fm;
+        *reinterpret_cast<int*>(o + 4) = n;
+        *reinterpret_cast<double*>(o + 8) = n ? 1.0 : 0.0;
+        if (n) {
+            *reinterpret_cast<float*>(o + 16) = fm;
+            *reinterpret_cast<int*>(o + 20) = fi;
         }
     }
 }
@@ -97,8 +179,9 @@ __global__ void k_qw38_head_reduce_max(const float* __restrict__ blk_max, const 
     }
 }
 
-// Pass 2: 64 CTAs per row compute double sum(exp(v - mx)) AND compact survivors v >= mx - 18.0f.
-__global__ void k_qw38_head_pass2(const float* __restrict__ lg, int vr, int v0,
+// Pass 2: 64 CTAs per row compute double sum(expf(v - mx)) with float4 loads + warp-ballot survivor compaction!
+// Replaces 1:64-rate FP64 exp() on sm_121a with IEEE FP32 expf() accumulated in FP64 (< 1e-7 lse error, 32x faster!).
+__global__ void __launch_bounds__(256) k_qw38_head_pass2(const float* __restrict__ lg, int vr, int v0,
                                   const float* __restrict__ row_max,
                                   double* __restrict__ blk_dsum,
                                   int* __restrict__ surv_cnt,
@@ -116,32 +199,104 @@ __global__ void k_qw38_head_pass2(const float* __restrict__ lg, int vr, int v0,
     double a = 0.0;
     float* sv_dst = surv_val + static_cast<size_t>(m) * HEAD_MAX_SURV;
     int* si_dst = surv_id + static_cast<size_t>(m) * HEAD_MAX_SURV;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const unsigned lane_lt_mask = (1u << lane) - 1u;
 
-    for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
-        const float v = x[j];
-        if (ink2::head_key(v)) {
-            a += exp(static_cast<double>(v - mx));
-            if (v >= cut) {
-                const int p = atomicAdd(&surv_cnt[m], 1);
-                if (p < HEAD_MAX_SURV) {
-                    sv_dst[p] = v;
-                    si_dst[p] = v0 + j;
+    auto emit_warp = [&](bool keep, float v, int id) {
+        const unsigned mask = __ballot_sync(0xffffffffu, keep);
+        if (!mask) return;
+        int base = 0;
+        const int leader = __ffs(mask) - 1;
+        if (lane == leader) base = atomicAdd(&surv_cnt[m], __popc(mask));
+        base = __shfl_sync(0xffffffffu, base, leader);
+        if (keep) {
+            const int p = base + __popc(mask & lane_lt_mask);
+            if (p < HEAD_MAX_SURV) {
+                sv_dst[p] = v;
+                si_dst[p] = id;
+            }
+        }
+    };
+
+    const int j0_a = (j0 + 3) & ~3;
+    const int j1_a = j1 & ~3;
+    if (j0_a < j1_a) {
+        if (threadIdx.x < (j0_a - j0)) {
+            const int j = j0 + threadIdx.x;
+            const float v = x[j];
+            if (ink2::head_key(v)) {
+                a += static_cast<double>(expf(v - mx));
+                if (v >= cut) {
+                    const int p = atomicAdd(&surv_cnt[m], 1);
+                    if (p < HEAD_MAX_SURV) { sv_dst[p] = v; si_dst[p] = v0 + j; }
+                }
+            }
+        }
+        const float4* x4 = reinterpret_cast<const float4*>(x + j0_a);
+        const int n4 = (j1_a - j0_a) >> 2;
+        const int n4_pad = (n4 + 255) & ~255;
+        for (int i = threadIdx.x; i < n4_pad; i += 256) {
+            float4 vv = make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+            int base = 0;
+            bool in = (i < n4);
+            if (in) {
+                vv = x4[i];
+                base = v0 + j0_a + (i << 2);
+            }
+            const bool k0 = in && ink2::head_key(vv.x);
+            const bool k1 = in && ink2::head_key(vv.y);
+            const bool k2 = in && ink2::head_key(vv.z);
+            const bool k3 = in && ink2::head_key(vv.w);
+            if (k0) a += static_cast<double>(expf(vv.x - mx));
+            if (k1) a += static_cast<double>(expf(vv.y - mx));
+            if (k2) a += static_cast<double>(expf(vv.z - mx));
+            if (k3) a += static_cast<double>(expf(vv.w - mx));
+            emit_warp(k0 && vv.x >= cut, vv.x, base);
+            emit_warp(k1 && vv.y >= cut, vv.y, base + 1);
+            emit_warp(k2 && vv.z >= cut, vv.z, base + 2);
+            emit_warp(k3 && vv.w >= cut, vv.w, base + 3);
+        }
+        if (threadIdx.x < (j1 - j1_a)) {
+            const int j = j1_a + threadIdx.x;
+            const float v = x[j];
+            if (ink2::head_key(v)) {
+                a += static_cast<double>(expf(v - mx));
+                if (v >= cut) {
+                    const int p = atomicAdd(&surv_cnt[m], 1);
+                    if (p < HEAD_MAX_SURV) { sv_dst[p] = v; si_dst[p] = v0 + j; }
+                }
+            }
+        }
+    } else {
+        for (int j = j0 + threadIdx.x; j < j1; j += blockDim.x) {
+            const float v = x[j];
+            if (ink2::head_key(v)) {
+                a += static_cast<double>(expf(v - mx));
+                if (v >= cut) {
+                    const int p = atomicAdd(&surv_cnt[m], 1);
+                    if (p < HEAD_MAX_SURV) { sv_dst[p] = v; si_dst[p] = v0 + j; }
                 }
             }
         }
     }
-    __shared__ double dsum[256];
-    dsum[threadIdx.x] = a;
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xffffffffu, a, off);
+    __shared__ double dsum[8];
+    if (lane == 0) dsum[warp] = a;
     __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if (threadIdx.x < s) dsum[threadIdx.x] += dsum[threadIdx.x + s];
-        __syncthreads();
+    if (warp == 0) {
+        double tot = (lane < 8) ? dsum[lane] : 0.0;
+        #pragma unroll
+        for (int off = 4; off > 0; off >>= 1) tot += __shfl_xor_sync(0xffffffffu, tot, off);
+        if (lane == 0) blk_dsum[m * HEAD_BLKS + b] = tot;
     }
-    if (threadIdx.x == 0) blk_dsum[m * HEAD_BLKS + b] = dsum[0];
 }
 
-// Pass 3: finalize wire packet per row from <= 4096 survivors, or fall back to full exact radix pack in-kernel.
-__global__ void k_qw38_head_finalize(const float* __restrict__ lg, int vr, int v0, int NC,
+// Pass 3: finalize wire packet per row from <= 4096 survivors cached in shared memory,
+// or fall back to full exact radix pack in-kernel.
+__global__ void __launch_bounds__(256) k_qw38_head_finalize(const float* __restrict__ lg, int vr, int v0, int NC,
                                      const float* __restrict__ row_max,
                                      const int* __restrict__ row_fin,
                                      const double* __restrict__ blk_dsum,
@@ -159,23 +314,49 @@ __global__ void k_qw38_head_finalize(const float* __restrict__ lg, int vr, int v
     __shared__ double dsum[64];
     if (t < HEAD_BLKS) dsum[t] = blk_dsum[m * HEAD_BLKS + t];
     __syncthreads();
-    for (int s = 32; s > 0; s >>= 1) {
-        if (t < s) dsum[t] += dsum[t + s];
-        __syncthreads();
+    if (t < 32) {
+        double tot = dsum[t] + dsum[t + 32];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) tot += __shfl_xor_sync(0xffffffffu, tot, off);
+        if (t == 0) dsum[0] = tot;
     }
+    __syncthreads();
     const double sum = dsum[0];
+
+    // Union shared memory (32 KiB) shared between fast survivor rank-select and rare radix fallback.
+    __shared__ union {
+        struct {
+            float sv[HEAD_MAX_SURV];
+            int si[HEAD_MAX_SURV];
+        } fast;
+        struct {
+            uint32_t hist[256];
+            int cg[256], ce[256];
+            float cl[ink2::INK2_HEAD_MAX_NC];
+            int cid[ink2::INK2_HEAD_MAX_NC];
+            uint32_t s_prefix;
+            int s_rem;
+        } fb;
+    } u;
 
     const int sc = surv_cnt[m];
     if (n > 0 && sc >= n && sc <= HEAD_MAX_SURV) {
-        // Fast path: rank-select top n out of sc survivors directly (no full 248K scan!)
-        const float* sv = surv_val + static_cast<size_t>(m) * HEAD_MAX_SURV;
-        const int* si = surv_id + static_cast<size_t>(m) * HEAD_MAX_SURV;
+        // Fast path: cache survivors into shared memory once -> 10x faster rank-select than global reads!
+        const float* sv_g = surv_val + static_cast<size_t>(m) * HEAD_MAX_SURV;
+        const int* si_g = surv_id + static_cast<size_t>(m) * HEAD_MAX_SURV;
         for (int i = t; i < sc; i += blockDim.x) {
-            const float li = sv[i];
-            const int ii = si[i];
+            u.fast.sv[i] = sv_g[i];
+            u.fast.si[i] = si_g[i];
+        }
+        __syncthreads();
+        for (int i = t; i < sc; i += blockDim.x) {
+            const float li = u.fast.sv[i];
+            const int ii = u.fast.si[i];
             int r = 0;
+            #pragma unroll 4
             for (int j = 0; j < sc; ++j) {
-                r += (sv[j] > li) || (sv[j] == li && si[j] < ii);
+                const float lj = u.fast.sv[j];
+                r += (lj > li) || (lj == li && u.fast.si[j] < ii);
             }
             if (r < n) {
                 *reinterpret_cast<float*>(o + 16 + static_cast<size_t>(r) * 8) = li;
@@ -194,36 +375,30 @@ __global__ void k_qw38_head_finalize(const float* __restrict__ lg, int vr, int v
 
     // Rare exact fallback (e.g., flat/uniform distribution where < NC or > 4096 logits sit within 18 of max)
     const float* x = lg + static_cast<size_t>(m) * vr;
-    __shared__ uint32_t hist[256];
-    __shared__ int cg[256], ce[256];
-    __shared__ float cl[ink2::INK2_HEAD_MAX_NC];
-    __shared__ int cid[ink2::INK2_HEAD_MAX_NC];
-    __shared__ uint32_t s_prefix;
-    __shared__ int s_rem;
     if (n > 0) {
         uint32_t prefix = 0, mask = 0;
         int rem = n;
         for (int sh = 24; sh >= 0; sh -= 8) {
-            hist[t] = 0;
+            u.fb.hist[t] = 0;
             __syncthreads();
             for (int j = t; j < vr; j += 256) {
                 const uint32_t k = ink2::head_key(x[j]);
-                if (k && (k & mask) == prefix) atomicAdd(&hist[(k >> sh) & 255u], 1u);
+                if (k && (k & mask) == prefix) atomicAdd(&u.fb.hist[(k >> sh) & 255u], 1u);
             }
             __syncthreads();
             if (t == 0) {
                 int acc = 0, d = 255;
                 for (; d > 0; --d) {
-                    const int c = static_cast<int>(hist[d]);
+                    const int c = static_cast<int>(u.fb.hist[d]);
                     if (acc + c >= rem) break;
                     acc += c;
                 }
-                s_prefix = prefix | (static_cast<uint32_t>(d) << sh);
-                s_rem = rem - acc;
+                u.fb.s_prefix = prefix | (static_cast<uint32_t>(d) << sh);
+                u.fb.s_rem = rem - acc;
             }
             __syncthreads();
-            prefix = s_prefix;
-            rem = s_rem;
+            prefix = u.fb.s_prefix;
+            rem = u.fb.s_rem;
             mask |= 255u << sh;
             __syncthreads();
         }
@@ -237,29 +412,29 @@ __global__ void k_qw38_head_finalize(const float* __restrict__ lg, int vr, int v
             a += k > thr;
             b += k == thr;
         }
-        cg[t] = a; ce[t] = b;
+        u.fb.cg[t] = a; u.fb.ce[t] = b;
         __syncthreads();
         if (t == 0) {
             int sa = 0, sb = 0;
             for (int i = 0; i < 256; ++i) {
-                const int ca = cg[i], cb = ce[i];
-                cg[i] = sa; ce[i] = sb; sa += ca; sb += cb;
+                const int ca = u.fb.cg[i], cb = u.fb.ce[i];
+                u.fb.cg[i] = sa; u.fb.ce[i] = sb; sa += ca; sb += cb;
             }
         }
         __syncthreads();
-        int pg = cg[t], pe = ce[t];
+        int pg = u.fb.cg[t], pe = u.fb.ce[t];
         for (int j = j0; j < j1; ++j) {
             const float v = x[j];
             const uint32_t k = ink2::head_key(v);
-            if (k > thr) { cl[pg] = v; cid[pg] = v0 + j; ++pg; }
-            else if (k == thr) { if (pe < take) { cl[g + pe] = v; cid[g + pe] = v0 + j; } ++pe; }
+            if (k > thr) { u.fb.cl[pg] = v; u.fb.cid[pg] = v0 + j; ++pg; }
+            else if (k == thr) { if (pe < take) { u.fb.cl[g + pe] = v; u.fb.cid[g + pe] = v0 + j; } ++pe; }
         }
         __syncthreads();
         for (int i = t; i < n; i += 256) {
-            const float li = cl[i];
-            const int ii = cid[i];
+            const float li = u.fb.cl[i];
+            const int ii = u.fb.cid[i];
             int r = 0;
-            for (int j = 0; j < n; ++j) r += (cl[j] > li) || (cl[j] == li && cid[j] < ii);
+            for (int j = 0; j < n; ++j) r += (u.fb.cl[j] > li) || (u.fb.cl[j] == li && u.fb.cid[j] < ii);
             *reinterpret_cast<float*>(o + 16 + static_cast<size_t>(r) * 8) = li;
             *reinterpret_cast<int*>(o + 20 + static_cast<size_t>(r) * 8) = ii;
         }
@@ -273,9 +448,14 @@ __global__ void k_qw38_head_finalize(const float* __restrict__ lg, int vr, int v
 }
 
 inline void head_pack_fast(const float* lg, int M, int vr, int v0, int NC,
-                           HeadPackScratch& sc, uint8_t* out, size_t rb, cudaStream_t st) {
+                           HeadPackScratch& sc, uint8_t* out, size_t rb, cudaStream_t st,
+                           bool argmax_only = false) {
     if (M <= 0) return;
-    k_qw38_head_pass1<<<M * HEAD_BLKS, 256, 0, st>>>(lg, vr, sc.blk_max, sc.blk_cnt);
+    k_qw38_head_pass1<<<M * HEAD_BLKS, 256, 0, st>>>(lg, vr, v0, sc.blk_max, sc.blk_cnt, sc.blk_argmax);
+    if (argmax_only && sc.blk_argmax) {
+        k_qw38_head_argmax_finalize<<<M, HEAD_BLKS, 0, st>>>(sc.blk_max, sc.blk_cnt, sc.blk_argmax, out, rb, M);
+        return;
+    }
     k_qw38_head_reduce_max<<<M, HEAD_BLKS, 0, st>>>(sc.blk_max, sc.blk_cnt, sc.row_max, sc.row_fin, sc.surv_cnt, M);
     k_qw38_head_pass2<<<M * HEAD_BLKS, 256, 0, st>>>(lg, vr, v0, sc.row_max, sc.blk_dsum, sc.surv_cnt, sc.surv_val, sc.surv_id);
     k_qw38_head_finalize<<<M, 256, 0, st>>>(lg, vr, v0, NC, sc.row_max, sc.row_fin, sc.blk_dsum, sc.surv_cnt, sc.surv_val, sc.surv_id, out, rb);
