@@ -662,6 +662,10 @@ __global__ void k_qw38_gqa_split_reduce(const float* __restrict__ split_m,
 
 inline int gqa_split_count(int M, int nh_kv, int max_pos, bool has_split) {
     if (M <= 8 && max_pos >= 128 && has_split) {
+        if (nh_kv <= 2 && max_pos >= 512) {
+            if (M == 1) return (max_pos >= 1024) ? 24 : 16;
+            return 12;
+        }
         int ns = (max_pos >= 512) ? (24 / std::min(M * nh_kv, 6)) : 8;
         if (ns > 24) ns = 24;
         if (ns < 2) ns = 2;
@@ -760,7 +764,7 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
     const bool need_qsa = ((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS;
 
     // 1. Projections (Q+gate, K, V, and QSA index_qk)
-    if ((M <= 12 && w.fp8_q.q) || M <= 8) {
+    if ((M <= 20 && w.fp8_q.q) || M <= 8) {
         if (w.fp8_q.q) {
             launch_fp8_gemv_smallm<false>(x, w.fp8_q, sc.q_gate, M, st);
             launch_fp8_gemv_smallm<false>(x, w.fp8_k, sc.k, M, st);
@@ -817,7 +821,7 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
             sc.split_m, sc.split_l, sc.split_o, sc.gate, sc.attn_out, M, nh_q, NS);
     }
 
-    if ((M <= 12 && w.fp8_o.q) || M <= 8) {
+    if ((M <= 20 && w.fp8_o.q) || M <= 8) {
         if (w.fp8_o.q) {
             launch_fp8_gemv_smallm<false>(sc.attn_out, w.fp8_o, out_part, M, st);
         } else {

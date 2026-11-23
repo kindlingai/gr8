@@ -978,8 +978,8 @@ __global__ void k_qw38_mtp_exp_accum(const __nv_bfloat16* __restrict__ dn_out,
 // Execute one Qwen3.8 MoE block (512 routed + gated shared expert) -> out_part [M, 2560] BF16.
 inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc,
                         const __nv_bfloat16* x, __nv_bfloat16* out_part, int M, cudaStream_t st) {
-    // 1. Router logits + shared expert (fused coalesced uint4 GEMV for M <= 12, cuBLAS tensor cores for M > 12)
-    if ((M <= 12 && w.fp8_sh_gate.q) || M <= 8) {
+    // 1. Router logits + shared expert (fused coalesced uint4 GEMV for M <= 20, cuBLAS tensor cores for M > 20)
+    if ((M <= 20 && w.fp8_sh_gate.q) || M <= 8) {
         const int rgrid = (geom::NEXP + 1 + 3) / 4; // 129 CTAs
         const int sgrid = (w.sh_i + 3) / 4;
         if (M == 1) {
@@ -994,9 +994,15 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
             k_qw38_router_and_shgate<8><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
             if (w.fp8_sh_gate.q) k_fp8_sh_gate_up_silu<8><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
             else k_qw38_sh_gate_up_silu<8><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
-        } else {
+        } else if (M <= 12) {
             k_qw38_router_and_shgate<12><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
             k_fp8_sh_gate_up_silu<12><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
+        } else if (M <= 16) {
+            k_qw38_router_and_shgate<16><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
+            k_fp8_sh_gate_up_silu<16><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
+        } else {
+            k_qw38_router_and_shgate<20><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
+            k_fp8_sh_gate_up_silu<20><<<sgrid, 128, 0, st>>>(x, w.fp8_sh_gate.q, w.fp8_sh_gate.sc, w.fp8_sh_up.q, w.fp8_sh_up.sc, sc.sh_gate_buf, M, w.sh_i);
         }
         k_qw38_router_topk10<<<M, 256, 0, st>>>(sc.router_logits, sc.topk_idx, sc.topk_w, M);
         if (w.fp8_sh_down.q) launch_fp8_gemv_smallm<false>(sc.sh_gate_buf, w.fp8_sh_down, sc.sh_out, M, st);
