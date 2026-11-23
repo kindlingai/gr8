@@ -733,6 +733,521 @@ __global__ void k_qsa_k_update_verify_batch(const __nv_bfloat16* __restrict__ id
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// Tensor-Core QSA Block Scorer + Tensor-Core GQA-12 Prefill FlashAttention (sm_80+)
+// ------------------------------------------------------------------------------------------------
+__device__ __forceinline__ void attn_mma_bf16_m16n8k16(float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+
+__device__ __forceinline__ void attn_ldsm4(uint32_t (&a)[4], const void* smem_ptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(s));
+#endif
+}
+
+__device__ __forceinline__ void attn_ldsm2(uint32_t (&b)[2], const void* smem_ptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(s));
+#endif
+}
+
+__device__ __forceinline__ void attn_ldsm2_trans(uint32_t (&b)[2], const void* smem_ptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(s));
+#endif
+}
+
+// Per-segment Tensor-Core Tiled QSA Block Scorer (BM=64 queries x BN=64 compressed blocks).
+// Reads idx_pages[seg_slot] once per 64 queries (64x less HBM traffic) and computes 4-head ReLU-sum via BF16 MMA.
+// Grid: dim3((seg_max_nblk + 63) / 64, (seg_len + 63) / 64), Block: 256 (8 warps = 4x2 tiles).
+__global__ void __launch_bounds__(256) k_qsa_score_blocks_tc_seg(
+    const __nv_bfloat16* __restrict__ idx_q,
+    const __nv_bfloat16* __restrict__ idx_pages,
+    float* __restrict__ idx_scores,
+    int max_pages, int max_blocks,
+    int seg_row0, int seg_len, int seg_slot, int seg_pos0) {
+    const int b0 = blockIdx.x * 64;
+    const int m0 = blockIdx.y * 64;
+    if (m0 >= seg_len) return;
+
+    const int n_m = min(64, seg_len - m0);
+    const int tile_max_nblk = (seg_pos0 + m0 + n_m) / geom::IDX_COMPRESS;
+    if (tile_max_nblk <= geom::IDX_TOP_BLOCKS || b0 >= tile_max_nblk) return;
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tid4 = lane & 3;
+    const int wm = (warp >> 1) * 16; // 0, 16, 32, 48
+    const int wn = (warp & 1) * 32;  // 0, 32
+
+    __shared__ __nv_bfloat16 sK[64][128];
+    __shared__ __nv_bfloat16 sQ[64][128];
+
+    for (int idx = tid; idx < 64 * 16; idx += 256) {
+        const int lb = idx >> 4, d8 = (idx & 15) << 3;
+        const int b = b0 + lb;
+        uint4 kv = make_uint4(0, 0, 0, 0);
+        if (b < tile_max_nblk) {
+            const int page = b >> 4, boff = b & 15;
+            const __nv_bfloat16* kb = idx_pages + ((static_cast<size_t>(seg_slot) * max_pages + page) * 16 + boff) * 128;
+            kv = *reinterpret_cast<const uint4*>(kb + d8);
+        }
+        *reinterpret_cast<uint4*>(sK[lb] + d8) = kv;
+    }
+
+    float tot[4][4] = {};
+
+    for (int h = 0; h < geom::IDX_HEADS; ++h) {
+        for (int idx = tid; idx < 64 * 16; idx += 256) {
+            const int lm = idx >> 4, d8 = (idx & 15) << 3;
+            const int lm_g = m0 + lm;
+            uint4 qv = make_uint4(0, 0, 0, 0);
+            if (lm_g < seg_len) {
+                qv = *reinterpret_cast<const uint4*>(
+                    idx_q + (static_cast<size_t>(seg_row0 + lm_g) * geom::IDX_HEADS + h) * 128 + d8);
+            }
+            *reinterpret_cast<uint4*>(sQ[lm] + d8) = qv;
+        }
+        __syncthreads();
+
+        float acc[4][4] = {};
+        #pragma unroll
+        for (int k0 = 0; k0 < 128; k0 += 16) {
+            uint32_t qa[4];
+            qa[0] = *reinterpret_cast<const uint32_t*>(sQ[wm + gid] + k0 + 2 * tid4);
+            qa[1] = *reinterpret_cast<const uint32_t*>(sQ[wm + gid + 8] + k0 + 2 * tid4);
+            qa[2] = *reinterpret_cast<const uint32_t*>(sQ[wm + gid] + k0 + 2 * tid4 + 8);
+            qa[3] = *reinterpret_cast<const uint32_t*>(sQ[wm + gid + 8] + k0 + 2 * tid4 + 8);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int lb = wn + j * 8 + gid;
+                uint32_t kb[2];
+                kb[0] = *reinterpret_cast<const uint32_t*>(sK[lb] + k0 + 2 * tid4);
+                kb[1] = *reinterpret_cast<const uint32_t*>(sK[lb] + k0 + 2 * tid4 + 8);
+                attn_mma_bf16_m16n8k16(acc[j], qa, kb);
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            tot[j][0] += fmaxf(acc[j][0], 0.0f);
+            tot[j][1] += fmaxf(acc[j][1], 0.0f);
+            tot[j][2] += fmaxf(acc[j][2], 0.0f);
+            tot[j][3] += fmaxf(acc[j][3], 0.0f);
+        }
+        __syncthreads();
+    }
+
+    constexpr float inv_sqrt_d = 0.08838834764831845f;
+    const int la = m0 + wm + gid;
+    const int lb = la + 8;
+    const int nblk_a = (la < seg_len) ? ((seg_pos0 + la + 1) / geom::IDX_COMPRESS) : 0;
+    const int nblk_b = (lb < seg_len) ? ((seg_pos0 + lb + 1) / geom::IDX_COMPRESS) : 0;
+    const bool act_a = (nblk_a > geom::IDX_TOP_BLOCKS);
+    const bool act_b = (nblk_b > geom::IDX_TOP_BLOCKS);
+
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int c0 = b0 + wn + j * 8 + 2 * tid4;
+        if (act_a) {
+            const size_t row_off = static_cast<size_t>(seg_row0 + la) * max_blocks;
+            if (c0 < nblk_a)     idx_scores[row_off + c0]     = tot[j][0] * inv_sqrt_d;
+            if (c0 + 1 < nblk_a) idx_scores[row_off + c0 + 1] = tot[j][1] * inv_sqrt_d;
+        }
+        if (act_b) {
+            const size_t row_off = static_cast<size_t>(seg_row0 + lb) * max_blocks;
+            if (c0 < nblk_b)     idx_scores[row_off + c0]     = tot[j][2] * inv_sqrt_d;
+            if (c0 + 1 < nblk_b) idx_scores[row_off + c0 + 1] = tot[j][3] * inv_sqrt_d;
+        }
+    }
+}
+
+// Zero-bank-conflict Tensor-Core GQA-12 Head-MMA FlashAttention (works for BOTH Dense & QSA Sparse, TP=1..4).
+// 1 CTA = (m, lkv), Grid: (nh_kv * M), Block: 256 (8 warps). Uses ldmatrix.x4 / ldmatrix.x2 / ldmatrix.x2.trans.
+__global__ void __launch_bounds__(256, 2) k_qw38_gqa_tc_head12(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ kv_pages,
+    const int* __restrict__ row_slot,
+    const int* __restrict__ row_pos,
+    const int* __restrict__ sel_blocks,
+    const int* __restrict__ sel_counts,
+    __nv_bfloat16* __restrict__ out,
+    int M, int nh_q, int nh_kv, int q0_global, int kv0_global, int max_pages) {
+    const int idx = blockIdx.x;
+    const int lkv = idx / M;
+    const int m = idx % M;
+    if (lkv >= nh_kv) return;
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tid4 = lane & 3;
+    const int gq_base = (kv0_global + lkv) * geom::GQA - q0_global;
+
+    const int slot = row_slot[m];
+    const int pos = row_pos[m];
+    const int nsel = sel_counts ? sel_counts[m] : -1;
+    const int n_blk_tok = (nsel >= 0) ? (nsel * geom::IDX_COMPRESS) : 0;
+    const int tail_start = ((pos + 1) / geom::IDX_COMPRESS) * geom::IDX_COMPRESS;
+    const int total_tok = (nsel < 0) ? (pos + 1) : (n_blk_tok + (pos + 1 - tail_start));
+    const int* sb = (nsel >= 0) ? (sel_blocks + static_cast<size_t>(m) * geom::IDX_TOP_BLOCKS) : nullptr;
+
+    constexpr int LD = 264; // +8 BF16 padding -> 16B aligned & bank-conflict-free
+    __shared__ __nv_bfloat16 sQ[16][LD];
+    __shared__ __nv_bfloat16 sKV[64][LD];
+    __shared__ __nv_bfloat16 sP[16][72];
+    __shared__ float s_wm[16][8], s_wl[16][8], s_mmax[16], s_lsum[16], s_alpha[16];
+    __shared__ int s_kvpos[64];
+
+    for (int i = tid; i < 16 * 32; i += 256) {
+        const int qh = i >> 5, d8 = (i & 31) << 3;
+        const int lq = gq_base + qh;
+        uint4 qv = make_uint4(0, 0, 0, 0);
+        if (qh < geom::GQA && lq >= 0 && lq < nh_q)
+            qv = *reinterpret_cast<const uint4*>(q + (static_cast<size_t>(m) * nh_q + lq) * 256 + d8);
+        *reinterpret_cast<uint4*>(sQ[qh] + d8) = qv;
+    }
+    if (tid < 16) { s_mmax[tid] = -1e30f; s_lsum[tid] = 0.0f; }
+
+    const size_t page_stride = static_cast<size_t>(2) * geom::KV_PAGE * nh_kv * 256;
+    const size_t plane_stride = static_cast<size_t>(geom::KV_PAGE) * nh_kv * 256;
+    const __nv_bfloat16* slot_base = kv_pages + static_cast<size_t>(slot) * max_pages * page_stride;
+    constexpr float scale = 0.0625f;
+
+    float oc[4][4] = {};
+    __syncthreads();
+
+    for (int t0 = 0; t0 < total_tok; t0 += 64) {
+        const int n_tok = min(64, total_tok - t0);
+        if (tid < 64) {
+            const int k = t0 + tid;
+            int kvp = -1;
+            if (tid < n_tok) {
+                if (nsel < 0) kvp = k;
+                else if (k < n_blk_tok) kvp = sb[k >> 2] * geom::IDX_COMPRESS + (k & 3);
+                else kvp = tail_start + (k - n_blk_tok);
+            }
+            s_kvpos[tid] = kvp;
+        }
+        __syncthreads();
+
+        for (int i = tid; i < 64 * 32; i += 256) {
+            const int j = i >> 5, d8 = (i & 31) << 3;
+            const int kvp = s_kvpos[j];
+            uint4 kv = make_uint4(0, 0, 0, 0);
+            if (kvp >= 0) {
+                const int page = kvp / geom::KV_PAGE, off = kvp % geom::KV_PAGE;
+                kv = *reinterpret_cast<const uint4*>(
+                    slot_base + static_cast<size_t>(page) * page_stride + (static_cast<size_t>(off) * nh_kv + lkv) * 256 + d8);
+            }
+            *reinterpret_cast<uint4*>(sKV[j] + d8) = kv;
+        }
+        __syncthreads();
+
+        float sc[4] = {0.f, 0.f, 0.f, 0.f};
+        const int k_base = warp * 8;
+        if (k_base < n_tok) {
+            const int q_r = lane & 15, q_c = (lane >> 4) * 8;
+            const int k_r = lane & 7,  k_c = ((lane >> 3) & 1) * 8;
+            #pragma unroll
+            for (int d0 = 0; d0 < 256; d0 += 16) {
+                uint32_t qa[4], kb[2];
+                attn_ldsm4(qa, sQ[q_r] + d0 + q_c);
+                attn_ldsm2(kb, sKV[k_base + k_r] + d0 + k_c);
+                attn_mma_bf16_m16n8k16(sc, qa, kb);
+            }
+        }
+        const int c0 = k_base + 2 * tid4, c1 = c0 + 1;
+        const float s0 = (c0 < n_tok) ? (sc[0] * scale) : -1e30f;
+        const float s1 = (c1 < n_tok) ? (sc[1] * scale) : -1e30f;
+        const float s2 = (c0 < n_tok) ? (sc[2] * scale) : -1e30f;
+        const float s3 = (c1 < n_tok) ? (sc[3] * scale) : -1e30f;
+
+        float ma = fmaxf(s0, s1), mb = fmaxf(s2, s3);
+        ma = fmaxf(ma, __shfl_xor_sync(0xffffffffu, ma, 1));
+        ma = fmaxf(ma, __shfl_xor_sync(0xffffffffu, ma, 2));
+        mb = fmaxf(mb, __shfl_xor_sync(0xffffffffu, mb, 1));
+        mb = fmaxf(mb, __shfl_xor_sync(0xffffffffu, mb, 2));
+        if (tid4 == 0) { s_wm[gid][warp] = ma; s_wm[gid + 8][warp] = mb; }
+        __syncthreads();
+
+        if (tid < 16) {
+            float tmax = s_mmax[tid];
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) tmax = fmaxf(tmax, s_wm[tid][w]);
+            s_alpha[tid] = __expf(s_mmax[tid] - tmax);
+            s_mmax[tid] = tmax;
+        }
+        __syncthreads();
+
+        const float nma = s_mmax[gid], nmb = s_mmax[gid + 8];
+        const float p0 = (c0 < n_tok) ? __expf(s0 - nma) : 0.0f;
+        const float p1 = (c1 < n_tok) ? __expf(s1 - nma) : 0.0f;
+        const float p2 = (c0 < n_tok) ? __expf(s2 - nmb) : 0.0f;
+        const float p3 = (c1 < n_tok) ? __expf(s3 - nmb) : 0.0f;
+        *reinterpret_cast<__nv_bfloat162*>(sP[gid] + c0)     = __floats2bfloat162_rn(p0, p1);
+        *reinterpret_cast<__nv_bfloat162*>(sP[gid + 8] + c0) = __floats2bfloat162_rn(p2, p3);
+
+        float la = p0 + p1, lb = p2 + p3;
+        la += __shfl_xor_sync(0xffffffffu, la, 1); la += __shfl_xor_sync(0xffffffffu, la, 2);
+        lb += __shfl_xor_sync(0xffffffffu, lb, 1); lb += __shfl_xor_sync(0xffffffffu, lb, 2);
+        if (tid4 == 0) { s_wl[gid][warp] = la; s_wl[gid + 8][warp] = lb; }
+        __syncthreads();
+
+        if (tid < 16) {
+            float l_add = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) l_add += s_wl[tid][w];
+            s_lsum[tid] = s_lsum[tid] * s_alpha[tid] + l_add;
+        }
+        const float aa = s_alpha[gid], ab = s_alpha[gid + 8];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            oc[j][0] *= aa; oc[j][1] *= aa;
+            oc[j][2] *= ab; oc[j][3] *= ab;
+        }
+
+        for (int i = tid; i < 64 * 32; i += 256) {
+            const int j = i >> 5, d8 = (i & 31) << 3;
+            const int kvp = s_kvpos[j];
+            uint4 vv = make_uint4(0, 0, 0, 0);
+            if (kvp >= 0) {
+                const int page = kvp / geom::KV_PAGE, off = kvp % geom::KV_PAGE;
+                vv = *reinterpret_cast<const uint4*>(
+                    slot_base + static_cast<size_t>(page) * page_stride + plane_stride + (static_cast<size_t>(off) * nh_kv + lkv) * 256 + d8);
+            }
+            *reinterpret_cast<uint4*>(sKV[j] + d8) = vv;
+        }
+        __syncthreads();
+
+        const int d_base = warp * 32;
+        const int p_r = lane & 15, p_c = (lane >> 4) * 8;
+        const int v_r = lane & 15;
+        for (int k0 = 0; k0 < n_tok; k0 += 16) {
+            uint32_t pa[4];
+            attn_ldsm4(pa, sP[p_r] + k0 + p_c);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint32_t vb[2];
+                attn_ldsm2_trans(vb, sKV[k0 + v_r] + d_base + j * 8);
+                attn_mma_bf16_m16n8k16(oc[j], pa, vb);
+            }
+        }
+        __syncthreads();
+    }
+
+    const int d_base = warp * 32;
+    const int lq_a = gq_base + gid, lq_b = gq_base + gid + 8;
+    const bool va = (gid < geom::GQA && lq_a >= 0 && lq_a < nh_q);
+    const bool vb = (gid + 8 < geom::GQA && lq_b >= 0 && lq_b < nh_q);
+    const float inv_a = (s_lsum[gid] > 0.f) ? (1.0f / s_lsum[gid]) : 0.0f;
+    const float inv_b = (s_lsum[gid + 8] > 0.f) ? (1.0f / s_lsum[gid + 8]) : 0.0f;
+
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int dc = d_base + j * 8 + 2 * tid4;
+        if (va) {
+            const size_t qh = static_cast<size_t>(m) * nh_q + lq_a;
+            const float2 fg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(gate + qh * 256 + dc));
+            const float o0 = __bfloat162float(__float2bfloat16(oc[j][0] * inv_a));
+            const float o1 = __bfloat162float(__float2bfloat16(oc[j][1] * inv_a));
+            *reinterpret_cast<__nv_bfloat162*>(out + qh * 256 + dc) = __floats2bfloat162_rn(o0 * sigmoid_f(fg.x), o1 * sigmoid_f(fg.y));
+        }
+        if (vb) {
+            const size_t qh = static_cast<size_t>(m) * nh_q + lq_b;
+            const float2 fg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(gate + qh * 256 + dc));
+            const float o0 = __bfloat162float(__float2bfloat16(oc[j][2] * inv_b));
+            const float o1 = __bfloat162float(__float2bfloat16(oc[j][3] * inv_b));
+            *reinterpret_cast<__nv_bfloat162*>(out + qh * 256 + dc) = __floats2bfloat162_rn(o0 * sigmoid_f(fg.x), o1 * sigmoid_f(fg.y));
+        }
+    }
+}
+
+// Per-segment Dense Causal Tensor-Core FlashAttention (BM=16 queries x 4 Q-heads per CTA -> 16x KV reuse).
+// Grid: dim3((seg_len + 15) / 16, nh_kv, 3), Block: 128 (4 warps = 4 Q-heads). Works for TP=1..4.
+__global__ void __launch_bounds__(128, 2) k_qw38_gqa_dense_tc16_seg(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ kv_pages,
+    __nv_bfloat16* __restrict__ out,
+    int seg_row0, int seg_len, int seg_slot, int seg_pos0,
+    int nh_q, int nh_kv, int q0_global, int kv0_global, int max_pages) {
+    const int m0 = blockIdx.x * 16;
+    const int lkv = blockIdx.y;
+    const int qgrp = blockIdx.z; // 0..2 -> 4 Q-heads each
+    if (m0 >= seg_len || lkv >= nh_kv) return;
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tid4 = lane & 3;
+    const int qh_local = qgrp * 4 + warp;
+    const int lq = (kv0_global + lkv) * geom::GQA + qh_local - q0_global;
+    const bool active_q = (qh_local < geom::GQA && lq >= 0 && lq < nh_q);
+
+    const int pos0 = seg_pos0 + m0;
+    const int n_m = min(16, seg_len - m0);
+    const int plast = pos0 + n_m - 1;
+    const int ra = m0 + gid, rb = ra + 8;
+    const int ga = seg_row0 + ra, gb = seg_row0 + rb;
+    const bool va = active_q && (ra < seg_len), vb = active_q && (rb < seg_len);
+    const int pa = pos0 + gid, pb = pa + 8;
+
+    constexpr int LD = 264;
+    __shared__ __nv_bfloat16 sKV[32][LD];
+
+    const size_t page_stride = static_cast<size_t>(2) * geom::KV_PAGE * nh_kv * 256;
+    const size_t plane_stride = static_cast<size_t>(geom::KV_PAGE) * nh_kv * 256;
+    const __nv_bfloat16* slot_base = kv_pages + static_cast<size_t>(seg_slot) * max_pages * page_stride;
+    const __nv_bfloat16* qpa = q + (static_cast<size_t>(va ? ga : 0) * nh_q + (active_q ? lq : 0)) * 256;
+    const __nv_bfloat16* qpb = q + (static_cast<size_t>(vb ? gb : 0) * nh_q + (active_q ? lq : 0)) * 256;
+
+    float oc[32][4];
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) oc[j][0] = oc[j][1] = oc[j][2] = oc[j][3] = 0.0f;
+    float ma = -1e30f, mb = -1e30f, la = 0.0f, lb = 0.0f;
+    constexpr float scale = 0.0625f;
+
+    const int k_r = lane & 7, k_c = ((lane >> 3) & 1) * 8;
+    const int v_r = lane & 15;
+
+    for (int kb = 0; kb <= plast; kb += 32) {
+        for (int i = tid; i < 32 * 32; i += 128) {
+            const int j = i >> 5, d8 = (i & 31) << 3;
+            const int kpos = kb + j;
+            uint4 kv = make_uint4(0, 0, 0, 0);
+            if (kpos <= plast) {
+                const int page = kpos / geom::KV_PAGE, off = kpos % geom::KV_PAGE;
+                kv = *reinterpret_cast<const uint4*>(
+                    slot_base + static_cast<size_t>(page) * page_stride + (static_cast<size_t>(off) * nh_kv + lkv) * 256 + d8);
+            }
+            *reinterpret_cast<uint4*>(sKV[j] + d8) = kv;
+        }
+        __syncthreads();
+
+        float sr[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) sr[j][0] = sr[j][1] = sr[j][2] = sr[j][3] = 0.0f;
+        if (active_q) {
+            for (int d0 = 0; d0 < 256; d0 += 16) {
+                uint32_t qa[4];
+                const int c = d0 + 2 * tid4;
+                qa[0] = va ? *reinterpret_cast<const uint32_t*>(qpa + c) : 0u;
+                qa[1] = vb ? *reinterpret_cast<const uint32_t*>(qpb + c) : 0u;
+                qa[2] = va ? *reinterpret_cast<const uint32_t*>(qpa + c + 8) : 0u;
+                qa[3] = vb ? *reinterpret_cast<const uint32_t*>(qpb + c + 8) : 0u;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    uint32_t kb_r[2];
+                    attn_ldsm2(kb_r, sKV[j * 8 + k_r] + d0 + k_c);
+                    attn_mma_bf16_m16n8k16(sr[j], qa, kb_r);
+                }
+            }
+        }
+        __syncthreads();
+
+        for (int i = tid; i < 32 * 32; i += 128) {
+            const int j = i >> 5, d8 = (i & 31) << 3;
+            const int kpos = kb + j;
+            uint4 vv = make_uint4(0, 0, 0, 0);
+            if (kpos <= plast) {
+                const int page = kpos / geom::KV_PAGE, off = kpos % geom::KV_PAGE;
+                vv = *reinterpret_cast<const uint4*>(
+                    slot_base + static_cast<size_t>(page) * page_stride + plane_stride + (static_cast<size_t>(off) * nh_kv + lkv) * 256 + d8);
+            }
+            *reinterpret_cast<uint4*>(sKV[j] + d8) = vv;
+        }
+
+        uint32_t pf[2][4];
+        if (active_q) {
+            float xa = -1e30f, xb = -1e30f;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int k0 = kb + j * 8 + 2 * tid4, k1 = k0 + 1;
+                sr[j][0] = (va && k0 <= pa) ? (sr[j][0] * scale) : -1e30f;
+                sr[j][1] = (va && k1 <= pa) ? (sr[j][1] * scale) : -1e30f;
+                sr[j][2] = (vb && k0 <= pb) ? (sr[j][2] * scale) : -1e30f;
+                sr[j][3] = (vb && k1 <= pb) ? (sr[j][3] * scale) : -1e30f;
+                xa = fmaxf(xa, fmaxf(sr[j][0], sr[j][1]));
+                xb = fmaxf(xb, fmaxf(sr[j][2], sr[j][3]));
+            }
+            xa = fmaxf(xa, __shfl_xor_sync(0xffffffffu, xa, 1));
+            xa = fmaxf(xa, __shfl_xor_sync(0xffffffffu, xa, 2));
+            xb = fmaxf(xb, __shfl_xor_sync(0xffffffffu, xb, 1));
+            xb = fmaxf(xb, __shfl_xor_sync(0xffffffffu, xb, 2));
+            const float na = fmaxf(ma, xa), nb = fmaxf(mb, xb);
+            const float aa = __expf(ma - na), ab = __expf(mb - nb);
+            ma = na; mb = nb;
+            la *= aa; lb *= ab;
+            #pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                oc[j][0] *= aa; oc[j][1] *= aa;
+                oc[j][2] *= ab; oc[j][3] *= ab;
+            }
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const float* c = sr[2 * kk + h];
+                    const float p0 = (c[0] > -1e29f) ? __expf(c[0] - na) : 0.f;
+                    const float p1 = (c[1] > -1e29f) ? __expf(c[1] - na) : 0.f;
+                    const float p2 = (c[2] > -1e29f) ? __expf(c[2] - nb) : 0.f;
+                    const float p3 = (c[3] > -1e29f) ? __expf(c[3] - nb) : 0.f;
+                    la += p0 + p1; lb += p2 + p3;
+                    const __nv_bfloat162 b01 = __floats2bfloat162_rn(p0, p1);
+                    const __nv_bfloat162 b23 = __floats2bfloat162_rn(p2, p3);
+                    pf[kk][h * 2 + 0] = *reinterpret_cast<const uint32_t*>(&b01);
+                    pf[kk][h * 2 + 1] = *reinterpret_cast<const uint32_t*>(&b23);
+                }
+            }
+        }
+        __syncthreads();
+
+        if (active_q) {
+            #pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                #pragma unroll
+                for (int j = 0; j < 32; ++j) {
+                    uint32_t vb_r[2];
+                    attn_ldsm2_trans(vb_r, sKV[kk * 16 + v_r] + j * 8);
+                    attn_mma_bf16_m16n8k16(oc[j], pf[kk], vb_r);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (!active_q) return;
+    la += __shfl_xor_sync(0xffffffffu, la, 1); la += __shfl_xor_sync(0xffffffffu, la, 2);
+    lb += __shfl_xor_sync(0xffffffffu, lb, 1); lb += __shfl_xor_sync(0xffffffffu, lb, 2);
+    const float inv_a = (la > 0.f) ? (1.0f / la) : 0.0f;
+    const float inv_b = (lb > 0.f) ? (1.0f / lb) : 0.0f;
+    const size_t qha = static_cast<size_t>(ga) * nh_q + lq;
+    const size_t qhb = static_cast<size_t>(gb) * nh_q + lq;
+    #pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const int dc = j * 8 + 2 * tid4;
+        if (va) {
+            const float2 fg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(gate + qha * 256 + dc));
+            const float o0 = __bfloat162float(__float2bfloat16(oc[j][0] * inv_a));
+            const float o1 = __bfloat162float(__float2bfloat16(oc[j][1] * inv_a));
+            *reinterpret_cast<__nv_bfloat162*>(out + qha * 256 + dc) = __floats2bfloat162_rn(o0 * sigmoid_f(fg.x), o1 * sigmoid_f(fg.y));
+        }
+        if (vb) {
+            const float2 fg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(gate + qhb * 256 + dc));
+            const float o0 = __bfloat162float(__float2bfloat16(oc[j][2] * inv_b));
+            const float o1 = __bfloat162float(__float2bfloat16(oc[j][3] * inv_b));
+            *reinterpret_cast<__nv_bfloat162*>(out + qhb * 256 + dc) = __floats2bfloat162_rn(o0 * sigmoid_f(fg.x), o1 * sigmoid_f(fg.y));
+        }
+    }
+}
+
 // Execute one full-attention + QSA layer on rank `rank` of `nr`.
 // Writes this rank's partial output [M, 2560] BF16 into `out_part`.
 inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, FullLayerKv& kv, FullAttnScratch& sc,
@@ -749,14 +1264,22 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
     bool all_len1 = (nsegs == M);
     const int V = snap_k + 1;
     bool all_verify = (snap_k > 0 && nsegs > 0 && nsegs * V == M);
+    bool all_qsa_tc = true;
+    bool all_dense_tc16 = (nsegs > 0);
+    int seg_rows_sum = 0;
     for (int s = 0; s < nsegs; ++s) {
         if (segs[s].len > 0) {
             const int ep = segs[s].pos0 + segs[s].len - 1;
             if (ep > max_pos) max_pos = ep;
+            const bool seg_qsa = ((ep + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS;
+            if (seg_qsa && segs[s].len < 16) all_qsa_tc = false;
+            if (segs[s].len < 16) all_dense_tc16 = false;
+            seg_rows_sum += segs[s].len;
         }
         if (segs[s].len != 1 || segs[s].row0 != s) all_len1 = false;
         if (segs[s].len != V || segs[s].row0 != s * V) all_verify = false;
     }
+    if (seg_rows_sum != M) { all_qsa_tc = false; all_dense_tc16 = false; }
     const bool need_qsa = ((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS;
 
     // 1. Projections (Q+gate, K, V, and QSA index_qk)
@@ -801,20 +1324,53 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
     }
     if (need_qsa) {
         k_qsa_q_norm_rope<<<M * geom::IDX_HEADS, 128, 0, st>>>(sc.idx_qk, w.idx_q_norm, row_pos_dev, sc.idx_q, M, geom::RMS_EPS);
-        k_qsa_score_blocks<<<M, 256, 0, st>>>(sc.idx_q, kv.idx_pages, row_slot_dev, row_pos_dev, sc.idx_scores, max_pages, max_blocks, M);
+        if (all_qsa_tc) {
+            for (int s = 0; s < nsegs; ++s) {
+                if (segs[s].len <= 0) continue;
+                const int seg_max_nblk = (segs[s].pos0 + segs[s].len) / geom::IDX_COMPRESS;
+                if (seg_max_nblk <= geom::IDX_TOP_BLOCKS) continue;
+                const dim3 grid((seg_max_nblk + 63) / 64, (segs[s].len + 63) / 64);
+                k_qsa_score_blocks_tc_seg<<<grid, 256, 0, st>>>(
+                    sc.idx_q, kv.idx_pages, sc.idx_scores, max_pages, max_blocks,
+                    segs[s].row0, segs[s].len, segs[s].slot, segs[s].pos0);
+            }
+        } else {
+            k_qsa_score_blocks<<<M, 256, 0, st>>>(sc.idx_q, kv.idx_pages, row_slot_dev, row_pos_dev, sc.idx_scores, max_pages, max_blocks, M);
+        }
         k_qsa_select_top512<<<M, 256, 0, st>>>(sc.idx_scores, row_pos_dev, sc.sel_blocks, sc.sel_counts, max_blocks, M);
     }
 
-    // 4. GQA-12 Tiled FlashAttention (+ Split-KV for decode M <= 8 & ctx >= 128) + output projection
-    const int NS = gqa_split_count(M, nh_kv, max_pos, sc.split_o != nullptr);
-    k_qw38_gqa_flash_tiled<<<M * nh_kv * NS, 384, 0, st>>>(
-        sc.q, sc.gate, kv.kv_pages, row_slot_dev, row_pos_dev,
-        need_qsa ? sc.sel_blocks : nullptr, need_qsa ? sc.sel_counts : nullptr,
-        sc.attn_out, sc.split_m, sc.split_l, sc.split_o,
-        M, nh_q, nh_kv, q0, kv0, max_pages, NS);
-    if (NS > 1) {
-        k_qw38_gqa_split_reduce<<<M * nh_q, 32, 0, st>>>(
-            sc.split_m, sc.split_l, sc.split_o, sc.gate, sc.attn_out, M, nh_q, NS);
+    // 4. GQA-12 FlashAttention:
+    //    - Prefill (M > 8): Tensor-Core BM=16 dense FlashAttention when all segments are dense >=16,
+    //      else Tensor-Core GQA-12 Head-MMA (works for QSA sparse and mixed dense/sparse).
+    //    - Decode (M <= 8): Tiled FlashAttention + Split-KV.
+    if (M > 8) {
+        if (!need_qsa && all_dense_tc16) {
+            for (int s = 0; s < nsegs; ++s) {
+                if (segs[s].len <= 0) continue;
+                const dim3 grid((segs[s].len + 15) / 16, nh_kv, 3);
+                k_qw38_gqa_dense_tc16_seg<<<grid, 128, 0, st>>>(
+                    sc.q, sc.gate, kv.kv_pages, sc.attn_out,
+                    segs[s].row0, segs[s].len, segs[s].slot, segs[s].pos0,
+                    nh_q, nh_kv, q0, kv0, max_pages);
+            }
+        } else {
+            k_qw38_gqa_tc_head12<<<nh_kv * M, 256, 0, st>>>(
+                sc.q, sc.gate, kv.kv_pages, row_slot_dev, row_pos_dev,
+                need_qsa ? sc.sel_blocks : nullptr, need_qsa ? sc.sel_counts : nullptr,
+                sc.attn_out, M, nh_q, nh_kv, q0, kv0, max_pages);
+        }
+    } else {
+        const int NS = gqa_split_count(M, nh_kv, max_pos, sc.split_o != nullptr);
+        k_qw38_gqa_flash_tiled<<<M * nh_kv * NS, 384, 0, st>>>(
+            sc.q, sc.gate, kv.kv_pages, row_slot_dev, row_pos_dev,
+            need_qsa ? sc.sel_blocks : nullptr, need_qsa ? sc.sel_counts : nullptr,
+            sc.attn_out, sc.split_m, sc.split_l, sc.split_o,
+            M, nh_q, nh_kv, q0, kv0, max_pages, NS);
+        if (NS > 1) {
+            k_qw38_gqa_split_reduce<<<M * nh_q, 32, 0, st>>>(
+                sc.split_m, sc.split_l, sc.split_o, sc.gate, sc.attn_out, M, nh_q, NS);
+        }
     }
 
     if ((M <= 12 && w.fp8_o.q) || M <= 8) {
