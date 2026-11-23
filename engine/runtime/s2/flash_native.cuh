@@ -24,7 +24,7 @@ struct FlashExtras {
     std::function<void(const Grant&)> bind;   // after serve_flash's
     std::function<void(const Slot&)> prefill;  // before serve_flash's prefill quantum
     // a Resize on the engine's tier (FLASH_KV_TIER): true when it was, false for serve_flash's
-    std::function<bool(const Resize&)> resize;
+    std::function<bool(const Resize&, RunPool&)> resize;
     std::function<bool(int)> dfl_ok;
     std::function<int(int)> dfl_start;
     std::function<s2::DflDrafts(const s2::DflReq&, const Sampling&)> dfl;
@@ -75,6 +75,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     const unsigned place = cp_split ? unsigned(std::min(c.main.s2->pool_pages, c.draft.d.s2->pool_pages)) : pages;
     RunPool pool(pages, place, cp_split ? unsigned(c.cp_R) : sc.pool_rows);
     if (cp_split) pool.tail(unsigned(g6nr::NR), 0);
+    // Multi-session GR8_GLM53F_KV_CHUNKS=1 (EL5 #153): track online chunks in RunPool so arbitrary page-table runs
+    // never land on offline chunks and shrinks/grows coordinate with live sessions.
+    if (multi && c.main.fkv.pages && !cp_split) pool.chunks(c.main.fkv.chunk_pages);
     const int rp = c.cp_R / PAGE;   // a split run's prefix pages
     FlashSlots ks(int(sc.limit()), std::max(1, c.main.kda_ring_rest ? c.main.kda_ring_rest : c.main.kda_ring),
                   std::max(1, c.main.kda_ring));
@@ -587,8 +590,8 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                         rank, (unsigned long long)r.segs, (unsigned long long)r.slots, ck->index().size(), gone.size(),
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), (long long)s2_wall_ms());
         }
-        void on_resize_kv(const Resize& r) { extra.resize(r); }
-        void on_resize_kv_ckpt(const Resize& r) { if (!extra.resize(r)) on_resize(r); }
+        void on_resize_kv(const Resize& r) { extra.resize(r, pool); }
+        void on_resize_kv_ckpt(const Resize& r) { if (!extra.resize(r, pool)) on_resize(r); }
         bool on_dfl_ok(int q) { return extra.dfl_ok(q); }
         int on_dfl_start(int q) { return extra.dfl_start(q); }
         s2::DflDrafts on_dfl(const s2::DflReq& r, const Sampling& smp) { return extra.dfl(r, smp); }

@@ -108,27 +108,27 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = s2_attn_test ]; then
   [ "$TEST" = all ] && ARGS=()
   case "$FLAGS" in
-    *-DDEC_S2*) build_run s2_attn_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
+    *-DDEC_S2*) build_run s2_attn_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
     *) build_run s2_attn_test || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
   esac
 fi
 if [ "$TEST" = all ] || [ "$TEST" = kv4_test ]; then
   [ "$TEST" = all ] && ARGS=()
-  build_run kv4_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  build_run kv4_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$TEST" = all ] || [ "$TEST" = kvb8_test ]; then
   # kv_b (UK / UV) in FP8 (#50): decode and prefill outputs against the BF16 form of the same weights, byte for byte
   [ "$TEST" = all ] && ARGS=()
   case "$FLAGS" in
     *-DG6_KV4=1*) echo "SKIP kvb8_test: it runs the FP8-row decode variants, which a G6_KV4 build does not" ;;
-    *) build_run kvb8_test "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
+    *) build_run kvb8_test "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/kvchunks.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
   esac
 fi
 if [ "$TEST" = all ] || [ "$TEST" = canon_test ]; then
   # a session's KV across page lists and layouts (#152): needs the S2 page allocator (engine/kvman-rs)
   [ "$TEST" = all ] && ARGS=()
   if why=$(kvlib_ready); then
-    build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
     echo "SKIP canon_test: $why"
   fi
@@ -177,7 +177,7 @@ if [ "$TEST" = all ] || [ "$TEST" = steering_cuda_test ]; then
 fi
 if [ "$TEST" = all ] || [ "$TEST" = headgroup_test ]; then
   [ "$TEST" = all ] && ARGS=()
-  with_flags "$K1H2_FLAGS -DG6_NR=3" build_run attn/tests/headgroup_test "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  with_flags "$K1H2_FLAGS -DG6_NR=3" build_run attn/tests/headgroup_test "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/kvchunks.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$TEST" = all ] || [ "$TEST" = kda_g9_det ]; then
   [ "$TEST" = all ] && ARGS=()

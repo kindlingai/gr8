@@ -224,3 +224,20 @@ knobs:
       Minimum live VMM-mapped dispramd carveout bytes each rank must map before allocating host KV memory when CAP was
       enlarged from the pre-boot dispramd probe; if unmet, the allocator unmaps its spans and exits 75 so the supervisor
       falls back to baseline CAP.
+  GR8_KV_CHUNKS:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      GLM-5.3 (EL5 #153): allocate each layer binding's MLA and index caches in reserved CUDA VMM regions (kvchunks.h)
+      backed per 2 MiB granule, so S2 Resize events on GLM_KV_TIER or in-process width switches can shrink and grow the
+      KV pool below place without moving cache addresses or invalidating captured CUDA graphs. 0 (default) keeps one
+      allocation per binding as before.
+  GR8_KV_CHUNK_PAGES:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      With GR8_KV_CHUNKS=1, pages per resizable KV chunk below place (0 = default 256 pages, clamped to place).

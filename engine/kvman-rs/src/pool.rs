@@ -441,13 +441,16 @@ impl Pool {
         if n == 0 {
             return Ok(Some(Vec::new()));
         }
-        // a size no state allows: fewer than n chunks online, or the largest n of them leave less than R / 64 pages
+        // a size no state allows: fewer than n chunks online, or the largest n of them leave fewer than the floor
+        // online below place. For CP pools (below_rows / PAGE < place) the floor is R / 64 so a request of R rows can
+        // still fit; for flat non-CP pools (below_rows / PAGE == place, e.g. multi-session Flash borrow-idle) the floor
+        // is 1 page (at least one chunk stays online).
         let mut sizes: Vec<u32> =
             (0..self.offline.len()).filter(|&k| !self.offline[k]).map(|k| self.chunk_range(k).len() as u32).collect();
         sizes.sort_unstable_by(|a, b| b.cmp(a));
+        let floor_pages = if self.below_rows as u64 / PAGE == self.place as u64 { 1 } else { self.below_rows as u64 / PAGE };
         if sizes.len() < n as usize
-            || ((self.place_online() - sizes.iter().take(n as usize).sum::<u32>()) as u64)
-                < self.below_rows as u64 / PAGE
+            || ((self.place_online() - sizes.iter().take(n as usize).sum::<u32>()) as u64) < floor_pages
         {
             return Err(Error::BadSize);
         }

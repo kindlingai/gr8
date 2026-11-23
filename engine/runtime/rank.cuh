@@ -53,6 +53,9 @@
 #include "../kernels/head2.cuh"
 #include "../attn/bind.h"
 #include "../attn/ops.h"
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41 && !G6_MODEL_INK2
+#include "glm_kv.h"
+#endif
 #if G6_MODEL_DS41
 #include "ds41_ops.h"          // host-only (the step plan and op table); must stay outside namespace g6rt
 #include "ds41_pack_layout.h"   // the ragged W segment table (C8 pack), host-only; decode keeps uniform ds_ns
@@ -481,6 +484,9 @@ struct Model
     // The main model checks GR8_MEM_MIN as its KV pool is allocated. The MTP draft is built after the prefill lanes, and
     // both are part of the rest of the boot that floor reserves, so the draft does not check it again.
     bool headroom = true;
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41 && !G6_MODEL_INK2
+    glmkv::Map kv_chunks;             // GR8_KV_CHUNKS=1 (EL5 #153): VMM-backed resizable KV cache regions
+#endif
     unsigned** errs = nullptr;        // [nl] device
     g6::FabricDev f{};
     u64* stepp = nullptr;             // device step counter
@@ -1000,6 +1006,44 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         at_kvb("kv_b.uk", y.ap.uk, y.ap.uks);
         at_kvb("kv_b.uv", y.ap.uv, y.ap.uvs);
         if (!y.ap.uks.data != !y.ap.uvs.data) die("layer " + std::to_string(y.l) + ": kv_b.uk and kv_b.uv differ in form");
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41 && !G6_MODEL_INK2
+        const bool vmm_kv = knob::kv_chunks();
+        if (vmm_kv)
+        {
+            int dev = 0;
+            G6RT_CK(cudaGetDevice(&dev));
+            int bind_cap = cap_ab, bind_pages = 0, bind_cp_R = 0, bind_cp_nr = 0, bind_cp_phys = 0;
+            uint32_t phys = (uint32_t)((cap_ab + 63) / 64);
+#if defined(G6_CP) && G6_CP
+            if (m.cp.on)
+            {
+                if (y.indexer != cp_full_index(y.l)) die("GR8_CP: layer " + std::to_string(y.l) + " indexer flag disagrees with the binder rule");
+                if (m.cp.colls.q.size() != (size_t)m.nl || (m.cp.colls.cand[i] >= 0) != y.indexer) die("GR8_CP: colls do not match the layer list");
+                bind_cap = capacity; bind_cp_R = m.cp.R; bind_cp_nr = g6nr::NR; bind_cp_phys = m.cp.phys;
+                const int ts = (capacity + 63) / 64, rp = m.cp.R / 64;
+                int p = 0;
+                for (int lp = 0; lp < ts; ++lp)
+                    if (lp < rp || lp % g6nr::NR == rank)
+                        if (!m.cp.phys || p < m.cp.phys) ++p;
+                phys = (uint32_t)p;
+            }
+#ifdef DEC_S2
+            else if (m.kv_pages)
+            {
+                bind_pages = m.kv_pages;
+                phys = (uint32_t)m.kv_pages;
+            }
+#endif
+#endif
+            G6KvChunks *mla = nullptr, *idx = nullptr;
+            if (m.kv_chunks.add(phys, y.indexer, dev, &mla, &idx))
+                die("GR8_KV_CHUNKS layer " + std::to_string(y.l) + ": " + m.kv_chunks.err);
+            G6RT_CK(g6_attn_bind_create_vmm(&y.ab, &y.ap, rank, y.l, bind_cap, bind_pages, attn_rows, ATT_QT,
+                                            bind_cp_R, bind_cp_nr, bind_cp_phys, st, m.dscratch, m.dscratch_bytes,
+                                            mla, idx));
+        }
+        else
+#endif
 #if defined(G6_CP) && G6_CP
         if (m.cp.on)
         {
