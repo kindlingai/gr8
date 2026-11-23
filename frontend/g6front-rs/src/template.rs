@@ -160,6 +160,13 @@ impl ChatTemplate {
             .and_then(|s| serde_json::from_str::<Value>(&s).ok());
         if let Some(mark) = processor.as_ref().and_then(|c| c.get("image_token")?.as_str()).filter(|m| !m.is_empty()) {
             template.image_mark = mark.to_string();
+        } else if template.image_mark == IMAGE_MARK {
+            // Qwen3-VL / Qwen3.8 templates emit <|image_pad|> and ship preprocessor_config.json instead of processor_config.json.
+            if let Ok(raw) = std::fs::read_to_string(&p) {
+                if raw.contains("<|image_pad|>") && !raw.contains(IMAGE_MARK) {
+                    template.image_mark = "<|image_pad|>".to_string();
+                }
+            }
         }
         Ok(template)
     }
@@ -393,7 +400,7 @@ impl ChatTemplate {
         });
         let n = blocks.len();
         let text = self.render(Some(&msgs), tools, kw.clone())?;
-        if text.contains(VIDEO_MARK) {
+        if text.contains(VIDEO_MARK) || text.contains("<|video_pad|>") {
             return Err("the prompt holds a video placeholder; videos are not supported".into());
         }
         let literal = || TemplateError(format!("the prompt text holds an image placeholder ({})", self.image_mark));
@@ -1453,6 +1460,23 @@ mod tests {
         assert_eq!(load(), "<|image|>");
         std::fs::write(dir.join("processor_config.json"), r#"{"image_token": "<|unused_200054|>"}"#).unwrap();
         assert_eq!(load(), "<|unused_200054|>");
+        // Qwen3.8 ships preprocessor_config.json (no processor_config.json) and emits <|image_pad|> in chat_template.jinja.
+        let _ = std::fs::remove_file(dir.join("processor_config.json"));
+        std::fs::write(
+            dir.join("chat_template.jinja"),
+            "{% for m in messages %}{% if m.content is string %}{{ m.content }}{% else %}{% for item in m.content %}{% if item.type == 'image' or 'image_url' in item %}<|vision_start|><|image_pad|><|vision_end|>{% elif item.type == 'text' %}{{ item.text }}{% endif %}{% endfor %}{% endif %}{% endfor %}",
+        )
+        .unwrap();
+        let t = ChatTemplate::load(&dir, Value::Null, Value::Null).unwrap();
+        assert_eq!(t.image_mark, "<|image_pad|>");
+        let msgs = json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,0"}},
+            {"type": "text", "text": "describe"},
+            {"type": "input_image", "image_url": "data:image/png;base64,1"}
+        ]}]);
+        let (rendered, blocks) = t.render_images(Some(&msgs), None, Map::new()).unwrap();
+        assert_eq!(rendered.matches("<|vision_start|><|image_pad|><|vision_end|>").count(), 2);
+        assert_eq!(blocks.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
