@@ -61,6 +61,7 @@ extern "C" const G6AttnOps* g6_attn_ops(void) {
         nullptr,   // qo_run
         nullptr,   // qo_warm
         nullptr,   // replay_run
+        nullptr,   // replay_append
         nullptr,   // bind_reset_pages
         nullptr,   // bind_check_clear
         nullptr,   // bind_create_pages

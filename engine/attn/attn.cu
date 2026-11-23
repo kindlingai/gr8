@@ -1285,6 +1285,23 @@ extern "C" int g6a_replay_run(const G6AttnReplay* r,void* s){
     AMARK(0);
     return (int)ga::run_body(a,input,w,stream,front);
 }
+extern "C" int g6a_replay_append(const G6AttnReplay* r,int n_rows,void* s){
+    if(!r||!r->cell||n_rows<=0)return (int)cudaErrorInvalidValue;
+#if defined(G6_CP) && G6_CP
+    G6Attn rep=r->fixed;rep.cp_nr=0;rep.cp_rank=0;const G6Attn& a=rep;
+#else
+    const G6Attn& a=r->fixed;
+#endif
+    if(!ga::valid(a)||n_rows>a.rows||!a.kv_a||!a.kv_norm||!a.mla_cache||!a.positions||!a.block_table||!a.error)
+        return (int)cudaErrorInvalidValue;
+    if(!a.reuse_indices&&(!a.index_k||!a.index_norm||!a.index_bias||!a.index_cache))return (int)cudaErrorInvalidValue;
+    cudaStream_t stream=(cudaStream_t)s;
+    ga::validate_replay<<<1,256,0,stream>>>(a,r->cell);
+    ga::ReplayInput input{a,r->cell};
+    ga::append_kv<<<n_rows,256,0,stream>>>(input);
+    if(!a.reuse_indices)ga::append_index<<<n_rows,128,0,stream>>>(input);
+    return (int)cudaGetLastError();
+}
 
 #include "prefill.cuh"
 #include "prefill-qo-bind.cuh"

@@ -396,6 +396,84 @@ __global__ void __launch_bounds__(1024) k_head_local_sl(glue::HeadArgs a, const 
     publish(a.f, a.c, g6::coll_seq(step, a.c, a.f.ncoll), a.ticket);
 }
 
+// S2 GR8_MTP_LASTROW with M > MXM: only each session's terminal row has a compacted slot row_map[m] in [0, MXM) in
+// cand / cl / a.logits; nonterminal rows (row_map[m] < 0) emit an empty HeadRec and skip the 38K LSE scan. grid M, block 1024.
+__global__ void __launch_bounds__(1024) k_head_local_sl_map(glue::HeadArgs a, const int* __restrict__ cand, const float* __restrict__ cl,
+                                                            const int* __restrict__ row_map)
+{
+    using namespace glue;
+    __shared__ float s_sc[32], s_lg[32], s_mx[32], s_sm[32];
+    __shared__ int s_id[32];
+    const int m = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
+    const int slot = row_map[m];
+    if (slot < 0)
+    {
+        if (t == 0)
+        {
+            HeadRec r{};
+            r.score = -INFINITY; r.id = 0; r.logit = 0.f; r.lmax = -INFINITY; r.lsum = 0.f;
+            r.pad_[0] = -INFINITY; r.pad_[1] = 0.f; r.pad_[2] = 0.f;
+            reinterpret_cast<HeadRec*>(send_slot(a.f, *a.stepp, a.c))[m] = r;
+        }
+        const u64 step = *a.stepp;
+        publish(a.f, a.c, g6::coll_seq(step, a.c, a.f.ncoll), a.ticket);
+        return;
+    }
+    const SampleRow sr = a.rows[m];
+    const float* row = a.logits + (size_t)slot * a.ldl;
+    float bs = -INFINITY, blg = 0.f, mx = -INFINITY, sm = 0.f;
+    int bid = 0x7fffffff;
+    if (t < SL)
+    {
+        const float lg = cl[(size_t)slot * SL + t];
+        const int v = a.vlo + cand[(size_t)slot * SL + t];
+        bs = sample_score(sr, lg, v); bid = v; blg = lg;
+    }
+    for (int i = t; i < a.vn; i += 1024)
+    {
+        const float lg = row[i];
+        if (lg > mx) { sm = sm * expf(mx - lg) + 1.f; mx = lg; }
+        else sm += expf(lg - mx);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        const float os = __shfl_xor_sync(0xffffffffu, bs, o), ol = __shfl_xor_sync(0xffffffffu, blg, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bid, o);
+        if (os > bs || (os == bs && oi < bid)) { bs = os; bid = oi; blg = ol; }
+        const float omx = __shfl_xor_sync(0xffffffffu, mx, o), osm = __shfl_xor_sync(0xffffffffu, sm, o);
+        const float nmx = fmaxf(mx, omx);
+        sm = (mx == -INFINITY ? 0.f : sm * expf(mx - nmx)) + (omx == -INFINITY ? 0.f : osm * expf(omx - nmx));
+        mx = nmx;
+    }
+    if (l == 0) { s_sc[w] = bs; s_id[w] = bid; s_lg[w] = blg; s_mx[w] = mx; s_sm[w] = sm; }
+    __syncthreads();
+    if (t == 0)
+    {
+        HeadRec r;
+        r.score = s_sc[0]; r.id = s_id[0]; r.logit = s_lg[0]; r.lmax = s_mx[0]; r.lsum = s_sm[0];
+        for (int i = 1; i < 32; ++i)
+        {
+            if (s_sc[i] > r.score || (s_sc[i] == r.score && s_id[i] < r.id)) { r.score = s_sc[i]; r.id = s_id[i]; r.logit = s_lg[i]; }
+            const float nmx = fmaxf(r.lmax, s_mx[i]);
+            r.lsum = (r.lmax == -INFINITY ? 0.f : r.lsum * expf(r.lmax - nmx)) +
+                     (s_mx[i] == -INFINITY ? 0.f : s_sm[i] * expf(s_mx[i] - nmx));
+            r.lmax = nmx;
+        }
+        r.pad_[0] = r.pad_[1] = r.pad_[2] = 0.f;
+        if (a.tgt)
+        {
+            const int i = a.tgt[m] - a.vlo;
+            r.pad_[0] = i >= 0 && i < a.vn ? row[i] : -INFINITY;
+        }
+        reinterpret_cast<HeadRec*>(send_slot(a.f, *a.stepp, a.c))[m] = r;
+    }
+    if (a.nc > 0 && topp_on(sr)) head_local_topp(a, m, row, sr, s_mx);
+    if (a.tk && sr.topk > 0) head_local_topk(a, m, row);
+    const u64 step = *a.stepp;
+    publish(a.f, a.c, g6::coll_seq(step, a.c, a.f.ncoll), a.ticket);
+}
+
 // GR8_DRAFT_HEAD2=2 (measurement): per row, whether the MXFP8 head's argmax of the slice (ref, the target's GEMV on the
 // same rows) is among the row's candidates. cnt[0] rows, cnt[1] misses; every 4096 rows rank prints a line (device
 // printf, flushed at the host's next synchronization). grid M, block 256
