@@ -361,7 +361,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
         for (int i = 0; i < e.n; ++i) { e.id[i] = o.top[size_t(i)].id; e.tlp[i] = o.top[size_t(i)].logit - o.lse; }
         e.lp = o.top.empty() ? 0.f : o.top.back().logit - o.lse;
         for (size_t i = 0; i < o.top.size(); ++i)
-            if (o.top[i].id == id) { e.lp = o.top[i].logit - o.lse; e.rank = i < size_t(g6rt::LP_MAX) ? int(i) : -1; break; }
+            if (o.top[i].id == id) { e.lp = o.top[i].logit - o.lse; e.rank = i < size_t(g6rt::LP_MAX) ? int(i) + 1 : -1; break; }
         return e;
     };
 
