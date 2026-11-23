@@ -333,6 +333,13 @@ int main(int argc, char** argv) {
         for (int p = 0; p < P; p += prefill) {
             const int n = std::min(prefill, P - p);
             const bool last = (p + n == P);
+            if (!last) {
+                const int np = p + n;
+                const int nn = std::min(prefill, P - np);
+                const int32_t c0 = (np >= 2) ? prompt[size_t(np - 2)] : geom::TOK_EOS;
+                const int32_t c1 = (np >= 1) ? prompt[size_t(np - 1)] : geom::TOK_EOS;
+                e.stage_ple_prefetch(&prompt[size_t(np)], nn, c0, c1);
+            }
             std::vector<qw38::StepSeg> segs = {{s, 0, p, n}};
             std::vector<RowSample> sm(static_cast<size_t>(n));
             for (int i = 0; i < n; ++i) sm[size_t(i)] = RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};

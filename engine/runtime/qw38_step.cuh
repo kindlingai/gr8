@@ -319,7 +319,9 @@ struct Engine {
     std::mutex ple_mu;
     std::condition_variable ple_cv, ple_done_cv;
     bool ple_stop = false, ple_has_job = false, ple_job_done = true, ple_job_ok = true;
+    bool ple_job_is_prefetch = false;
     std::vector<uint64_t> ple_job_ids;
+    std::vector<uint64_t> ple_next_pf_ids;
 
     struct RankLayer {
         qw38::GdnWeights gdn_w;
@@ -412,7 +414,12 @@ struct Engine {
         }
         mtp_graphs.clear();
         if (ple_thr.joinable()) {
-            { std::lock_guard<std::mutex> lk(ple_mu); ple_stop = true; ple_has_job = true; }
+            {
+                std::unique_lock<std::mutex> lk(ple_mu);
+                ple_done_cv.wait(lk, [&]() { return ple_job_done; });
+                ple_stop = true;
+                ple_has_job = true;
+            }
             ple_cv.notify_one();
             ple_thr.join();
         }
@@ -552,9 +559,12 @@ struct Engine {
                         ple_cv.wait(lk, [&]() { return ple_has_job; });
                         if (ple_stop) return;
                         ple_has_job = false;
+                        const bool is_pf = ple_job_is_prefetch;
                         lk.unlock();
-                        const bool ok = ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
-                                                             reinterpret_cast<uint8_t*>(ple_pinned));
+                        const bool ok = is_pf
+                            ? ple_store.prefetch_rows(ple_job_ids.data(), ple_job_ids.size())
+                            : ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
+                                                   reinterpret_cast<uint8_t*>(ple_pinned));
                         lk.lock();
                         ple_job_ok = ok;
                         ple_job_done = true;
@@ -921,6 +931,14 @@ struct Engine {
         }
     }
 
+    // Stage next prefill chunk's PLE row IDs so ple_thr warms PleRowCache during Layers 1..47 of this chunk.
+    void stage_ple_prefetch(const int* toks, int n, int32_t ctx0, int32_t ctx1) {
+        if (!has_ple || !o.ple_async || !ple_thr.joinable() || n <= 0) return;
+        int32_t c[2] = {ctx0, ctx1};
+        ple_next_pf_ids.resize(size_t(n) * geom::PLE_HEADS);
+        ple_store.compute_ids(toks, n, c, false, ple_next_pf_ids.data());
+    }
+
     // Forward one step over `segs` (`M` total rows), optionally skipping lm_head (prefill chunks).
     // When `snap_k > 0` (MTP verify step), saves post-token-t recurrent/conv/idx_raw snapshots for t in 0..snap_k-1!
     void forward(const std::vector<qw38::StepSeg>& segs, const int* toks, const RowSample* samples,
@@ -960,6 +978,11 @@ struct Engine {
         // 0b. Kick off async PLE NVMe fetch BEFORE Layer 0 GPU compute so it overlaps completely behind Layer 0!
         bool ple_in_flight = false;
         if (has_ple && o.ple_async && ple_thr.joinable()) {
+            {
+                // Drain any prior chunk's background cross-chunk prefetch before overwriting ple_job_ids.
+                std::unique_lock<std::mutex> lk(ple_mu);
+                ple_done_cv.wait(lk, [&]() { return ple_job_done; });
+            }
             ple_job_ids.resize(size_t(M) * geom::PLE_HEADS);
             for (const auto& g : segs) {
                 if (g.len <= 0) continue;
@@ -969,6 +992,7 @@ struct Engine {
             }
             {
                 std::lock_guard<std::mutex> lk(ple_mu);
+                ple_job_is_prefetch = false;
                 ple_job_done = false;
                 ple_has_job = true;
             }
@@ -983,6 +1007,15 @@ struct Engine {
                 ple_done_cv.wait(lk, [&]() { return ple_job_done; });
                 if (!ple_job_ok) die("PLE async fetch_rows failed");
                 ple_in_flight = false;
+                if (!ple_next_pf_ids.empty()) {
+                    ple_job_ids.swap(ple_next_pf_ids);
+                    ple_next_pf_ids.clear();
+                    ple_job_is_prefetch = true;
+                    ple_job_done = false;
+                    ple_has_job = true;
+                    lk.unlock();
+                    ple_cv.notify_one();
+                }
             } else {
                 std::vector<uint64_t> all_ids(size_t(M) * geom::PLE_HEADS);
                 for (const auto& g : segs) {

@@ -359,6 +359,16 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 if (ck > at && ck < step_lim) step_lim = ck;
             }
             const int n = int(step_lim - at);
+            if (step_lim < limit) {
+                uint32_t next_lim = std::min<uint32_t>(limit, step_lim + uint32_t(max_rows));
+                if (stash) {
+                    const uint32_t ck = store_slots[size_t(q)].ckpt;
+                    if (ck > step_lim && ck < next_lim) next_lim = ck;
+                }
+                const int32_t c0 = (step_lim >= 2) ? p.prompt[step_lim - 2] : geom::TOK_EOS;
+                const int32_t c1 = (step_lim >= 1) ? p.prompt[step_lim - 1] : geom::TOK_EOS;
+                c.engine.stage_ple_prefetch(&p.prompt[step_lim], int(next_lim - step_lim), c0, c1);
+            }
             std::vector<qw38::StepSeg> segs = {{q, 0, int(at), n}};
             c.engine.forward(segs, &p.prompt[at], nullptr, out, true);
             at = step_lim;
