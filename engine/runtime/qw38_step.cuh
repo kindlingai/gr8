@@ -373,7 +373,9 @@ struct Engine {
     std::condition_variable ple_cv, ple_done_cv;
     bool ple_stop = false, ple_has_job = false, ple_job_done = true, ple_job_ok = true;
     int ple_job_buf = 0;
+    bool ple_job_is_prefetch = false;
     std::vector<uint64_t> ple_job_ids;
+    std::vector<uint64_t> ple_next_pf_ids;
     // Cross-chunk async prefetch tracking (never mutates ple_ctx until consumed by forward())
     bool ple_pf_valid = false;
     int ple_pf_buf = 0, ple_pf_slot = -1, ple_pf_pos0 = -1, ple_pf_len = 0;
@@ -446,6 +448,7 @@ struct Engine {
     // Fabric callbacks (set by g6m4_qw38; nullptr on m4sim_qw38 where all ranks are already in `parts`)
     std::function<void(int M, bool skip_head, int n_layers_override)> step_begin;
     std::function<void(int c, __nv_bfloat16* parts, size_t bytes)> gather_dev;
+    std::function<void(int c, __nv_bfloat16* hyper, const __nv_bfloat16* parts, const float* inj, int M)> gather_inject;
     std::function<void(int c, uint8_t* host_parts, size_t bytes)> gather_host;
     std::function<void()> step_end;
     std::function<int()> step_parity;     // returns 0 or 1 for double-buffered multi-box graph capture
@@ -493,7 +496,12 @@ struct Engine {
         }
         mtp_graphs.clear();
         if (ple_thr.joinable()) {
-            { std::lock_guard<std::mutex> lk(ple_mu); ple_stop = true; ple_has_job = true; }
+            {
+                std::unique_lock<std::mutex> lk(ple_mu);
+                ple_done_cv.wait(lk, [&]() { return ple_job_done; });
+                ple_stop = true;
+                ple_has_job = true;
+            }
             ple_cv.notify_one();
             ple_thr.join();
         }
@@ -642,9 +650,12 @@ struct Engine {
                         if (ple_stop) return;
                         ple_has_job = false;
                         const int buf = ple_job_buf;
+                        const bool is_pf = ple_job_is_prefetch;
                         lk.unlock();
-                        const bool ok = ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
-                                                             reinterpret_cast<uint8_t*>(ple_pinned[buf]));
+                        const bool ok = is_pf
+                            ? ple_store.prefetch_rows(ple_job_ids.data(), ple_job_ids.size())
+                            : ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
+                                                   reinterpret_cast<uint8_t*>(ple_pinned[buf]));
                         lk.lock();
                         ple_job_ok = ok;
                         ple_job_done = true;
@@ -1080,10 +1091,19 @@ struct Engine {
         {
             std::lock_guard<std::mutex> lk(ple_mu);
             ple_job_buf = buf;
+            ple_job_is_prefetch = false;
             ple_job_done = false;
             ple_has_job = true;
         }
         ple_cv.notify_one();
+    }
+
+    // Stage next prefill chunk's PLE row IDs so ple_thr warms PleRowCache during Layers 1..47 of this chunk.
+    void stage_ple_prefetch(const int* toks, int n, int32_t ctx0, int32_t ctx1) {
+        if (!has_ple || !o.ple_async || !ple_thr.joinable() || n <= 0) return;
+        int32_t c[2] = {ctx0, ctx1};
+        ple_next_pf_ids.resize(size_t(n) * geom::PLE_HEADS);
+        ple_store.compute_ids(toks, n, c, false, ple_next_pf_ids.data());
     }
 
     // Forward one step over `segs` (`M` total rows), optionally skipping lm_head (prefill chunks).
@@ -1178,6 +1198,7 @@ struct Engine {
                 {
                     std::lock_guard<std::mutex> lk(ple_mu);
                     ple_job_buf = ple_cur_buf;
+                    ple_job_is_prefetch = false;
                     ple_job_done = false;
                     ple_has_job = true;
                 }
@@ -1193,6 +1214,15 @@ struct Engine {
                 ple_done_cv.wait(lk, [&]() { return ple_job_done; });
                 if (!ple_job_ok) die("PLE async fetch_rows failed");
                 ple_in_flight = false;
+                if (!ple_next_pf_ids.empty()) {
+                    ple_job_ids.swap(ple_next_pf_ids);
+                    ple_next_pf_ids.clear();
+                    ple_job_is_prefetch = true;
+                    ple_job_done = false;
+                    ple_has_job = true;
+                    lk.unlock();
+                    ple_cv.notify_one();
+                }
             } else {
                 ple_cur_buf = 1 - ple_active_buf;
                 ple_active_buf = ple_cur_buf;
@@ -1237,9 +1267,13 @@ struct Engine {
                                       segs.data(), int(segs.size()), M, o.nr, r, true, stream, d_slot, d_pos, snap_k);
                 }
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
             for (int i = 0; i < o.nloc; ++i) {
@@ -1248,9 +1282,13 @@ struct Engine {
                 __nv_bfloat16* p_dst = parts + size_t(r) * part_stride;
                 qw38::moe_forward(blas, rl.moe_w, moe_sc, mixed, p_dst, M, stream);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
         };
 
         auto run_head_gpu = [&]() {
@@ -1261,15 +1299,10 @@ struct Engine {
                 for (int r0 = 0; r0 < M; r0 += HEAD_CHUNK) {
                     const int mc = std::min(M - r0, HEAD_CHUNK);
                     const __nv_bfloat16* mx_ptr = mixed + size_t(r0) * geom::HID;
-                    if (M <= 12) {
-                        if (i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
-                            qw38::launch_fp8_gemv_smallm<true>(mx_ptr, fp8_lm_head[size_t(i)], head_logits, mc, stream);
-                        } else if (M <= 8) {
-                            qw38::launch_bf16_gemv_smallm<true>(mx_ptr, lm_head[size_t(i)], head_logits, mc, v_rows[size_t(i)], geom::HID, stream);
-                        } else {
-                            cublasSetStream(blas, stream);
-                            qw38::gemm_bf16_nt_f32(blas, mc, v_rows[size_t(i)], geom::HID, mx_ptr, lm_head[size_t(i)], head_logits);
-                        }
+                    if (M <= 20 && i < static_cast<int>(fp8_lm_head.size()) && fp8_lm_head[size_t(i)].q) {
+                        qw38::launch_fp8_gemv_smallm<true>(mx_ptr, fp8_lm_head[size_t(i)], head_logits, mc, stream);
+                    } else if (M <= 8) {
+                        qw38::launch_bf16_gemv_smallm<true>(mx_ptr, lm_head[size_t(i)], head_logits, mc, v_rows[size_t(i)], geom::HID, stream);
                     } else {
                         cublasSetStream(blas, stream);
                         qw38::gemm_bf16_nt_f32(blas, mc, v_rows[size_t(i)], geom::HID, mx_ptr, lm_head[size_t(i)], head_logits);
@@ -1282,7 +1315,7 @@ struct Engine {
             }
         };
 
-        // Fast CUDA Graph path for decode (M <= 8, all_len1) AND MTP verify (M <= 20, all_verify)!
+        // Fast CUDA Graph path for decode (M <= 16, all_len1) AND MTP verify (M <= 64, all_verify)!
         const int V_chk = snap_k + 1;
         bool all_verify = (!all_len1 && snap_k > 0 && !segs.empty() && static_cast<int>(segs.size()) * V_chk == M);
         if (all_verify) {
@@ -1290,10 +1323,9 @@ struct Engine {
                 if (segs[s].len != V_chk || segs[s].row0 != static_cast<int>(s) * V_chk) { all_verify = false; break; }
             }
         }
-        const bool fp8_ready = !fp8_lm_head.empty() && fp8_lm_head[0].q != nullptr;
-        const bool verify_graph_ok = all_verify && (M <= 8 || (M <= 20 && fp8_ready));
+        const bool verify_graph_ok = all_verify && M <= 64;
         const bool graph_ok = o.use_graph && !o.profile && !skip_head && vis_n == 0 && !rope_thw &&
-                              ((snap_k == 0 && M <= 8 && all_len1) || verify_graph_ok) &&
+                              ((snap_k == 0 && M <= 16 && all_len1) || verify_graph_ok) &&
                               (o.nr == 1 || o.nloc == o.nr || static_cast<bool>(step_parity));
         if (graph_ok) {
             const int need_qsa = (((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS) ? 1 : 0;
@@ -1427,14 +1459,20 @@ struct Engine {
             }
             t_end(y.is_full ? prof.attn_ms : prof.gdn_ms);
 
-            t_start();
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            t_end(prof.ar_ms);
+            if (o.nr > 1 && gather_inject) {
+                t_start();
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+                t_end(prof.ar_ms);
+            } else {
+                t_start();
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                t_end(prof.ar_ms);
 
-            t_start();
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
-            t_end(prof.hc_ms);
+                t_start();
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                t_end(prof.hc_ms);
+            }
 
             t_start();
             qw38::hc_prepare(blas, y.mlp_hc, hyper, mixed, hc_sc, M, stream);
@@ -1449,14 +1487,20 @@ struct Engine {
             }
             t_end(prof.moe_ms);
 
-            t_start();
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            t_end(prof.ar_ms);
+            if (o.nr > 1 && gather_inject) {
+                t_start();
+                gather_inject(coll++, hyper, parts, hc_sc.inj, M);
+                t_end(prof.ar_ms);
+            } else {
+                t_start();
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                t_end(prof.ar_ms);
 
-            t_start();
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
-            t_end(prof.hc_ms);
+                t_start();
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+                t_end(prof.hc_ms);
+            }
         }
 
         if (skip_head) {
@@ -1621,9 +1665,13 @@ struct Engine {
                 qw38::full_attn_forward(blas, mtp_w.attn[size_t(i)], mtp_w.kv[size_t(i)], attn_sc, mixed, p_dst,
                                         d_slot, d_pos, segs.data(), int(segs.size()), M, o.nr, r, max_pps, max_blocks, stream, 0, d_rope);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, mtp_sc.mtp_hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             // L048 MoE (GPU-native FP8/BF16!) + AR + Inject
             qw38::hc_prepare(blas, mtp_w.mlp_hc, mtp_sc.mtp_hyper, mixed, hc_sc, M, stream);
@@ -1633,9 +1681,13 @@ struct Engine {
                 qw38::mtp_moe_forward(blas, mtp_w.moe[size_t(i)], mtp_w.fp8_exp_gu[size_t(i)], mtp_w.fp8_exp_dn[size_t(i)],
                                       moe_sc, mtp_sc, mixed, p_dst, M, stream);
             }
-            if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
-            else ++coll;
-            qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            if (o.nr > 1 && gather_inject) {
+                gather_inject(coll++, mtp_sc.mtp_hyper, parts, hc_sc.inj, M);
+            } else {
+                if (o.nr > 1 && gather_dev) gather_dev(coll++, parts, part_stride * 2);
+                else ++coll;
+                qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
+            }
 
             if (hid_out) {
                 QW38_CK(cudaMemcpyAsync(hid_out, mtp_sc.mtp_hyper, size_t(M) * geom::HC_D * sizeof(__nv_bfloat16),
@@ -1667,8 +1719,7 @@ struct Engine {
         };
 
         const int hin_kind = (hid_in == last_hyper) ? 0 : ((hid_in == mtp_hid_cur) ? 1 : -1);
-        const bool mtp_graph_ok = o.use_graph && !o.profile && M <= 5 && hin_kind >= 0 && hid_out == mtp_hid_cur &&
-                                  mtp_w.fp8_fc_hid.q != nullptr &&
+        const bool mtp_graph_ok = o.use_graph && !o.profile && M <= 16 && hin_kind >= 0 && hid_out == mtp_hid_cur &&
                                   (o.nr == 1 || o.nloc == o.nr || static_cast<bool>(step_parity));
         if (mtp_graph_ok) {
             const int need_qsa = (((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS) ? 1 : 0;

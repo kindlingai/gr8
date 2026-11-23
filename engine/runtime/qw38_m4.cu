@@ -64,6 +64,184 @@ inline void qw38_ar_exchange(const g6::FabricDev& f, const unsigned long long* d
     }
 }
 
+struct Qw38ArInject {
+    g6::FabricDev f;
+    const unsigned long long* d_step;
+    __nv_bfloat16* hyper;
+    const __nv_bfloat16* parts;
+    const float* inj;
+    size_t bytes;
+    int M, par, c;
+    unsigned code;
+};
+
+// Single-kernel fused RDMA AllReduce + HC residual injection for small decode batches (M <= 8).
+// Replaces copy-out + ring-wait + (NR-1) copy-in + k_hc_inject (5..6 launches -> 1 launch!),
+// reducing partials in exact rank order 0..NR-1 for bit-exact parity with k_hc_inject.
+// Grid: 1, Block: 320 (320 * 8 = 2560 hidden dims exact).
+template <int NR>
+__global__ void __launch_bounds__(320) k_qw38_ar_fused_inject_small(Qw38ArInject a) {
+    const int d8 = threadIdx.x; // 0..319 (each uint4 = 8 BF16s)
+    constexpr size_t ROW_U4 = geom::HID / 8; // 320
+    const size_t part_stride_u4 = static_cast<size_t>(a.M) * ROW_U4;
+    const uint4* local_p = reinterpret_cast<const uint4*>(a.parts) + static_cast<size_t>(a.f.rank) * part_stride_u4;
+    uint4* send_p = reinterpret_cast<uint4*>(a.f.send + g6::fab_send_off(a.f, a.par, a.c));
+
+    uint4 my_row0{};
+    for (int m = 0; m < a.M; ++m) {
+        const size_t off = static_cast<size_t>(m) * ROW_U4 + d8;
+        const uint4 v = local_p[off];
+        send_p[off] = v;
+        if (m == 0) my_row0 = v;
+    }
+    __syncthreads();
+
+    const unsigned long long seq = g6::coll_seq(*a.d_step, a.c, a.f.ncoll);
+    if (d8 == 0) {
+        __threadfence_system();
+        ink2::ar_st_release_sys(a.f.doorbell + a.c, seq);
+    }
+    if (d8 < NR && d8 != a.f.rank) {
+        const unsigned long long* tail = reinterpret_cast<const unsigned long long*>(
+            a.f.recv + g6::fab_recv_off(a.f, a.par, a.c, d8) + a.bytes);
+        const long long t0 = clock64();
+        unsigned it = 0;
+        while (ink2::ar_ld_acquire_sys(tail) != seq) {
+            if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(a.f.error) != 0 || clock64() - t0 > INK2_SPIN_TIMEOUT_CYC)) {
+                atomicCAS(a.f.error, 0u, a.code | static_cast<unsigned>(d8));
+                break;
+            }
+        }
+    }
+    __syncthreads();
+
+    const uint4* rptr[NR];
+    #pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        rptr[r] = (r == a.f.rank)
+                      ? local_p
+                      : reinterpret_cast<const uint4*>(a.f.recv + g6::fab_recv_off(a.f, a.par, a.c, r));
+    }
+
+    for (int m = 0; m < a.M; ++m) {
+        float w[geom::HC];
+        #pragma unroll
+        for (int s = 0; s < geom::HC; ++s) w[s] = a.inj[m * geom::HC + s];
+
+        float y[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        const size_t roff = static_cast<size_t>(m) * ROW_U4 + d8;
+        #pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            const uint4 pv = (r == a.f.rank) ? ((m == 0) ? my_row0 : local_p[roff]) : __ldcv(rptr[r] + roff);
+            const __nv_bfloat162* pp = reinterpret_cast<const __nv_bfloat162*>(&pv);
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float2 fv = __bfloat1622float2(pp[k]);
+                y[2 * k] += fv.x;
+                y[2 * k + 1] += fv.y;
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) y[k] = __bfloat162float(__float2bfloat16(y[k]));
+
+        __nv_bfloat16* h = a.hyper + static_cast<size_t>(m) * geom::HC_D;
+        #pragma unroll
+        for (int s = 0; s < geom::HC; ++s) {
+            uint4* hp = reinterpret_cast<uint4*>(h + s * geom::HID) + d8;
+            const uint4 prev = *hp;
+            const __nv_bfloat162* pr = reinterpret_cast<const __nv_bfloat162*>(&prev);
+            uint4 out;
+            __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&out);
+            const float ws = w[s];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float2 fp = __bfloat1622float2(pr[k]);
+                const float a0 = __bfloat162float(__float2bfloat16(y[2 * k] * ws));
+                const float a1 = __bfloat162float(__float2bfloat16(y[2 * k + 1] * ws));
+                op[k] = __floats2bfloat162_rn(fp.x + a0, fp.y + a1);
+            }
+            *hp = out;
+        }
+    }
+}
+
+// Multi-CTA HC residual injection reading peers directly from RDMA recv slots via __ldcv (M > 8).
+// Eliminates all (NR-1) intermediate HBM copy-in kernels and their HBM write+read round-trips!
+// Grid: (M * 5), Block: 64 (5 * 64 * 8 = 2560 hidden dims exact).
+template <int NR>
+__global__ void k_qw38_hc_inject_from_recv(Qw38ArInject a) {
+    const int m = blockIdx.x / 5;
+    const int blk = blockIdx.x % 5;
+    if (m >= a.M) return;
+    const int d8 = blk * 64 + threadIdx.x; // 0..319
+    constexpr size_t ROW_U4 = geom::HID / 8;
+    const size_t part_stride_u4 = static_cast<size_t>(a.M) * ROW_U4;
+    const uint4* local_p = reinterpret_cast<const uint4*>(a.parts) + static_cast<size_t>(a.f.rank) * part_stride_u4;
+
+    float w[geom::HC];
+    #pragma unroll
+    for (int s = 0; s < geom::HC; ++s) w[s] = a.inj[m * geom::HC + s];
+
+    float y[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const size_t roff = static_cast<size_t>(m) * ROW_U4 + d8;
+    #pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        const uint4 pv = (r == a.f.rank)
+                             ? local_p[roff]
+                             : __ldcv(reinterpret_cast<const uint4*>(a.f.recv + g6::fab_recv_off(a.f, a.par, a.c, r)) + roff);
+        const __nv_bfloat162* pp = reinterpret_cast<const __nv_bfloat162*>(&pv);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 fv = __bfloat1622float2(pp[k]);
+            y[2 * k] += fv.x;
+            y[2 * k + 1] += fv.y;
+        }
+    }
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) y[k] = __bfloat162float(__float2bfloat16(y[k]));
+
+    __nv_bfloat16* h = a.hyper + static_cast<size_t>(m) * geom::HC_D;
+    #pragma unroll
+    for (int s = 0; s < geom::HC; ++s) {
+        uint4* hp = reinterpret_cast<uint4*>(h + s * geom::HID) + d8;
+        const uint4 prev = *hp;
+        const __nv_bfloat162* pr = reinterpret_cast<const __nv_bfloat162*>(&prev);
+        uint4 out;
+        __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&out);
+        const float ws = w[s];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 fp = __bfloat1622float2(pr[k]);
+            const float a0 = __bfloat162float(__float2bfloat16(y[2 * k] * ws));
+            const float a1 = __bfloat162float(__float2bfloat16(y[2 * k + 1] * ws));
+            op[k] = __floats2bfloat162_rn(fp.x + a0, fp.y + a1);
+        }
+        *hp = out;
+    }
+}
+
+inline void qw38_ar_exchange_inject(const g6::FabricDev& f, const unsigned long long* d_step, int par, int c,
+                                    __nv_bfloat16* hyper, const __nv_bfloat16* parts, const float* inj,
+                                    int M, cudaStream_t st) {
+    const size_t bytes = static_cast<size_t>(M) * geom::HID * sizeof(__nv_bfloat16);
+    const unsigned code = ink2::INK2_ERR_AR | (static_cast<unsigned>(c) << 8);
+    Qw38ArInject a{f, d_step, hyper, parts, inj, bytes, M, par, c, code};
+    if constexpr (G6_NR > 1) {
+        if (M <= 8) {
+            k_qw38_ar_fused_inject_small<G6_NR><<<1, 320, 0, st>>>(a);
+            return;
+        }
+        const size_t n16 = bytes / 16;
+        const unsigned grid = static_cast<unsigned>((n16 + 255) / 256);
+        ink2::k_ink2_ar_copy<<<grid, 256, 0, st>>>(
+            reinterpret_cast<const uint4*>(reinterpret_cast<const char*>(parts) + static_cast<size_t>(f.rank) * bytes),
+            reinterpret_cast<uint4*>(f.send + g6::fab_send_off(f, par, c)), n16);
+        Qw38ArWait w{f, bytes, d_step, code, par, c};
+        k_qw38_ar_ring_wait<<<1, 32, 0, st>>>(w);
+        k_qw38_hc_inject_from_recv<G6_NR><<<M * 5, 64, 0, st>>>(a);
+    }
+}
+
 struct Wire {
     g6::Fabric fab;
     g6::FabricDev f{};
@@ -107,6 +285,11 @@ struct Wire {
     void fast_dev(int c, __nv_bfloat16* parts, size_t bytes, cudaStream_t st) {
         const size_t wire = (bytes + 15) / 16 * 16;
         qw38_ar_exchange(f, d_step, static_cast<int>(step & 1), c, reinterpret_cast<char*>(parts), wire, st);
+    }
+
+    void fast_dev_inject(int c, __nv_bfloat16* hyper, const __nv_bfloat16* parts, const float* inj,
+                         int M, cudaStream_t st) {
+        qw38_ar_exchange_inject(f, d_step, static_cast<int>(step & 1), c, hyper, parts, inj, M, st);
     }
 
     void fast_host(int c, uint8_t* parts, size_t bytes) {
@@ -283,6 +466,7 @@ int main(int argc, char** argv) {
         cfg.proxy_cpu = proxy_cpu;
         cfg.ncoll = wire.fast ? static_cast<int>(2 * e.L.size() + 1) : 1;
         cfg.stripe_min = cfg.ips2.empty() ? 0 : 65536;
+        cfg.compact = true;
         cfg.slot_bytes = (slot_b + 7) / 8 * 8;
         wire.fab.init(cfg);
         wire.f = wire.fab.dev();
@@ -296,6 +480,9 @@ int main(int argc, char** argv) {
             wire.d_step = qw38rt::dalloc<unsigned long long>(1);
             e.step_begin = [&](int M, bool skip_head, int nl) { wire.fast_begin(M, skip_head, nl, e.stream); };
             e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.fast_dev(c, p, b, e.stream); };
+            e.gather_inject = [&](int c, __nv_bfloat16* h, const __nv_bfloat16* p, const float* inj, int M) {
+                wire.fast_dev_inject(c, h, p, inj, M, e.stream);
+            };
             e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.fast_host(c, p, b); };
             e.step_end = [&]() { wire.fast_end(e.stream); };
             e.step_parity = [&]() -> int { return static_cast<int>(wire.step & 1); };
