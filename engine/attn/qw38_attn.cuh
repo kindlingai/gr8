@@ -264,6 +264,16 @@ __global__ void k_qsa_k_update_seg(const __nv_bfloat16* __restrict__ idx_qk,
     __shared__ float sm[4];
     __shared__ float kf[128];
 
+    const int snap_stride = snap_k + 1;
+    if (idx_raw_snap && snap_k > 0) {
+        __nv_bfloat16* sb0 = idx_raw_snap + (static_cast<size_t>(slot) * snap_stride) * 4 * 128;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) sb0[k * 128 + d] = raw_slot[k * 128 + d];
+        if (idx_raw_thw_snap && idx_raw_thw && d == 0) {
+            idx_raw_thw_snap[static_cast<size_t>(slot) * snap_stride] = idx_raw_thw[slot];
+        }
+    }
+
     for (int t = 0; t < len; ++t) {
         const int pos = pos0 + t;
         const int sub = pos & 3;
@@ -304,11 +314,11 @@ __global__ void k_qsa_k_update_seg(const __nv_bfloat16* __restrict__ idx_qk,
             __syncthreads();
         }
         if (idx_raw_snap && t < len - 1 && t < snap_k) {
-            __nv_bfloat16* sb = idx_raw_snap + (static_cast<size_t>(slot) * snap_k + t) * 4 * 128;
+            __nv_bfloat16* sb = idx_raw_snap + (static_cast<size_t>(slot) * snap_stride + (t + 1)) * 4 * 128;
             #pragma unroll
             for (int k = 0; k < 4; ++k) sb[k * 128 + d] = raw_slot[k * 128 + d];
             if (idx_raw_thw_snap && idx_raw_thw && d == 0) {
-                idx_raw_thw_snap[static_cast<size_t>(slot) * snap_k + t] = idx_raw_thw[slot];
+                idx_raw_thw_snap[static_cast<size_t>(slot) * snap_stride + (t + 1)] = idx_raw_thw[slot];
             }
         }
     }
@@ -991,6 +1001,16 @@ __global__ void k_qsa_k_update_verify_batch(const __nv_bfloat16* __restrict__ id
     __shared__ float sm[4];
     __shared__ float kf[128];
 
+    const int snap_stride = snap_k + 1;
+    if (idx_raw_snap && snap_k > 0) {
+        __nv_bfloat16* sb0 = idx_raw_snap + (static_cast<size_t>(slot) * snap_stride) * 4 * 128;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) sb0[k * 128 + d] = raw_slot[k * 128 + d];
+        if (idx_raw_thw_snap && idx_raw_thw && d == 0) {
+            idx_raw_thw_snap[static_cast<size_t>(slot) * snap_stride] = idx_raw_thw[slot];
+        }
+    }
+
     for (int t = 0; t < V; ++t) {
         const int pos = pos0 + t;
         const int sub = pos & 3;
@@ -1031,11 +1051,11 @@ __global__ void k_qsa_k_update_verify_batch(const __nv_bfloat16* __restrict__ id
             __syncthreads();
         }
         if (idx_raw_snap && t < V - 1 && t < snap_k) {
-            __nv_bfloat16* sb = idx_raw_snap + (static_cast<size_t>(slot) * snap_k + t) * 4 * 128;
+            __nv_bfloat16* sb = idx_raw_snap + (static_cast<size_t>(slot) * snap_stride + (t + 1)) * 4 * 128;
             #pragma unroll
             for (int k = 0; k < 4; ++k) sb[k * 128 + d] = raw_slot[k * 128 + d];
             if (idx_raw_thw_snap && idx_raw_thw && d == 0) {
-                idx_raw_thw_snap[static_cast<size_t>(slot) * snap_k + t] = idx_raw_thw[slot];
+                idx_raw_thw_snap[static_cast<size_t>(slot) * snap_stride + (t + 1)] = idx_raw_thw[slot];
             }
         }
     }

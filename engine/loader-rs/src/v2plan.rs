@@ -137,6 +137,17 @@ pub(crate) fn widths(m: &Json, l: usize) -> Result<Option<Widths>, String> {
     widths_nh(m, l, NH)
 }
 
+/// widths() detecting `nh` (128-blocks per expert) from the manifest's layer entry (e.g. 5 for Qwen3.8, 16 for GLM, 18 for DS41).
+pub(crate) fn widths_auto(m: &Json, l: usize) -> Result<Option<Widths>, String> {
+    let Some(e) = m.get("layers").and_then(|x| x.get(&l.to_string())) else { return Ok(None) };
+    let gate = e.get("gate").and_then(Json::arr).ok_or(format!("layer {l}: no gate widths"))?;
+    let nh = gate.first().and_then(Json::arr).map(<[_]>::len).unwrap_or(NH);
+    if nh == 0 || nh > NH_MAX {
+        return Err(format!("layer {l}: unsupported half count {nh} (expected 1..={NH_MAX})"));
+    }
+    widths_nh(m, l, nh)
+}
+
 /// widths() for a model whose experts have `nh` 128-blocks.
 pub(crate) fn widths_nh(m: &Json, l: usize, nh: usize) -> Result<Option<Widths>, String> {
     let Some(e) = m.get("layers").and_then(|x| x.get(&l.to_string())) else { return Ok(None) };

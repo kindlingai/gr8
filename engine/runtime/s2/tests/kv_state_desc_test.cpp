@@ -448,6 +448,34 @@ int main() {
 
     }
 
+    // Qwen3.8 kv_state: idx_raw + staging pages round-trip and uneven TP=3 block/state agreement.
+    {
+        constexpr uint32_t SL = 2, MP = 4;
+        std::vector<uint8_t> kvp0(SL * MP * 64 * 2 * 1 * 256 * 2, 0), kvs0(SL * 64 * 2 * 1 * 256 * 2, 0);
+        std::vector<uint8_t> ixp0(SL * MP * 16 * 128 * 2, 0), ixs0(SL * 16 * 128 * 2, 0);
+        std::vector<uint8_t> ixr0(SL * 4 * 128 * 2, 0);
+        std::vector<uint8_t> gdn_s(SL * 16 * 128 * 128 * 4, 0), gdn_c(SL * 3 * 3328 * 2, 0);
+        std::vector<uint8_t> ple_c(SL * 9 * 10240 * 2, 0), ple_ctx(SL * 8, 0);
+        std::vector<Qw38FullKvLayer> fl0 = {{kvp0.data(), kvs0.data(), ixp0.data(), ixs0.data(), ixr0.data()}};
+        std::vector<Qw38GdnStateLayer> gl0 = {{gdn_s.data(), gdn_c.data()}};
+        // Rank 0 (nh_kv=1) vs Rank 1 (nh_kv=2) at TP=3 must agree on slot_bytes and state_blocks!
+        const KvStateDesc d0 = qw38_kv_state(fl0, gl0, ple_c.data(), ple_ctx.data(), SL, MP, 1, 16, 3328, 2, 16, 3584);
+        const KvStateDesc d1 = qw38_kv_state(fl0, gl0, ple_c.data(), ple_ctx.data(), SL, MP, 2, 16, 3584, 2, 16, 3584);
+        assert(d0.slot_bytes() == d1.slot_bytes());
+        assert(d0.state_blocks() == d1.state_blocks());
+        // Verify idx_raw bytes survive pack/unpack round-trip across slots!
+        for (size_t i = 0; i < 4 * 128 * 2; ++i) {
+            ixr0[i] = uint8_t((i * 37 + 13) & 0xFFu);
+            ixr0[4 * 128 * 2 + i] = 0xAAu;
+        }
+        std::vector<uint8_t> blk(d0.slot_bytes(), 0);
+        for (uint32_t sub = 0; sub < d0.state_blocks(); ++sub) {
+            d0.pack_state_block_host(pack_state_handle(0, 67), sub, blk.data());
+            d0.unpack_state_block_host(pack_state_handle(1, 67), sub, blk.data());
+        }
+        assert(std::memcmp(ixr0.data(), ixr0.data() + 4 * 128 * 2, 4 * 128 * 2) == 0);
+    }
+
     fs::remove_all(root);
     std::printf("kv_state_desc_test: PASS\n");
     return 0;

@@ -1272,8 +1272,8 @@ class Supervisor:
             front += ['--dialect', model.dialect]
         if model.served:
             front += ['--served-model-name', *model.served]
-        if plan['knobs'].get('REUSE') == '1' or model.dialect == 'glm':
-            # glm keeps prefix reuse on; other models report reused rows in the a line when REUSE=1
+        if plan['knobs'].get('REUSE') == '1' or opt.kv_stores(o) or model.dialect == 'glm':
+            # glm keeps prefix reuse on; other models report reused rows in the a line when REUSE=1 or --kv-store is set
             front += ['--enable-prompt-tokens-details']
         if o.get('DEFAULT_MAX_TOKENS') != '0':
             front += ['--default-max-tokens', o.get('DEFAULT_MAX_TOKENS')]

@@ -240,7 +240,11 @@ __global__ void __launch_bounds__(1024) k_screen_top(const float* __restrict__ y
     __syncthreads();
     mx = s_mx[0];
     for (int i = 1; i < 32; ++i) mx = fmaxf(mx, s_mx[i]);
-    auto bin = [&](float v) { const float b = (mx - v) * (BINS / RANGE); return b < (float)(BINS - 1) ? (int)b : BINS - 1; };
+    auto bin = [&](float v) {
+        if (!isfinite(mx) || !isfinite(v)) return BINS - 1;
+        const float b = (mx - v) * (BINS / RANGE);
+        return b < (float)(BINS - 1) ? max(0, (int)b) : BINS - 1;
+    };
     for (int i = i0; i < i1; ++i) atomicAdd(&hist[bin(row[i])], 1u);
     __syncthreads();
     if (w == 0)                          // cut = the first bin where the count of bins 0..cut reaches SL
@@ -354,8 +358,11 @@ __global__ void __launch_bounds__(1024) k_head_local_sl(glue::HeadArgs a, const 
     for (int i = t; i < a.vn; i += 1024)
     {
         const float lg = row[i];
-        if (lg > mx) { sm = sm * expf(mx - lg) + 1.f; mx = lg; }
-        else sm += expf(lg - mx);
+        if (lg != -INFINITY)
+        {
+            if (lg > mx) { sm = (mx == -INFINITY ? 0.f : sm * expf(mx - lg)) + 1.f; mx = lg; }
+            else sm += expf(lg - mx);
+        }
     }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
@@ -432,8 +439,11 @@ __global__ void __launch_bounds__(1024) k_head_local_sl_map(glue::HeadArgs a, co
     for (int i = t; i < a.vn; i += 1024)
     {
         const float lg = row[i];
-        if (lg > mx) { sm = sm * expf(mx - lg) + 1.f; mx = lg; }
-        else sm += expf(lg - mx);
+        if (lg != -INFINITY)
+        {
+            if (lg > mx) { sm = (mx == -INFINITY ? 0.f : sm * expf(mx - lg)) + 1.f; mx = lg; }
+            else sm += expf(lg - mx);
+        }
     }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)

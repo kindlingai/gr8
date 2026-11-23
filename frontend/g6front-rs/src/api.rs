@@ -772,7 +772,7 @@ async fn with_images(
             .map_err(image_err)?;
     let n_spans: Vec<usize> = prepared.iter().map(|p| p.n_span).collect();
     let (ids, pos) = vision::expand(prompt, &n_spans, model.token()).map_err(image_err)?;
-    let spans = prepared
+    let spans: Vec<vision::Span> = prepared
         .into_iter()
         .zip(pos)
         .map(|(p, pos)| vision::Span {
@@ -783,6 +783,15 @@ async fn with_images(
             key: p.key,
         })
         .collect();
+    // Match frontend/g6s2shim.py IMAGES_B64_MAX so oversized decoded RGB payloads return 400 instead of shim 500.
+    const IMAGES_RGB_B64_MAX: usize = 96 << 20;
+    let total_rgb_b64: usize = spans.iter().map(|s| s.rgb_b64.len()).sum();
+    if total_rgb_b64 > IMAGES_RGB_B64_MAX {
+        return Err(ApiError::bad(
+            &format!("decoded images exceed {} MiB base64 budget", IMAGES_RGB_B64_MAX >> 20),
+            Some("messages"),
+        ));
+    }
     Ok((ids, spans, n_spans))
 }
 
@@ -1448,7 +1457,9 @@ async fn chat_step(
     rf: &jsonmode::Rf,
 ) -> Result<(), ()> {
     let finished = step.finish_reason.is_some();
+    let was_reasoning = parser.in_reasoning();
     let mut delta = parser.delta(&step.text, finished);
+    let has_visible = delta.is_some();
     let first_call = !*tools_streamed && delta.as_ref().is_some_and(|d| !d.tool_calls.is_empty());
     if first_call {
         *tools_streamed = true;
@@ -1481,7 +1492,9 @@ async fn chat_step(
             }
         }
     }
-    let want_lp = lp_k.is_some() && !step.ids.is_empty() && parser.include_reasoning();
+    let want_lp = lp_k.is_some()
+        && !step.ids.is_empty()
+        && (parser.include_reasoning() || has_visible || (!was_reasoning && !parser.in_reasoning()));
     if delta.is_none() && !finished && !want_lp && !ret_ids {
         return Ok(());
     }
@@ -2241,7 +2254,17 @@ mod http_tokenize_chat_tests {
                 g2.lock().unwrap().push(v.clone());
                 let n = (v["max_tokens"].as_u64().unwrap() as usize).min(reply.len());
                 let id = v["id"].clone();
-                wr.write_all(&frame(json!({"type": "tokens", "id": id, "ids": &reply[..n]}))).await.unwrap();
+                if v["logprobs"].is_number() {
+                    let lps: Vec<Value> = reply[..n]
+                        .iter()
+                        .map(|&tid| json!({"lp": -0.25, "rank": 1, "top": [[tid, -0.25]]}))
+                        .collect();
+                    wr.write_all(&frame(json!({"type": "tokens", "id": id, "ids": &reply[..n], "logprobs": lps})))
+                        .await
+                        .unwrap();
+                } else {
+                    wr.write_all(&frame(json!({"type": "tokens", "id": id, "ids": &reply[..n]}))).await.unwrap();
+                }
                 let fin = json!({"type": "finish", "id": id, "reason": "length", "stop_id": null,
                                  "cached_tokens": 0, "completion_tokens": n});
                 wr.write_all(&frame(fin)).await.unwrap();
@@ -2505,6 +2528,101 @@ mod http_tokenize_chat_tests {
         let stream_text = String::from_utf8(streamed).unwrap();
         assert!(stream_text.contains("\"session_id\":\"sess-"), "{stream_text}");
         assert!(stream_text.contains("data: [DONE]"), "{stream_text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stream_logprobs_kept_when_thinking_off_and_hidden_reasoning_not_leaked() {
+        let tok = crate::tok::prefix_tests::fixture(true);
+        let dir = std::env::temp_dir().join(format!("g6front-stream-lp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tok.tk.save(dir.join("tokenizer.json"), false).unwrap();
+        std::fs::write(
+            dir.join("chat_template.jinja"),
+            "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}{% if add_generation_prompt %}assistant:\n{% if enable_thinking is defined and not enable_thinking %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}",
+        )
+        .unwrap();
+        let template = crate::template::ChatTemplate::load(&dir, tok.eos_token.clone(), tok.pad_token.clone()).unwrap();
+        let grammars = crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap();
+        let reply: Vec<u32> = "answer".bytes().map(|b| tok.tk.token_to_id(&(b as char).to_string()).unwrap()).collect();
+        let (engine, _gens) = fake_engine(reply).await;
+        let st: &'static State = Box::leak(Box::new(State {
+            tok,
+            template: Some(template),
+            dialect: Dialect::Qwen,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine,
+            served: vec!["model".into()],
+            model_name: "model".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: true,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars,
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+            sessions: None,
+        }));
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+        // Thinking off (enable_thinking: false) + stream: true + logprobs: true MUST emit content logprobs.
+        let (status, raw) = post_raw(
+            addr,
+            "/v1/chat/completions",
+            &json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 6,
+                "stream": true,
+                "logprobs": true,
+                "top_logprobs": 1,
+                "chat_template_kwargs": {"enable_thinking": false}
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let sse = String::from_utf8(raw).unwrap();
+        assert!(sse.contains("\"logprobs\":{\"content\":["), "thinking_off streaming dropped logprobs: {sse}");
+        assert!(sse.contains("\"token\":\"a\""), "{sse}");
+
+        // Thinking ON + include_reasoning: false MUST NOT leak withheld reasoning tokens via logprobs.
+        let (status, raw_hidden) = post_raw(
+            addr,
+            "/v1/chat/completions",
+            &json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 6,
+                "stream": true,
+                "logprobs": true,
+                "include_reasoning": false
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let sse_hidden = String::from_utf8(raw_hidden).unwrap();
+        assert!(!sse_hidden.contains("\"logprobs\":{\"content\":["), "hidden reasoning leaked via logprobs: {sse_hidden}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The literal-content gate: every case in `literal_golden.json` was tokenized by the release's own tokenizer

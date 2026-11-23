@@ -56,26 +56,26 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     struct Drafts {
         std::array<int, 6> d{};
         int q = -1;
+        int chained_k = 0;
         bool valid = false;
     };
     std::array<Pending, MAX_SESSIONS> pend{};
     std::array<Drafts, MAX_SESSIONS> drafts{};
     std::array<int, MAX_SESSIONS> done_end{};
+    std::array<bool, MAX_SESSIONS> slot_want_lp{};
 
     const auto commit_pending_meta = [&](int q, int kept, std::vector<int>& gdn_slots, std::vector<int>& gdn_kept) {
         Pending& w = pend[size_t(q)];
         if (w.rows <= 0) return;
         kept = std::max(0, std::min(w.rows, kept));
         if (kept < w.rows) {
-            if (kept > 0) {
-                c.engine.mtp_rollback_slot(q, kept - 1);
-                if (kept >= 2) {
-                    c.engine.ple_ctx[size_t(q)][0] = w.toks[size_t(kept - 2)];
-                    c.engine.ple_ctx[size_t(q)][1] = w.toks[size_t(kept - 1)];
-                } else {
-                    c.engine.ple_ctx[size_t(q)][0] = w.ple_ctx[1];
-                    c.engine.ple_ctx[size_t(q)][1] = w.toks[0];
-                }
+            c.engine.mtp_rollback_slot(q, kept);
+            if (kept >= 2) {
+                c.engine.ple_ctx[size_t(q)][0] = w.toks[size_t(kept - 2)];
+                c.engine.ple_ctx[size_t(q)][1] = w.toks[size_t(kept - 1)];
+            } else if (kept == 1) {
+                c.engine.ple_ctx[size_t(q)][0] = w.ple_ctx[1];
+                c.engine.ple_ctx[size_t(q)][1] = w.toks[0];
             } else {
                 c.engine.ple_ctx[size_t(q)] = w.ple_ctx;
             }
@@ -147,6 +147,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                     reinterpret_cast<uint8_t*>(rl.kv.kv_staging),
                     reinterpret_cast<uint8_t*>(rl.kv.idx_pages),
                     reinterpret_cast<uint8_t*>(rl.kv.idx_staging),
+                    reinterpret_cast<uint8_t*>(rl.kv.idx_raw),
                 });
             } else {
                 gl.push_back(Qw38GdnStateLayer{
@@ -162,6 +163,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 reinterpret_cast<uint8_t*>(mkv.kv_staging),
                 reinterpret_cast<uint8_t*>(mkv.idx_pages),
                 reinterpret_cast<uint8_t*>(mkv.idx_staging),
+                reinterpret_cast<uint8_t*>(mkv.idx_raw),
             });
         }
         const int nr = c.engine.o.nr, r = c.rank;
@@ -181,7 +183,13 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
         stash->set_rules(false, true, 0);
 
         std::vector<std::string> specs = c.kv_tiers;
-        if (specs.empty()) specs.push_back("mem:,size=512M,keep=" + c.kv_keep);
+        if (specs.empty()) {
+            // Size the default in-memory prefix cache to hold a full-cap conversation plus sibling state (clamped 512M..4096M).
+            const uint64_t want_blocks = uint64_t(max_pps) + 2ULL * desc.state_blocks() + 16ULL;
+            const uint64_t want_mib = (want_blocks * uint64_t(desc.slot_bytes()) + ((1ULL << 20) - 1ULL)) >> 20;
+            const uint64_t def_mib = std::max<uint64_t>(512ULL, std::min<uint64_t>(4096ULL, want_mib));
+            specs.push_back("mem:,size=" + std::to_string(def_mib) + "M,keep=" + c.kv_keep);
+        }
         const std::string exe = exe_stamp();
         for (size_t i = 0; i < specs.size(); ++i) {
             const auto t = TierSpec::parse(specs[i], false);
@@ -317,7 +325,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             }
             if (p > 0) {
                 sync_ple_ctx_to_dev(q);
-                QW38_CK(cudaStreamSynchronize(c.engine.stream));
+                c.engine.stage_partial_page(q, p, true);
                 std::lock_guard<std::mutex> lk(ck_mu);
                 StoreSlot& ss = store_slots[size_t(q)];
                 if (p > ss.earned) {
@@ -348,6 +356,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     h.bind_request = [&](unsigned slot, const g6rt::ServeReq& r) {
         require(slot < MAX_SESSIONS, "qw38 bind_request: bad slot");
         incoming_sys[slot] = r.sys;
+        slot_want_lp[slot] = (r.lp >= 0 || r.plp >= 0);
         incoming_mrope_delta[slot] = qw38rt::qw38_mrope_delta(r.images);
         incoming_img_geom[slot].clear();
         for (const auto& im : r.images) {
@@ -392,6 +401,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 require(r.valid == int32_t(g.reuse), "qw38 bind: restored position mismatch");
                 drain_store();
                 QW38_CK(cudaStreamSynchronize(c.engine.stream));
+                c.engine.stage_partial_page(q, g.reuse, false);
                 sync_ple_ctx_from_dev(q);
                 ss.hits = r.hits + 1;
                 ss.pages = uint32_t(r.full_pages);
@@ -406,7 +416,11 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
 
     h.retire = [&](const Slot& s) {
         if (!stash && int(s.key.slot) >= 0 && int(s.key.slot) < slots) bound_live[s.key.slot] = false;
-        if (int(s.key.slot) >= 0 && int(s.key.slot) < slots) { pend[s.key.slot] = Pending{}; drafts[s.key.slot] = Drafts{}; }
+        if (int(s.key.slot) >= 0 && int(s.key.slot) < slots) {
+            pend[s.key.slot] = Pending{};
+            drafts[s.key.slot] = Drafts{};
+            slot_want_lp[s.key.slot] = false;
+        }
         QW38_CK(cudaDeviceSynchronize());
     };
     h.fence = []() { QW38_CK(cudaDeviceSynchronize()); };
@@ -420,11 +434,12 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
         if (sp.kind == s2::Step::CHAIN) {
             std::vector<int> u(size_t(M), 0);
             for (size_t j = 0; j < sp.sess.size(); ++j) {
-                const Drafts& d = drafts[size_t(sp.sess[j])];
+                Drafts& d = drafts[size_t(sp.sess[j])];
                 const s2::Row& x = sp.r[size_t(sp.row0[j])];
                 const int i = x.pos - d.q;
                 require(K > 0 && sp.rows[j] == 1 && d.valid && i >= 1 && i < K && x.tok == d.d[size_t(i - 1)],
                         "qw38 chain step does not continue cached draft");
+                d.chained_k = std::max(d.chained_k, i + 1);
                 u[size_t(sp.row0[j])] = d.d[size_t(i)];
             }
             return u;
@@ -463,6 +478,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                     d = Drafts{};
                     for (int t = 0; t < K; ++t) d.d[size_t(t)] = dout[i * size_t(K) + size_t(t)];
                     d.q = dq[i];
+                    d.chained_k = 1;
                     d.valid = true;
                     u[size_t(dlast[i])] = d.d[0];
                 }
@@ -474,11 +490,29 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
         std::vector<int> toks(static_cast<size_t>(M));
         std::vector<qw38rt::RowSample> sm(static_cast<size_t>(M));
         targets.assign(static_cast<size_t>(M), -1);
+        std::vector<bool> is_verify(sp.sess.size(), false);
         bool has_verify = false;
+        bool exact_head = false;
         for (size_t j = 0; j < sp.sess.size(); ++j) {
             const int q = sp.sess[j], r0 = sp.row0[j], n = sp.rows[j];
-            if (K > 0 && sp.round >= 0 && n > 1) has_verify = true;
-            segs.push_back({q, r0, sp.r[size_t(r0)].pos, n});
+            const int pos0 = sp.r[size_t(r0)].pos;
+            if (slot_want_lp[size_t(q)]) exact_head = true;
+            // Distinguish forced-insert MAIN chunks (single session from planner::forced, e.g. forced tool_choice)
+            // from MTP verify steps (round_all). Single-session round_all never uses waterfill, so its verify rows
+            // always satisfy n <= K + 1, pos0 == d.q + 1, (n - 1) <= d.chained_k, and match cached draft tokens.
+            bool ver = (K > 0 && sp.round >= 0 && n > 1);
+            if (ver && sp.sess.size() == 1) {
+                const Drafts& d = drafts[size_t(q)];
+                if (n > K + 1 || !d.valid || pos0 != d.q + 1 || (n - 1) > d.chained_k) {
+                    ver = false;
+                } else {
+                    for (int i = 1; i < n; ++i) {
+                        if (sp.r[size_t(r0 + i)].tok != d.d[size_t(i - 1)]) { ver = false; break; }
+                    }
+                }
+            }
+            if (ver) { is_verify[j] = true; has_verify = true; }
+            segs.push_back({q, r0, pos0, n});
             for (int r = r0; r < r0 + n; ++r) {
                 const s2::Row& x = sp.r[size_t(r)];
                 toks[size_t(r)] = x.tok;
@@ -488,12 +522,12 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             }
         }
         const auto saved_ple_ctx = has_verify ? c.engine.ple_ctx : std::vector<std::array<int32_t, 2>>{};
-        c.engine.forward(segs, toks.data(), sm.data(), out, false, has_verify ? K : 0);
+        c.engine.forward(segs, toks.data(), sm.data(), out, false, has_verify ? K : 0, 0, nullptr, false, exact_head);
         if (K > 0) {
             for (size_t j = 0; j < sp.sess.size(); ++j) {
                 const int q = sp.sess[j], r0 = sp.row0[j], n = sp.rows[j];
                 const int pos0 = sp.r[size_t(r0)].pos;
-                if (sp.round < 0 || n == 1) {
+                if (!is_verify[j]) {
                     if (n > 1) c.engine.mtp_sync_kv(q, r0, pos0, n - 1, &toks[size_t(r0 + 1)]);
                     c.engine.mtp_save_last_hyper(q, r0 + n - 1);
                     done_end[size_t(q)] = pos0 + n;
@@ -542,7 +576,8 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 if (ck > at && ck < step_lim) step_lim = ck;
             }
             const int n = int(step_lim - at);
-            if (K > 0) settle(nullptr);
+            // Do not discard other live sessions' uncommitted verify rows during prefill on slot q.
+            if (K > 0 && pend[size_t(q)].rows > 0) commit_pending(q, 0);
             std::vector<qw38::StepSeg> segs = {{q, 0, int(at), n}};
             if (!p.images.empty()) {
                 const int vis_n = c.engine.vision.stage(p.images, int(at), n, c.engine.stream, c.rank, s.req.id);
@@ -568,7 +603,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             }
             if (stash && p.images.empty() && store_slots[size_t(q)].ckpt && at == store_slots[size_t(q)].ckpt) {
                 sync_ple_ctx_to_dev(q);
-                QW38_CK(cudaStreamSynchronize(c.engine.stream));
+                c.engine.stage_partial_page(q, at, true);
                 std::lock_guard<std::mutex> lk(ck_mu);
                 StoreSlot& ss = store_slots[size_t(q)];
                 if (at > ss.earned) {
@@ -583,7 +618,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
         }
         if (stash && !p.prompt.empty() && limit == p.prompt.size() - 1 && limit > 0) {
             sync_ple_ctx_to_dev(q);
-            QW38_CK(cudaStreamSynchronize(c.engine.stream));
+            c.engine.stage_partial_page(q, limit, true);
             const g6rt::CacheNamespace ns = g6rt::steering::cache_namespace(s.req.steering);
             std::lock_guard<std::mutex> lk(ck_mu);
             StoreSlot& ss = store_slots[size_t(q)];

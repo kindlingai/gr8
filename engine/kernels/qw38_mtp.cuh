@@ -121,7 +121,7 @@ struct Int4Arena {
             total += align256(static_cast<size_t>(p.N) * (p.K >> 5) * sizeof(__half));
         }
         void* ptr = nullptr;
-        if (cudaMalloc(&ptr, total) != cudaSuccess) return 0;
+        if (cudaMalloc(&ptr, total) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
         base = static_cast<uint8_t*>(ptr);
         cap = total;
         used = 0;

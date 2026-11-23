@@ -156,13 +156,13 @@ __global__ void k_gdn_conv1d_dec_batch(const __nv_bfloat16* __restrict__ qkv_raw
 }
 
 // Causal depthwise conv1d (kernel=4, dilation=1) + SiLU over one segment (slot, row0, pos0, len).
-// When conv_snap != nullptr (MTP verify step), saves post-token-t conv ring state into conv_snap[slot, t] for t < len - 1!
+// When conv_snap != nullptr (MTP verify step), saves pre-verify state at index 0 and post-token-t at index t + 1!
 __global__ void k_gdn_conv1d_seg(const __nv_bfloat16* __restrict__ qkv_raw,
                                  const __nv_bfloat16* __restrict__ w,
                                  __nv_bfloat16* __restrict__ conv_hist,
                                  __nv_bfloat16* __restrict__ conv_snap,
                                  __nv_bfloat16* __restrict__ qkv_out,
-                                 int qkv_dim, int slot, int row0, int pos0, int len, int snap_stride_slots, bool update_state,
+                                 int qkv_dim, int slot, int row0, int pos0, int len, int snap_k, bool update_state,
                                  __nv_bfloat16* __restrict__ v_qkv = nullptr, int v_stride = 0) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= qkv_dim) return;
@@ -177,6 +177,14 @@ __global__ void k_gdn_conv1d_seg(const __nv_bfloat16* __restrict__ qkv_raw,
     float h1 = (pos0 > 0) ? __bfloat162float(hbase[1 * qkv_dim + c]) : 0.0f;
     float h2 = (pos0 > 0) ? __bfloat162float(hbase[2 * qkv_dim + c]) : 0.0f;
 
+    const int snap_stride = snap_k + 1;
+    if (conv_snap && snap_k > 0) {
+        __nv_bfloat16* sb0 = conv_snap + (static_cast<size_t>(slot) * snap_stride) * 3 * qkv_dim;
+        sb0[0 * qkv_dim + c] = __float2bfloat16(h0);
+        sb0[1 * qkv_dim + c] = __float2bfloat16(h1);
+        sb0[2 * qkv_dim + c] = __float2bfloat16(h2);
+    }
+
     for (int t = 0; t < len; ++t) {
         const size_t idx = static_cast<size_t>(row0 + t) * qkv_dim + c;
         const float x = __bfloat162float(qkv_raw[idx]);
@@ -189,8 +197,8 @@ __global__ void k_gdn_conv1d_seg(const __nv_bfloat16* __restrict__ qkv_raw,
         h0 = h1;
         h1 = h2;
         h2 = x;
-        if (conv_snap && t < len - 1 && t < snap_stride_slots) {
-            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * snap_stride_slots + t) * 3 * qkv_dim;
+        if (conv_snap && t < len - 1 && t < snap_k) {
+            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * snap_stride + (t + 1)) * 3 * qkv_dim;
             sb[0 * qkv_dim + c] = __float2bfloat16(h0);
             sb[1 * qkv_dim + c] = __float2bfloat16(h1);
             sb[2 * qkv_dim + c] = __float2bfloat16(h2);
@@ -511,6 +519,14 @@ __global__ void k_gdn_conv1d_verify_batch(const __nv_bfloat16* __restrict__ qkv_
     float h1 = (pos0 > 0) ? __bfloat162float(hbase[1 * qkv_dim + c]) : 0.0f;
     float h2 = (pos0 > 0) ? __bfloat162float(hbase[2 * qkv_dim + c]) : 0.0f;
 
+    const int snap_stride = snap_k + 1;
+    if (conv_snap && snap_k > 0) {
+        __nv_bfloat16* sb0 = conv_snap + (static_cast<size_t>(slot) * snap_stride) * 3 * qkv_dim;
+        sb0[0 * qkv_dim + c] = __float2bfloat16(h0);
+        sb0[1 * qkv_dim + c] = __float2bfloat16(h1);
+        sb0[2 * qkv_dim + c] = __float2bfloat16(h2);
+    }
+
     for (int t = 0; t < V; ++t) {
         const size_t ri = static_cast<size_t>(row0 + t) * qkv_dim + c;
         const float x = __bfloat162float(qkv_raw[ri]);
@@ -524,7 +540,7 @@ __global__ void k_gdn_conv1d_verify_batch(const __nv_bfloat16* __restrict__ qkv_
         h1 = h2;
         h2 = x;
         if (conv_snap && t < V - 1 && t < snap_k) {
-            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * snap_k + t) * 3 * qkv_dim;
+            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * snap_stride + (t + 1)) * 3 * qkv_dim;
             sb[0 * qkv_dim + c] = __float2bfloat16(h0);
             sb[1 * qkv_dim + c] = __float2bfloat16(h1);
             sb[2 * qkv_dim + c] = __float2bfloat16(h2);

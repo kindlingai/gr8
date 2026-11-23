@@ -384,7 +384,8 @@ class Release:
             raise modelset.ModelError(f'{self} has no index slices for TP={tp}')
         dense = sorted(p for p in self.files if p.startswith('dense/') and p.endswith('.safetensors')
                        and (self.vision or not p.startswith('dense/vision-')))
-        return slices + dense
+        ple = sorted(p for p in self.files if p.startswith('ple/'))
+        return slices + dense + ple
 
     def key(self, tp, rank, variant):
         lay = f'.layout-{self.layout_sha256[:12]}' if self.layout else ''

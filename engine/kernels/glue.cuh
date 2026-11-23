@@ -944,7 +944,7 @@ constexpr int TP_BINS = 2048;             // local candidate cut: histogram of (
 constexpr float TP_RANGE = 32.f;
 constexpr int TP_SORT = 2048;             // merge sort size: nr * nc must fit
 __host__ __device__ __forceinline__ size_t head_bytes(int M, int nc) { return (size_t)M * (sizeof(HeadRec) + (size_t)nc * sizeof(HeadCand)); }
-__device__ __forceinline__ int tp_bin(float d) { const float b = d * (TP_BINS / TP_RANGE); return b < (float)(TP_BINS - 1) ? (int)b : TP_BINS - 1; }
+__device__ __forceinline__ int tp_bin(float d) { if (!(d >= 0.f)) return 0; const float b = d * (TP_BINS / TP_RANGE); return b < (float)(TP_BINS - 1) ? (int)b : TP_BINS - 1; }
 
 struct HeadArgs
 {
@@ -1002,6 +1002,18 @@ __device__ __forceinline__ void head_local_topp(const HeadArgs& a, int m, const 
     const int t = threadIdx.x, w = t >> 5, l = t & 31;
     float lmx = -INFINITY;
     for (int i = 0; i < 32; ++i) lmx = fmaxf(lmx, s_mx[i]);
+    HeadCand* cand = reinterpret_cast<HeadCand*>(send_slot(a.f, *a.stepp, a.c) + (size_t)a.M * sizeof(HeadRec)) + (size_t)m * a.nc;
+    if (lmx == -INFINITY)
+    {
+        for (int i = t; i < a.nc; i += 1024) cand[i] = HeadCand{-INFINITY, -1};
+        if (t == 0)
+        {
+            HeadRec* r = reinterpret_cast<HeadRec*>(send_slot(a.f, *a.stepp, a.c)) + m;
+            r->pad_[1] = 0.f;
+            r->pad_[2] = -INFINITY;
+        }
+        return;
+    }
     for (int i = t; i < TP_BINS; i += 1024) s_hist[i] = 0u;
     if (t == 0) s_cnt = 0;
     __syncthreads();
@@ -1009,6 +1021,7 @@ __device__ __forceinline__ void head_local_topp(const HeadArgs& a, int m, const 
     for (int i = t; i < a.vn; i += 1024)
     {
         const float lg = row[i];
+        if (lg == -INFINITY) continue;
         z += expf((lg - lmx) * sr.inv_temp);
         atomicAdd(&s_hist[tp_bin(lmx - lg)], 1u);
     }
@@ -1044,20 +1057,25 @@ __device__ __forceinline__ void head_local_topp(const HeadArgs& a, int m, const 
         }
     }
     __syncthreads();
-    HeadCand* cand = reinterpret_cast<HeadCand*>(send_slot(a.f, *a.stepp, a.c) + (size_t)a.M * sizeof(HeadRec)) + (size_t)m * a.nc;
     const int cut = s_cut;
     float um = -INFINITY;                // largest logit not sent
     for (int i = t; i < a.vn; i += 1024)
     {
         const float lg = row[i];
-        if (tp_bin(lmx - lg) <= cut) cand[atomicAdd(&s_cnt, 1)] = HeadCand{lg, a.vlo + i};
+        if (lg == -INFINITY) continue;
+        if (tp_bin(lmx - lg) <= cut)
+        {
+            const int pos = atomicAdd(&s_cnt, 1);
+            if (pos < a.nc) cand[pos] = HeadCand{lg, a.vlo + i};
+        }
         else um = fmaxf(um, lg);
     }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) um = fmaxf(um, __shfl_xor_sync(0xffffffffu, um, o));
     if (l == 0) s_u[w] = um;
     __syncthreads();
-    for (int i = s_cnt + t; i < a.nc; i += 1024) cand[i] = HeadCand{-INFINITY, -1};
+    const int ncand = s_cnt < a.nc ? s_cnt : a.nc;
+    for (int i = ncand + t; i < a.nc; i += 1024) cand[i] = HeadCand{-INFINITY, -1};
     if (t == 0)
     {
         float zs = 0.f, us = -INFINITY;
@@ -1142,10 +1160,11 @@ __global__ void __launch_bounds__(1024) k_head_local(HeadArgs a)
     for (int i = t; i < a.vn; i += 1024)
     {
         const float lg = row[i];
+        if (lg == -INFINITY) continue;
         const int v = a.vlo + i;
         const float sc = sample_score(sr, lg, v);
         if (sc > bs) { bs = sc; bid = v; blg = lg; }   // i ascending per thread -> lowest id on ties
-        if (lg > mx) { sm = sm * expf(mx - lg) + 1.f; mx = lg; }
+        if (lg > mx) { sm = (mx == -INFINITY ? 0.f : sm * expf(mx - lg)) + 1.f; mx = lg; }
         else sm += expf(lg - mx);
     }
     #pragma unroll
@@ -1204,11 +1223,21 @@ __global__ void __launch_bounds__(1024) k_head_local_rs(HeadArgs a, const int* t
     for (int i = t; i < a.vn; i += 1024)
     {
         const float lg = row[i];
+        if (lg == -INFINITY) continue;
         const int v = a.vlo + i;
         const float sc = sample_score(sr, lg, v);
         if (sc > bs && v != d) { bs = sc; bid = v; blg = lg; }   // i ascending per thread -> lowest id on ties
-        if (lg > mx) { sm = sm * expf(mx - lg) + 1.f; zt = zt * expf((mx - lg) * sr.inv_temp) + 1.f; mx = lg; }
-        else { sm += expf(lg - mx); zt += expf((lg - mx) * sr.inv_temp); }
+        if (lg > mx)
+        {
+            sm = (mx == -INFINITY ? 0.f : sm * expf(mx - lg)) + 1.f;
+            zt = (mx == -INFINITY ? 0.f : zt * expf((mx - lg) * sr.inv_temp)) + 1.f;
+            mx = lg;
+        }
+        else
+        {
+            sm += expf(lg - mx);
+            zt += expf((lg - mx) * sr.inv_temp);
+        }
     }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
@@ -1260,7 +1289,7 @@ __global__ void __launch_bounds__(1024) k_head_local_rs(HeadArgs a, const int* t
 // tok / logit: the row's output token and its raw logit, set to d and ld when d is kept.
 __device__ __forceinline__ void rs_accept(const SampleRow& sr, int d, float pd, int& tok, float& logit, float ld)
 {
-    if (uniform01(sr) < pd) { tok = d; logit = ld; }
+    if ((tok == 0x7fffffff && ld != -INFINITY) || uniform01(sr) < pd) { tok = d; logit = ld; }
 }
 
 // grid 1, block 32: wait for the 5 peer records, merge in rank order, write the sampled token + logprob.
@@ -1300,13 +1329,15 @@ template <bool RS> __device__ __forceinline__ void head_merge(const HeadArgs& a,
                     for (int p = 0; p < a.f.nr; ++p)
                     {
                         const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
-                        z += __ldcv(q + 1).z * expf((__ldcv(q).w - mx) * sr.inv_temp);
+                        const float4 v = __ldcv(q), u = __ldcv(q + 1);
+                        if (v.w != -INFINITY && u.z != 0.f) z += u.z * expf((v.w - mx) * sr.inv_temp);
                     }
-                    rs_accept(sr, d, expf((tl - mx) * sr.inv_temp) / z, bid, blg, tl);
+                    const float pd = (tl != -INFINITY && z > 0.f) ? expf((tl - mx) * sr.inv_temp) / z : 0.f;
+                    rs_accept(sr, d, pd, bid, blg, tl);
                 }
             a.tok_out[m] = bid;
-            a.lp_out[m] = blg - mx - logf(sm);
-            if (a.lpt_out) a.lpt_out[m] = tl - mx - logf(sm);
+            a.lp_out[m] = (mx == -INFINITY || blg == -INFINITY) ? -INFINITY : blg - mx - logf(sm);
+            if (a.lpt_out) a.lpt_out[m] = (mx == -INFINITY || tl == -INFINITY) ? -INFINITY : tl - mx - logf(sm);
         }
         if (a.tk && any)
         {
@@ -1375,7 +1406,7 @@ template <bool RS> __device__ __forceinline__ void head_merge_tp(const HeadArgs&
             {
                 const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
                 const float4 v = __ldcv(q), u = __ldcv(q + 1);
-                z += u.z * expf((v.w - mx) * sr.inv_temp);
+                if (v.w != -INFINITY && u.z != 0.f) z += u.z * expf((v.w - mx) * sr.inv_temp);
             }
         s_mx = mx; s_sm = sm; s_tl = tl; s_bid = bid; s_blg = blg; s_z = z; s_cut = cut;
     }
@@ -1468,14 +1499,16 @@ template <bool RS> __device__ __forceinline__ void head_merge_tp(const HeadArgs&
             {
                 for (int i = 1; i < 32; ++i)
                     if (s_best[i] > s_best[0] || (s_best[i] == s_best[0] && s_bi[i] < s_bi[0])) { s_best[0] = s_best[i]; s_bi[0] = s_bi[i]; s_bl[0] = s_bl[i]; }
+                const bool only_d = RS && d >= 0 && s_in && s_bi[0] == 0x7fffffff;
                 if (!RS || s_bi[0] != 0x7fffffff) { s_bid = s_bi[0]; s_blg = s_bl[0]; }   // RS: d was the only kept entry
                 if (RS && d >= 0)
                 {
                     float kz = 0.f;
                     for (int i = 0; i < 32; ++i) kz += s_kz[i];
-                    int bt = s_bid;
+                    int bt = only_d ? 0x7fffffff : s_bid;
                     float bg = s_blg;
-                    rs_accept(sr, d, s_in ? expf((s_ld - mx) * sr.inv_temp) / kz : 0.f, bt, bg, s_in ? s_ld : 0.f);
+                    const float pd = (s_in && kz > 0.f) ? expf((s_ld - mx) * sr.inv_temp) / kz : 0.f;
+                    rs_accept(sr, d, pd, bt, bg, s_in ? s_ld : -INFINITY);
                     s_bid = bt; s_blg = bg;
                 }
             }
@@ -1487,14 +1520,15 @@ template <bool RS> __device__ __forceinline__ void head_merge_tp(const HeadArgs&
     {
         int bt = s_bid;
         float bg = s_blg;
-        rs_accept(sr, d, expf((s_tl - s_mx) * sr.inv_temp) / s_z, bt, bg, s_tl);
+        const float pd = (s_tl != -INFINITY && s_z > 0.f) ? expf((s_tl - s_mx) * sr.inv_temp) / s_z : 0.f;
+        rs_accept(sr, d, pd, bt, bg, s_tl);
         s_bid = bt; s_blg = bg;
     }
     if (t == 0)
     {
         a.tok_out[m] = s_bid;
-        a.lp_out[m] = s_blg - s_mx - logf(s_sm);
-        if (a.lpt_out) a.lpt_out[m] = s_tl - s_mx - logf(s_sm);
+        a.lp_out[m] = (s_mx == -INFINITY || s_blg == -INFINITY) ? -INFINITY : s_blg - s_mx - logf(s_sm);
+        if (a.lpt_out) a.lpt_out[m] = (s_mx == -INFINITY || s_tl == -INFINITY) ? -INFINITY : s_tl - s_mx - logf(s_sm);
     }
     if (a.tk && sr.topk > 0)                  // top list: loaded by the block, merged by thread 0
     {
@@ -1540,10 +1574,11 @@ __global__ void __launch_bounds__(1024) k_head_local_rx(HeadArgs a, const int* t
     for (int i = t; i < a.vn; i += 1024)
     {
         const float lg = row[i];
+        if (lg == -INFINITY) continue;
         const int v = a.vlo + i;
         const float sc = sample_score(sr, lg, v);
         if (sc > bs) { bs = sc; bid = v; blg = lg; }   // i ascending per thread -> lowest id on ties
-        if (lg > mx) { sm = sm * expf(mx - lg) + 1.f; mx = lg; }
+        if (lg > mx) { sm = (mx == -INFINITY ? 0.f : sm * expf(mx - lg)) + 1.f; mx = lg; }
         else sm += expf(lg - mx);
     }
     #pragma unroll

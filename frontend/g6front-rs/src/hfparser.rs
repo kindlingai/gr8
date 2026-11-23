@@ -128,6 +128,11 @@ impl HfParser {
         self
     }
 
+    /// Whether the parser is currently inside (or awaiting) a reasoning block.
+    pub fn in_reasoning(&self) -> bool {
+        matches!(self.mode, Mode::Start | Mode::InThinkStart | Mode::Reasoning)
+    }
+
     /// `--undeclared-tool-calls emit`: a call to an undeclared tool whose name is a plausible identifier is emitted as
     /// a tool call rather than kept as content text.
     pub fn emit_undeclared(mut self, on: bool) -> HfParser {

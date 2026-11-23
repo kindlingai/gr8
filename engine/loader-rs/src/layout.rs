@@ -140,14 +140,19 @@ impl Model {
     pub fn release(man: &Json) -> Result<Model, String> {
         let layers = man.get("layers").and_then(Json::obj).ok_or("the width manifest lists no layers")?;
         let last = layers.keys().filter_map(|k| k.parse::<usize>().ok()).max().ok_or("the width manifest lists no layers")?;
-        let hidden = match man.get("hidden_size") {
-            None => 6144,
-            Some(Json::Str(v)) => v.parse::<u64>().map_err(|_| format!("hidden_size {v}"))?,
-            Some(v) => v.int().ok_or("bad hidden_size")? as u64,
+        let first_nh = layers.values().next()
+            .and_then(|e| e.get("gate")).and_then(Json::arr)
+            .and_then(|g| g.first()).and_then(Json::arr).map(<[_]>::len);
+        let explicit_hidden = match man.get("hidden_size") {
+            None => None,
+            Some(Json::Str(v)) => Some(v.parse::<u64>().map_err(|_| format!("hidden_size {v}"))?),
+            Some(v) => Some(v.int().ok_or("bad hidden_size")? as u64),
         };
-        let is_qw38 = hidden == 2560
+        let is_qw38 = explicit_hidden == Some(2560)
             || man.get("model").and_then(Json::str) == Some("qw38")
-            || man.get("nh").and_then(Json::int) == Some(5);
+            || man.get("nh").and_then(Json::int) == Some(5)
+            || first_nh == Some(5);
+        let hidden = explicit_hidden.unwrap_or(if is_qw38 { 2560 } else { 6144 });
         let geom = if is_qw38 { ModelGeom::QW38 } else { ModelGeom::GLM };
         let mut groups = vec![(Group::Vocab, vec![0; geom.vtiles])];
         for l in 0..=last {

@@ -92,7 +92,7 @@ INK2_IMAGE_TOKEN, INK2_PATCH, INK2_MERGE, INK2_MIN_TOKENS, INK2_MAX_TOKENS = 200
 # Qwen3.8-Flash-Next (vision.s2 says qw38): engine/runtime/qw38_vision_plan.h
 QW38_IMAGE_TOKEN, QW38_PATCH, QW38_MERGE, QW38_MIN_TOKENS, QW38_MAX_TOKENS = 248056, 16, 2, 1, 16384
 IMAGES_MAX = 16
-IMAGES_B64_MAX = 48 << 20
+IMAGES_B64_MAX = 96 << 20
 
 
 def payload_hash(data: bytes) -> int:

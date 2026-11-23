@@ -780,7 +780,6 @@ __device__ __forceinline__ void tr3_fc1_body_nt(const K1Args& A, int plan, int s
     const int steps = KSU >> s_wg;
     const int ksq = q * steps;
     const int csteps = (A.WG == 4) ? 8 : (A.WG == 2 ? (steps < 24 ? steps : 24) : (steps < 48 ? steps : 48));
-    const int cblks = csteps >> 3;
     const __half* suh = A.t_v1 + (row * 2 + mat) * HID;
     const bool wide4 = BS && BITS == 4 && A.t_wide4;
     const bool wide = !wide4 && trw_ok<BITS>() && A.t_wide;
@@ -796,6 +795,8 @@ __device__ __forceinline__ void tr3_fc1_body_nt(const K1Args& A, int plan, int s
     for (int c0 = 0; c0 < steps; c0 += csteps)
     {
         if (c0) __syncthreads();
+        const int cur_steps = (steps - c0 < csteps) ? (steps - c0) : csteps;
+        const int cur_blks = cur_steps >> 3;
         const int g_base = (ks0 + ksq + c0) >> 3;
         const uint8_t* g4 = mw + static_cast<size_t>(g_base) * TR4W_GROUP + (j * 2) * 512 + lane * 16;
         const uint8_t* base = mw + (static_cast<size_t>(ks0 + ksq + c0) * 8 + j) * TB;
@@ -833,12 +834,12 @@ __device__ __forceinline__ void tr3_fc1_body_nt(const K1Args& A, int plan, int s
             const int mask_t = masks[ti];
             const int nact = __popc(mask_t & 0xff);
             const int m0 = __ffs(mask_t) - 1;
-            const int ntask = nact * A.WG * cblks;
+            const int ntask = nact * A.WG * cur_blks;
             for (int task = warp; task < ntask; task += nwarps)
             {
                 const int col = (nact == 1) ? m0 : __fns(mask_t, 0, (task % nact) + 1);
                 const int qblk = task / nact;
-                const int qq = qblk / cblks, b_in_c = qblk % cblks;
+                const int qq = qblk / cur_blks, b_in_c = qblk % cur_blks;
                 const int tok = (ss < A.n_slots) ? A.slot_tok[(plan * SMAX + ss) * 8 + col] : (ss - A.n_slots) * 8 + col;
                 const int k = (ks0 + qq * steps + c0 + b_in_c * 8) * 16 + lane * 4;
                 const uint2 xr = *reinterpret_cast<const uint2*>(A.x + tok * HID + k);
@@ -870,10 +871,10 @@ __device__ __forceinline__ void tr3_fc1_body_nt(const K1Args& A, int plan, int s
         {
             if (wide4)
             {
-                for (int g = 0; g < cblks; ++g)
+                for (int g = 0; g < cur_blks; ++g)
                 {
                     const u32 w[8] = {nw4_0.x, nw4_0.y, nw4_0.z, nw4_0.w, nw4_1.x, nw4_1.y, nw4_1.z, nw4_1.w};
-                    if (g + 1 < cblks)
+                    if (g + 1 < cur_blks)
                     {
                         const uint8_t* gp = g4 + static_cast<size_t>(g + 1) * TR4W_GROUP;
                         nw4_0 = tr4w_ld128(gp);
@@ -897,10 +898,10 @@ __device__ __forceinline__ void tr3_fc1_body_nt(const K1Args& A, int plan, int s
         {
             if (wide)
             {
-                for (int s = 0; s < csteps; s += 8)
+                for (int s = 0; s < cur_steps; s += 8)
                 {
                     const u64 w[3] = {nw[0], nw[1], nw[2]};
-                    if (s + 8 < csteps)
+                    if (s + 8 < cur_steps)
                     {
                         #pragma unroll
                         for (int n = 0; n < trw_nw<BITS>(); ++n) nw[n] = ld_nc64(g0 + static_cast<size_t>(s + 8) * 8 * TB + n * 2048);
@@ -918,12 +919,12 @@ __device__ __forceinline__ void tr3_fc1_body_nt(const K1Args& A, int plan, int s
                 continue;
             }
         }
-        for (int s = 0; s < csteps; s += TR3_UNR)
+        for (int s = 0; s < cur_steps; s += TR3_UNR)
         {
             u32 wa[TR3_UNR];
             #pragma unroll
             for (int p = 0; p < TR3_UNR; ++p) wa[p] = na[p];
-            if (s + TR3_UNR < csteps)
+            if (s + TR3_UNR < cur_steps)
             {
                 #pragma unroll
                 for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(base + static_cast<size_t>(s + TR3_UNR + p) * 8 * TB, lane);
