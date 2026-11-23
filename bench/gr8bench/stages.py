@@ -64,7 +64,16 @@ def info(ctx):
 
 
 def smoke(ctx):
-    script = REPO / 'smoketest' / ('ds41.sh' if ctx.cl.model.startswith('deepseek') else 'run.sh')
+    m = ctx.cl.model.lower()
+    if m.startswith('deepseek'):
+        name = 'ds41.sh'
+    elif m.startswith(('qwen3.8', 'qw38')):
+        name = 'qw38.sh'
+    elif m.startswith(('inkling', 'ink2')):
+        name = 'ink2.sh'
+    else:
+        name = 'run.sh'
+    script = REPO / 'smoketest' / name
     p = subprocess.run(['bash', str(script), ctx.cl.url, ctx.cl.model], capture_output=True, text=True, timeout=1800)
     lines = p.stdout.strip().splitlines()
     m = re.match(r'(\d+)/(\d+) passed', lines[-1]) if lines else None
