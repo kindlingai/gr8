@@ -495,12 +495,12 @@ jobs:
           if-no-files-found: error
 
   image:
-    name: Container image (linux/arm64)
+    name: Container image (linux/arm64, push)
     # The runtime image around the rust and engine jobs' binaries: the Dockerfile's dist stage is replaced by them (a
-    # named build context), so nothing is compiled here. Pushed to ghcr.io from main and from tags, never from a pull
-    # request. A PR that changes only the Dockerfile runs no CPU tests, so a skipped cpu does not stop it.
+    # named build context), so nothing is compiled here. This job runs on pushes to main and tags and pushes to ghcr.io
+    # only after the CPU tests pass; image-pr runs the same steps for pull requests and manual runs, which never push.
     needs: [cpu, rust, engine]
-    if: ${{ !cancelled() && needs.engine.result == 'success' && needs.rust.result == 'success' && needs.cpu.result != 'failure' }}
+    if: ${{ github.event_name == 'push' && !cancelled() && needs.engine.result == 'success' && needs.rust.result == 'success' && needs.cpu.result != 'failure' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     # main's runs overlap, so their pushes take turns, and latest and main move only to main's head (below)
@@ -514,7 +514,7 @@ jobs:
       attestations: write
     env:
       PUSH: ${{ github.event_name == 'push' }}
-    steps:
+    steps: &image-steps
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
@@ -626,6 +626,21 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
+  # image's steps on pull requests and manual runs, which push nothing: it starts once the binaries are built instead of
+  # also waiting for the CPU tests, which finish about five minutes after them. Finalize still needs both to pass.
+  image-pr:
+    name: Container image (linux/arm64)
+    needs: [rust, engine]
+    if: ${{ github.event_name != 'push' && !cancelled() && needs.engine.result == 'success' && needs.rust.result == 'success' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUSH: false
+    steps: *image-steps
+
   finalize:
     name: Finalize
     # The check a PR needs to land. It runs after a failure or a cancellation too, so it always reports. It passes when
@@ -635,7 +650,7 @@ jobs:
     # The label counts only if it was added after GitHub first saw the head commit. pr-ready.yml removes it on a push,
     # but a run with only changes and zip-check can reach this step before that removal.
     if: always()
-    needs: [changes, cpu, cpu-macos, rust, engine, env-lint, zip-check, zip, image]
+    needs: [changes, cpu, cpu-macos, rust, engine, env-lint, zip-check, zip, image, image-pr]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
