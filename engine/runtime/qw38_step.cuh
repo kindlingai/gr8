@@ -864,7 +864,9 @@ struct Engine {
         moe_sc.d_n_groups = dalloc<int>(1);
         moe_sc.grp_exp = dalloc<int>(M * geom::TOPK);
         moe_sc.grp_cnt = dalloc<int>(M * geom::TOPK);
+        moe_sc.grp_off = dalloc<int>(M * geom::TOPK);
         moe_sc.grp_routes = dalloc<int>(M * geom::TOPK * 8);
+        moe_sc.x_had = dalloc<__half>(M * geom::HID);
         moe_sc.fc1_part = dalloc<float>(8 * geom::TOPK * size_t(g6nr::EB) * 2 * 2 * 128);
         moe_sc.fc1_act = dalloc<__half>(M * geom::TOPK * size_t(g6nr::EB) * 128);
         moe_sc.fc2_part = dalloc<float>(M * geom::TOPK * geom::HID);
