@@ -47,6 +47,7 @@ struct FullLayerKv {
     __nv_bfloat16* kv_pages = nullptr;
     __nv_bfloat16* idx_pages = nullptr;
     __nv_bfloat16* idx_raw = nullptr;
+    __nv_bfloat16* idx_raw_snap = nullptr; // optional [slots, max_K, 4, 128] BF16 (MTP rollback)
     // Optional staging pages for StashPool partial-page checkpoints
     __nv_bfloat16* kv_staging = nullptr;
     __nv_bfloat16* idx_staging = nullptr;
@@ -228,8 +229,9 @@ __global__ void k_qsa_q_norm_rope(const __nv_bfloat16* __restrict__ idx_qk,
 __global__ void k_qsa_k_update_seg(const __nv_bfloat16* __restrict__ idx_qk,
                                    const __nv_bfloat16* __restrict__ k_norm_w,
                                    __nv_bfloat16* __restrict__ idx_raw,
+                                   __nv_bfloat16* __restrict__ idx_raw_snap,
                                    __nv_bfloat16* __restrict__ idx_pages,
-                                   int max_pages, int slot, int row0, int pos0, int len, float eps) {
+                                   int max_pages, int slot, int row0, int pos0, int len, int snap_k, float eps) {
     const int d = threadIdx.x; // 0..127
     __nv_bfloat16* raw_slot = idx_raw + static_cast<size_t>(slot) * 4 * 128;
     __shared__ float sm[4];
@@ -269,6 +271,11 @@ __global__ void k_qsa_k_update_seg(const __nv_bfloat16* __restrict__ idx_qk,
                 dst[d] = __float2bfloat16(normed);
             }
             __syncthreads();
+        }
+        if (idx_raw_snap && t < len - 1 && t < snap_k) {
+            __nv_bfloat16* sb = idx_raw_snap + (static_cast<size_t>(slot) * snap_k + t) * 4 * 128;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) sb[k * 128 + d] = raw_slot[k * 128 + d];
         }
     }
 }
@@ -663,13 +670,76 @@ inline int gqa_split_count(int M, int nh_kv, int max_pos, bool has_split) {
     return 1;
 }
 
+// Graph-safe batched MTP verify QSA K update across S sessions x V tokens/session!
+// Grid: (S), Block: 128 threads.
+__global__ void k_qsa_k_update_verify_batch(const __nv_bfloat16* __restrict__ idx_qk,
+                                            const __nv_bfloat16* __restrict__ k_norm_w,
+                                            __nv_bfloat16* __restrict__ idx_raw,
+                                            __nv_bfloat16* __restrict__ idx_raw_snap,
+                                            __nv_bfloat16* __restrict__ idx_pages,
+                                            const int* __restrict__ row_slot,
+                                            const int* __restrict__ row_pos,
+                                            int max_pages, int S, int V, int snap_k, float eps) {
+    const int s = blockIdx.x;
+    if (s >= S) return;
+    const int d = threadIdx.x; // 0..127
+    const int row0 = s * V;
+    const int slot = row_slot[row0];
+    const int pos0 = row_pos[row0];
+    __nv_bfloat16* raw_slot = idx_raw + static_cast<size_t>(slot) * 4 * 128;
+    __shared__ float sm[4];
+    __shared__ float kf[128];
+
+    for (int t = 0; t < V; ++t) {
+        const int pos = pos0 + t;
+        const int sub = pos & 3;
+        const __nv_bfloat16 kv = idx_qk[static_cast<size_t>(row0 + t) * geom::IDX_PROJ_OUT + geom::IDX_HEADS * 128 + d];
+        raw_slot[sub * 128 + d] = kv;
+        __syncthreads();
+        if (sub == 3) {
+            const float avg = 0.25f * (
+                __bfloat162float(raw_slot[0 * 128 + d]) +
+                __bfloat162float(raw_slot[1 * 128 + d]) +
+                __bfloat162float(raw_slot[2 * 128 + d]) +
+                __bfloat162float(raw_slot[3 * 128 + d]));
+            const float avg_bf = __bfloat162float(__float2bfloat16(avg));
+            const float ss = warp_sum(avg_bf * avg_bf);
+            if ((d & 31) == 0) sm[d >> 5] = ss;
+            __syncthreads();
+            const float inv = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / 128.0f + eps);
+            const float normed = __bfloat162float(__float2bfloat16(avg_bf * inv * (1.0f + __bfloat162float(k_norm_w[d]))));
+            kf[d] = normed;
+            __syncthreads();
+
+            const int blk = pos >> 2;
+            const int page = blk >> 4;
+            const int boff = blk & 15;
+            __nv_bfloat16* dst = idx_pages + ((static_cast<size_t>(slot) * max_pages + page) * 16 + boff) * 128;
+            if (d < geom::ROPE_DIM / 2) {
+                float x0 = kf[d], x1 = kf[d + geom::ROPE_DIM / 2];
+                apply_partial_rope_pair(x0, x1, blk * 4, d);
+                dst[d] = __float2bfloat16(x0);
+                dst[d + geom::ROPE_DIM / 2] = __float2bfloat16(x1);
+            } else if (d >= geom::ROPE_DIM) {
+                dst[d] = __float2bfloat16(normed);
+            }
+            __syncthreads();
+        }
+        if (idx_raw_snap && t < V - 1 && t < snap_k) {
+            __nv_bfloat16* sb = idx_raw_snap + (static_cast<size_t>(slot) * snap_k + t) * 4 * 128;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) sb[k * 128 + d] = raw_slot[k * 128 + d];
+        }
+    }
+}
+
 // Execute one full-attention + QSA layer on rank `rank` of `nr`.
 // Writes this rank's partial output [M, 2560] BF16 into `out_part`.
 inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, FullLayerKv& kv, FullAttnScratch& sc,
                               const __nv_bfloat16* x, __nv_bfloat16* out_part,
                               const int* row_slot_dev, const int* row_pos_dev,
                               const StepSeg* segs, int nsegs, int M, int nr, int rank,
-                              int max_pages, int max_blocks, cudaStream_t st) {
+                              int max_pages, int max_blocks, cudaStream_t st, int snap_k = 0) {
     const int nh_q = geom::nh_q(nr);
     const int nh_kv = geom::nh_kv(nr, rank);
     const int q0 = geom::q0(nr, rank);
@@ -677,17 +747,20 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
 
     int max_pos = 0;
     bool all_len1 = (nsegs == M);
+    const int V = snap_k + 1;
+    bool all_verify = (snap_k > 0 && nsegs > 0 && nsegs * V == M);
     for (int s = 0; s < nsegs; ++s) {
         if (segs[s].len > 0) {
             const int ep = segs[s].pos0 + segs[s].len - 1;
             if (ep > max_pos) max_pos = ep;
         }
         if (segs[s].len != 1 || segs[s].row0 != s) all_len1 = false;
+        if (segs[s].len != V || segs[s].row0 != s * V) all_verify = false;
     }
     const bool need_qsa = ((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS;
 
     // 1. Projections (Q+gate, K, V, and QSA index_qk)
-    if (M <= 8) {
+    if ((M <= 12 && w.fp8_q.q) || M <= 8) {
         if (w.fp8_q.q) {
             launch_fp8_gemv_smallm<false>(x, w.fp8_q, sc.q_gate, M, st);
             launch_fp8_gemv_smallm<false>(x, w.fp8_k, sc.k, M, st);
@@ -715,11 +788,15 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
     if (all_len1) {
         k_qsa_k_update_dec_batch<<<M, 128, 0, st>>>(sc.idx_qk, w.idx_k_norm, kv.idx_raw, kv.idx_pages,
                                                     row_slot_dev, row_pos_dev, max_pages, M, geom::RMS_EPS);
+    } else if (all_verify) {
+        k_qsa_k_update_verify_batch<<<nsegs, 128, 0, st>>>(sc.idx_qk, w.idx_k_norm, kv.idx_raw, kv.idx_raw_snap, kv.idx_pages,
+                                                           row_slot_dev, row_pos_dev, max_pages, nsegs, V, snap_k, geom::RMS_EPS);
     } else {
         for (int s = 0; s < nsegs; ++s) {
             if (segs[s].len <= 0) continue;
-            k_qsa_k_update_seg<<<1, 128, 0, st>>>(sc.idx_qk, w.idx_k_norm, kv.idx_raw, kv.idx_pages,
-                                                  max_pages, segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, geom::RMS_EPS);
+            k_qsa_k_update_seg<<<1, 128, 0, st>>>(sc.idx_qk, w.idx_k_norm, kv.idx_raw,
+                                                  snap_k > 0 ? kv.idx_raw_snap : nullptr, kv.idx_pages,
+                                                  max_pages, segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, snap_k, geom::RMS_EPS);
         }
     }
     if (need_qsa) {
@@ -740,7 +817,7 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
             sc.split_m, sc.split_l, sc.split_o, sc.gate, sc.attn_out, M, nh_q, NS);
     }
 
-    if (M <= 8) {
+    if ((M <= 12 && w.fp8_o.q) || M <= 8) {
         if (w.fp8_o.q) {
             launch_fp8_gemv_smallm<false>(sc.attn_out, w.fp8_o, out_part, M, st);
         } else {

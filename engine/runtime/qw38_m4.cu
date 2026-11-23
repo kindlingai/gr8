@@ -92,11 +92,12 @@ struct Wire {
         }
     }
 
-    // Multi-collective single-step device-driven AR (ncoll = 2*L + 1, ZERO syncs across all 96 layer collectives!)
-    void fast_begin(int M, bool skip_head, cudaStream_t st) {
+    // Multi-collective single-step device-driven AR (ncoll = 2*L + 1, ZERO syncs across all layer collectives!)
+    void fast_begin(int M, bool skip_head, int n_layers_override, cudaStream_t st) {
+        const int nl = (n_layers_override > 0) ? n_layers_override : n_layers;
         const uint32_t wire_part = static_cast<uint32_t>((size_t(M) * geom::HID * 2 + 15) / 16 * 16);
         const uint32_t wire_head = static_cast<uint32_t>((size_t(M) * head_rb + 7) / 8 * 8);
-        std::vector<uint32_t> sizes(static_cast<size_t>(2 * n_layers + (skip_head ? 0 : 1)), wire_part);
+        std::vector<uint32_t> sizes(static_cast<size_t>(2 * nl + (skip_head ? 0 : 1)), wire_part);
         if (!skip_head) sizes.back() = wire_head;
         fab.enqueue_step(step, sizes);
         QW38_CK(cudaMemcpyAsync(d_step, &step, sizeof(step), cudaMemcpyHostToDevice, st));
@@ -237,7 +238,7 @@ int main(int argc, char** argv) {
     o.rank0 = rank;
     o.nloc = 1;
     o.slots = s2sess;
-    o.max_rows = std::max(prefill, std::max(chunk, o.slots));
+    o.max_rows = std::max(prefill, std::max(chunk, o.slots * (mtp + 1)));
     o.cap = cap;
     o.nc = std::max(nc, 1);
     o.mtp = mtp;
@@ -272,7 +273,7 @@ int main(int argc, char** argv) {
         wire.head_rb = head_row_bytes(o.nc);
         if (wire.fast) {
             wire.d_step = qw38rt::dalloc<unsigned long long>(1);
-            e.step_begin = [&](int M, bool skip_head) { wire.fast_begin(M, skip_head, e.stream); };
+            e.step_begin = [&](int M, bool skip_head, int nl) { wire.fast_begin(M, skip_head, nl, e.stream); };
             e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.fast_dev(c, p, b, e.stream); };
             e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.fast_host(c, p, b); };
             e.step_end = [&]() { wire.fast_end(e.stream); };
@@ -336,6 +337,11 @@ int main(int argc, char** argv) {
             std::vector<RowSample> sm(static_cast<size_t>(n));
             for (int i = 0; i < n; ++i) sm[size_t(i)] = RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};
             e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last);
+            if (e.has_mtp) {
+                const int sync_n = std::min(n, P - 1 - p);
+                if (sync_n > 0) e.mtp_sync_kv(s, 0, p, sync_n, &prompt[size_t(p + 1)]);
+                if (last) e.mtp_save_last_hyper(s, n - 1);
+            }
             if (last) next[size_t(s)] = out[size_t(n - 1)].tok;
         }
     }
@@ -343,19 +349,35 @@ int main(int argc, char** argv) {
     const auto t_pf1 = std::chrono::steady_clock::now();
 
     const auto t_dec0 = std::chrono::steady_clock::now();
+    int total_drafted = 0, total_accepted = 0, mtp_rounds = 0;
     if (gen > 0) {
         for (int s = 0; s < S; ++s) said[size_t(s)].push_back(next[size_t(s)]);
-        for (int g = 1; g < gen; ++g) {
-            std::vector<qw38::StepSeg> segs;
-            std::vector<RowSample> sm;
-            for (int s = 0; s < S; ++s) {
-                segs.push_back({s, s, P + g - 1, 1});
-                sm.push_back(RowSample{inv_temp, top_p, seed, uint32_t(P + g)});
+        if (e.has_mtp && mtp > 0) {
+            std::vector<int> pos(static_cast<size_t>(S), P);
+            auto all_done = [&]() {
+                for (int s = 0; s < S; ++s)
+                    if (static_cast<int>(said[size_t(s)].size()) < gen) return false;
+                return true;
+            };
+            while (!all_done()) {
+                e.mtp_round(S, mtp, next, pos, inv_temp, top_p, seed, said, total_drafted, total_accepted);
+                ++mtp_rounds;
             }
-            e.forward(segs, next.data(), sm.data(), out, false);
-            for (int s = 0; s < S; ++s) {
-                next[size_t(s)] = out[size_t(s)].tok;
-                said[size_t(s)].push_back(next[size_t(s)]);
+            for (int s = 0; s < S; ++s)
+                if (static_cast<int>(said[size_t(s)].size()) > gen) said[size_t(s)].resize(size_t(gen));
+        } else {
+            for (int g = 1; g < gen; ++g) {
+                std::vector<qw38::StepSeg> segs;
+                std::vector<RowSample> sm;
+                for (int s = 0; s < S; ++s) {
+                    segs.push_back({s, s, P + g - 1, 1});
+                    sm.push_back(RowSample{inv_temp, top_p, seed, uint32_t(P + g)});
+                }
+                e.forward(segs, next.data(), sm.data(), out, false);
+                for (int s = 0; s < S; ++s) {
+                    next[size_t(s)] = out[size_t(s)].tok;
+                    said[size_t(s)].push_back(next[size_t(s)]);
+                }
             }
         }
     }
@@ -366,8 +388,14 @@ int main(int argc, char** argv) {
     const double dec_ms = std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count();
     if (rank == 0) {
         const double tps_s = gen > 1 ? ((gen - 1) / (dec_ms / 1e3 + 1e-9)) : 0.0;
-        std::fprintf(stderr, "# g6m4_qw38 TP=%d P=%d gen=%d sess=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s/sess, %.2f agg tok/s)\n",
-                     G6_NR, P, gen, S, pf_ms, (P * S) / (pf_ms / 1e3 + 1e-9), dec_ms, tps_s, tps_s * S);
+        std::fprintf(stderr, "# g6m4_qw38 TP=%d P=%d gen=%d sess=%d mtp=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s/sess, %.2f agg tok/s)",
+                     G6_NR, P, gen, S, mtp, pf_ms, (P * S) / (pf_ms / 1e3 + 1e-9), dec_ms, tps_s, tps_s * S);
+        if (mtp_rounds > 0) {
+            const double acc_rate = total_drafted > 0 ? (100.0 * total_accepted / total_drafted) : 0.0;
+            const double tok_per_round = double(S * mtp_rounds + total_accepted) / double(S * mtp_rounds);
+            std::fprintf(stderr, " [mtp acc=%.1f%%, %.2f tok/round, %d rounds]", acc_rate, tok_per_round, mtp_rounds);
+        }
+        std::fprintf(stderr, "\n");
         if (e.o.profile) e.prof.print(rank);
         for (int s = 0; s < S; ++s) {
             std::printf("session %d:", s);

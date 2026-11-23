@@ -174,7 +174,10 @@ inline void launch_bf16_gemv_smallm(const __nv_bfloat16* A, const __nv_bfloat16*
     const int grid = (N + 3) / 4;
     if (M == 1) k_bf16_gemv_1warp<1, OUT_F32><<<grid, 128, 0, st>>>(A, B, C, M, N, K);
     else if (M <= 4) k_bf16_gemv_1warp<4, OUT_F32><<<grid, 128, 0, st>>>(A, B, C, M, N, K);
-    else k_bf16_gemv_1warp<8, OUT_F32><<<grid, 128, 0, st>>>(A, B, C, M, N, K);
+    else if (M <= 8) k_bf16_gemv_1warp<8, OUT_F32><<<grid, 128, 0, st>>>(A, B, C, M, N, K);
+    else if (M <= 12) k_bf16_gemv_1warp<12, OUT_F32><<<grid, 128, 0, st>>>(A, B, C, M, N, K);
+    else if (M <= 16) k_bf16_gemv_1warp<16, OUT_F32><<<grid, 128, 0, st>>>(A, B, C, M, N, K);
+    else k_bf16_gemv_1warp<20, OUT_F32><<<grid, 128, 0, st>>>(A, B, C, M, N, K);
 }
 
 // Replicate token embeddings into 4 hyper-connection streams: out[m, s, d] = embed[tok[m], d]
@@ -572,25 +575,29 @@ __global__ void __launch_bounds__(256) k_fp8_hc_up_mix_fused(const __nv_bfloat16
 inline void hc_prepare(cublasHandle_t blas, const HcWeights& w, const __nv_bfloat16* hyper_in,
                        __nv_bfloat16* mixed, HcScratch& sc, int M, cudaStream_t st) {
     k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, st>>>(hyper_in, w.norm, sc.hn, M, geom::HC, geom::RMS_EPS);
+    if (M <= 12 && w.fp8_down.q && w.fp8_up.q) {
+        const int down_grid = w.inject ? (geom::HC_RANK + geom::HC) : geom::HC_RANK;
+        const int up_grid = geom::HID / 2;
+        if (M == 1) {
+            k_fp8_hc_down_silu_inj<1><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, 1);
+            k_fp8_hc_up_mix_fused<1><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, 1);
+        } else if (M <= 4) {
+            k_fp8_hc_down_silu_inj<4><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
+            k_fp8_hc_up_mix_fused<4><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
+        } else if (M == 5) {
+            k_fp8_hc_down_silu_inj<5><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
+            k_fp8_hc_up_mix_fused<5><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
+        } else if (M <= 8) {
+            k_fp8_hc_down_silu_inj<8><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
+            k_fp8_hc_up_mix_fused<8><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
+        } else {
+            k_fp8_hc_down_silu_inj<12><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
+            k_fp8_hc_up_mix_fused<12><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
+        }
+        return;
+    }
     if (M <= 8) {
         const int down_grid = w.inject ? (geom::HC_RANK + geom::HC) : geom::HC_RANK;
-        if (w.fp8_down.q && w.fp8_up.q) {
-            const int up_grid = geom::HID / 2;
-            if (M == 1) {
-                k_fp8_hc_down_silu_inj<1><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, 1);
-                k_fp8_hc_up_mix_fused<1><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, 1);
-            } else if (M <= 4) {
-                k_fp8_hc_down_silu_inj<4><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
-                k_fp8_hc_up_mix_fused<4><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
-            } else if (M == 5) {
-                k_fp8_hc_down_silu_inj<5><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
-                k_fp8_hc_up_mix_fused<5><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
-            } else {
-                k_fp8_hc_down_silu_inj<8><<<down_grid, 128, 0, st>>>(sc.hn, w.fp8_down.q, w.fp8_down.sc, w.inject, sc.down, sc.inj, M);
-                k_fp8_hc_up_mix_fused<8><<<up_grid, 256, 0, st>>>(sc.hn, sc.down, w.fp8_up.q, w.fp8_up.sc, mixed, M);
-            }
-            return;
-        }
         const int up_grid = geom::HID / 8;
         if (M == 1) {
             k_hc_down_silu_inj<1><<<down_grid, 256, 0, st>>>(sc.hn, w.down, w.inject, sc.down, sc.inj, 1);

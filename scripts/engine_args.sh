@@ -341,7 +341,7 @@ qw38_defaults() {
   case $CHUNK in [1-8]) ;; *) echo "engine_defaults: CHUNK=$CHUNK: Qwen3.8-Flash-Next takes 1 to 8 prompt rows a step" >&2; return 2 ;; esac
   EAGER=${EAGER:-0}
   case $EAGER in 0|1) ;; *) echo "engine_defaults: EAGER=$EAGER: 0 (--graph) or 1 (eager, no --graph)" >&2; return 2 ;; esac
-  case $MTP in [0-1]) ;; *) echo "engine_defaults: MTP=$MTP: Qwen3.8-Flash-Next drafts 0 or 1 token a round" >&2; return 2 ;; esac
+  case $MTP in [0-3]) ;; *) echo "engine_defaults: MTP=$MTP: Qwen3.8-Flash-Next drafts 0 to 3 tokens a round" >&2; return 2 ;; esac
   case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: Qwen3.8-Flash-Next serves 1 to 8 sessions" >&2; return 2 ;; esac
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-0}
 }

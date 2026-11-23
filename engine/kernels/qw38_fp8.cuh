@@ -194,7 +194,10 @@ inline void launch_fp8_gemv_smallm(const __nv_bfloat16* A, const Fp8Mat& B, void
     if (M == 1) k_fp8_gemv_1warp<1, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
     else if (M <= 4) k_fp8_gemv_1warp<4, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
     else if (M == 5) k_fp8_gemv_1warp<5, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
-    else k_fp8_gemv_1warp<8, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
+    else if (M <= 8) k_fp8_gemv_1warp<8, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
+    else if (M <= 12) k_fp8_gemv_1warp<12, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
+    else if (M <= 16) k_fp8_gemv_1warp<16, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
+    else k_fp8_gemv_1warp<20, OUT_F32><<<grid, 128, 0, st>>>(A, B.q, B.sc, C, M, B.N, B.K);
 }
 
 // Single-allocation aligned device arena for all on-load FP8 weights & scales.

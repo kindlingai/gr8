@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
     o.rank0 = 0;
     o.nloc = G6_NR;
     o.slots = sessions;
-    o.max_rows = std::max(chunk, sessions);
+    o.max_rows = std::max(chunk, sessions * (mtp + 1));
     o.cap = cap;
     o.nc = std::max(nc, 1);
     o.mtp = mtp;
@@ -90,6 +90,11 @@ int main(int argc, char** argv) {
             std::vector<RowSample> sm(static_cast<size_t>(n));
             for (int i = 0; i < n; ++i) sm[size_t(i)] = RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};
             e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last_chunk);
+            if (e.has_mtp) {
+                const int sync_n = std::min(n, P - 1 - p);
+                if (sync_n > 0) e.mtp_sync_kv(s, 0, p, sync_n, &prompt[size_t(p + 1)]);
+                if (last_chunk) e.mtp_save_last_hyper(s, n - 1);
+            }
             if (last_chunk) next[size_t(s)] = out[size_t(n - 1)].tok;
         }
     }
@@ -97,21 +102,37 @@ int main(int argc, char** argv) {
     const auto t_pf1 = std::chrono::steady_clock::now();
 
     const auto t_dec0 = std::chrono::steady_clock::now();
+    int total_drafted = 0, total_accepted = 0, mtp_rounds = 0;
     if (gen > 0) {
         for (int s = 0; s < sessions; ++s) said[size_t(s)].push_back(next[size_t(s)]);
-        for (int g = 1; g < gen; ++g) {
-            std::vector<qw38::StepSeg> segs;
-            std::vector<int> tk;
-            std::vector<RowSample> sm;
-            for (int s = 0; s < sessions; ++s) {
-                segs.push_back({s, s, P + g - 1, 1});
-                tk.push_back(next[size_t(s)]);
-                sm.push_back(RowSample{inv_temp, top_p, seed, uint32_t(P + g)});
+        if (e.has_mtp && mtp > 0) {
+            std::vector<int> pos(size_t(sessions), P);
+            auto all_done = [&]() {
+                for (int s = 0; s < sessions; ++s)
+                    if (static_cast<int>(said[size_t(s)].size()) < gen) return false;
+                return true;
+            };
+            while (!all_done()) {
+                e.mtp_round(sessions, mtp, next, pos, inv_temp, top_p, seed, said, total_drafted, total_accepted);
+                ++mtp_rounds;
             }
-            e.forward(segs, tk.data(), sm.data(), out, false);
-            for (int s = 0; s < sessions; ++s) {
-                next[size_t(s)] = out[size_t(s)].tok;
-                said[size_t(s)].push_back(next[size_t(s)]);
+            for (int s = 0; s < sessions; ++s)
+                if (static_cast<int>(said[size_t(s)].size()) > gen) said[size_t(s)].resize(size_t(gen));
+        } else {
+            for (int g = 1; g < gen; ++g) {
+                std::vector<qw38::StepSeg> segs;
+                std::vector<int> tk;
+                std::vector<RowSample> sm;
+                for (int s = 0; s < sessions; ++s) {
+                    segs.push_back({s, s, P + g - 1, 1});
+                    tk.push_back(next[size_t(s)]);
+                    sm.push_back(RowSample{inv_temp, top_p, seed, uint32_t(P + g)});
+                }
+                e.forward(segs, tk.data(), sm.data(), out, false);
+                for (int s = 0; s < sessions; ++s) {
+                    next[size_t(s)] = out[size_t(s)].tok;
+                    said[size_t(s)].push_back(next[size_t(s)]);
+                }
             }
         }
     }
@@ -120,9 +141,15 @@ int main(int argc, char** argv) {
 
     const double pf_ms = std::chrono::duration<double, std::milli>(t_pf1 - t_pf0).count();
     const double dec_ms = std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count();
-    std::fprintf(stderr, "# m4sim_qw38 TP=%d P=%d gen=%d sess=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s/sess)\n",
-                 G6_NR, P, gen, sessions, pf_ms, (P * sessions) / (pf_ms / 1e3 + 1e-9),
-                 dec_ms, gen > 1 ? ((gen - 1) / (dec_ms / 1e3 + 1e-9)) : 0.0);
+    const double tps = gen > 1 ? ((gen - 1) / (dec_ms / 1e3 + 1e-9)) : 0.0;
+    std::fprintf(stderr, "# m4sim_qw38 TP=%d P=%d gen=%d sess=%d mtp=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s/sess, %.2f agg tok/s)",
+                 G6_NR, P, gen, sessions, mtp, pf_ms, (P * sessions) / (pf_ms / 1e3 + 1e-9), dec_ms, tps, tps * sessions);
+    if (mtp_rounds > 0) {
+        const double acc_rate = total_drafted > 0 ? (100.0 * total_accepted / total_drafted) : 0.0;
+        const double tok_per_round = double(sessions * mtp_rounds + total_accepted) / double(sessions * mtp_rounds);
+        std::fprintf(stderr, " [mtp acc=%.1f%%, %.2f tok/round, %d rounds]", acc_rate, tok_per_round, mtp_rounds);
+    }
+    std::fprintf(stderr, "\n");
     if (e.o.profile) e.prof.print(0);
 
     for (int s = 0; s < sessions; ++s) {
