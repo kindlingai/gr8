@@ -70,6 +70,31 @@ __device__ __forceinline__ void tr3_fc2_any(const K1Args& A, int plan, int unit,
     else tr3_fc2_body<K2 ? 2 : 4, E4, CB, BS>(A, plan, unit, tr, mask, smem);
 }
 
+// Multi-tile (nt in 2..4) dispatchers for fc1 and fc2 (M > 8 only; weights streamed strictly once across nt tiles).
+template <bool E4, bool K2, bool BS = false, int CB = TR3_MCG>
+__device__ __forceinline__ void tr3_fc1_any_nt(const K1Args& A, int plan, int ss0, int b, int mat, int h, int e,
+                                               int nt, const int (&masks)[4], u32* smem)
+{
+    const long long* tr = A.t_tab + 6 * e;
+    if (b >= static_cast<int>(tr[3])) return;
+    const uint8_t* mw;
+    const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, e, tr, b * 2 + mat, mw);
+    const int4 m4 = make_int4(masks[0], masks[1], masks[2], masks[3]);
+    if ((!BS || K2) && k == 3) tr3_fc1_body_nt<3, E4, BS, CB>(A, plan, ss0, b, mat, h, tr, mw, nt, m4, smem);
+    else if (!K2 || k == 4) tr3_fc1_body_nt<4, E4, BS, CB>(A, plan, ss0, b, mat, h, tr, mw, nt, m4, smem);
+    else tr3_fc1_body_nt<K2 ? 2 : 4, E4, BS, CB>(A, plan, ss0, b, mat, h, tr, mw, nt, m4, smem);
+}
+
+template <bool E4, bool K2, bool BS = false, int CB = TR3_MCG>
+__device__ __forceinline__ void tr3_fc2_any_nt(const K1Args& A, int ss0, int b, int ns,
+                                               const long long* tr, int nt, const int (&masks)[4], u32* smem)
+{
+    const int4 m4 = make_int4(masks[0], masks[1], masks[2], masks[3]);
+    if ((!BS || K2) && tr[4] == 3) tr3_fc2_body_nt<3, E4, CB, BS>(A, ss0, b, ns, tr, nt, m4, smem);
+    else if (!K2 || tr[4] == 4) tr3_fc2_body_nt<4, E4, CB, BS>(A, ss0, b, ns, tr, nt, m4, smem);
+    else tr3_fc2_body_nt<K2 ? 2 : 4, E4, CB, BS>(A, ss0, b, ns, tr, nt, m4, smem);
+}
+
 // Trellis shared-expert slots of a step (SH): one per 8 rows (an n=8 tile each), so 1 at M <= 8; 0 without SH.
 template <bool SH>
 __device__ __forceinline__ int k1_nsh(const K1Args& A)
@@ -101,6 +126,62 @@ __device__ __forceinline__ bool k1_slot(const K1Args& A, int plan, int slot, int
         return true;
     }
     return false;
+}
+
+// Leader-dedup multi-tile slot resolver: groups up to 4 consecutive 8-token slots for the same expert
+// (including the trellis shared expert at M > 8) onto the first slot of each run so weights are read once.
+// Returns nt in 1..4 for a leader slot, or 0 for an inactive / non-leader slot.
+template <bool SH>
+__device__ __forceinline__ int k1_slot_nt(const K1Args& A, int plan, int slot, int& e, int (&masks)[4], int& ss0)
+{
+    if constexpr (g6mx::NT == 1)
+    {
+        int m = 0;
+        if (!k1_slot<SH>(A, plan, slot, e, m, ss0)) return 0;
+        masks[0] = m; masks[1] = masks[2] = masks[3] = 0;
+        return 1;
+    }
+    const int nsh = k1_nsh<SH>(A);
+    if (SH && slot < nsh)
+    {
+        if (slot & 3) return 0;
+        const int nt = (nsh - slot < 4) ? (nsh - slot) : 4;
+        e = A.sh_e;
+        ss0 = A.n_slots + slot;
+        #pragma unroll
+        for (int ti = 0; ti < 4; ++ti)
+        {
+            if (ti < nt)
+            {
+                const int r = A.M - 8 * (slot + ti);
+                masks[ti] = r >= 8 ? 0xff : (1 << r) - 1;
+            }
+            else masks[ti] = 0;
+        }
+        return nt;
+    }
+    const int ss = slot - nsh;
+    const int ns = A.n_slots_dev[plan];
+    if (ss >= ns) return 0;
+    const int* se = A.slot_expert + plan * SMAX;
+    e = se[ss];
+    if (A.M <= 8)
+    {
+        ss0 = ss;
+        masks[0] = A.slot_mask[plan * SMAX + ss];
+        masks[1] = masks[2] = masks[3] = 0;
+        return 1;
+    }
+    int back = 0;
+    while (ss - back > 0 && se[ss - back - 1] == e) ++back;
+    if (back & 3) return 0;
+    int nt = 1;
+    while (nt < 4 && ss + nt < ns && se[ss + nt] == e) ++nt;
+    ss0 = ss;
+    #pragma unroll
+    for (int ti = 0; ti < 4; ++ti)
+        masks[ti] = (ti < nt) ? A.slot_mask[plan * SMAX + ss + ti] : 0;
+    return nt;
 }
 
 // GR8_K1_TLBW (A/B, bind.cuh make_k1): warp 0 of fc1 CTA s, s < the step's item slots, prefetches one L2 line per
@@ -155,9 +236,36 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
     if (A.tlbw && static_cast<int>(blockIdx.x) < A.n_slots + k1_nsh<SH>(A)) k1_tlbw<SH>(A, plan, blockIdx.x);
     if (static_cast<int>(blockIdx.x) < nr)
     {
-        int e, mask, ss;
+        int e, m, ss;
         const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (static_cast<int>(blockIdx.x) >> (__ffs(ups) - 1)) : (static_cast<int>(blockIdx.x) / ups);
-        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH, CB>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem);
+        if (k1_slot<SH>(A, plan, slot, e, m, ss))
+            tr3_fc1_any<E4, K2, SH, CB>(A, plan, blockIdx.x + (ss - slot) * ups, e, m, smem);
+    }
+    else if (!SH) k1_shared_fc1(A, blockIdx.x - nr, reinterpret_cast<float*>(smem));
+    if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
+}
+
+template <bool E4 = false, bool K2 = false, bool SH = false, int CB = TR3_MCG>
+__global__ __launch_bounds__(1024) void k1_tr3_fc1_nt(K1Args A)
+{
+    extern __shared__ __align__(16) u32 smem[];
+    const int plan = A.ctl[0];
+    const int ups = g6nr::EB * 2 * A.KS1, nr = (A.n_slots + k1_nsh<SH>(A)) * ups;
+    if (A.tlbw && static_cast<int>(blockIdx.x) < A.n_slots + k1_nsh<SH>(A)) k1_tlbw<SH>(A, plan, blockIdx.x);
+    if (static_cast<int>(blockIdx.x) < nr)
+    {
+        int e, masks[4], ss;
+        const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (static_cast<int>(blockIdx.x) >> (__ffs(ups) - 1)) : (static_cast<int>(blockIdx.x) / ups);
+        const int nt = k1_slot_nt<SH>(A, plan, slot, e, masks, ss);
+        if (nt == 1) tr3_fc1_any<E4, K2, SH, CB>(A, plan, blockIdx.x + (ss - slot) * ups, e, masks[0], smem);
+        else if (nt > 1)
+        {
+            const int s_ks1 = __ffs(A.KS1) - 1;
+            const int h = static_cast<int>(blockIdx.x) & (A.KS1 - 1);
+            const int u_ks1 = static_cast<int>(blockIdx.x) >> s_ks1, mat = u_ks1 & 1, u_b = u_ks1 >> 1;
+            const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
+            tr3_fc1_any_nt<E4, K2, SH, CB>(A, plan, ss, b, mat, h, e, nt, masks, smem);
+        }
     }
     else if (!SH) k1_shared_fc1(A, blockIdx.x - nr, reinterpret_cast<float*>(smem));
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
@@ -171,9 +279,37 @@ __global__ __launch_bounds__(512, 2) void k1_tr3_fc2(K1Args A)   // 68 -> 64 reg
     const int ups = g6nr::EB * A.NS2, nr = (A.n_slots + k1_nsh<SH>(A)) * ups;
     if (static_cast<int>(blockIdx.x) < nr)
     {
-        int e, mask, ss;
+        int e, m, ss;
         const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (static_cast<int>(blockIdx.x) >> (__ffs(ups) - 1)) : (static_cast<int>(blockIdx.x) / ups);
-        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc2_any<E4, K2, SH, CB>(A, plan, blockIdx.x + (ss - slot) * ups, A.t_tab + 6 * e, mask, smem);
+        if (k1_slot<SH>(A, plan, slot, e, m, ss))
+            tr3_fc2_any<E4, K2, SH, CB>(A, plan, blockIdx.x + (ss - slot) * ups, A.t_tab + 6 * e, m, smem);
+    }
+    else if (!SH) k1_shared_fc2(A, blockIdx.x - nr, smem);
+    if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[2] = plan;
+#if DEC_SLOT >= 2
+    if (A.slot.send && A.s_direct) dslot::publish(A.slot, true);
+#endif
+}
+
+template <bool E4 = false, bool K2 = false, bool SH = false, int CB = TR3_MCG>
+__global__ __launch_bounds__(512, 2) void k1_tr3_fc2_nt(K1Args A)
+{
+    extern __shared__ __align__(16) u32 smem[];
+    const int plan = A.ctl[1];
+    const int ups = g6nr::EB * A.NS2, nr = (A.n_slots + k1_nsh<SH>(A)) * ups;
+    if (static_cast<int>(blockIdx.x) < nr)
+    {
+        int e, masks[4], ss;
+        const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (static_cast<int>(blockIdx.x) >> (__ffs(ups) - 1)) : (static_cast<int>(blockIdx.x) / ups);
+        const int nt = k1_slot_nt<SH>(A, plan, slot, e, masks, ss);
+        if (nt == 1) tr3_fc2_any<E4, K2, SH, CB>(A, plan, blockIdx.x + (ss - slot) * ups, A.t_tab + 6 * e, masks[0], smem);
+        else if (nt > 1)
+        {
+            const int s_ns2 = __ffs(A.NS2) - 1;
+            const int ns = static_cast<int>(blockIdx.x) & (A.NS2 - 1), u_b = static_cast<int>(blockIdx.x) >> s_ns2;
+            const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
+            tr3_fc2_any_nt<E4, K2, SH, CB>(A, ss, b, ns, A.t_tab + 6 * e, nt, masks, smem);
+        }
     }
     else if (!SH) k1_shared_fc2(A, blockIdx.x - nr, smem);
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[2] = plan;
@@ -209,9 +345,32 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1_ovl(K1Args A)
     const int ups = A.B * 2 * A.KS1;
     const int cta = static_cast<int>(blockIdx.x) + (PART == 2 ? k1_nsh<true>(A) * ups : 0);
     if (PART == 2 && A.tlbw && static_cast<int>(blockIdx.x) < A.n_slots) k1_tlbw<true>(A, plan, blockIdx.x + k1_nsh<true>(A));
-    int e, mask, ss;
+    int e, m, ss;
     const int slot = cta / ups;
-    if (k1_slot<true>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, true, CB>(A, plan, cta + (ss - slot) * ups, e, mask, smem);
+    if (k1_slot<true>(A, plan, slot, e, m, ss))
+        tr3_fc1_any<E4, K2, true, CB>(A, plan, cta + (ss - slot) * ups, e, m, smem);
+    if (PART == 2 && blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
+}
+
+template <bool E4, bool K2, int PART, int CB = TR3_MCG, int MAXT = 1024, int MINB = 1>
+__global__ __launch_bounds__(MAXT, MINB) void k1_tr3_fc1_ovl_nt(K1Args A)
+{
+    extern __shared__ __align__(16) u32 smem[];
+    const int plan = A.ctl[0];
+    const int ups = A.B * 2 * A.KS1;
+    const int cta = static_cast<int>(blockIdx.x) + (PART == 2 ? k1_nsh<true>(A) * ups : 0);
+    if (PART == 2 && A.tlbw && static_cast<int>(blockIdx.x) < A.n_slots) k1_tlbw<true>(A, plan, blockIdx.x + k1_nsh<true>(A));
+    int e, masks[4], ss;
+    const int slot = cta / ups;
+    const int nt = k1_slot_nt<true>(A, plan, slot, e, masks, ss);
+    if (nt == 1) tr3_fc1_any<E4, K2, true, CB>(A, plan, cta + (ss - slot) * ups, e, masks[0], smem);
+    else if (nt > 1)
+    {
+        const int s_ks1 = __ffs(A.KS1) - 1;
+        const int h = cta & (A.KS1 - 1), u_ks1 = cta >> s_ks1, mat = u_ks1 & 1, u_b = u_ks1 >> 1;
+        const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
+        tr3_fc1_any_nt<E4, K2, true, CB>(A, plan, ss, b, mat, h, e, nt, masks, smem);
+    }
     if (PART == 2 && blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
 }
 
@@ -222,9 +381,31 @@ __global__ __launch_bounds__(512, 2) void k1_tr3_fc2_ovl(K1Args A)
     const int plan = PART == 2 ? A.ctl[1] : A.ctl[0];
     const int ups = A.B * A.NS2;
     const int cta = static_cast<int>(blockIdx.x) + (PART == 2 ? k1_nsh<true>(A) * ups : 0);
-    int e, mask, ss;
+    int e, m, ss;
     const int slot = cta / ups;
-    if (k1_slot<true>(A, plan, slot, e, mask, ss)) tr3_fc2_any<E4, K2, true, CB>(A, plan, cta + (ss - slot) * ups, A.t_tab + 6 * e, mask, smem);
+    if (k1_slot<true>(A, plan, slot, e, m, ss))
+        tr3_fc2_any<E4, K2, true, CB>(A, plan, cta + (ss - slot) * ups, A.t_tab + 6 * e, m, smem);
+    if (PART == 2 && blockIdx.x == 0 && threadIdx.x == 0) A.ctl[2] = plan;
+}
+
+template <bool E4, bool K2, int PART, int CB = TR3_MCG>
+__global__ __launch_bounds__(512, 2) void k1_tr3_fc2_ovl_nt(K1Args A)
+{
+    extern __shared__ __align__(16) u32 smem[];
+    const int plan = PART == 2 ? A.ctl[1] : A.ctl[0];
+    const int ups = A.B * A.NS2;
+    const int cta = static_cast<int>(blockIdx.x) + (PART == 2 ? k1_nsh<true>(A) * ups : 0);
+    int e, masks[4], ss;
+    const int slot = cta / ups;
+    const int nt = k1_slot_nt<true>(A, plan, slot, e, masks, ss);
+    if (nt == 1) tr3_fc2_any<E4, K2, true, CB>(A, plan, cta + (ss - slot) * ups, A.t_tab + 6 * e, masks[0], smem);
+    else if (nt > 1)
+    {
+        const int s_ns2 = __ffs(A.NS2) - 1;
+        const int ns = cta & (A.NS2 - 1), u_b = cta >> s_ns2;
+        const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
+        tr3_fc2_any_nt<E4, K2, true, CB>(A, ss, b, ns, A.t_tab + 6 * e, nt, masks, smem);
+    }
     if (PART == 2 && blockIdx.x == 0 && threadIdx.x == 0) A.ctl[2] = plan;
 }
 
@@ -273,11 +454,21 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
             const int u_b = item >> __ffs(A.KS1);
             const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b >> (__ffs(g6nr::EB) - 1)) : (item / u1);
             const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
-            int e, mask, ss = slot;
-            if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH, CB>(A, plan, item + (ss - slot) * u1, e, mask, smem);
-            __threadfence();
-            __syncthreads();
-            if (t == 0) atomicAdd(done + ss * g6nr::EB + b, 1);
+            int e, masks[4], ss = slot;
+            const int nt = k1_slot_nt<SH>(A, plan, slot, e, masks, ss);
+            if (nt > 0)
+            {
+                if (nt == 1) tr3_fc1_any<E4, K2, SH, CB>(A, plan, item + (ss - slot) * u1, e, masks[0], smem);
+                else
+                {
+                    const int s_ks1 = __ffs(A.KS1) - 1;
+                    const int h = item & (A.KS1 - 1), mat = (item >> s_ks1) & 1;
+                    tr3_fc1_any_nt<E4, K2, SH, CB>(A, plan, ss, b, mat, h, e, nt, masks, smem);
+                }
+                __threadfence();
+                __syncthreads();
+                if (t == 0) atomicAdd(done + ss * g6nr::EB + b, 1);
+            }
         }
         else if constexpr (!SH)
         {
@@ -294,15 +485,17 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
                 const int u_b = unit >> (__ffs(A.NS2) - 1);
                 const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b >> (__ffs(g6nr::EB) - 1)) : (unit / u2);
                 const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
-                int e, mask, ss;
-                if (k1_slot<SH>(A, plan, slot, e, mask, ss))
+                int e, masks[4], ss;
+                const int nt = k1_slot_nt<SH>(A, plan, slot, e, masks, ss);
+                if (nt > 0)
                 {
                     const long long* tr = A.t_tab + 6 * e;
                     if (b < static_cast<int>(tr[3]))
                     {
                         if (t == 0) while (ld_acquire(done + ss * g6nr::EB + b) < 2 * A.KS1) {}
                         __syncthreads();
-                        tr3_fc2_any<E4, K2, SH, CB>(A, plan, unit + (ss - slot) * u2, tr, mask, smem);
+                        if (nt == 1) tr3_fc2_any<E4, K2, SH, CB>(A, plan, unit + (ss - slot) * u2, tr, masks[0], smem);
+                        else tr3_fc2_any_nt<E4, K2, SH, CB>(A, ss, b, unit & (A.NS2 - 1), tr, nt, masks, smem);
                     }
                 }
             }
@@ -319,15 +512,17 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
             const int u_b = unit >> (__ffs(A.NS2) - 1);
             const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b >> (__ffs(g6nr::EB) - 1)) : (unit / u2);
             const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
-            int e, mask, ss;
-            if (k1_slot<SH>(A, plan, slot, e, mask, ss))
+            int e, masks[4], ss;
+            const int nt = k1_slot_nt<SH>(A, plan, slot, e, masks, ss);
+            if (nt > 0)
             {
                 const long long* tr = A.t_tab + 6 * e;
                 if (b < static_cast<int>(tr[3]))
                 {
                     if (t == 0) while (ld_acquire(done + ss * g6nr::EB + b) < 2 * A.KS1) {}
                     __syncthreads();
-                    tr3_fc2_any<E4, K2, SH, CB>(A, plan, unit + (ss - slot) * u2, tr, mask, smem);
+                    if (nt == 1) tr3_fc2_any<E4, K2, SH, CB>(A, plan, unit + (ss - slot) * u2, tr, masks[0], smem);
+                    else tr3_fc2_any_nt<E4, K2, SH, CB>(A, ss, b, unit & (A.NS2 - 1), tr, nt, masks, smem);
                 }
             }
         }
@@ -818,22 +1013,50 @@ __device__ __forceinline__ void k1_fused_w4_body(const K1Args& A)
             const int u_b = item >> __ffs(A.KS1);
             const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b >> (__ffs(g6nr::EB) - 1)) : (item / u1);
             const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
-            int e, mask, ss = slot;
-            if (k1_slot<true>(A, plan, slot, e, mask, ss))
+            int e, masks[4], ss = slot;
+            const int nt = k1_slot_nt<true>(A, plan, slot, e, masks, ss);
+            if (nt > 0)
             {
                 const long long* tr = A.t_tab + 6 * e;
                 if (b < static_cast<int>(tr[3]))
                 {
                     const int unit = item + (ss - slot) * u1;
-                    const int mat = (unit >> (__ffs(A.KS1) - 1)) & 1;
+                    const int s_ks1 = __ffs(A.KS1) - 1;
+                    const int h = unit & (A.KS1 - 1);
+                    const int mat = (unit >> s_ks1) & 1;
                     const uint8_t* mw;
                     const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, e, tr, b * 2 + mat, mw);
-                    if constexpr (HAS_K3)
+                    if constexpr (!XCOMP)
                     {
-                        if (k == 3) tr3_fc1_body_k3w<XCOMP, CB>(A, plan, unit, tr, mw, mask, smem);
-                        else tr4_fc1_body_w4<XCOMP, P256, CB>(A, plan, unit, tr, mw, mask, smem);
+                        if (nt > 1)
+                        {
+                            const int4 m4 = make_int4(masks[0], masks[1], masks[2], masks[3]);
+                            if constexpr (HAS_K3)
+                            {
+                                if (k == 3) tr3_fc1_body_nt<3, true, true, CB>(A, plan, ss, b, mat, h, tr, mw, nt, m4, smem);
+                                else tr3_fc1_body_nt<4, true, true, CB>(A, plan, ss, b, mat, h, tr, mw, nt, m4, smem);
+                            }
+                            else tr3_fc1_body_nt<4, true, true, CB>(A, plan, ss, b, mat, h, tr, mw, nt, m4, smem);
+                        }
+                        else
+                        {
+                            if constexpr (HAS_K3)
+                            {
+                                if (k == 3) tr3_fc1_body_k3w<XCOMP, CB>(A, plan, unit, tr, mw, masks[0], smem);
+                                else tr4_fc1_body_w4<XCOMP, P256, CB>(A, plan, unit, tr, mw, masks[0], smem);
+                            }
+                            else tr4_fc1_body_w4<XCOMP, P256, CB>(A, plan, unit, tr, mw, masks[0], smem);
+                        }
                     }
-                    else tr4_fc1_body_w4<XCOMP, P256, CB>(A, plan, unit, tr, mw, mask, smem);
+                    else
+                    {
+                        if constexpr (HAS_K3)
+                        {
+                            if (k == 3) tr3_fc1_body_k3w<XCOMP, CB>(A, plan, unit, tr, mw, masks[0], smem);
+                            else tr4_fc1_body_w4<XCOMP, P256, CB>(A, plan, unit, tr, mw, masks[0], smem);
+                        }
+                        else tr4_fc1_body_w4<XCOMP, P256, CB>(A, plan, unit, tr, mw, masks[0], smem);
+                    }
                     __threadfence();
                     __syncthreads();
                     if (t == 0) atomicAdd(A.fctl + 1 + ss * g6nr::EB + b, 1);
@@ -847,8 +1070,9 @@ __device__ __forceinline__ void k1_fused_w4_body(const K1Args& A)
             const int u_b = unit0 >> (__ffs(A.NS2) - 1);
             const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b >> (__ffs(g6nr::EB) - 1)) : (unit0 / u2);
             const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
-            int e, mask, ss;
-            if (k1_slot<true>(A, plan, slot, e, mask, ss))
+            int e, masks[4], ss;
+            const int nt = k1_slot_nt<true>(A, plan, slot, e, masks, ss);
+            if (nt > 0)
             {
                 const long long* tr = A.t_tab + 6 * e;
                 if (b < static_cast<int>(tr[3]))
@@ -856,12 +1080,38 @@ __device__ __forceinline__ void k1_fused_w4_body(const K1Args& A)
                     if (t == 0) while (ld_acquire(A.fctl + 1 + ss * g6nr::EB + b) < 2 * A.KS1) {}
                     __syncthreads();
                     const int unit = unit0 + (ss - slot) * u2;
-                    if constexpr (HAS_K3)
+                    if constexpr (!XCOMP)
                     {
-                        if (tr[4] == 3) tr3_fc2_body_k3w<NWARPS, CB>(A, unit, tr, mask, smem);
-                        else tr4_fc2_body_w4<NWARPS, P256, CB>(A, unit, tr, mask, smem);
+                        if (nt > 1)
+                        {
+                            const int ns = unit & (A.NS2 - 1);
+                            const int4 m4 = make_int4(masks[0], masks[1], masks[2], masks[3]);
+                            if constexpr (HAS_K3)
+                            {
+                                if (tr[4] == 3) tr3_fc2_body_nt<3, true, CB, true>(A, ss, b, ns, tr, nt, m4, smem);
+                                else tr3_fc2_body_nt<4, true, CB, true>(A, ss, b, ns, tr, nt, m4, smem);
+                            }
+                            else tr3_fc2_body_nt<4, true, CB, true>(A, ss, b, ns, tr, nt, m4, smem);
+                        }
+                        else
+                        {
+                            if constexpr (HAS_K3)
+                            {
+                                if (tr[4] == 3) tr3_fc2_body_k3w<NWARPS, CB>(A, unit, tr, masks[0], smem);
+                                else tr4_fc2_body_w4<NWARPS, P256, CB>(A, unit, tr, masks[0], smem);
+                            }
+                            else tr4_fc2_body_w4<NWARPS, P256, CB>(A, unit, tr, masks[0], smem);
+                        }
                     }
-                    else tr4_fc2_body_w4<NWARPS, P256, CB>(A, unit, tr, mask, smem);
+                    else
+                    {
+                        if constexpr (HAS_K3)
+                        {
+                            if (tr[4] == 3) tr3_fc2_body_k3w<NWARPS, CB>(A, unit, tr, masks[0], smem);
+                            else tr4_fc2_body_w4<NWARPS, P256, CB>(A, unit, tr, masks[0], smem);
+                        }
+                        else tr4_fc2_body_w4<NWARPS, P256, CB>(A, unit, tr, masks[0], smem);
+                    }
                 }
             }
         }

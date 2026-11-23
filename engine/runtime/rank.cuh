@@ -1968,8 +1968,8 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
 #endif
             keep = 1u << (M - 1);
         }
-        if (!moe_union_cap::launch_router_plan(b.router, y.router_bias, M, m.logits, m.plan, keep, keep_dev, st) &&
-            !moe_rtr_fin_opt::launch_router_plan(m.mrfo, b.router, y.router_bias, M, m.logits, m.plan, keep, keep_dev, st))
+        if (!moe_rtr_fin_opt::launch_router_plan(m.mrfo, b.router, y.router_bias, M, m.logits, m.plan, keep, keep_dev, st) &&
+            !moe_union_cap::launch_router_plan(b.router, y.router_bias, M, m.logits, m.plan, keep, keep_dev, st))
         {
             bind::launch(b.router, st);
             glue::k_router_plan<<<1, glue::NEXP, 0, st>>>(m.logits, y.router_bias, M, m.plan, keep, keep_dev);
