@@ -971,10 +971,10 @@ struct Engine {
         moe_sc.topk_w = dalloc<float>(M * geom::TOPK);
         moe_sc.d_n_groups = dalloc<int>(1);
         moe_sc.grp_exp = dalloc<int>(M * geom::TOPK);
-        moe_sc.grp_off = dalloc<int>(M * geom::TOPK);
         moe_sc.grp_cnt = dalloc<int>(M * geom::TOPK);
+        moe_sc.grp_off = dalloc<int>(M * geom::TOPK);
         moe_sc.grp_routes = dalloc<int>(M * geom::TOPK * 8);
-        moe_sc.x_had = dalloc<float>(M * geom::HID);
+        moe_sc.x_had = dalloc<__half>(M * geom::HID);
         moe_sc.fc1_part = dalloc<float>(8 * geom::TOPK * size_t(g6nr::EB) * 2 * 2 * 128);
         moe_sc.fc1_act = dalloc<__half>(M * geom::TOPK * size_t(g6nr::EB) * 128);
         moe_sc.fc2_part = dalloc<float>(M * geom::TOPK * geom::HID);
@@ -1697,9 +1697,9 @@ struct Engine {
                 qw38::gemm_bf16_nt(blas, len, geom::IDX_PROJ_OUT, geom::HID, mixed, aw.idx_qk_proj, attn_sc.idx_qk);
             }
             qw38::k_qw38_kv_write<<<len * nh_kv, 256, 0, stream>>>(attn_sc.k, attn_sc.v, aw.k_norm, d_slot, d_pos, kv.kv_pages, len, nh_kv, max_pps, geom::RMS_EPS, d_rope);
-            qw38::k_qsa_k_update_seg<<<1, 128, 0, stream>>>(attn_sc.idx_qk, aw.idx_k_norm, kv.idx_raw, nullptr, kv.idx_pages,
-                                                            max_pps, seg.slot, seg.row0, seg.pos0, seg.len, 0, geom::RMS_EPS,
-                                                            kv.idx_raw_thw, nullptr, d_rope);
+            qw38::qsa_k_update_seg_fast(attn_sc.idx_qk, aw.idx_k_norm, kv.idx_raw, nullptr, kv.idx_pages,
+                                        max_pps, seg.slot, seg.row0, seg.pos0, seg.len, 0, geom::RMS_EPS, stream,
+                                        kv.idx_raw_thw, nullptr, d_rope);
         }
     }
 
