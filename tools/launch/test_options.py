@@ -166,6 +166,13 @@ class ValidateTests(unittest.TestCase):
                    'no --ips')
         self.check(['--peers', PEERS, '--shape', 'ring', '--ips', 'a,b,c,d', '--ips2', 'a,b,c,d'], 'no --ips')
         self.check(['--peers', PEERS, '--shape', 'ring', '--ring-devs', 'a,b'], 'want four devices')
+        for m in ('qw38', 'ink2'):
+            self.check(['--mentat', 'localhost', '--tp', '4', '--shape', 'ring'],
+                       'supports --shape mesh only', {'GR8_MODEL': m})
+        # qw38 uses StashPool --kv-store directly (not Flash checkpoint_cache)
+        o_qw = opt.parse(['--no-config', '--peers', '10.0.0.1', '--kv-store', 'mem:,size=2G'], {'GR8_MODEL': 'qw38'})
+        opt.validate(o_qw)
+        self.check(['--peers', '10.0.0.1', '--flash-cache', 'aligned'], 'glm53f only', {'GR8_MODEL': 'qw38'})
         self.check(['--peers', PEERS, '--tp', '7'], 'want 4, 6, 3 or 5')
         self.check(['--peers', PEERS, '--tp', '6'], 'names 4 boxes for --tp 6')
         self.check(['--mentat', 'localhost'], '--tp is needed')

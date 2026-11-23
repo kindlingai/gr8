@@ -204,6 +204,15 @@ impl AnyParser {
         }
     }
 
+    pub fn in_reasoning(&self) -> bool {
+        match self {
+            AnyParser::Glm(p) => p.in_reasoning(),
+            AnyParser::Ds(p) => p.in_reasoning(),
+            AnyParser::Hf(p) => p.in_reasoning(),
+            AnyParser::Ink(p) => p.in_reasoning(),
+        }
+    }
+
     /// A live call block has closed: the reply is complete and the generation should end. Only DeepSeek's format has a
     /// closer to stop on; the model sometimes goes on writing after it (the 10,559-line `</function>` runaway).
     pub fn call_closed(&self) -> bool {

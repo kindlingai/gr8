@@ -613,6 +613,8 @@ def validate(o):
     if o.get('SHAPE') not in ('mesh', 'ring'):
         raise OptionError(f'--shape {o.get("SHAPE")}: want mesh or ring')
     if o.get('SHAPE') == 'ring':
+        if model.engine_profile in ('ink2', 'qw38'):
+            raise OptionError(f'--shape ring: {model.name} supports --shape mesh only')
         if tp not in ('3', '4'):
             raise OptionError(f'--shape ring: TP=3 or 4, not {tp}')
         if o.get('IPS'):

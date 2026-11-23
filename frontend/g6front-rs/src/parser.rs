@@ -184,6 +184,11 @@ impl GlmParser {
         self
     }
 
+    /// Whether the parser is currently inside the reasoning block.
+    pub fn in_reasoning(&self) -> bool {
+        self.state == State::Reasoning
+    }
+
     /// Bytes of reply text fed so far.
     pub fn fed_bytes(&self) -> usize {
         self.fed

@@ -324,11 +324,17 @@ inline const char* bind_trellis(LayerState& s, const Find& find, int l)
     if (!s.tr->sh_trellis) return "trellis layer without the trellis shared expert (tr3.table row 384)";
     static const cudaError_t attr = [] {
         cudaError_t err = cudaSuccess;
+        auto set = [&](const void* f) {
+            const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
+            if (err == cudaSuccess) err = e;
+        };
         ::bind::k1_each([&](auto E4, auto K2, auto SH, auto CB) {
-            for (const void* f : {::bind::k1_fn_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>(), ::bind::k1_fn_fc2<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>()})
+            set(::bind::k1_fn_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
+            set(::bind::k1_fn_fc2<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
+            if constexpr (g6mx::NT > 1)
             {
-                const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
-                if (err == cudaSuccess) err = e;
+                set(reinterpret_cast<const void*>(::k1_tr3_fc1_nt<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>));
+                set(reinterpret_cast<const void*>(::k1_tr3_fc2_nt<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>));
             }
         });
         return err;

@@ -142,6 +142,11 @@ impl InkParser {
         self
     }
 
+    /// Whether the parser is currently inside a thinking block.
+    pub fn in_reasoning(&self) -> bool {
+        self.mode == Mode::Body(Kind::Thinking)
+    }
+
     /// `--undeclared-tool-calls emit`: a call to an undeclared tool whose name is a plausible identifier is a tool call.
     pub fn emit_undeclared(mut self, on: bool) -> InkParser {
         self.emit_undeclared = on;

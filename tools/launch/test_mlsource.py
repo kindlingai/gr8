@@ -271,6 +271,16 @@ class ModelLoaderTests(unittest.TestCase):
         self.assertIn('dense/vision-bf16.safetensors', self.ml.puts[-1][1]['include'])
         self.assertEqual(ms.release.check(4, 1, v), [])
 
+    def test_ple_files_included_and_pinned(self):
+        ple_dir = os.path.join(self.rel, 'ple')
+        os.makedirs(ple_dir, exist_ok=True)
+        with open(os.path.join(ple_dir, 'exlr8-ple-L001.bin'), 'wb') as f:
+            f.write(b'ple-row-store-bytes')
+        o, ms, v = self.resolve()
+        self.assertIn('ple/exlr8-ple-L001.bin', ms.release.whole_files(4, 1))
+        ms.release.fetch_rank(4, 1, v)
+        self.assertIn('ple/exlr8-ple-L001.bin', self.ml.puts[-1][1]['include'])
+
     def test_a_layout_requests_its_halves(self):
         o, ms, v = self.resolve()
         g6layout = os.path.join(os.path.dirname(T.hfsource.fetch_ranks().g6load()), 'g6layout')

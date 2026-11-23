@@ -690,6 +690,7 @@ struct Qw38FullKvLayer {
     uint8_t* kv_staging = nullptr;   // [slots][2][64][nh_kv * 256] BF16
     uint8_t* idx_pages = nullptr;    // [slots][max_pages][16][128] BF16 (blocks of 4)
     uint8_t* idx_staging = nullptr;  // [slots][16][128] BF16
+    uint8_t* idx_raw = nullptr;      // [slots][4][128] BF16 (incomplete 4-token QSA block)
 };
 struct Qw38GdnStateLayer {
     uint8_t* S = nullptr;            // [slots][nh_v][128][128] FP32
@@ -709,11 +710,17 @@ inline KvStateDesc qw38_kv_state(const std::vector<Qw38FullKvLayer>& full_layers
     const uint64_t kv_page = uint64_t(KV_STATE_PAGE_TOKENS) * kv_row;
     const uint64_t idx_row = 128u * 2u;
     const uint64_t idx_page = (KV_STATE_PAGE_TOKENS / 4u) * idx_row;
+    const uint64_t idx_raw_bytes = 4u * 128u * 2u;
+    size_t n_idx_raw = 0;
     for (const auto& y : full_layers) {
         d.page_planes.push_back(KvPagePlane{y.kv_pages, uint64_t(max_pages_per_slot) * kv_page, KV_STATE_PAGE_TOKENS, uint32_t(kv_row), 1});
         d.page_planes.push_back(KvPagePlane{y.idx_pages, uint64_t(max_pages_per_slot) * idx_page, KV_STATE_PAGE_TOKENS / 4u, uint32_t(idx_row), 4});
         d.tail_extents.push_back(KvTailExtent{y.kv_staging, kv_page, kv_page});
         d.tail_extents.push_back(KvTailExtent{y.idx_staging, idx_page, idx_page});
+        if (y.idx_raw) {
+            d.tail_extents.push_back(KvTailExtent{y.idx_raw, idx_raw_bytes, idx_raw_bytes});
+            ++n_idx_raw;
+        }
     }
     const uint64_t s_bytes = uint64_t(nh_v) * 128u * 128u * 4u;
     const uint64_t c_bytes = uint64_t(3u) * qkv_local * 2u;
@@ -735,6 +742,7 @@ inline KvStateDesc qw38_kv_state(const std::vector<Qw38FullKvLayer>& full_layers
         const size_t max_slot = (max_pb + 4095u) / 4096u * 4096u;
         const size_t max_cap = max_slot - sizeof(KvStateHeader32);
         const size_t max_tail = full_layers.size() * (max_kvp + size_t(idx_page))
+            + n_idx_raw * size_t(idx_raw_bytes)
             + gdn_layers.size() * (size_t(mv) * 128 * 128 * 4 + size_t(3) * mq * 2)
             + (ple_conv ? size_t(ple_bytes) : 0)
             + (ple_ctx ? size_t(ple_ctx_bytes) : 0);

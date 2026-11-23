@@ -1,5 +1,5 @@
-// Fast 2-bit block-32 screen + exact FP8/BF16 top-64 rescore for Qwen3.8-Flash-Next MTP draft lm_head.
-// Drafts ONLY (trunk verify still uses exact FP8/BF16 lm_head -> 0 output quality degradation, 100% exact MTP=0==MTP=K).
+// Fast 2-bit block-32 screen + exact FP8/BF16 rescore for Qwen3.8-Flash-Next MTP draft (top-64) and trunk (top-256) lm_head.
+// Requests asking for logprobs bypass trunk_head2 to exact full-vocab FP8 lm_head for unbiased full-vocab LSE.
 //
 // Format for HID = 2560 (NCH = 40 chunks of 64 weights, NG = 80 groups of 32 weights):
 //   - codes[vr, 40]  uint4   (16 B/chunk = 64 x 2-bit codes, 640 B/row)
@@ -123,8 +123,8 @@ inline size_t build_mtp_head2(const __nv_bfloat16* W, int vr, int v0, MtpHead2& 
     const size_t sb = static_cast<size_t>(vr) * NCH * sizeof(__half2);
     void* cp = nullptr;
     void* sp = nullptr;
-    if (cudaMalloc(&cp, cb) != cudaSuccess) return 0;
-    if (cudaMalloc(&sp, sb) != cudaSuccess) { cudaFree(cp); return 0; }
+    if (cudaMalloc(&cp, cb) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    if (cudaMalloc(&sp, sb) != cudaSuccess) { (void)cudaGetLastError(); cudaFree(cp); return 0; }
     out.codes = static_cast<uint4*>(cp);
     out.scales = static_cast<__half2*>(sp);
     out.vr = vr;
@@ -258,6 +258,7 @@ __global__ void __launch_bounds__(1024) k_qw38_head2_top(
 
     __shared__ unsigned hist[BINS];
     __shared__ float s_mx[32];
+    __shared__ float s_mn[32];
     __shared__ double s_tail[32];
     __shared__ int s_cut, s_lt;
     __shared__ int s_n[2][1024];
@@ -271,24 +272,38 @@ __global__ void __launch_bounds__(1024) k_qw38_head2_top(
     const int i0 = min(t * per, vr);
     const int i1 = min(i0 + per, vr);
 
-    float mx = -INFINITY;
+    float mx = -INFINITY, mn = INFINITY;
     for (int i = i0; i < i1; ++i) {
         const float v = row[i];
-        if (isfinite(v)) mx = fmaxf(mx, v);
+        if (isfinite(v)) {
+            mx = fmaxf(mx, v);
+            mn = fminf(mn, v);
+        }
     }
     #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-    if (l == 0) s_mx[w] = mx;
+    for (int o = 16; o > 0; o >>= 1) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        mn = fminf(mn, __shfl_xor_sync(0xffffffffu, mn, o));
+    }
+    if (l == 0) { s_mx[w] = mx; s_mn[w] = mn; }
     for (int i = t; i < BINS; i += 1024) hist[i] = 0u;
     __syncthreads();
 
     mx = s_mx[0];
+    mn = s_mn[0];
     #pragma unroll
-    for (int i = 1; i < 32; ++i) mx = fmaxf(mx, s_mx[i]);
+    for (int i = 1; i < 32; ++i) {
+        mx = fmaxf(mx, s_mx[i]);
+        mn = fminf(mn, s_mn[i]);
+    }
 
+    // Adapt histogram range to peaked logits (up to 256 logit units) so rank <= SL never collapses into overflow bin BINS - 1.
+    const float span = (isfinite(mx) && isfinite(mn) && mx > mn) ? (mx - mn) * 1.001f + 1e-3f : RANGE;
+    const float range = fmaxf(RANGE, fminf(span, 256.0f));
+    const float inv_step = static_cast<float>(BINS - 1) / range;
     auto bin = [&](float v) -> int {
         if (!isfinite(v)) return BINS - 1;
-        const float b = (mx - v) * (BINS / RANGE);
+        const float b = (mx - v) * inv_step;
         return (b < static_cast<float>(BINS - 1)) ? max(0, static_cast<int>(b)) : (BINS - 1);
     };
     for (int i = i0; i < i1; ++i) atomicAdd(&hist[bin(row[i])], 1u);

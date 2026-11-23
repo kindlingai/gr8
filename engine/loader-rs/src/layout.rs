@@ -145,9 +145,13 @@ impl Model {
             Some(Json::Str(v)) => v.parse::<u64>().map_err(|_| format!("hidden_size {v}"))?,
             Some(v) => v.int().ok_or("bad hidden_size")? as u64,
         };
+        let first_nh = layers.values().next()
+            .and_then(|e| e.get("gate")).and_then(Json::arr)
+            .and_then(|g| g.first()).and_then(Json::arr).map(<[_]>::len);
         let is_qw38 = hidden == 2560
             || man.get("model").and_then(Json::str) == Some("qw38")
-            || man.get("nh").and_then(Json::int) == Some(5);
+            || man.get("nh").and_then(Json::int) == Some(5)
+            || first_nh == Some(5);
         let geom = if is_qw38 { ModelGeom::QW38 } else { ModelGeom::GLM };
         let mut groups = vec![(Group::Vocab, vec![0; geom.vtiles])];
         for l in 0..=last {

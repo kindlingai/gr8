@@ -6,7 +6,7 @@
 
 use crate::json::{self, Json};
 use crate::layout::{Group, Layout};
-use crate::v2plan::{widths, Slice};
+use crate::v2plan::{widths_auto, Slice, NH};
 use crate::xxh64::Xxh64;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
@@ -101,7 +101,7 @@ pub fn units(slices_dir: &str, tp: usize, rank: usize, choice: &Choice, layers: 
     if let Some(lo) = layout.filter(|lo| lo.nr() != tp || rank >= tp) {
         return Err(format!("rank {rank} of TP {tp} with a layout of {} members", lo.nr()));
     }
-    // unit (e, h) of layer l is listed in the slice of rank (16 e + h + l) % tp
+    // unit (e, h) of layer l is listed in the slice of rank (nh * e + h + l) % tp
     let ranks: Vec<usize> = if layout.is_some() { (0..tp).collect() } else { vec![rank] };
     let mut slices: BTreeMap<(u8, usize), Slice> = BTreeMap::new();
     for &r in &ranks {
@@ -137,12 +137,13 @@ pub fn units(slices_dir: &str, tp: usize, rank: usize, choice: &Choice, layers: 
         if at.is_empty() {
             return Err(format!("layer {l}: no index slice holds it"));
         }
-        let src = |e: usize, h: usize| if layout.is_some() { (16 * e + h + l) % tp } else { rank };
         let held = |e: usize, h: usize| layout.map_or(Ok(true), |lo| lo.held(Group::Halves(l, e), rank).map(|hs| hs.contains(&h)));
         // every (expert, half) the slices list
         let listed: BTreeSet<(usize, usize)> = at.values().flat_map(|r| r.row.keys().copied()).collect();
         match choice {
             Choice::Widths(ks) => {
+                let nh = listed.iter().map(|&(_, h)| h + 1).max().unwrap_or(NH);
+                let src = |e: usize, h: usize| if layout.is_some() { (nh * e + h + l) % tp } else { rank };
                 let have: BTreeSet<u8> = at.keys().map(|&(k, _)| k).collect();
                 for k in have.into_iter().filter(|k| ks.contains(k)) {
                     for &(e, h) in &listed {
@@ -156,7 +157,8 @@ pub fn units(slices_dir: &str, tp: usize, rank: usize, choice: &Choice, layers: 
                 }
             }
             Choice::Manifest(m) => {
-                let w = widths(m, l)?.ok_or(format!("layer {l}: the manifest has no widths for it"))?;
+                let w = widths_auto(m, l)?.ok_or(format!("layer {l}: the manifest has no widths for it"))?;
+                let src = |e: usize, h: usize| if layout.is_some() { (w.nh * e + h + l) % tp } else { rank };
                 for &(e, h) in &listed {
                     if e == w.down.len() && w.sdown == 0 {
                         continue; // the manifest leaves the shared expert to the base pack
@@ -244,6 +246,101 @@ mod compact_tests {
         assert!(compact::write(source, bad.to_str().unwrap(), &units).is_err());
         assert!(!bad.exists());
         assert!(!dir.join(format!(".bad.partial-{}", std::process::id())).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Build a minimal synthetic safetensors index-slice file for layer `l` holding `(expert, half)` pairs.
+    fn write_slice(path: &std::path::Path, l: usize, experts: usize, blocks: usize, pairs: &[(usize, usize)]) {
+        let mut raw = Vec::<u8>::new();
+        let mut header = Vec::<String>::new();
+        let mut add = |name: &str, dtype: &str, shape: &[usize], bytes: &[u8]| {
+            let a = raw.len();
+            raw.extend_from_slice(bytes);
+            let b = raw.len();
+            let sh = shape.iter().map(usize::to_string).collect::<Vec<_>>().join(",");
+            header.push(format!("\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{sh}],\"data_offsets\":[{a},{b}]}}"));
+        };
+        let p = format!("L{l:03}.");
+        let mut units = Vec::with_capacity(pairs.len() * 4);
+        let mut offsets = Vec::with_capacity(pairs.len() * 3 * 8);
+        let mut checksums = Vec::with_capacity(pairs.len() * 3 * 8);
+        for &(e, h) in pairs {
+            units.extend_from_slice(&(e as i16).to_le_bytes());
+            units.extend_from_slice(&(h as i16).to_le_bytes());
+            for proj in 0..3usize {
+                let off = ((l * 1000 + e * 100 + h * 10 + proj) as u64) * 2048;
+                offsets.extend_from_slice(&off.to_le_bytes());
+                checksums.extend_from_slice(&(off ^ 0x55AAu64).to_le_bytes());
+            }
+        }
+        add(&format!("{p}units"), "I16", &[pairs.len(), 2], &units);
+        add(&format!("{p}offset"), "I64", &[pairs.len(), 3], &offsets);
+        add(&format!("{p}checksum"), "U64", &[pairs.len(), 3], &checksums);
+        add(&format!("{p}chan"), "F16", &[pairs.len(), 3, 128], &vec![0u8; pairs.len() * 3 * 256]);
+        add(&format!("{p}block"), "F16", &[experts, 3, blocks], &vec![0u8; experts * 3 * blocks * 2]);
+        let hdr = format!("{{{}}}", header.join(","));
+        let mut out = (hdr.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(hdr.as_bytes());
+        out.extend_from_slice(&raw);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn units_supports_nh5_manifest_and_layout() {
+        let dir = std::env::temp_dir().join(format!("g6fetch-nh5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let slices = dir.join("slices");
+        let (tp, nh, experts, blocks, layer) = (2usize, 5usize, 4usize, 20usize, 0usize);
+        for r in 0..tp {
+            let mut pairs = Vec::new();
+            for e in 0..experts {
+                for h in 0..nh {
+                    if (nh * e + h + layer) % tp == r {
+                        pairs.push((e, h));
+                    }
+                }
+            }
+            write_slice(&slices.join(format!("tp{tp}/k3/rank{r}.safetensors")), layer, experts, blocks, &pairs);
+        }
+        let row = "[3,3,3,3,3]";
+        let rows = format!("[{row},{row},{row},{row}]");
+        let man_path = dir.join("manifest.json");
+        std::fs::write(
+            &man_path,
+            format!("{{\"format\":\"exlr8-v2-manifest\",\"layers\":{{\"{layer}\":{{\"gate\":{rows},\"up\":{rows},\"down\":[3,3,3,3]}}}}}}"),
+        )
+        .unwrap();
+        let choice = Choice::manifest(man_path.to_str().unwrap()).unwrap();
+        // Direct fetch without layout: each rank gets its own (5 * e + h + l) % tp halves.
+        let mut direct_all = BTreeSet::new();
+        for r in 0..tp {
+            let us = units(slices.to_str().unwrap(), tp, r, &choice, None, None).unwrap();
+            assert_eq!(us.len(), (experts * nh / tp) * 3);
+            for u in &us {
+                assert_eq!((nh * u.expert + u.half + u.layer) % tp, r);
+                direct_all.insert((u.layer, u.expert, u.half, u.proj, u.offset));
+            }
+        }
+        assert_eq!(direct_all.len(), experts * nh * 3);
+        // Layout fetch (planned from TP=1 -> TP=2 so halves move across ranks) must locate every half via (nh * e + h + l) % tp.
+        let m = crate::layout::Model::release(&json::parse(&std::fs::read_to_string(&man_path).unwrap()).unwrap()).unwrap();
+        assert_eq!(m.geom.nh, 5);
+        let f1 = Layout::formula(&m, vec!["a".into()]).unwrap();
+        let lo = crate::layout::plan(&m, &f1, vec!["a".into(), "b".into()]).unwrap();
+        let mut lo_all = BTreeSet::new();
+        let mut moved = 0usize;
+        for r in 0..tp {
+            let us_m = units(slices.to_str().unwrap(), tp, r, &choice, None, Some(&lo)).unwrap();
+            let us_w = units(slices.to_str().unwrap(), tp, r, &Choice::Widths(vec![3]), Some(&[layer]), Some(&lo)).unwrap();
+            assert_eq!(us_m.len(), us_w.len());
+            for u in &us_m {
+                if (nh * u.expert + u.half + u.layer) % tp != r { moved += 1; }
+                lo_all.insert((u.layer, u.expert, u.half, u.proj, u.offset));
+            }
+        }
+        assert_eq!(lo_all, direct_all);
+        assert!(moved > 0, "layout should move halves across ranks");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

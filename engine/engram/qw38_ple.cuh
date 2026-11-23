@@ -111,6 +111,13 @@ __global__ void k_ple_dilated_conv_add_seg(const __nv_bfloat16* __restrict__ gv,
         h[k] = (pos0 > 0) ? __bfloat162float(hbase[static_cast<size_t>(k) * geom::HC_D + c]) : 0.0f;
     }
 
+    const int snap_stride = snap_k + 1;
+    if (conv_snap && snap_k > 0) {
+        __nv_bfloat16* sb0 = conv_snap + (static_cast<size_t>(slot) * snap_stride) * geom::PLE_NHIST * geom::HC_D;
+        #pragma unroll
+        for (int k = 0; k < geom::PLE_NHIST; ++k) sb0[static_cast<size_t>(k) * geom::HC_D + c] = __float2bfloat16(h[k]);
+    }
+
     for (int t = 0; t < len; ++t) {
         const size_t idx = static_cast<size_t>(row0 + t) * geom::HC_D + c;
         const float x = __bfloat162float(gv_norm[idx]);
@@ -125,7 +132,7 @@ __global__ void k_ple_dilated_conv_add_seg(const __nv_bfloat16* __restrict__ gv,
         h[geom::PLE_NHIST - 1] = x;
 
         if (conv_snap && t < len - 1 && t < snap_k) {
-            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * snap_k + t) * geom::PLE_NHIST * geom::HC_D;
+            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * snap_stride + (t + 1)) * geom::PLE_NHIST * geom::HC_D;
             #pragma unroll
             for (int k = 0; k < geom::PLE_NHIST; ++k) sb[static_cast<size_t>(k) * geom::HC_D + c] = __float2bfloat16(h[k]);
         }
@@ -214,6 +221,13 @@ __global__ void k_ple_dilated_conv_add_verify_batch(const __nv_bfloat16* __restr
         h[k] = (pos0 > 0) ? __bfloat162float(hbase[static_cast<size_t>(k) * geom::HC_D + c]) : 0.0f;
     }
 
+    const int snap_stride = snap_k + 1;
+    if (conv_snap && snap_k > 0) {
+        __nv_bfloat16* sb0 = conv_snap + (static_cast<size_t>(slot) * snap_stride) * geom::PLE_NHIST * geom::HC_D;
+        #pragma unroll
+        for (int k = 0; k < geom::PLE_NHIST; ++k) sb0[static_cast<size_t>(k) * geom::HC_D + c] = __float2bfloat16(h[k]);
+    }
+
     for (int t = 0; t < V; ++t) {
         const size_t ri = static_cast<size_t>(row0 + t) * geom::HC_D + c;
         const float x = __bfloat162float(gv_norm[ri]);
@@ -227,7 +241,7 @@ __global__ void k_ple_dilated_conv_add_verify_batch(const __nv_bfloat16* __restr
         h[geom::PLE_NHIST - 1] = x;
 
         if (conv_snap && t < V - 1 && t < snap_k) {
-            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * snap_k + t) * geom::PLE_NHIST * geom::HC_D;
+            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * snap_stride + (t + 1)) * geom::PLE_NHIST * geom::HC_D;
             #pragma unroll
             for (int k = 0; k < geom::PLE_NHIST; ++k) sb[static_cast<size_t>(k) * geom::HC_D + c] = __float2bfloat16(h[k]);
         }

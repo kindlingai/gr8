@@ -297,7 +297,7 @@ struct Fp8Arena {
         }
         void* ptr = nullptr;
         cudaError_t e = cudaMalloc(&ptr, total);
-        if (e != cudaSuccess) return 0;
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return 0; }
         base = static_cast<uint8_t*>(ptr);
         cap = total;
         used = 0;

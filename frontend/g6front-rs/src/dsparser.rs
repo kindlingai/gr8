@@ -118,6 +118,11 @@ impl DsParser {
         self
     }
 
+    /// Whether the parser is currently inside the reasoning block.
+    pub fn in_reasoning(&self) -> bool {
+        self.mode == Mode::Reasoning
+    }
+
     /// A live block has closed. The generation can stop.
     pub fn call_closed(&self) -> bool {
         self.mode == Mode::Done
