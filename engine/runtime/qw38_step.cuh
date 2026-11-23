@@ -258,6 +258,7 @@ struct Options {
     int ple_uring = 128;
     bool ple_direct = true;
     ptab::Mode ptab_mode = ptab::OFF;
+    bool wide = true;
     bool profile = false;
 };
 
@@ -390,6 +391,7 @@ struct Engine {
             if (o.widths_path.empty()) die("no exlr8-manifest-bit*.json found in " + release_dir);
         }
         if (o.ptab_mode == ptab::OFF) o.ptab_mode = ptab::mode_env();
+        if (const char* we = std::getenv("GR8_QW38_WIDE")) o.wide = (std::atoi(we) != 0);
         if (const char* pe = std::getenv("GR8_QW38_PROFILE")) o.profile = (std::atoi(pe) != 0);
         if (const char* cm = std::getenv("GR8_QW38_PLE_CACHE_MIB")) {
             long v = std::atol(cm);
@@ -545,6 +547,19 @@ struct Engine {
                 rl.moe_w.t_rows = static_cast<int>(im.entry(lname(l, "tr3.table")).shape[0]);
                 rl.moe_w.t_eb = g6nr::EB;
 
+                if (o.wide) {
+                    launch_tr3_widen(const_cast<uint8_t*>(rl.moe_w.t_fc1), rl.moe_w.t_tab, rl.moe_w.t_kmix,
+                                     rl.moe_w.t_rows, rl.moe_w.t_eb, stream);
+                    launch_tr4_widen(const_cast<uint8_t*>(rl.moe_w.t_fc1), rl.moe_w.t_tab, rl.moe_w.t_kmix,
+                                     rl.moe_w.t_rows, rl.moe_w.t_eb, stream);
+                    launch_tr3_widen2(const_cast<uint8_t*>(rl.moe_w.t_fc2), rl.moe_w.t_tab,
+                                      rl.moe_w.t_rows, rl.moe_w.t_eb, stream);
+                    launch_tr4_widen2(const_cast<uint8_t*>(rl.moe_w.t_fc2), rl.moe_w.t_tab,
+                                      rl.moe_w.t_rows, rl.moe_w.t_eb, stream);
+                    rl.moe_w.fc1_wide = 1;
+                    rl.moe_w.fc2_wide = 1;
+                }
+
                 if (o.ptab_mode != ptab::OFF) {
                     if (const char* perr = ptab::build(rl.ptab_tbl, rl.moe_w.t_tab, rl.moe_w.t_kmix,
                                                        rl.moe_w.t_fc1, rl.moe_w.t_fc2,
@@ -602,8 +617,13 @@ struct Engine {
         moe_sc.router_logits = dalloc<float>(M * geom::NEXP);
         moe_sc.topk_idx = dalloc<int>(M * geom::TOPK);
         moe_sc.topk_w = dalloc<float>(M * geom::TOPK);
+        moe_sc.d_n_groups = dalloc<int>(1);
+        moe_sc.grp_exp = dalloc<int>(M * geom::TOPK);
+        moe_sc.grp_cnt = dalloc<int>(M * geom::TOPK);
+        moe_sc.grp_routes = dalloc<int>(M * geom::TOPK * 8);
+        moe_sc.fc1_part = dalloc<float>(8 * geom::TOPK * size_t(g6nr::EB) * 2 * 2 * 128);
         moe_sc.fc1_act = dalloc<__half>(M * geom::TOPK * size_t(g6nr::EB) * 128);
-        moe_sc.fc2_part = dalloc<float>(M * geom::TOPK * size_t(g6nr::EB) * geom::HID);
+        moe_sc.fc2_part = dalloc<float>(M * geom::TOPK * geom::HID);
         moe_sc.routed_acc = dalloc<float>(M * geom::HID);
         moe_sc.sh_gate_buf = dalloc<__nv_bfloat16>(M * geom::SHARED_I);
         moe_sc.sh_up_buf = dalloc<__nv_bfloat16>(M * geom::SHARED_I);

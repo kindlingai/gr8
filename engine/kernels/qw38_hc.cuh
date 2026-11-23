@@ -123,6 +123,57 @@ __global__ void k_bf16_gemv_smallm(const __nv_bfloat16* __restrict__ A,
     }
 }
 
+// Warp-per-row coalesced BF16 GEMV for small decode batches (M <= 8):
+//   C[M, N] = A[M, K] @ B[N, K]^T (K multiple of 8; 4 warps/CTA = 4 output dims/CTA, zero smem, zero __syncthreads).
+template <int MAX_M, bool OUT_F32 = false>
+__global__ void k_bf16_gemv_1warp(const __nv_bfloat16* __restrict__ A,
+                                  const __nv_bfloat16* __restrict__ B,
+                                  void* __restrict__ C,
+                                  int M, int N, int K) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * 4 + warp;
+    if (n >= N) return;
+    const int k8 = K >> 3;
+    const uint4* brow = reinterpret_cast<const uint4*>(B + static_cast<size_t>(n) * K);
+    float acc[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+
+    for (int i = lane; i < k8; i += 32) {
+        const uint4 wv = __ldg(brow + i);
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+                const uint4 av = reinterpret_cast<const uint4*>(A + static_cast<size_t>(m) * K)[i];
+                acc[m] += dot_bf16x8(av, wv);
+            }
+        }
+    }
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            const float tot = warp_sum(acc[m]);
+            if (lane == 0) {
+                if constexpr (OUT_F32) {
+                    static_cast<float*>(C)[static_cast<size_t>(m) * N + n] = tot;
+                } else {
+                    static_cast<__nv_bfloat16*>(C)[static_cast<size_t>(m) * N + n] = __float2bfloat16(tot);
+                }
+            }
+        }
+    }
+}
+
+template <bool OUT_F32 = false>
+inline void launch_bf16_gemv_smallm(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C,
+                                    int M, int N, int K, cudaStream_t st) {
+    const int grid = (N + 3) / 4;
+    if (M == 1) k_bf16_gemv_1warp<1, OUT_F32><<<grid, 128, 0, st>>>(A, B, C, M, N, K);
+    else if (M <= 4) k_bf16_gemv_1warp<4, OUT_F32><<<grid, 128, 0, st>>>(A, B, C, M, N, K);
+    else k_bf16_gemv_1warp<8, OUT_F32><<<grid, 128, 0, st>>>(A, B, C, M, N, K);
+}
+
 // Replicate token embeddings into 4 hyper-connection streams: out[m, s, d] = embed[tok[m], d]
 __global__ void k_embed_hc4(const int* __restrict__ tok, const __nv_bfloat16* __restrict__ embed,
                             __nv_bfloat16* __restrict__ out, int M) {

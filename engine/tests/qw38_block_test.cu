@@ -506,8 +506,13 @@ int main(int argc, char** argv) {
         CK(cudaMalloc(&msc.router_logits, size_t(S) * geom::NEXP * 4));
         CK(cudaMalloc(&msc.topk_idx, size_t(S) * geom::TOPK * 4));
         CK(cudaMalloc(&msc.topk_w, size_t(S) * geom::TOPK * 4));
+        CK(cudaMalloc(&msc.d_n_groups, 4));
+        CK(cudaMalloc(&msc.grp_exp, size_t(S) * geom::TOPK * 4));
+        CK(cudaMalloc(&msc.grp_cnt, size_t(S) * geom::TOPK * 4));
+        CK(cudaMalloc(&msc.grp_routes, size_t(S) * geom::TOPK * 8 * 4));
+        CK(cudaMalloc(&msc.fc1_part, size_t(8) * geom::TOPK * g6nr::EB * 2 * 2 * 128 * 4));
         CK(cudaMalloc(&msc.fc1_act, size_t(S) * geom::TOPK * g6nr::EB * 128 * 2));
-        CK(cudaMalloc(&msc.fc2_part, size_t(S) * geom::TOPK * g6nr::EB * geom::HID * 4));
+        CK(cudaMalloc(&msc.fc2_part, size_t(S) * geom::TOPK * geom::HID * 4));
         CK(cudaMalloc(&msc.routed_acc, size_t(S) * geom::HID * 4));
         CK(cudaMalloc(&msc.sh_gate_buf, size_t(S) * geom::SHARED_I * 2));
         CK(cudaMalloc(&msc.sh_up_buf, size_t(S) * geom::SHARED_I * 2));
