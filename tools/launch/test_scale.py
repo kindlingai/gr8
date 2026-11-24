@@ -482,5 +482,40 @@ class StorePrep(unittest.TestCase):
                          ['--tp', '4', '--port', '1', '--node-ip', '10.0.0.1'])
 
 
+class LiveSwitchCapabilityTest(unittest.TestCase):
+    """Phase B --live capability check (#156); runs without loopback aliases."""
+
+    class _FakeOpt:
+        def __init__(self, extra=''):
+            self._extra = extra
+
+        def get(self, k):
+            return self._extra if k == 'EXTRA_ENV' else None
+
+    def test_live_switch_capable_requires_all_three_primitives(self):
+        glm, flash = sv.models.GLM53, sv.models.GLM53F   # the real models: Flash's name is glm53f, its build flash
+        ok, why = sv.live_switch_capable(self._FakeOpt(''), glm)
+        self.assertFalse(ok)
+        self.assertIn('GR8_FABRIC_POOL=1', why)
+        self.assertIn('GR8_PTAB>=1', why)
+        self.assertIn('GR8_KV_CHUNKS=1', why)
+
+        ok, why = sv.live_switch_capable(self._FakeOpt('GR8_FABRIC_POOL=1 GR8_PTAB=3'), glm)
+        self.assertFalse(ok)
+        self.assertIn('GR8_KV_CHUNKS=1', why)
+
+        ok, why = sv.live_switch_capable(self._FakeOpt('GR8_FABRIC_POOL=1 GR8_PTAB=3 GR8_KV_CHUNKS=1'), glm)
+        self.assertTrue(ok)
+        self.assertEqual(why, '')
+
+        ok, why = sv.live_switch_capable(self._FakeOpt('GR8_FABRIC_POOL=1 GR8_PTAB=1 GR8_KV_CHUNKS=1'), flash)
+        self.assertFalse(ok)
+        self.assertIn('GR8_GLM53F_KV_CHUNKS=1', why)
+
+        ok, why = sv.live_switch_capable(self._FakeOpt('GR8_FABRIC_POOL=1 GR8_PTAB=1 GR8_GLM53F_KV_CHUNKS=1'), flash)
+        self.assertTrue(ok)
+        self.assertEqual(why, '')
+
+
 if __name__ == '__main__':
     unittest.main()

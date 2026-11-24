@@ -5,7 +5,7 @@
 //! makes the head's multi-call pool sequences in the commit safe. The no-event path is atomics only: no lock, syscall
 //! or allocation.
 
-use super::wire::{Ack, Notice, ADMIT, IMPORT};
+use super::wire::{Ack, Notice, ADMIT, SWITCH};
 use super::{refused, require, R};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::SeqCst};
 use std::sync::{Condvar, Mutex, MutexGuard};
@@ -74,7 +74,7 @@ impl Gate {
         let mut s = lock(&self.mu);
         require(!self.failed.load(SeqCst) && s.n.is_none(), "pending event or failed epoch")?;
         require(
-            n.epoch == self.epoch && n.event == s.next_event && (ADMIT..=IMPORT).contains(&n.kind),
+            n.epoch == self.epoch && n.event == s.next_event && (ADMIT..=SWITCH).contains(&n.kind),
             "notice epoch/sequence/kind mismatch",
         )?;
         require(n.boundary <= i64::MAX as u64 && n.boundary as i64 > self.passed.load(SeqCst), "late event notice")?;

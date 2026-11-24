@@ -24,7 +24,7 @@ inline uint64_t number(const std::string& s) {
     return n;
 }
 // ingress command kinds (files.rs CMD_*)
-constexpr uint32_t CMD_CANCEL = 0, CMD_ADMIT = 1, CMD_EXPORT = 2, CMD_IMPORT = 3;
+constexpr uint32_t CMD_CANCEL = 0, CMD_ADMIT = 1, CMD_EXPORT = 2, CMD_IMPORT = 3, CMD_SWITCH = 4;
 // resize: a Resize event the head makes itself (Service share poll), never from the ingress files
 struct Command { bool admit=false; uint64_t epoch=0, request=0, hash=0; std::optional<Resize> resize{}; uint32_t kind=0; };
 namespace svc {

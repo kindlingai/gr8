@@ -20,6 +20,9 @@ Every message in both directions is one frame:
 - If the connection drops, every in-flight request is dead on both sides. The engine aborts them and frees
   their KV (the prefix cache may keep blocks). The front end fails them with HTTP 500 / a stream error chunk
   and reconnects.
+- **In-process live width switch (S2 `EventKind::Switch`, #156):** the target is that the Unix stream socket between
+  the front end and rank 0 stays connected across a width cutover, with no frame changes. No engine module implements
+  the switch yet, so `./gr8 <model> scale --live` runs the drain/restart scale (the front end holds new requests).
 
 ## Engine -> front end: `hello` (first frame after accept)
 

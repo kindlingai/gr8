@@ -34,6 +34,9 @@ inline g6ctl_commit to_ctl(const Commit& e) {
                        e.export_op->export_id, e.export_op->first_row, e.export_op->rows};
     }
     x.has_import = e.import_session;
+    if ((x.has_switch = bool(e.switch_op))) {
+        x.switch_op = {e.switch_op->group_id, e.switch_op->target_nr, e.switch_op->flags};
+    }
     return x;
 }
 inline Commit from_ctl(const g6ctl_commit& x) {
@@ -49,6 +52,9 @@ inline Commit from_ctl(const g6ctl_commit& x) {
                              x.export_op.export_id, x.export_op.first_row, x.export_op.rows};
     }
     c.import_session = x.has_import;
+    if (x.has_switch) {
+        c.switch_op = SwitchOp{x.switch_op.group_id, x.switch_op.target_nr, x.switch_op.flags};
+    }
     return c;
 }
 } // namespace g6s2::ctl

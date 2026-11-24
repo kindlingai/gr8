@@ -103,6 +103,7 @@ pub struct CHooks {
     pub grown: Option<GrownFn>,
     pub export_session: Option<crate::module::ExportSessionFn>,
     pub import_session: Option<BindFn>,
+    pub switch_width: Option<crate::module::SwitchWidthFn>,
     pub has_prefill_pack: bool,
     pub has_dfl_ok: bool,
     pub has_terminal: bool,
@@ -114,6 +115,7 @@ pub struct CHooks {
     pub has_grown: bool,
     pub has_export_session: bool,
     pub has_import_session: bool,
+    pub has_switch_width: bool,
 }
 
 /// admit(slot, first, n_gen, dfl)
@@ -374,6 +376,7 @@ impl Driver {
         pay: Option<&CPayload>,
         export_op: Option<&crate::control::wire::Export>,
         is_import: bool,
+        switch_op: Option<&crate::control::wire::SwitchOp>,
     ) -> Res<sch::Changes> {
         let _b = self.enter()?;
         let s = &self.s();
@@ -388,7 +391,7 @@ impl Driver {
         let mut before = [s.slot(0); QMAX];
         before[..s.n].copy_from_slice(s.slots());
         let changes = s.with(|c, sl, st| sch::apply(c, sl, st, e, digest)).map_err(sch_err)?;
-        if let Err(r) = self.apply_hooks(s, e, resize, pay, export_op, is_import, &before[..s.n]) {
+        if let Err(r) = self.apply_hooks(s, e, resize, pay, export_op, is_import, switch_op, &before[..s.n]) {
             s.fail();
             return Err(r);
         }
@@ -404,6 +407,7 @@ impl Driver {
         pay: Option<&CPayload>,
         export_op: Option<&crate::control::wire::Export>,
         is_import: bool,
+        switch_op: Option<&crate::control::wire::SwitchOp>,
         before: &[Slot],
     ) -> Res<()> {
         for old in before {
@@ -480,6 +484,12 @@ impl Driver {
                 // SAFETY: as retire
                 ok(unsafe { self.h.export_session.ok_or_else(missing)?(self.h.ctx, &sl, ex) })?;
             }
+        }
+        if let Some(sw) = switch_op {
+            require(self.h.has_switch_width, "a switch commit without the switch_width hook")?;
+            require(sw.group_id != 0 && (1..=8).contains(&sw.target_nr), "invalid switch parameters")?;
+            // SAFETY: as retire; live sessions remain intact across an in-process width switch (#156)
+            ok(unsafe { self.h.switch_width.ok_or_else(missing)?(self.h.ctx, sw) })?;
         }
         Ok(())
     }
@@ -817,7 +827,8 @@ pub unsafe extern "C" fn g6s2_driver_view(d: *const Driver, out: *mut CView) {
     *out = CView { s: s.s, n: s.n, st: s.st };
 }
 
-/// Driver::apply. pay: null without an admit. export_op: null without an export. freed: room for the driver's slot count
+/// Driver::apply. pay: null without an admit. export_op: null without an export. switch_op: null without a switch.
+/// freed: room for the driver's slot count
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_driver_apply(
     d: *const Driver,
@@ -827,13 +838,14 @@ pub unsafe extern "C" fn g6s2_driver_apply(
     pay: *const CPayload,
     export_op: *const crate::control::wire::Export,
     is_import: bool,
+    switch_op: *const crate::control::wire::SwitchOp,
     freed: *mut Run,
     n_freed: *mut usize,
     admitted: *mut bool,
 ) -> i32 {
     let d = &*d;
     let n_slots = d.s().n;
-    let r = d.apply(&*e, digest, resize, pay.as_ref(), export_op.as_ref(), is_import).map(|c| {
+    let r = d.apply(&*e, digest, resize, pay.as_ref(), export_op.as_ref(), is_import, switch_op.as_ref()).map(|c| {
         let n = c.freed.len().min(n_slots);
         std::slice::from_raw_parts_mut(freed, n).copy_from_slice(&c.freed[..n]);
         *n_freed = n;
@@ -1264,7 +1276,7 @@ mod tests {
             let mut e = commit(&d);
             e.has_shrink = true;
             e.shrink = Shrink { key: d.s().slot(2).key, r_rows: c.r2_rows, run };
-            d.apply(&e, 0, false, None, None, false).map(|_| (d.s().slot(2).run, pool.lock().digest()))
+            d.apply(&e, 0, false, None, None, false, None).map(|_| (d.s().slot(2).run, pool.lock().digest()))
         };
         let shrink = |pool: &Handle, u: CPool, run: Run| shrink_own(pool, u, run, true);
         // the head's change, made when it built the commit, on a pool seated alike
@@ -1299,7 +1311,7 @@ mod tests {
             let x = d.s().slot(0);
             let mut e = commit(&d);
             (e.has_cancel, e.cancel) = (true, x.key);
-            d.apply(&e, 0, false, None, None, false).unwrap();
+            d.apply(&e, 0, false, None, None, false, None).unwrap();
             assert_eq!(live(&pool), if head { 3 } else { 2 });
             if head {
                 pool.lock().release(&kv(&x.run)).unwrap();

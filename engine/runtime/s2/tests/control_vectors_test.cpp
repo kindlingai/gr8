@@ -383,10 +383,10 @@ std::vector<std::vector<uint8_t>> read_frames(const char* path) {
 int main(int argc, char** argv) {
     struct Section { const char* name; uint64_t seed; uint64_t (*run)(uint64_t, std::vector<std::string>*); uint64_t want; };
     const Section sections[] = {
-        // Control v16 adds EventKind::Export/Import and Commit::export_op/import_session (#159);
-        // re-recorded frame, piece, match, and gate transcripts.
-        {"frames", 1, frames_section, 0xd1ab320951fe6f4full},
-        {"pieces", 2, pieces_section, 0x719f1353a189dee8ull},
+        // Control v17 adds EventKind::Switch and Commit::switch_op (#156);
+        // re-recorded frame and piece transcripts (match, gate, agreement, difference unchanged).
+        {"frames", 1, frames_section, 0x4fce1940e16f6b52ull},
+        {"pieces", 2, pieces_section, 0xcade345102bd41adull},
         {"match", 3, match_section, 0x8afa450eb7c9ae0dull},
         {"gate", 4, gate_section, 0x626d389dba969f61ull},
         {"agreement", 5, agreement_section, 0x2475fad827f09bfbull},

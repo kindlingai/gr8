@@ -749,7 +749,7 @@ impl Control {
                     self.intake(inn, &command, false)?;
                 } else if command.kind == files::CMD_IMPORT {
                     self.intake(inn, &command, true)?;
-                } else if command.kind == files::CMD_EXPORT {
+                } else if command.kind == files::CMD_EXPORT || command.kind == files::CMD_SWITCH {
                     self.event(inn, &Cmd { c: command, resize: None }, None)?;
                 } else if self.queue_cancel(id) {
                     inn.commands.remove(&id);
@@ -928,6 +928,8 @@ impl Control {
             ("export", wire::EXPORT)
         } else if cmd.c.kind == files::CMD_IMPORT {
             ("import", wire::IMPORT)
+        } else if cmd.c.kind == files::CMD_SWITCH {
+            ("switch", wire::SWITCH)
         } else if cmd.c.admit {
             ("admit", wire::ADMIT)
         } else {
@@ -1011,6 +1013,11 @@ impl Control {
         if let Some(r) = cmd.resize {
             cm.has_resize = true;
             cm.resize = r;
+        }
+        if cmd.c.kind == files::CMD_SWITCH && cmd.resize.is_none() {
+            cm.has_switch = true;
+            cm.switch_op = wire::SwitchOp { group_id: cmd.c.request, target_nr: cmd.c.hash as u32, flags: 0 };
+            return Ok(cm);
         }
         if cmd.c.kind == files::CMD_EXPORT && cmd.resize.is_none() {
             cm.has_export = true;

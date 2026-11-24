@@ -33,7 +33,8 @@ constexpr unsigned PACK_MAX_MEMBERS = unsigned(g6mod::INFO.pack_members);
 // DS41 prefill packs. 14 adds the image digest to a request's identity (DS41 image input).
 // 15 adds an optional exact prefill checkpoint boundary (zero leaves scheduling unchanged).
 // 16 adds session Export and Import events at an event fence (#159).
-constexpr unsigned CONTROL_VERSION = 16;
+// 17 adds in-process live width Switch events at an event fence (#156).
+constexpr unsigned CONTROL_VERSION = 17;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
@@ -180,6 +181,13 @@ struct Export {
         return key == b.key && export_id == b.export_id && first_row == b.first_row && rows == b.rows;
     }
 };
+// an in-process live width switch cutover at an event fence (#156): target fabric group_id, target_nr, flags
+struct SwitchOp {
+    uint64_t group_id = 0; uint32_t target_nr = 0, flags = 0;
+    bool operator==(const SwitchOp& b) const {
+        return group_id == b.group_id && target_nr == b.target_nr && flags == b.flags;
+    }
+};
 struct Commit {
     uint64_t epoch = 0, event = 0, boundary = 0, before_hash = 0;
     std::optional<Key> cancel;
@@ -197,6 +205,8 @@ struct Commit {
     std::optional<Export> export_op = std::nullopt;
     // an Import event (#159): admit carries imported rows in Grant::reuse; Driver::apply calls import_session after bind
     bool import_session = false;
+    // a Switch event (#156): Driver::apply passes it to DriverHooks::switch_width; leaves live sessions intact
+    std::optional<SwitchOp> switch_op = std::nullopt;
 };
 struct Changes {
     std::vector<Run> freed;

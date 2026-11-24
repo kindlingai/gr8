@@ -85,6 +85,7 @@ pub const CMD_CANCEL: u32 = 0;
 pub const CMD_ADMIT: u32 = 1;
 pub const CMD_EXPORT: u32 = 2;
 pub const CMD_IMPORT: u32 = 3;
+pub const CMD_SWITCH: u32 = 4;
 
 /// One command file: `ADMIT <epoch> <request> <hash>`, `CANCEL <epoch> <request> 0`,
 /// `EXPORT <epoch> <request> <export_id>` or `IMPORT <epoch> <request> <hash>`.
@@ -116,11 +117,16 @@ pub fn parse_command(text: &[u8], epoch: u64) -> R<Command> {
         b"CANCEL" => CMD_CANCEL,
         b"EXPORT" => CMD_EXPORT,
         b"IMPORT" => CMD_IMPORT,
+        b"SWITCH" => CMD_SWITCH,
         _ => return Err(refused("unknown ingress command")),
     };
     let c = Command { admit: ck == CMD_ADMIT, kind: ck, epoch: number(e)?, request: number(r)?, hash: number(h)? };
     require(c.epoch == epoch && (ck != CMD_CANCEL || c.hash == 0), "ingress epoch/cancel mismatch")?;
     require(ck != CMD_EXPORT || c.hash != 0, "ingress export id must be nonzero")?;
+    require(
+        ck != CMD_SWITCH || (c.request != 0 && c.hash >= 1 && c.hash <= 8),
+        "ingress switch requires nonzero group id and target width 1..8",
+    )?;
     Ok(c)
 }
 
@@ -363,6 +369,18 @@ mod tests {
         assert_eq!(
             parse_command(b"IMPORT 1 5 77\n", 1),
             Ok(Command { admit: false, kind: CMD_IMPORT, epoch: 1, request: 5, hash: 77 })
+        );
+        assert_eq!(
+            parse_command(b"SWITCH 1 2 3\n", 1),
+            Ok(Command { admit: false, kind: CMD_SWITCH, epoch: 1, request: 2, hash: 3 })
+        );
+        assert_eq!(
+            parse_command(b"SWITCH 1 0 3\n", 1),
+            Err(refused("ingress switch requires nonzero group id and target width 1..8"))
+        );
+        assert_eq!(
+            parse_command(b"SWITCH 1 2 9\n", 1),
+            Err(refused("ingress switch requires nonzero group id and target width 1..8"))
         );
         assert_eq!(parse_command(b"STOP 1 2 3", 1), Err(refused("unknown ingress command")));
         assert_eq!(parse_command(b"ADMIT 1 2", 1), Err(refused("invalid ingress command")));

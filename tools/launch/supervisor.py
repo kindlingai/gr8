@@ -1490,7 +1490,7 @@ class Supervisor:
         s = {'id': f'{self.hs["epoch"]}.{self.scale_n}', 'members': members, 'old_members': list(self.members),
              'argv': delta, 'phase': 'prepare', 'error': '', 'ready': {}, 'msg': None, 'token': secrets.token_hex(16),
              'drain': float(m.get('drain_timeout') or 300), 'boot_s': max(900.0, ready + 120), 'marks': [],
-             'extra_env': o.get('EXTRA_ENV')}
+             'extra_env': o.get('EXTRA_ENV'), 'live': bool(m.get('live'))}
         self.scale_seen |= set(members) | set(self.members)
         self.scale = s
         log(f'scale {s["id"]}: TP={self.o.get("TP")} {",".join(self.members)} -> TP={tp} {",".join(members)}')
@@ -1535,6 +1535,12 @@ class Supervisor:
             bad = [f'{a}: {w}' for a, (ok, w) in s['ready'].items() if not ok]
             if bad:
                 raise RuntimeError('; '.join(bad))
+            if s.get('live'):
+                # no engine module installs switch_width yet (#156), so an in-process cutover cannot happen: --live says
+                # why and runs the drain/restart scale below
+                ok, why = live_switch_capable(self.o, models.of(self.o))
+                log(f'scale {s["id"]}: --live: {why if not ok else "the engine has no in-process width switch yet"}; '
+                    'falling back to the drain/restart scale')
             s['phase'] = 'drain'
             self.front_hold(s['drain'] + s['boot_s'])
             s['held'] = time.time()
@@ -2365,6 +2371,38 @@ def scale_store(o):
     if models.of(o).checkpoint_cache:
         stores = stores[:1]
     return next((t['path'] for t in stores if t['kind'] == 'ssd' and t['persist']), None)
+
+
+def _env_kv(extra_env):
+    """Parse KEY=VAL words from EXTRA_ENV into a dict."""
+    out = {}
+    for w in (extra_env or '').split():
+        if '=' in w:
+            k, _, v = w.partition('=')
+            out[k] = v
+    return out
+
+
+def live_switch_capable(o, model):
+    """Whether a running boot supports Phase B in-process live width switching (`./gr8 <model> scale --live`, #156).
+    Requires all three Phase B dynamic primitives enabled in EXTRA_ENV:
+      - GR8_FABRIC_POOL=1 (reconfigurable fabric groups, #154)
+      - GR8_PTAB>=1 (chunked weight pool, #151)
+      - GR8_KV_CHUNKS=1 (GLM) or GR8_GLM53F_KV_CHUNKS=1 (Flash) (resizable VMM KV pool, #153)
+    Returns (ok, reason)."""
+    kv = _env_kv(o.get('EXTRA_ENV'))
+    missing = []
+    if kv.get('GR8_FABRIC_POOL', '0') in ('', '0'):
+        missing.append('GR8_FABRIC_POOL=1')
+    ptab = kv.get('GR8_PTAB', '0')
+    if not ptab.isdigit() or int(ptab) < 1:
+        missing.append('GR8_PTAB>=1')
+    kv_key = 'GR8_GLM53F_KV_CHUNKS' if model.build == 'flash' else 'GR8_KV_CHUNKS'   # build, not name: Flash is glm53f
+    if kv.get(kv_key, '0') in ('', '0'):
+        missing.append(f'{kv_key}=1')
+    if missing:
+        return False, 'missing ' + ', '.join(missing)
+    return True, ''
 
 
 def layout_file(d, text):
