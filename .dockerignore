@@ -2,6 +2,8 @@
 # runtime image.
 .git
 .github
+.release-please-manifest.json
+release-please-config.json
 bin*
 **/target
 **/__pycache__

@@ -178,7 +178,11 @@ If you are an agent (or developer) building on gr8, start from the matching entr
   ([docs/SWITCHING.md](docs/SWITCHING.md)) for cluster control.
 - **Add a model:** Follow [docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md). Launcher metadata,
   per-TP defaults and image checks share one registry; an unsupported architecture still needs engine work.
-- **Change gr8 itself:** Read [AGENTS.md](AGENTS.md) before editing engine, launcher, or front-end code.
+- **Change gr8 itself:** Read [AGENTS.md](AGENTS.md) before editing engine, launcher, or front-end code. Pull request
+  titles must follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `perf:`, `docs:`,
+  `ci:`, `refactor:`, `test:`, `chore:`, with optional scope such as `feat(qw38): ...` or `fix(kvman): ...`, and `!:`
+  for breaking changes) — checked on every PR by `.github/workflows/pr-title.yml` because squash-merged PR titles drive
+  automated `release-please` releases and [`CHANGELOG.md`](CHANGELOG.md).
 
 ## What gr8 does today
 

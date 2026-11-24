@@ -1,16 +1,8 @@
 # Changelog
 
-Every numbered `v*` release of `gr8` is recorded in this file alongside its machine-readable version spec in
-[`releases/<tag>.json`](releases/) and its matching [GitHub Release](https://github.com/kindlingai/gr8/releases).
-Format and release rules live in [`RELEASING.md`](RELEASING.md).
-
----
-
-## [Unreleased]
-
-Changes merged on `main` since `v1.2.0` that are not yet cut in a numbered `v*` release tag.
-
-- **Breaking changes:** None.
+Releases of `gr8` are automated with `release-please` from Conventional Commits on `main`. See [`RELEASING.md`](RELEASING.md)
+for versioning, release gates, and optional machine-readable specs in [`releases/`](releases/), and the
+[GitHub Releases](https://github.com/kindlingai/gr8/releases) page for container digests and tester archives.
 
 ---
 
