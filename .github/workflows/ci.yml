@@ -39,11 +39,11 @@ on:
 permissions:
   contents: read
 
-# A pull request's new push cancels its old run. Each push to main or a tag runs in its own group: one group per ref
-# keeps a single pending run, and a newer one cancels it, so in a burst of merges only the first and last were tested.
+# A new push to a pull request or to main cancels the older run. Releases, tags and manual runs each run in their own
+# group and are never cancelled.
 concurrency:
-  group: ci-${{ inputs.tag || github.ref }}${{ github.event_name != 'pull_request' && format('-{0}', github.sha) || '' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ inputs.tag || github.ref }}${{ !(github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && !inputs.tag)) && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && !inputs.tag) }}
 
 jobs:
   changes:
