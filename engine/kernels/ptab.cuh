@@ -143,7 +143,7 @@ inline const char* image_entries(Table& t, const uint8_t* fc1, const uint8_t* fc
     {
         const long long* tr = &h[static_cast<size_t>(e) * 6];
         if (tr[3] > t.eb) return "ptab: a row has more blocks than EB";
-        if (tr[3] > 8) return "ptab: a row has more than 8 blocks (the tr3.kmix format's ceiling)";
+        if (k[e] && tr[3] > 8) return "ptab: a row with mixed widths has more than 8 blocks (the tr3.kmix format's ceiling)";
         for (int b = 0; b < tr[3]; ++b)
         {
             const size_t f1 = tr3_piece_fc1_bytes(k[e], tr, b), f2 = tr3_piece_fc2_bytes(tr);
@@ -324,7 +324,7 @@ inline const char* alloc_direct(Table& t, const std::vector<long long>& h, const
         const long long km = k.empty() ? 0 : k[e];
         const int nb = static_cast<int>(tr[3]);
         if (nb > eb) return "ptab::alloc_direct: a row has more blocks than EB";
-        if (nb > 8) return "ptab::alloc_direct: a row has more than 8 blocks (tr3.kmix ceiling)";
+        if (km && nb > 8) return "ptab::alloc_direct: a row with mixed widths has more than 8 blocks (tr3.kmix ceiling)";
         if (nb <= 0) continue;
         for (int b = 0; b < nb; ++b)
         {

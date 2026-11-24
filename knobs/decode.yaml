@@ -176,8 +176,8 @@ knobs:
       The routed-expert kernels (decode K1 and prefill) read each piece, one 128-column block of an expert, through
       the layer's device piece table (`kernels/ptab.cuh`): 1 = entries into the rank image, 2 = every piece copied
       into its own scattered slab (an A/B; the image's expert bytes stay allocated), 3 = contiguous-per-expert slabs
-      in ptab::Pool (loaded directly into slabs in g6m4 without duplicating tr3.fc1/fc2 in DevImage). Same bytes out.
-      0 = the pack layout.
+      in ptab::Pool (loaded directly into slabs in g6m4 without duplicating tr3.fc1/fc2 in DevImage; an --image boot
+      with GR8_WEIGHT_CHECK=0, which cannot sum slabs: g6m4 stops otherwise). Same bytes out. 0 = the pack layout.
   GR8_L2PF:
     scope: local
     kind: int

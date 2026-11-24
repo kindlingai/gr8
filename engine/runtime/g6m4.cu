@@ -619,6 +619,12 @@ int main(int argc, char** argv)
         m.ppool = direct_ptab.pool;
         m.direct_ptab = direct_ptab.tables;
     }
+    // GR8_PTAB=3 is the direct slab load: building its slabs from the image instead keeps the image's expert bytes too,
+    // every routed expert held twice (a TP=1 Flash rank cannot fit that)
+    else if (ptab::mode_env() == ptab::CONTIG)
+        die(wcheck::enabled() ? "GR8_PTAB=3 loads the routed experts straight into slabs, which the weight check cannot "
+                                "follow (it sums the whole image): set GR8_WEIGHT_CHECK=0 with it"
+                              : "GR8_PTAB=3 needs the direct slab load: an --image boot through the Rust loader");
     u64* stepp = dmalloc<u64>(1);
     StepIn* in;
     StepOut* out;
