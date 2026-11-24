@@ -477,6 +477,13 @@ run_job admit_hold_drain_test '
   g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/admit_hold_drain_test.cpp" "${KVLIB[@]}" -o "$D/admit_hold_drain_test"
   (cd "$D" && "$D/admit_hold_drain_test" 2>/dev/null)
 '
+# live session KV export & cross-width import (#159): compact owned-page plans, multi-rank CP/replicated transforms,
+# mid-decode Service EXPORT, cross-width IMPORT with zero prefill and exact continuation, and intake refusals
+run_job session_export_import_test '
+  g++ -std=c++17 -O1 -g -Wall -Wextra -pthread -fsanitize=address,undefined -I "$REPO/engine/runtime" \
+    "$REPO/engine/runtime/s2/tests/session_export_import_test.cpp" "${KVLIB[@]}" -o "$D/session_export_import_test"
+  "$D/session_export_import_test" 2>/dev/null
+'
 run_job ds41_geom_dump '
   g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/ds41_geom_dump.cpp" -o "$D/ds41_geom_dump"
   (cd "$REPO/engine/tests" && DS41_GEOM_DUMP="$D/ds41_geom_dump" python3 -m unittest -q test_ds41_geom)

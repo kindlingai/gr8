@@ -69,6 +69,9 @@ struct DriverHooks {
     std::function<void()> settle;
     // DS41 prefill pack: one native pass for the ordered segments, never N solo hooks.
     std::function<void(const std::vector<PrefillPart>&)> prefill_pack;
+    // optional (#159): session KV export/import at an event fence
+    std::function<void(const Slot&, const Export&)> export_session;
+    std::function<void(const Grant&)> import_session;
 };
 // The pool calls the Rust driver makes itself on the rank's pool (pool.h RunPool::handle; the pool must outlive the
 // Driver), each under the pool's lock for that call alone and with no hook running. grow: runs grow before a round
@@ -193,6 +196,16 @@ class Driver {
         static int32_t t_payload(void* c, uint32_t slot, bool set) noexcept {
             Impl& m = of(c); return m.guard([&] { m.payload[slot] = set ? *m.admit : Payload{}; });
         }
+        static int32_t t_export_session(void* c, const g6sch_slot* s, const g6sch_export* ex) noexcept {
+            Impl& m = of(c);
+            return m.guard([&] {
+                const Export e{Key{ex->key.epoch, ex->key.slot, ex->key.generation}, ex->export_id, ex->first_row, ex->rows};
+                m.hooks.export_session(m.live(s), e);
+            });
+        }
+        static int32_t t_import_session(void* c, const g6sch_grant* g) noexcept {
+            Impl& m = of(c); return m.guard([&] { m.hooks.import_session(*sch::c<Grant>(g)); });
+        }
         static int32_t t_admit(void* c, uint32_t slot, int32_t first, int32_t n_gen, bool dfl) noexcept {
             Impl& m = of(c);
             return m.guard([&] {
@@ -255,9 +268,10 @@ public:
         require(!pool.grow || bool(k.grown), "the driver's pool growth without the grown hook");
         const g6s2_drv_hooks hooks{&m, Impl::t_bind, Impl::t_retire, Impl::t_prefill, Impl::t_prefill_pack, Impl::t_dfl_ok,
                                    Impl::t_terminal, Impl::t_grow, Impl::t_finished, Impl::t_resize, Impl::t_shrink,
-                                   Impl::t_settle, Impl::t_payload, Impl::t_grown, bool(k.prefill_pack), bool(k.dfl_ok),
-                                   bool(k.terminal), bool(k.grow), bool(k.finished), bool(k.resize), bool(k.shrink),
-                                   bool(k.settle), bool(k.grown)};
+                                   Impl::t_settle, Impl::t_payload, Impl::t_grown, Impl::t_export_session, Impl::t_import_session,
+                                   bool(k.prefill_pack), bool(k.dfl_ok), bool(k.terminal), bool(k.grow), bool(k.finished),
+                                   bool(k.resize), bool(k.shrink), bool(k.settle), bool(k.grown),
+                                   bool(k.export_session), bool(k.import_session)};
         const g6s2_drv_planner planner{&m, Impl::t_admit, Impl::t_admit_pack, Impl::t_round, Impl::t_demote, Impl::t_promote,
                                        Impl::t_release, Impl::t_length, Impl::t_finished_q, Impl::t_active, Impl::t_inserted};
         const Slot empty{};
@@ -313,7 +327,13 @@ public:
         {
             const Impl::Restore keep(m);
             m.admit = p; m.commit = &c;
+            g6sch_export ex{};
+            if (c.export_op) {
+                ex = {{c.export_op->key.epoch, c.export_op->key.slot, c.export_op->key.generation},
+                      c.export_op->export_id, c.export_op->first_row, c.export_op->rows};
+            }
             rc = g6s2_driver_apply(m.rs.get(), &x, digest, bool(c.resize), p ? &pay : nullptr,
+                                   c.export_op ? &ex : nullptr, c.import_session,
                                    sch::m<g6sch_run>(d.freed.data()), &n, &admitted);
         }
         m.check(rc);

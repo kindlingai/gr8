@@ -23,11 +23,16 @@ inline uint64_t number(const std::string& s) {
     ctl::check(g6svc_number(ctl::bytes(s), s.size(), &n));
     return n;
 }
+// ingress command kinds (files.rs CMD_*)
+constexpr uint32_t CMD_CANCEL = 0, CMD_ADMIT = 1, CMD_EXPORT = 2, CMD_IMPORT = 3;
 // resize: a Resize event the head makes itself (Service share poll), never from the ingress files
-struct Command { bool admit=false; uint64_t epoch=0, request=0, hash=0; std::optional<Resize> resize{}; };
+struct Command { bool admit=false; uint64_t epoch=0, request=0, hash=0; std::optional<Resize> resize{}; uint32_t kind=0; };
 namespace svc {
-inline Command command(const g6svc_command& c) { return Command{c.admit, c.epoch, c.request, c.hash}; }
-inline g6svc_command command(const Command& c) { return g6svc_command{c.epoch, c.request, c.hash, c.admit}; }
+inline Command command(const g6svc_command& c) { return Command{c.admit, c.epoch, c.request, c.hash, {}, c.kind}; }
+inline g6svc_command command(const Command& c) {
+    const uint32_t k = c.kind ? c.kind : (c.admit ? CMD_ADMIT : CMD_CANCEL);
+    return g6svc_command{c.epoch, c.request, c.hash, c.admit, k};
+}
 // what ready.s2 and the agreement read; valid while c is
 struct Boot {
     SteeringView steering;

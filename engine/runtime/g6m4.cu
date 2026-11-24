@@ -149,6 +149,9 @@ namespace g6rt {
 #include "s2/pool.h"
 #include "s2/kv_chunks_plan.h"
 #include "s2/kv_tier.cuh"
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41 && !G6_MODEL_INK2
+#include "s2/canon_mover.cuh"
+#endif
 #include "rt_rows.cuh"
 #include "s2/kv_share.h"
 #include "host_reclaim.h"
@@ -2896,7 +2899,7 @@ int main(int argc, char** argv)
 #define GLM_CAPTURES(X) X(R) X(m) X(D) X(DF) X(st) X(st_par) X(exec_f) X(fabf) X(in_f) X(out_f) X(plan) X(dfl_reuse) \
     X(rtt) X(pool) X(kvt) X(kv_drained) X(kv_drain) X(bind_delay_rank) X(bind_delay_ms) X(dfl_owner) X(dfl_from) \
     X(slot_prompt) X(slot_whole) X(s2_dstep) X(dfl_par_st) X(dfl_tl) X(dfl_t0) X(rt_told) X(rt_log) X(rt_layers) \
-    X(rt_gen) X(nd) X(place) X(kv_chunk_pages)
+    X(rt_gen) X(nd) X(place) X(kv_chunk_pages) X(s2dir)
             GLM_CAPTURES(G6S2_CAPTURE_TYPE)
             uint32_t big = 0;   // GR8_CP_R2_BIG, with GR8_CP_R2
 #define GLM_POOL_ONLY(X) X(cap) X(rt_runs) X(cp_R2) X(big)
@@ -3299,6 +3302,56 @@ int main(int argc, char** argv)
                     for (int i = 0; i < dfl::B; ++i) { o.tok[i] = out_f->tok[i]; o.lp[i] = out_f->lp[i]; }
                     return o;
                 }
+                void on_export_session(const g6s2::Slot& sl, const g6s2::Export& ex) {
+                    kv_drain();
+                    std::vector<const G6AttnBinding*> bs;
+                    bs.reserve(m.layers.size() + D.d.layers.size());
+                    for (const auto& y : m.layers) bs.push_back(&y.ab);
+                    for (const auto& y : D.d.layers) bs.push_back(&y.ab);
+                    const std::vector<int> list = pool.list(sl.run);
+                    const bool ex_run = pool.exclusive_run(sl.run);
+                    const uint32_t canon_place = (ex_run && !pool.split()) ? UINT32_MAX : uint32_t(m.s2->pool_pages);
+                    const uint32_t nr = !m.layers.empty() ? uint32_t(m.layers[0].ab.args.cp_nr) : 0u;
+                    const uint32_t below = nr ? (sl.req.r_rows ? sl.req.r_rows : uint32_t(m.s2_below ? m.s2_below : m.cp.R)) : 0u;
+                    const g6s2::CanonShard shard = g6s2::canon_export_bindings(
+                        bs, list, canon_place, nr, uint32_t(R), below, ex.first_row, ex.rows, st);
+                    const std::string spath = s2dir + "/export." + std::to_string(ex.export_id) + ".r" + std::to_string(R) + ".shard";
+                    g6s2::canon_shard_write(spath, shard);
+                    if (nr == 0 && R == 0) {
+                        const auto blob = g6s2::canon_assemble_shards({shard}, false);
+                        g6s2::canon_write_file_atomic(s2dir + "/export." + std::to_string(ex.export_id) + ".canon", blob.data(), blob.size());
+                    }
+                    if (R == 0)
+                        fprintf(stderr, "# s2 export request %llu id %llu slot %u rows %u..%u (nr %u)\n",
+                                (unsigned long long)sl.req.id, (unsigned long long)ex.export_id, sl.key.slot,
+                                ex.first_row, ex.first_row + ex.rows, nr);
+                }
+                void on_import_session(const g6s2::Grant& g) {
+                    const std::string path = s2dir + "/import." + std::to_string(g.req.id) + ".canon";
+                    std::vector<uint8_t> blob;
+                    std::string err;
+                    if (!g6s2::canon_read_file_bytes(path, blob, err))
+                        throw std::runtime_error("s2 import read failed: " + err);
+                    std::vector<const G6AttnBinding*> bs;
+                    bs.reserve(m.layers.size() + D.d.layers.size());
+                    for (const auto& y : m.layers) bs.push_back(&y.ab);
+                    for (const auto& y : D.d.layers) bs.push_back(&y.ab);
+                    const std::vector<int> list = pool.list(g.run);
+                    const bool ex_run = pool.exclusive_run(g.run);
+                    const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
+                    for (Model* x : {&m, &D.d}) {
+                        if (ex_run && !pool.split()) reset(*x, st);
+                        else s2_reset_pages(*x, list, st, most);
+                    }
+                    const uint32_t canon_place = (ex_run && !pool.split()) ? UINT32_MAX : uint32_t(m.s2->pool_pages);
+                    const uint32_t nr = !m.layers.empty() ? uint32_t(m.layers[0].ab.args.cp_nr) : 0u;
+                    const uint32_t below = nr ? (g.req.r_rows ? g.req.r_rows : uint32_t(m.s2_below ? m.s2_below : m.cp.R)) : 0u;
+                    const uint64_t written = g6s2::canon_import_bindings(
+                        bs, list, canon_place, nr, uint32_t(R), below, blob.data(), blob.size(), st);
+                    if (R == 0)
+                        fprintf(stderr, "# s2 import request %llu slot %u rows %u (written %llu, nr %u)\n",
+                                (unsigned long long)g.req.id, g.key.slot, g.reuse, (unsigned long long)written, nr);
+                }
             };
             GlmModule gm{{}, GLM_CAPTURES(G6S2_CAPTURE_ARG)};
 #undef GLM_CAPTURES
@@ -3311,6 +3364,8 @@ int main(int argc, char** argv)
             o.grown = g6s2::mod::grown<G, &G::on_grown>;
             o.retire = g6s2::mod::retire<G, &G::on_retire>;
             o.fence = g6s2::mod::call<G, &G::on_fence>;
+            o.export_session = g6s2::mod::export_session<G, &G::on_export_session>;
+            o.import_session = g6s2::mod::import_session<G, &G::on_import_session>;
             if (kvt) o.drained = g6s2::mod::drained<G, &G::on_drained>;
             // a tier on a group lease (--kv-store group=): every rank resizes it at the Resize commit; the head reports
             // to the node, asking for the segments an oversize entry, the pages the tier pushed out since its last

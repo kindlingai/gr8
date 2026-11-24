@@ -16,6 +16,8 @@ static_assert(sizeof(g6rt::LpRow) == sizeof(g6s2_lp_row) && offsetof(g6rt::LpRow
               offsetof(g6rt::LpRow, tlp) == offsetof(g6s2_lp_row, tlp), "LpRow layout");
 static_assert(sizeof(Resize) == sizeof(g6sch_resize) && offsetof(Resize, segs) == offsetof(g6sch_resize, segs) &&
               offsetof(Resize, txn) == offsetof(g6sch_resize, txn), "Resize layout");
+static_assert(sizeof(Export) == sizeof(g6sch_export) && offsetof(Export, export_id) == offsetof(g6sch_export, export_id) &&
+              offsetof(Export, rows) == offsetof(g6sch_export, rows), "Export layout");
 static_assert(sizeof(s2::DflReq) == sizeof(g6s2_dfl_req) && offsetof(s2::DflReq, phase) == offsetof(g6s2_dfl_req, phase) &&
               sizeof(s2::DflDrafts) == sizeof(g6s2_dfl_drafts), "DflReq layout");
 static_assert(sizeof(g6rt::CacheNamespace) == G6KV_NAMESPACE_BYTES, "cache namespace size");
@@ -79,6 +81,13 @@ template <class C, void (C::*F)(const Resize&)> int32_t resize(void* x, const g6
 }
 template <class C, uint32_t (C::*F)()> int32_t flash_room(void* x, uint32_t* out) noexcept {
     return guard<C>(x, [&](C& c) { *out = (c.*F)(); });
+}
+template <class C, void (C::*F)(const Slot&, const Export&)>
+int32_t export_session(void* x, const g6sch_slot* s, const g6sch_export* ex) noexcept {
+    return guard<C>(x, [&](C& c) { (c.*F)(*as<const Slot>(s), *as<const Export>(ex)); });
+}
+template <class C, void (C::*F)(const Grant&)> int32_t import_session(void* x, const g6sch_grant* g) noexcept {
+    return guard<C>(x, [&](C& c) { (c.*F)(*as<const Grant>(g)); });
 }
 template <class C, int (C::*F)(bool, int)> int32_t bucket(void* x, bool draft, int32_t context, int32_t* out) noexcept {
     return guard<C>(x, [&](C& c) { *out = (c.*F)(draft, context); });
@@ -151,6 +160,10 @@ public:
     bool drained() const { bool d = false; call(o.drained, &d); return d; }
     void resize(const Resize& r) const { call(o.resize, mod::as<const g6sch_resize>(&r)); }
     uint32_t flash_room() const { uint32_t n = 0; call(o.flash_room, &n); return n; }
+    void export_session(const Slot& s, const Export& ex) const {
+        call(o.export_session, mod::as<const g6sch_slot>(&s), mod::as<const g6sch_export>(&ex));
+    }
+    void import_session(const Grant& g) const { call(o.import_session, mod::as<const g6sch_grant>(&g)); }
     int bucket(bool draft, int context) const { int32_t b = 0; call(o.bucket, draft, context, &b); return b; }
     void mode(int old_solo, int new_solo) const { call(o.mode, old_solo, new_solo); }
     std::vector<int> launch(const Launch& l) const {
@@ -196,6 +209,8 @@ template <class H> class FnModule : public ModuleCtx {
     bool on_drained() { return h_.drained(); }
     void on_resize(const Resize& r) { h_.resize(r); }
     uint32_t on_flash_room() { return h_.flash_room(); }
+    void on_export_session(const Slot& s, const Export& ex) { h_.export_session(s, ex); }
+    void on_import_session(const Grant& g) { h_.import_session(g); }
     int on_bucket(bool draft, int context) { return d().bucket(draft, context); }
     void on_mode(int old_solo, int new_solo) { d().mode(old_solo, new_solo); }
     std::vector<int> on_launch(const Launch& l) { return d().launch(l); }
@@ -227,6 +242,8 @@ public:
             if (h_.drained) o.drained = mod::drained<F, &F::on_drained>;
             if (h_.resize) o.resize = mod::resize<F, &F::on_resize>;
             if (h_.flash_room) o.flash_room = mod::flash_room<F, &F::on_flash_room>;
+            if (h_.export_session) o.export_session = mod::export_session<F, &F::on_export_session>;
+            if (h_.import_session) o.import_session = mod::import_session<F, &F::on_import_session>;
         }
         const auto& x = d();
         if (x.bucket) o.bucket = mod::bucket<F, &F::on_bucket>;

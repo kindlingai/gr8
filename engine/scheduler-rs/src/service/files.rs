@@ -80,7 +80,14 @@ pub fn number(s: &[u8]) -> R<u64> {
     Ok(n)
 }
 
-/// One command file: `ADMIT <epoch> <request> <hash>` or `CANCEL <epoch> <request> 0`.
+/// Ingress command kinds (ingress.h).
+pub const CMD_CANCEL: u32 = 0;
+pub const CMD_ADMIT: u32 = 1;
+pub const CMD_EXPORT: u32 = 2;
+pub const CMD_IMPORT: u32 = 3;
+
+/// One command file: `ADMIT <epoch> <request> <hash>`, `CANCEL <epoch> <request> 0`,
+/// `EXPORT <epoch> <request> <export_id>` or `IMPORT <epoch> <request> <hash>`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Command {
@@ -88,6 +95,7 @@ pub struct Command {
     pub request: u64,
     pub hash: u64,
     pub admit: bool,
+    pub kind: u32,
 }
 
 // isspace in the C locale, as istream's >> splits words
@@ -103,9 +111,16 @@ pub fn parse_command(text: &[u8], epoch: u64) -> R<Command> {
     else {
         return Err(refused("invalid ingress command"));
     };
-    require(kind == b"ADMIT" || kind == b"CANCEL", "unknown ingress command")?;
-    let c = Command { admit: kind == b"ADMIT", epoch: number(e)?, request: number(r)?, hash: number(h)? };
-    require(c.epoch == epoch && (c.admit || c.hash == 0), "ingress epoch/cancel mismatch")?;
+    let ck = match kind {
+        b"ADMIT" => CMD_ADMIT,
+        b"CANCEL" => CMD_CANCEL,
+        b"EXPORT" => CMD_EXPORT,
+        b"IMPORT" => CMD_IMPORT,
+        _ => return Err(refused("unknown ingress command")),
+    };
+    let c = Command { admit: ck == CMD_ADMIT, kind: ck, epoch: number(e)?, request: number(r)?, hash: number(h)? };
+    require(c.epoch == epoch && (ck != CMD_CANCEL || c.hash == 0), "ingress epoch/cancel mismatch")?;
+    require(ck != CMD_EXPORT || c.hash != 0, "ingress export id must be nonzero")?;
     Ok(c)
 }
 
@@ -145,9 +160,9 @@ impl Ingress {
         parse_command(&read_file(&p)?, self.epoch).map(Some)
     }
 
-    /// The request file an ADMIT of this epoch names, checked against its hash.
+    /// The request file an ADMIT or IMPORT of this epoch names, checked against its hash.
     pub fn request(&self, c: &Command) -> R<Vec<u8>> {
-        require(c.admit && c.epoch == self.epoch, "not this epoch's admission")?;
+        require((c.admit || c.kind == CMD_IMPORT) && c.epoch == self.epoch, "not this epoch's admission")?;
         let b = read_file(&join_n(&self.dir, "req.", c.request))?;
         require(payload_hash(&b) == c.hash, "published request payload mismatch")?;
         Ok(b)
@@ -334,9 +349,21 @@ mod tests {
 
     #[test]
     fn commands() {
-        assert_eq!(parse_command(b"ADMIT 1 2 3\n", 1), Ok(Command { admit: true, epoch: 1, request: 2, hash: 3 }));
-        assert_eq!(parse_command(b"CANCEL\x0b1 2 0", 1).map(|c| c.admit), Ok(false));
+        assert_eq!(
+            parse_command(b"ADMIT 1 2 3\n", 1),
+            Ok(Command { admit: true, kind: CMD_ADMIT, epoch: 1, request: 2, hash: 3 })
+        );
+        assert_eq!(parse_command(b"CANCEL\x0b1 2 0", 1).map(|c| (c.admit, c.kind)), Ok((false, CMD_CANCEL)));
         assert_eq!(parse_command(b"CANCEL 1 2 3", 1), Err(refused("ingress epoch/cancel mismatch")));
+        assert_eq!(
+            parse_command(b"EXPORT 1 2 99\n", 1),
+            Ok(Command { admit: false, kind: CMD_EXPORT, epoch: 1, request: 2, hash: 99 })
+        );
+        assert_eq!(parse_command(b"EXPORT 1 2 0\n", 1), Err(refused("ingress export id must be nonzero")));
+        assert_eq!(
+            parse_command(b"IMPORT 1 5 77\n", 1),
+            Ok(Command { admit: false, kind: CMD_IMPORT, epoch: 1, request: 5, hash: 77 })
+        );
         assert_eq!(parse_command(b"STOP 1 2 3", 1), Err(refused("unknown ingress command")));
         assert_eq!(parse_command(b"ADMIT 1 2", 1), Err(refused("invalid ingress command")));
         assert_eq!(parse_command(b"ADMIT 1 2 3 4", 1), Err(refused("invalid ingress command")));
