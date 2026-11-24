@@ -38,8 +38,10 @@ not ship recipes as patch stacks on top of an older commit. Pull request titles 
 `.github/workflows/release.yml`) maintains automated Release PRs updating [`CHANGELOG.md`](CHANGELOG.md) and cuts
 immutable `vMAJOR.MINOR.PATCH` tags and GitHub Releases on merge (`fix:` / `perf:` for `PATCH`, `feat:` for `MINOR`,
 `!:` / `BREAKING CHANGE:` for `MAJOR`, or `Release-As: X.Y.Z`), triggering `.github/workflows/ci.yml` once to build
-and publish the container image, tester archive, and attestations. Optional curated version specs live in
-[`releases/<tag>.json`](releases/README.md) (validated whenever present).
+and publish the container image, tester archive, and attestations. Before merging a `release-please` Release PR, run the
+GPU hardware tests on the core recipes (Level-3 hardware gate) and complete a pre-release bug sweep across the changes
+landed since the previous `v*` tag — fixing any critical bugs on `main` and re-testing before cutting the release.
+Optional curated version specs live in [`releases/<tag>.json`](releases/README.md) (validated whenever present).
 Deployable tuned recipes live in standalone repositories, pin an immutable `v*` tag or an exact merged `main`/`stable`
 commit SHA by submodule or `ghcr.io/kindlingai/gr8` `@sha256:<digest>` (never a moving branch or floating tag such as
 `:latest`, `:main`, or `:stable`), and record their engine pin in `kindling.json` for the `README.md` freshness
@@ -63,9 +65,11 @@ Update the matching items in the same PR as a change (or during each `v*` releas
       and [`docs/cards/make.sh`](docs/cards/make.sh) from [`recipes.json`](recipes.json) for `gr8`'s README cards, plus
       [`docs/cards/switch_card.py`](docs/cards/switch_card.py) from `docs/cards/switching.json` when model-switching
       times change).
-- [ ] **Release notes, changelog, and optional version spec on every release:** Review the `release-please` Release PR
-      (adding highlights, default/cache-key notes, or `Dockerfile`/toolchain sync notes to [`CHANGELOG.md`](CHANGELOG.md)
-      when relevant), optionally update [`README.md#building-on-gr8`](README.md#building-on-gr8) and add a curated
+- [ ] **Pre-release GPU tests, bug sweep, and release notes on every release:** Before merging the `release-please`
+      Release PR, complete the GPU hardware tests on the core recipes and a pre-release bug sweep over changes since the
+      last `v*` tag ([RELEASING.md](RELEASING.md#cutting-a-release)), review the Release PR (adding highlights,
+      default/cache-key notes, or `Dockerfile`/toolchain sync notes to [`CHANGELOG.md`](CHANGELOG.md) when relevant),
+      and optionally update [`README.md#building-on-gr8`](README.md#building-on-gr8) and add a curated
       [`releases/<tag>.json`](releases/README.md) once the tagged image digest is published
       ([RELEASING.md](RELEASING.md#automated-release-records-and-optional-version-specs)).
 - [ ] **Recipe table links and dates:** Keep [`recipes.json`](recipes.json) and the

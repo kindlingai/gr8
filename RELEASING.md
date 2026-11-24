@@ -36,11 +36,14 @@ complementary sources of stability:
        contributors roll forward a fix on `main` — bisecting and reverting the offending commit only when a forward fix is
        not straightforward. If `stable` fails two consecutive nights, only pull requests that fix the failure or revert
        the offending commit merge to `main` until `stable` is green again.
-  3. **Level 3 (`stable -> v*` tag, per release):** Full benchmark and harness gate across the supported `TP=N` model
-     configurations on the `stable` commit (cold prefill, single-stream and concurrent decode, greedy reproducibility,
-     long-context passkey needles, teacher-forced `KL`, and quality evaluation). Wrong results anywhere or a speed
-     regression on `gr8`'s default `GLM-5.3` `TP=4` setup block the tag; a tuned standalone recipe that measures slower on
-     the candidate tag does not block cutting the `v*` release and simply remains on its prior pin until updated.
+  3. **Level 3 (`stable -> v*` tag, per release):** Full GPU hardware test and benchmark gate across the core recipes
+     and supported `TP=N` model configurations on the release candidate commit (cold prefill, single-stream and
+     concurrent decode, greedy reproducibility, long-context passkey needles, teacher-forced `KL`, and quality
+     evaluation), **plus a pre-release bug sweep** reviewing the changes landed since the previous `v*` tag for
+     regressions, edge cases, and critical defects. Any critical bug found in the sweep, wrong results anywhere, or a
+     speed regression on `gr8`'s default `GLM-5.3` `TP=4` setup block the tag — fix on `main` and re-verify before
+     merging the Release PR. A tuned standalone recipe that measures slower on the candidate tag does not block cutting
+     the `v*` release and simply remains on its prior pin until updated.
 
 ## 2. Numbered releases
 
@@ -143,9 +146,15 @@ include those details in the PR commit messages (`BREAKING CHANGE:` footer when 
 1. Land changes on `main` via normal pull requests with Conventional Commit titles (verified by `pr-title.yml`).
    `release-please` automatically opens and updates the pending Release PR (`chore(main): release X.Y.Z`) on every push
    to `main`.
-2. Before merging the Release PR, verify the Level-3 hardware gate across the supported `TP=N` model configurations and
-   walk the keep-current checklist in [AGENTS.md](AGENTS.md#keeping-docs-and-recipes-current) (`README.md`, model pages,
-   `KNOBS.md`, `KNOWN-ISSUES.md`, `CREDITS.md`, `recipes.json`, and `docs/cards/`).
+2. Before merging the Release PR, complete **both** pre-release gates on the release candidate commit (fixing any
+   critical issues on `main` and re-testing before merge, since downstream recipes and users build on numbered `v*`
+   tags):
+   - **GPU tests on core recipes (Level-3 hardware gate):** Run the hardware correctness and benchmark gate across the
+     core recipes and supported `TP=N` model configurations.
+   - **Pre-release bug sweep:** Audit the commits landed since the previous `v*` tag for critical bugs, regressions, and
+     edge cases that automated CPU CI does not catch.
+   Also walk the keep-current checklist in [AGENTS.md](AGENTS.md#keeping-docs-and-recipes-current) (`README.md`, model
+   pages, `KNOBS.md`, `KNOWN-ISSUES.md`, `CREDITS.md`, `recipes.json`, and `docs/cards/`).
 3. Review the Release PR (optionally adding measured benchmark highlights or upgrade notes to its `CHANGELOG.md` diff).
    If `RELEASE_PLEASE_TOKEN` is configured as a repository secret, `ci.yml` and `pr-title.yml` trigger automatically on
    the Release PR; otherwise (using the default `GITHUB_TOKEN`), close and reopen the Release PR once so GitHub triggers
