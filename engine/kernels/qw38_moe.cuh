@@ -19,6 +19,7 @@
 #include "ptab.cuh"
 #include "qw38_hc.cuh"
 #include "qw38_fp8.cuh"
+#include "../runtime/qw38_cpu_moe.h"
 
 namespace qw38 {
 
@@ -42,10 +43,22 @@ struct MoeWeights {
     const __half* t_v2 = nullptr;                // [n_blks, 3, 128] (svh gate, svh up, suh down)
     const __half* t_v3b = nullptr;               // [n_blks, 20] (down svh block scales over HB=20)
     const uint8_t* const* t_ptab = nullptr;      // GR8_PTAB=1|2 per-layer fixed-address piece table!
+    uint32_t* d_exp_hits = nullptr;              // optional [512] per-expert hit counter (Strata mode)
     int t_rows = 0;
     int t_eb = g6nr::EB;
     int fc1_wide = 0;
     int fc2_wide = 0;
+
+    // Optional Strata-mode prefill double-buffered H2D cold-expert callback (M >= 32)
+    void* strata_ctx = nullptr;
+    int strata_li = -1;
+    void (*strata_pf_fn)(void*, int, const MoeWeights&, struct MoeScratch&,
+                         const __nv_bfloat16*, __nv_bfloat16*, int, cudaStream_t) = nullptr;
+
+    // Optional Strata-mode hybrid CPU AVX-512 cold-expert offload for decode (M <= 8)
+    const uint8_t* d_is_cold = nullptr;          // [512] 1 = cold in host RAM, 0 = hot in VRAM
+    qw38rt::CpuMoeBridge* cpu_bridge = nullptr;  // mapped pinned GPU<->CPU bridge (device pointer)
+    float cpu_frac = 0.0f;                       // fraction of cold experts assigned to CPU
 
     // Routed experts: BF16 3D tensors (MTP layer L048)
     const __nv_bfloat16* mtp_gate_up = nullptr;  // [512, 2 * sh_i, 2560]
@@ -312,7 +325,8 @@ __global__ void k_qw38_moe_build_groups(const int* __restrict__ topk_idx,
                                         int* __restrict__ grp_exp,
                                         int* __restrict__ grp_cnt,
                                         int* __restrict__ grp_routes,
-                                        int n_routes) {
+                                        int n_routes,
+                                        uint32_t* __restrict__ d_exp_hits = nullptr) {
     const int tid = threadIdx.x; // 0..511 = expert id
     __shared__ int cnt[geom::NEXP];
     __shared__ int g_off[geom::NEXP];
@@ -326,6 +340,9 @@ __global__ void k_qw38_moe_build_groups(const int* __restrict__ topk_idx,
         atomicAdd(&cnt[topk_idx[r]], 1);
     }
     __syncthreads();
+    if (d_exp_hits && cnt[tid] > 0) {
+        d_exp_hits[tid] += static_cast<uint32_t>(cnt[tid]);
+    }
 
     // Exclusive prefix sum of ceil(cnt[e] / 8) over 512 experts (16 warps x 32 lanes)
     const int ng = (cnt[tid] + 7) >> 3;
@@ -377,12 +394,15 @@ __global__ void k_qw38_moe_groups_m1(const int* __restrict__ topk_idx,
                                      int* __restrict__ d_n_groups,
                                      int* __restrict__ grp_exp,
                                      int* __restrict__ grp_cnt,
-                                     int* __restrict__ grp_routes) {
+                                     int* __restrict__ grp_routes,
+                                     uint32_t* __restrict__ d_exp_hits = nullptr) {
     const int k = threadIdx.x;
     if (k < geom::TOPK) {
-        grp_exp[k] = topk_idx[k];
+        const int e = topk_idx[k];
+        grp_exp[k] = e;
         grp_cnt[k] = 1;
         grp_routes[k * 8] = k;
+        if (d_exp_hits) d_exp_hits[e] += 1u;
     }
     if (k == 0) d_n_groups[0] = geom::TOPK;
 }
@@ -631,11 +651,13 @@ __global__ void k_qw38_moe_fc1_epilogue_ks2(const float* __restrict__ fc1_part,
                                             const long long* __restrict__ t_tab,
                                             const __half* __restrict__ t_v2,
                                             __half* __restrict__ fc1_act,
-                                            int M, int eb) {
+                                            int M, int eb,
+                                            const uint8_t* __restrict__ route_on_cpu = nullptr) {
     const int idx = blockIdx.x;
     const int b = idx % eb;
     const int route = idx / eb;
     if (route >= M * geom::TOPK) return;
+    if (route_on_cpu && route_on_cpu[route]) return;
     const int e = topk_idx[route];
     const long long* tr = t_tab + 6 * e;
     if (b >= static_cast<int>(tr[3])) return;
@@ -884,6 +906,328 @@ __global__ void __launch_bounds__(256) k_qw38_moe_fc2_grp(
         *reinterpret_cast<float4*>(dst) = make_float4(
             rw * (v[0] * sg_v[0]), rw * (v[1] * sg_v[1]),
             rw * (v[2] * sg_v[2]), rw * (v[3] * sg_v[3]));
+    }
+}
+
+// Multi-CTA deterministic vectorized reduction of per-route fc2_part[m*10 + 0..9] + sigmoid(sh_scalar_gate) * sh_out -> out_part [M, 2560] BF16.
+// Hybrid variant: reads CPU-computed cold routes from mapped pinned `cpu_fc2_part` via __ldcv!
+__global__ void __launch_bounds__(64) k_qw38_moe_combine_det_m10_hybrid(
+    const float* __restrict__ fc2_part,
+    const float* __restrict__ cpu_fc2_part,
+    const uint8_t* __restrict__ route_on_cpu,
+    const __nv_bfloat16* __restrict__ sh_out,
+    const float* __restrict__ sh_scalar_gate,
+    __nv_bfloat16* __restrict__ out_part,
+    int M) {
+    const int m = blockIdx.x / 10;
+    const int blk = blockIdx.x % 10;
+    if (m >= M) return;
+    const int i = blk * 64 + threadIdx.x; // 0..639 (each = 4 dims -> 2560 exact)
+    const float sg = sigmoid_f(sh_scalar_gate[m]);
+    const __nv_bfloat16* s = sh_out + static_cast<size_t>(m) * geom::HID;
+    __nv_bfloat16* o = out_part + static_cast<size_t>(m) * geom::HID;
+    const int r0 = m * geom::TOPK;
+
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    #pragma unroll
+    for (int k = 0; k < geom::TOPK; ++k) {
+        const int r = r0 + k;
+        float4 v;
+        if (route_on_cpu[r]) {
+            const uint4 raw = __ldcv(reinterpret_cast<const uint4*>(cpu_fc2_part + static_cast<size_t>(r) * geom::HID) + i);
+            v = *reinterpret_cast<const float4*>(&raw);
+        } else {
+            v = reinterpret_cast<const float4*>(fc2_part + static_cast<size_t>(r) * geom::HID)[i];
+        }
+        acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+    }
+    const uint2 sv = reinterpret_cast<const uint2*>(s)[i];
+    const float2 sf0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&sv.x));
+    const float2 sf1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&sv.y));
+    const float s0 = __bfloat162float(__float2bfloat16(sg * sf0.x));
+    const float s1 = __bfloat162float(__float2bfloat16(sg * sf0.y));
+    const float s2 = __bfloat162float(__float2bfloat16(sg * sf1.x));
+    const float s3 = __bfloat162float(__float2bfloat16(sg * sf1.y));
+    uint2 ov;
+    *reinterpret_cast<__nv_bfloat162*>(&ov.x) = __floats2bfloat162_rn(acc.x + s0, acc.y + s1);
+    *reinterpret_cast<__nv_bfloat162*>(&ov.y) = __floats2bfloat162_rn(acc.z + s2, acc.w + s3);
+    reinterpret_cast<uint2*>(o)[i] = ov;
+}
+
+// Single-thread GPU wait for CPU worker pool completion on current layer (skipped in ~0.2 us when cpu_n_groups == 0).
+__global__ void k_qw38_cpu_moe_wait(qw38rt::CpuMoeBridge* bridge) {
+    if (bridge->cpu_n_groups <= 0) return;
+    const uint32_t target = bridge->step_counter;
+    const uint32_t* dp = const_cast<const uint32_t*>(reinterpret_cast<const volatile uint32_t*>(&bridge->done_seq));
+    for (;;) {
+        uint32_t v;
+        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(dp) : "memory");
+        if (v == target) break;
+    }
+}
+
+// Pre-rotate x_had = H128(x * t_sg_in) and mirror to mapped pinned bridge->x_had in one pass.
+__global__ void k_qw38_moe_prerot_x_bridge(const __nv_bfloat16* __restrict__ x_in,
+                                           const __half* __restrict__ t_sg,
+                                           __half* __restrict__ x_had,
+                                           uint16_t* __restrict__ bridge_x_had,
+                                           int M) {
+    const int idx = blockIdx.x;
+    const int hb = idx % geom::HB;
+    const int t = idx / geom::HB;
+    if (t >= M) return;
+    const int lane = threadIdx.x;
+    const __nv_bfloat16* xh = x_in + static_cast<size_t>(t) * geom::HID + hb * 128 + lane * 4;
+    const uint2 xv = *reinterpret_cast<const uint2*>(xh);
+    const uint2 sv = *reinterpret_cast<const uint2*>(t_sg + hb * 128 + lane * 4);
+    const float2 xf0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+    const float2 xf1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+    const float2 sf0 = __half22float2(*reinterpret_cast<const __half2*>(&sv.x));
+    const float2 sf1 = __half22float2(*reinterpret_cast<const __half2*>(&sv.y));
+    float vx[4] = {xf0.x * sf0.x, xf0.y * sf0.y, xf1.x * sf1.x, xf1.y * sf1.y};
+    had128(vx, lane);
+    uint2 ov;
+    *reinterpret_cast<__half2*>(&ov.x) = __floats2half2_rn(vx[0], vx[1]);
+    *reinterpret_cast<__half2*>(&ov.y) = __floats2half2_rn(vx[2], vx[3]);
+    const size_t off = (static_cast<size_t>(t) * geom::HB + hb) * 128 + lane * 4;
+    *reinterpret_cast<uint2*>(x_had + off) = ov;
+    *reinterpret_cast<uint2*>(bridge_x_had + off) = ov;
+}
+
+// Hybrid GPU/CPU group builder (1 CTA of 512 threads): splits cold experts between CPU AVX-512 & GPU PCIe,
+// writes CPU group metadata into mapped pinned `bridge`, and rings `bridge->go_seq` with system release fence!
+__global__ void k_qw38_moe_build_groups_hybrid(
+    const int* __restrict__ topk_idx,
+    const float* __restrict__ topk_w,
+    const uint8_t* __restrict__ d_is_cold,
+    int* __restrict__ d_n_groups,
+    int* __restrict__ grp_exp,
+    int* __restrict__ grp_cnt,
+    int* __restrict__ grp_routes,
+    qw38rt::CpuMoeBridge* bridge,
+    int li, int M, float cpu_frac,
+    uint32_t* __restrict__ d_exp_hits) {
+    const int tid = threadIdx.x; // 0..511
+    const int n_routes = M * geom::TOPK;
+    const int lane = tid & 31, warp = tid >> 5;
+
+    __shared__ int cnt[geom::NEXP];
+    __shared__ int g_off[geom::NEXP];
+    __shared__ int c_off[geom::NEXP];
+    __shared__ int cur[geom::NEXP];
+    __shared__ uint8_t s_to_cpu[geom::NEXP];
+    __shared__ int wsum[16];
+
+    cnt[tid] = 0;
+    cur[tid] = 0;
+    s_to_cpu[tid] = 0;
+    __syncthreads();
+
+    for (int r = tid; r < n_routes; r += geom::NEXP) {
+        atomicAdd(&cnt[topk_idx[r]], 1);
+    }
+    __syncthreads();
+    const int c_tot = cnt[tid];
+    if (d_exp_hits && c_tot > 0) {
+        d_exp_hits[tid] += static_cast<uint32_t>(c_tot);
+    }
+
+    // 1. Priority-ranked active cold experts: c_tot == 1 first, then c_tot == 2, then c_tot >= 3 as fallback
+    //    (keeps CPU on cheapest single/dual-token cold experts first, while never starving CPU when GPU UVA would stall!)
+    const int is_cold_m1 = (c_tot == 1 && d_is_cold[tid] != 0) ? 1 : 0;
+    const int is_cold_m2 = (c_tot == 2 && d_is_cold[tid] != 0) ? 1 : 0;
+    const int is_cold_m3 = (c_tot >= 3 && d_is_cold[tid] != 0) ? 1 : 0;
+    const int is_act_cold = (c_tot > 0 && d_is_cold[tid] != 0) ? 1 : 0;
+    __shared__ int s_n_m1;
+    __shared__ int s_n_m2;
+    __shared__ int s_n_m3;
+
+    // Exclusive prefix sum of c_tot == 1 cold experts
+    int cr1 = is_cold_m1;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        int n = __shfl_up_sync(0xffffffffu, cr1, off);
+        if (lane >= off) cr1 += n;
+    }
+    if (lane == 31) wsum[warp] = cr1;
+    __syncthreads();
+    if (warp == 0) {
+        int wv = (lane < 16) ? wsum[lane] : 0;
+        #pragma unroll
+        for (int off = 1; off < 16; off <<= 1) {
+            int n = __shfl_up_sync(0xffffffffu, wv, off);
+            if (lane >= off) wv += n;
+        }
+        if (lane < 16) wsum[lane] = wv;
+    }
+    __syncthreads();
+    const int rank_m1 = (warp > 0 ? wsum[warp - 1] : 0) + (cr1 - is_cold_m1);
+    if (tid == geom::NEXP - 1) s_n_m1 = rank_m1 + is_cold_m1;
+    __syncthreads();
+
+    // Exclusive prefix sum of c_tot == 2 cold experts
+    int cr2 = is_cold_m2;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        int n = __shfl_up_sync(0xffffffffu, cr2, off);
+        if (lane >= off) cr2 += n;
+    }
+    if (lane == 31) wsum[warp] = cr2;
+    __syncthreads();
+    if (warp == 0) {
+        int wv = (lane < 16) ? wsum[lane] : 0;
+        #pragma unroll
+        for (int off = 1; off < 16; off <<= 1) {
+            int n = __shfl_up_sync(0xffffffffu, wv, off);
+            if (lane >= off) wv += n;
+        }
+        if (lane < 16) wsum[lane] = wv;
+    }
+    __syncthreads();
+    const int rank_m2 = (warp > 0 ? wsum[warp - 1] : 0) + (cr2 - is_cold_m2);
+    if (tid == geom::NEXP - 1) s_n_m2 = rank_m2 + is_cold_m2;
+    __syncthreads();
+
+    // Exclusive prefix sum of c_tot >= 3 cold experts
+    int cr3 = is_cold_m3;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        int n = __shfl_up_sync(0xffffffffu, cr3, off);
+        if (lane >= off) cr3 += n;
+    }
+    if (lane == 31) wsum[warp] = cr3;
+    __syncthreads();
+    if (warp == 0) {
+        int wv = (lane < 16) ? wsum[lane] : 0;
+        #pragma unroll
+        for (int off = 1; off < 16; off <<= 1) {
+            int n = __shfl_up_sync(0xffffffffu, wv, off);
+            if (lane >= off) wv += n;
+        }
+        if (lane < 16) wsum[lane] = wv;
+    }
+    __syncthreads();
+    const int rank_m3 = (warp > 0 ? wsum[warp - 1] : 0) + (cr3 - is_cold_m3);
+    if (tid == geom::NEXP - 1) s_n_m3 = rank_m3 + is_cold_m3;
+    __syncthreads();
+
+    const int n_m1 = s_n_m1;
+    const int n_m2 = s_n_m2;
+    const int n_cold = n_m1 + n_m2 + s_n_m3;
+    int n_cpu = 0;
+    bool to_cpu = false;
+    if (n_cold > 0) {
+        if (cpu_frac >= 0.999f) {
+            to_cpu = (is_act_cold != 0);
+        } else {
+            if (n_cold == 1) {
+                // Single cold expert: CPU hides behind GPU hot experts whenever c_tot <= 2!
+                n_cpu = (n_m1 + n_m2 >= 1) ? 1 : 0;
+            } else {
+                // Balance live DDR5-shared CPU (~70 us/exp) vs GPU PCIe UVA (~130 us/exp):
+                // at cpu_frac=0.68, +0.25 bias yields optimal (2+0, 2+1, 3+1, 4+1, 4+2, 5+2, 6+2) for N=2..8!
+                n_cpu = min(n_cold, max(1, __float2int_rn(static_cast<float>(n_cold) * cpu_frac + 0.25f)));
+            }
+            if (is_cold_m1) to_cpu = (rank_m1 < n_cpu);
+            else if (is_cold_m2) to_cpu = (n_m1 + rank_m2 < n_cpu);
+            else if (is_cold_m3) to_cpu = (n_m1 + n_m2 + rank_m3 < n_cpu);
+        }
+    }
+    s_to_cpu[tid] = to_cpu ? 1 : 0;
+
+    // 2. Exclusive prefix sum for GPU groups
+    const int ng = (c_tot + 7) >> 3;
+    const int g_ng = to_cpu ? 0 : ng;
+    int gv = g_ng;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        int n = __shfl_up_sync(0xffffffffu, gv, off);
+        if (lane >= off) gv += n;
+    }
+    if (lane == 31) wsum[warp] = gv;
+    __syncthreads();
+    if (warp == 0) {
+        int wv = (lane < 16) ? wsum[lane] : 0;
+        #pragma unroll
+        for (int off = 1; off < 16; off <<= 1) {
+            int n = __shfl_up_sync(0xffffffffu, wv, off);
+            if (lane >= off) wv += n;
+        }
+        if (lane < 16) wsum[lane] = wv;
+    }
+    __syncthreads();
+    const int g_base = (warp > 0 ? wsum[warp - 1] : 0) + (gv - g_ng);
+    g_off[tid] = g_base;
+    if (tid == geom::NEXP - 1) d_n_groups[0] = g_base + g_ng;
+
+    // 3. Exclusive prefix sum for CPU groups
+    const int c_ng = to_cpu ? ng : 0;
+    int cv = c_ng;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        int n = __shfl_up_sync(0xffffffffu, cv, off);
+        if (lane >= off) cv += n;
+    }
+    if (lane == 31) wsum[warp] = cv;
+    __syncthreads();
+    if (warp == 0) {
+        int wv = (lane < 16) ? wsum[lane] : 0;
+        #pragma unroll
+        for (int off = 1; off < 16; off <<= 1) {
+            int n = __shfl_up_sync(0xffffffffu, wv, off);
+            if (lane >= off) wv += n;
+        }
+        if (lane < 16) wsum[lane] = wv;
+    }
+    __syncthreads();
+    const int c_base = (warp > 0 ? wsum[warp - 1] : 0) + (cv - c_ng);
+    c_off[tid] = c_base;
+    if (tid == geom::NEXP - 1) bridge->cpu_n_groups = c_base + c_ng;
+
+    // Emit group metadata
+    if (!to_cpu) {
+        for (int gi = 0; gi < g_ng; ++gi) {
+            const int g = g_base + gi;
+            const int rem = c_tot - gi * 8;
+            grp_exp[g] = tid;
+            grp_cnt[g] = (rem < 8) ? rem : 8;
+        }
+    } else {
+        for (int gi = 0; gi < c_ng; ++gi) {
+            const int g = c_base + gi;
+            const int rem = c_tot - gi * 8;
+            bridge->cpu_grp_exp[g] = tid;
+            bridge->cpu_grp_cnt[g] = (rem < 8) ? rem : 8;
+        }
+    }
+    __syncthreads();
+
+    // Scatter routes to GPU or CPU lists
+    for (int r = tid; r < n_routes; r += geom::NEXP) {
+        const int e = topk_idx[r];
+        const int pos = atomicAdd(&cur[e], 1);
+        if (s_to_cpu[e]) {
+            const int g = c_off[e] + (pos >> 3);
+            bridge->cpu_grp_routes[g * 8 + (pos & 7)] = r;
+            bridge->route_on_cpu[r] = 1;
+            bridge->topk_w[r] = topk_w[r];
+        } else {
+            const int g = g_off[e] + (pos >> 3);
+            grp_routes[g * 8 + (pos & 7)] = r;
+            bridge->route_on_cpu[r] = 0;
+        }
+    }
+    __syncthreads();
+
+    // Ring CPU doorbell ONLY if there is CPU work!
+    if (tid == 0 && bridge->cpu_n_groups > 0) {
+        bridge->cur_layer = li;
+        bridge->cur_M = M;
+        const uint32_t seq = bridge->step_counter + 1u;
+        bridge->step_counter = seq;
+        __threadfence_system();
+        uint32_t* gp = const_cast<uint32_t*>(reinterpret_cast<volatile uint32_t*>(&bridge->go_seq));
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(gp), "r"(seq) : "memory");
     }
 }
 
@@ -1496,6 +1840,21 @@ __global__ void __launch_bounds__(256) k_qw38_moe_fc2_multi_hb_dyn(
     }
 }
 
+// Scatter CPU-computed FP16 prefill cold-expert route outputs from mapped pinned buffer into sc.fc2_part (__half).
+// Grid: (n_cpu_routes), Block: 320 (each thread copies 1 uint4 = 8 halfs = 16 B -> 320 * 8 = 2560 = geom::HID).
+__global__ void k_qw38_pf_scatter_cpu_fc2(const __half* __restrict__ src_rows,
+                                          const int* __restrict__ route_ids,
+                                          __half* __restrict__ fc2_part_h,
+                                          int n_rows) {
+    const int i = blockIdx.x;
+    if (i >= n_rows) return;
+    const int r = __ldcv(route_ids + i);
+    const int tid = threadIdx.x; // 0..319
+    const uint4* src4 = reinterpret_cast<const uint4*>(src_rows + static_cast<size_t>(i) * geom::HID);
+    uint4* dst4 = reinterpret_cast<uint4*>(fc2_part_h + static_cast<size_t>(r) * geom::HID);
+    dst4[tid] = __ldcv(src4 + tid);
+}
+
 __global__ void k_qw38_moe_combine_det_h16(const __half* __restrict__ fc2_part_h,
                                            const __nv_bfloat16* __restrict__ sh_out,
                                            const float* __restrict__ sh_scalar_gate,
@@ -1556,6 +1915,27 @@ inline void launch_moe_pf_wide(const MoeWeights& w, MoeScratch& sc, const __nv_b
     k_qw38_moe_combine_det_h16<<<M, 256, 0, st>>>(fc2_part_h, sc.sh_out, sc.sh_scalar_gate, out_part, M);
 }
 
+template <int PF_GRP, int HB_PER_CTA>
+inline void launch_moe_pf_wide_batch(const MoeWeights& w, MoeScratch& sc,
+                                     const int* d_n_groups, const int* grp_exp,
+                                     const int* grp_cnt, const int* grp_off,
+                                     const uint8_t* const* t_ptab, int grid_G, cudaStream_t st) {
+    if (grid_G <= 0) return;
+    constexpr int N_HBG = geom::HB / HB_PER_CTA;
+    const size_t fc2_smem = static_cast<size_t>(w.t_eb) * PF_GRP * 136 * sizeof(__half);
+    if (fc2_smem > 40000) {
+        cudaFuncSetAttribute(k_qw38_moe_fc2_multi_hb_dyn<PF_GRP, HB_PER_CTA>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(fc2_smem));
+    }
+    __half* fc2_part_h = reinterpret_cast<__half*>(sc.fc2_part);
+    k_qw38_moe_fc1_pf_wide<PF_GRP><<<grid_G * w.t_eb, 256, 0, st>>>(
+        sc.x_had, d_n_groups, grp_exp, grp_cnt, grp_off, sc.grp_routes,
+        w.t_tab, w.t_kmix, w.t_fc1, t_ptab, w.t_v1b, w.t_v2, sc.fc1_act, w.t_eb);
+    k_qw38_moe_fc2_multi_hb_dyn<PF_GRP, HB_PER_CTA><<<grid_G * N_HBG, 256, fc2_smem, st>>>(
+        sc.fc1_act, d_n_groups, grp_exp, grp_cnt, grp_off, sc.grp_routes,
+        sc.topk_w, w.t_tab, w.t_fc2, t_ptab, w.t_sg, w.t_v3b, fc2_part_h, w.t_eb);
+}
+
 // Shared expert activation: sh_gate = bf16(silu(sh_gate) * sh_up) (for large M > 8 cuBLAS path)
 __global__ void k_silu_mul_bf16(__nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up, int N) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1608,6 +1988,54 @@ __global__ void k_qw38_mtp_exp_accum(const __nv_bfloat16* __restrict__ dn_out,
 // Execute one Qwen3.8 MoE block (512 routed + gated shared expert) -> out_part [M, 2560] BF16.
 inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc,
                         const __nv_bfloat16* x, __nv_bfloat16* out_part, int M, cudaStream_t st) {
+    const bool use_cpu_hybrid = (M <= 8 && w.is_tr3 && w.cpu_bridge && w.d_is_cold && w.cpu_frac > 0.0f && sc.fc1_part);
+    if (use_cpu_hybrid) {
+        const int rgrid = (geom::NEXP + 1 + 3) / 4;
+        const int sgrid = (w.sh_i + 3) / 4;
+        // 1. Router + topk + x_had mirror + hybrid CPU/GPU group split FIRST so CPU starts cold experts IMMEDIATELY!
+        if (M == 1) k_qw38_router_and_shgate<1><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
+        else if (M <= 4) k_qw38_router_and_shgate<4><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
+        else k_qw38_router_and_shgate<8><<<rgrid, 128, 0, st>>>(x, w.router, w.sh_exp_gate, sc.router_logits, sc.sh_scalar_gate, M);
+        k_qw38_router_topk10<<<M, 256, 0, st>>>(sc.router_logits, sc.topk_idx, sc.topk_w, M);
+        k_qw38_moe_prerot_x_bridge<<<M * geom::HB, 32, 0, st>>>(x, w.t_sg, sc.x_had, w.cpu_bridge->x_had, M);
+        const int n_routes = M * geom::TOPK;
+        const int grid_G = std::min(n_routes, geom::NEXP + (n_routes + 7) / 8);
+        k_qw38_moe_build_groups_hybrid<<<1, geom::NEXP, 0, st>>>(
+            sc.topk_idx, sc.topk_w, w.d_is_cold,
+            sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
+            w.cpu_bridge, w.strata_li, M, w.cpu_frac, w.d_exp_hits);
+
+        // 2. Overlap GPU shared expert + ALL VRAM-hot + GPU-PCIe cold experts behind CPU AVX-512 cold experts!
+        if (M == 1) {
+            if (w.fp8_sh_gate.q) launch_fp8_sh_gate_up_silu<1>(x, w.fp8_sh_gate, w.fp8_sh_up, sc.sh_gate_buf, M, w.sh_i, st);
+            else k_qw38_sh_gate_up_silu<1><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
+        } else if (M <= 4) {
+            if (w.fp8_sh_gate.q) launch_fp8_sh_gate_up_silu<4>(x, w.fp8_sh_gate, w.fp8_sh_up, sc.sh_gate_buf, M, w.sh_i, st);
+            else k_qw38_sh_gate_up_silu<4><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
+        } else {
+            if (w.fp8_sh_gate.q) launch_fp8_sh_gate_up_silu<8>(x, w.fp8_sh_gate, w.fp8_sh_up, sc.sh_gate_buf, M, w.sh_i, st);
+            else k_qw38_sh_gate_up_silu<8><<<sgrid, 128, 0, st>>>(x, w.sh_gate, w.sh_up, sc.sh_gate_buf, M, w.sh_i);
+        }
+        if (w.fp8_sh_down.q) launch_fp8_gemv_smallm<false>(sc.sh_gate_buf, w.fp8_sh_down, sc.sh_out, M, st);
+        else launch_bf16_gemv_smallm<false>(sc.sh_gate_buf, w.sh_down, sc.sh_out, M, geom::HID, w.sh_i, st);
+
+        k_qw38_moe_fc1_ks2<<<grid_G * w.t_eb * 4, 256, 0, st>>>(
+            sc.x_had, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
+            w.t_tab, w.t_kmix, w.t_fc1, w.t_ptab, w.t_v1b, sc.fc1_part, w.t_eb, w.fc1_wide);
+        k_qw38_moe_fc1_epilogue_ks2<<<n_routes * w.t_eb, 32, 0, st>>>(
+            sc.fc1_part, sc.topk_idx, w.t_tab, w.t_v2, sc.fc1_act, M, w.t_eb, w.cpu_bridge->route_on_cpu);
+        k_qw38_moe_fc2_grp<<<grid_G * geom::HB, 256, 0, st>>>(
+            sc.fc1_act, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
+            sc.topk_w, w.t_tab, w.t_fc2, w.t_ptab, w.t_sg, w.t_v3b, sc.fc2_part, w.t_eb, w.fc2_wide);
+
+        // 3. Synchronize CPU cold experts (instant if 0 CPU groups) and deterministically combine!
+        k_qw38_cpu_moe_wait<<<1, 1, 0, st>>>(w.cpu_bridge);
+        k_qw38_moe_combine_det_m10_hybrid<<<M * 10, 64, 0, st>>>(
+            sc.fc2_part, w.cpu_bridge->cpu_fc2_part, w.cpu_bridge->route_on_cpu,
+            sc.sh_out, sc.sh_scalar_gate, out_part, M);
+        return;
+    }
+
     // 1. Router logits (exact BF16) + shared expert (MXFP8 TC for M >= 16, coalesced FP8/BF16 GEMV for small M)
     const bool use_sh_mx = (M >= 16 && w.fp8_sh_gate.mx_sc && w.fp8_sh_up.mx_sc && w.fp8_sh_down.mx_sc && sc.x8);
     if (use_sh_mx) {
@@ -1675,6 +2103,10 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
     // 2. Routed experts + 3. Combine routed + gated shared -> out_part [M, 2560] BF16
     if (w.is_tr3) {
         if (M >= 32 && w.fc1_wide && w.fc2_wide && sc.grp_off && sc.x_had) {
+            if (w.strata_pf_fn && w.strata_ctx) {
+                w.strata_pf_fn(w.strata_ctx, w.strata_li, w, sc, x, out_part, M, st);
+                return;
+            }
             if (M >= 128 && w.t_eb <= 5) launch_moe_pf_wide<32, 10>(w, sc, x, out_part, M, st);
             else launch_moe_pf_wide<16, 10>(w, sc, x, out_part, M, st);
             return;
@@ -1682,11 +2114,11 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
         const int n_routes = M * geom::TOPK;
         int grid_G = 0;
         if (M == 1) {
-            k_qw38_moe_groups_m1<<<1, 32, 0, st>>>(sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes);
+            k_qw38_moe_groups_m1<<<1, 32, 0, st>>>(sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes, w.d_exp_hits);
             grid_G = geom::TOPK;
         } else {
             k_qw38_moe_build_groups<<<1, geom::NEXP, 0, st>>>(
-                sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes, n_routes);
+                sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes, n_routes, w.d_exp_hits);
             grid_G = std::min(n_routes, geom::NEXP + (n_routes + 7) / 8);
         }
 

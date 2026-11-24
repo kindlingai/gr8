@@ -487,7 +487,7 @@ inline void ple_forward(cublasHandle_t blas, const PleWeights& w, PleState& st_b
             if (segs[s].len != 1 || segs[s].row0 != s) { all_len1 = false; break; }
         }
     }
-    const int V = snap_k + 1;
+    const int V = (nsegs > 0 && segs[0].len >= 2 && segs[0].len <= snap_k + 1) ? segs[0].len : (snap_k + 1);
     bool all_verify = (!all_len1 && snap_k > 0 && d_slot != nullptr && d_pos != nullptr && nsegs > 0 && nsegs * V == M);
     if (all_verify) {
         for (int s = 0; s < nsegs; ++s) {

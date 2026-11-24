@@ -42,8 +42,8 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     const bool spec_on = (max_k > 0);
     require(sc.max_sessions == unsigned(slots) && sc.max_rows <= unsigned(max_rows),
             "qw38: --s2-sessions and --max-rows mismatch");
-    require(K == 0 || (K >= 1 && K <= 5 && c.engine.has_mtp),
-            "qw38: --mtp 1..5 requires loaded L048 MTP drafter");
+    require(K == 0 || (K >= 1 && K <= 7 && c.engine.has_mtp),
+            "qw38: --mtp 1..7 requires loaded L048 MTP drafter");
     const unsigned max_pps = unsigned(c.engine.max_pages_per_slot());
     const unsigned pages = sc.pool_rows / geom::KV_PAGE;
     RunPool pool(pages, pages, sc.pool_rows);
@@ -60,9 +60,13 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     };
     struct Drafts {
         std::array<int, 8> d{};
+        std::array<float, 8> lp{};
         int q = -1;
         int chained_k = 0;
+        int avail_k = 0;
         bool valid = false;
+        bool idx_dirty = false;
+        qw38rt::RowSample base_sm{};
     };
     std::array<Pending, MAX_SESSIONS> pend{};
     std::array<Drafts, MAX_SESSIONS> drafts{};
@@ -72,8 +76,30 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     Drafts dfl_last{};
     g6s2::FlashDflWindow dwin(slots, qw38::dfl::WIN, 0);
     int cur_solo = -1;
+    std::vector<float> last_dlp;
+
+    // KStopB early-stop lazy drafting parameters (copied up front so lambdas never read moved-from NativeHooks).
+    std::array<double, 8> kstop_tau1{};
+    bool kstop_early_stop = false;
+    if (K > 1 && c.engine.has_mtp && c.engine.o.nr == 1 && c.engine.o.use_graph && c.engine.o.mtp_fast &&
+        knob::mtp_kstopb() && int(knob::mtp_kstopb_kmin()) == 0) {
+        const auto& btau = knob::mtp_kstopb_tau();
+        for (size_t i = 0; i < btau.size() && i < 7; ++i) kstop_tau1[i + 1] = btau[i];
+        if (const auto ts1 = knob::mtp_kstopb_tau_s(1)) {
+            for (size_t i = 0; i < ts1->size() && i < 7; ++i) kstop_tau1[i + 1] = (*ts1)[i];
+        }
+        bool any_multi_s_override = false;
+        for (int s = 2; s <= s2::S2N_SLOTS; ++s) {
+            if (knob::mtp_kstopb_tau_s(uint32_t(s))) { any_multi_s_override = true; break; }
+        }
+        kstop_early_stop = !any_multi_s_override;
+    }
 
     const auto commit_pending_meta = [&](int q, int kept, std::vector<int>& gdn_slots, std::vector<int>& gdn_kept) {
+        if (drafts[size_t(q)].idx_dirty) {
+            c.engine.mtp_restore_idx_raw(q);
+            drafts[size_t(q)].idx_dirty = false;
+        }
         Pending& w = pend[size_t(q)];
         if (w.rows <= 0) return;
         kept = std::max(0, std::min(w.rows, kept));
@@ -287,6 +313,10 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
 
     if (stash) {
         h.checkpoint = [&](const g6rt::ServeReq& r) -> uint32_t {
+            // In Strata mode, splitting a prompt at a mid-prompt 64-token page boundary forces a second full pass
+            // over cold MoE experts across PCIe (+50..220 ms TTFT). stash->capture() at end-of-prefill already
+            // caches the full prompt prefix without splitting!
+            if (c.engine.o.strata.enabled) return 0;
             if (!store_shared || r.prompt.empty() || r.steering.enabled || !r.images.empty()) return 0;
             const uint64_t top = std::min<uint64_t>(r.prompt.size() - 1, r.sys < 0 ? r.prompt.size() - 1 : uint64_t(r.sys));
             return uint32_t(top / geom::KV_PAGE * geom::KV_PAGE);
@@ -329,6 +359,10 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 if (bound_live[size_t(i)] && bound[size_t(i)] == r) { q = i; break; }
             require(q >= 0, "qw38 retain: run has no bound slot");
             const uint32_t p = uint32_t(std::max(0, st.valid));
+            if (K > 0 && drafts[size_t(q)].idx_dirty) {
+                c.engine.mtp_restore_idx_raw(q);
+                drafts[size_t(q)].idx_dirty = false;
+            }
             if (spec_on && pend[size_t(q)].rows > 0) {
                 commit_pending(q, int(p) - pend[size_t(q)].pos0);
             }
@@ -430,6 +464,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
     h.retire = [&](const Slot& s) {
         if (!stash && int(s.key.slot) >= 0 && int(s.key.slot) < slots) bound_live[s.key.slot] = false;
         if (int(s.key.slot) >= 0 && int(s.key.slot) < slots) {
+            if (drafts[s.key.slot].idx_dirty) c.engine.mtp_restore_idx_raw(int(s.key.slot));
             pend[s.key.slot] = Pending{};
             drafts[s.key.slot] = Drafts{};
             slot_want_lp[s.key.slot] = false;
@@ -512,8 +547,10 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
         require(M >= 1 && M <= max_rows && l.samples.size() >= size_t(M), "qw38 launch: bad M");
         if (sp.kind == s2::Step::CHAIN) {
             std::vector<int> u(size_t(M), 0);
+            last_dlp.assign(size_t(M), 0.0f);
             for (size_t j = 0; j < sp.sess.size(); ++j) {
-                Drafts& d = drafts[size_t(sp.sess[j])];
+                const int q = sp.sess[j];
+                Drafts& d = drafts[size_t(q)];
                 const s2::Row& x = sp.r[size_t(sp.row0[j])];
                 if (!d.valid && use_dfl) {
                     // Single demotion transition round from solo QSpine-DF2 -> multi-session L48 MTP (100% lossless)
@@ -523,8 +560,51 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 const int i = x.pos - d.q;
                 require(K > 0 && sp.rows[j] == 1 && d.valid && i >= 1 && i < K && x.tok == d.d[size_t(i - 1)],
                         "qw38 chain step does not continue cached draft");
+                if (i >= d.avail_k) {
+                    if (kstop_early_stop && sp.sess.size() == 1) {
+                        double pcum = 1.0;
+                        bool can_pass = true;
+                        for (int t = 0; t < i; ++t) {
+                            pcum *= std::exp(double(d.lp[size_t(t)]));
+                            if (pcum < kstop_tau1[size_t(t + 1)]) { can_pass = false; break; }
+                        }
+                        if (can_pass && pcum < kstop_tau1[size_t(i + 1)]) can_pass = false;
+                        if (!can_pass) {
+                            for (int t = i; t < K; ++t) {
+                                d.d[size_t(t)] = 0;
+                                d.lp[size_t(t)] = -100.0f;
+                            }
+                            d.avail_k = K;
+                        } else {
+                            const bool last_k = (i + 1 == K);
+                            std::vector<int> qv{q}, pv{d.q + i}, tv{d.d[size_t(i - 1)]}, dout;
+                            std::vector<qw38rt::RowSample> smv{d.base_sm};
+                            std::vector<float> dlp;
+                            c.engine.mtp_draft_k(qv, pv, tv, smv, 1, dout, &dlp, last_k ? 2 : 3);
+                            require(dout.size() == 1, "qw38 early-stop lazy draft: bad output size");
+                            d.d[size_t(i)] = dout[0];
+                            d.lp[size_t(i)] = dlp[0];
+                            d.avail_k = i + 1;
+                            d.idx_dirty = !last_k;
+                        }
+                    } else {
+                        const int rem = K - d.avail_k;
+                        std::vector<int> qv{q}, pv{d.q + d.avail_k}, tv{d.d[size_t(d.avail_k - 1)]}, dout;
+                        std::vector<qw38rt::RowSample> smv{d.base_sm};
+                        std::vector<float> dlp;
+                        c.engine.mtp_draft_k(qv, pv, tv, smv, rem, dout, &dlp, 2);
+                        require(dout.size() == size_t(rem), "qw38 lazy draft cont: bad output size");
+                        for (int t = 0; t < rem; ++t) {
+                            d.d[size_t(d.avail_k + t)] = dout[size_t(t)];
+                            d.lp[size_t(d.avail_k + t)] = dlp[size_t(t)];
+                        }
+                        d.avail_k = K;
+                        d.idx_dirty = false;
+                    }
+                }
                 d.chained_k = std::max(d.chained_k, i + 1);
                 u[size_t(sp.row0[j])] = d.d[size_t(i)];
+                last_dlp[size_t(sp.row0[j])] = d.lp[size_t(i)];
             }
             return u;
         }
@@ -533,8 +613,13 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             std::vector<int> u(size_t(M), 0), ds, dq, dg, dlast, gs, gk;
             std::vector<qw38rt::RowSample> dsm;
             const bool solo_dfl = use_dfl && (sp.sess.size() == 1) && dfl_active[size_t(sp.sess[0])];
+            last_dlp.assign(size_t(M), 0.0f);
             for (size_t j = 0; j < sp.sess.size(); ++j) {
                 const int q = sp.sess[j], r0 = sp.row0[j], n = sp.rows[j];
+                if (drafts[size_t(q)].idx_dirty) {
+                    c.engine.mtp_restore_idx_raw(q);
+                    drafts[size_t(q)].idx_dirty = false;
+                }
                 for (int i = 1; i < n; ++i)
                     require(sp.r[size_t(r0 + i)].pos == sp.r[size_t(r0)].pos + i, "qw38 draft rows are not consecutive");
                 Pending& w = pend[size_t(q)];
@@ -561,17 +646,29 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             }
             if (!gs.empty()) c.engine.mtp_commit_gdn_batch(gs, gk);
             if (!ds.empty()) {
+                const int k1 = (kstop_early_stop && ds.size() == 1)
+                    ? 1
+                    : ((K > 3 && ds.size() == 1 && c.engine.o.nr == 1 && c.engine.o.use_graph && c.engine.o.mtp_fast) ? 3 : K);
+                const int dmode = (k1 < K) ? 1 : 0;
                 std::vector<int> dout;
-                c.engine.mtp_draft_k(ds, dq, dg, dsm, K, dout);
-                require(dout.size() == ds.size() * size_t(K), "qw38 draft: bad output size");
+                std::vector<float> dlp;
+                c.engine.mtp_draft_k(ds, dq, dg, dsm, k1, dout, &dlp, dmode);
+                require(dout.size() == ds.size() * size_t(k1), "qw38 draft: bad output size");
                 for (size_t i = 0; i < ds.size(); ++i) {
                     Drafts& d = drafts[size_t(ds[i])];
                     d = Drafts{};
-                    for (int t = 0; t < K; ++t) d.d[size_t(t)] = dout[i * size_t(K) + size_t(t)];
+                    for (int t = 0; t < k1; ++t) {
+                        d.d[size_t(t)] = dout[i * size_t(k1) + size_t(t)];
+                        d.lp[size_t(t)] = dlp[i * size_t(k1) + size_t(t)];
+                    }
                     d.q = dq[i];
                     d.chained_k = 1;
+                    d.avail_k = k1;
                     d.valid = true;
+                    d.idx_dirty = (dmode == 1);
+                    d.base_sm = dsm[i];
                     u[size_t(dlast[i])] = d.d[0];
+                    last_dlp[size_t(dlast[i])] = d.lp[0];
                 }
             }
             return u;
@@ -632,6 +729,10 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
                 const int q = sp.sess[j], r0 = sp.row0[j], n = sp.rows[j];
                 const int pos0 = sp.r[size_t(r0)].pos;
                 if (!is_verify[j]) {
+                    if (drafts[size_t(q)].idx_dirty) {
+                        c.engine.mtp_restore_idx_raw(q);
+                        drafts[size_t(q)].idx_dirty = false;
+                    }
                     if (n > 1) c.engine.mtp_sync_kv(q, r0, pos0, n - 1, &toks[size_t(r0 + 1)]);
                     c.engine.mtp_save_last_hyper(q, r0 + n - 1);
                     done_end[size_t(q)] = pos0 + n;
@@ -686,6 +787,10 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             }
             const int n = int(step_lim - at);
             // Do not discard other live sessions' uncommitted verify rows during prefill on slot q.
+            if (K > 0 && drafts[size_t(q)].idx_dirty) {
+                c.engine.mtp_restore_idx_raw(q);
+                drafts[size_t(q)].idx_dirty = false;
+            }
             if (spec_on && pend[size_t(q)].rows > 0) commit_pending(q, 0);
             std::vector<qw38::StepSeg> segs = {{q, 0, int(at), n}};
             if (!p.images.empty()) {
@@ -752,6 +857,31 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
         }
         lp_rows = 0;
     };
+
+    if (K > 0) {
+        h.dispatch.draft_lp = [&](int row) -> float {
+            return (row >= 0 && row < int(last_dlp.size())) ? last_dlp[size_t(row)] : 0.0f;
+        };
+        const int lplog = int(knob::mtp_lplog());
+        h.kstop.log = (lplog == 2 || (lplog == 1 && c.rank == 0));
+        if (knob::mtp_kstopb()) {
+            h.kstop.b.mode = 1;
+            h.kstop.b.kmin = std::max(0, std::min(K, int(knob::mtp_kstopb_kmin())));
+            const auto& btau = knob::mtp_kstopb_tau();
+            for (int s = 1; s <= s2::S2N_SLOTS; ++s) {
+                for (size_t i = 0; i < btau.size() && i < 7; ++i) h.kstop.b.tau[s][i + 1] = btau[i];
+                if (const auto ts = knob::mtp_kstopb_tau_s(uint32_t(s))) {
+                    for (size_t i = 0; i < ts->size() && i < 7; ++i) h.kstop.b.tau[s][i + 1] = (*ts)[i];
+                }
+            }
+            if (c.rank == 0) {
+                std::fprintf(stderr, "# qw38 s2 MTP KStopB: ON (kmin=%d, K=%d, early_stop=%d, tau=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f)\n",
+                             h.kstop.b.kmin, K, int(kstop_early_stop),
+                             h.kstop.b.tau[1][1], h.kstop.b.tau[1][2], h.kstop.b.tau[1][3],
+                             h.kstop.b.tau[1][4], h.kstop.b.tau[1][5], h.kstop.b.tau[1][6], h.kstop.b.tau[1][7]);
+            }
+        }
+    }
 
     ControlLinks links = bootstrap(bc);
     try {

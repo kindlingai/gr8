@@ -509,8 +509,10 @@ __global__ void k_qsa_score_blocks(const __nv_bfloat16* __restrict__ idx_q,
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int nwarps = blockDim.x >> 5;
+    const int b0 = static_cast<int>(blockIdx.y) * nwarps + warp;
+    const int bstride = static_cast<int>(gridDim.y) * nwarps;
 
-    for (int b = warp; b < nblk; b += nwarps) {
+    for (int b = b0; b < nblk; b += bstride) {
         const int page = b >> 4;
         const int boff = b & 15;
         const __nv_bfloat16* kb = idx_pages + ((static_cast<size_t>(slot) * max_pages + page) * 16 + boff) * 128;
@@ -966,15 +968,14 @@ __global__ void k_qw38_gqa_split_reduce(const float* __restrict__ split_m,
 }
 
 inline int gqa_split_count(int M, int nh_kv, int max_pos, bool has_split) {
-    if (M <= 8 && max_pos >= 128 && has_split) {
-        if (nh_kv <= 2 && max_pos >= 512) {
-            if (M == 1) return (max_pos >= 1024) ? 24 : 16;
-            return 12;
+    if (M <= 8 && has_split) {
+        if (nh_kv <= 2) return 12; // TP=1: single split count across all positions -> eliminates mid-request graph captures!
+        if (max_pos >= 128) {
+            int ns = (max_pos >= 512) ? (24 / std::min(M * nh_kv, 6)) : 8;
+            if (ns > 24) ns = 24;
+            if (ns < 2) ns = 2;
+            return ns;
         }
-        int ns = (max_pos >= 512) ? (24 / std::min(M * nh_kv, 6)) : 8;
-        if (ns > 24) ns = 24;
-        if (ns < 2) ns = 2;
-        return ns;
     }
     return 1;
 }
@@ -1592,7 +1593,7 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
 
     int max_pos = 0;
     bool all_len1 = (nsegs == M);
-    const int V = snap_k + 1;
+    const int V = (nsegs > 0 && segs[0].len >= 2 && segs[0].len <= snap_k + 1) ? segs[0].len : (snap_k + 1);
     bool all_verify = (snap_k > 0 && nsegs > 0 && nsegs * V == M);
     bool all_qsa_tc = true;
     bool all_dense_tc16 = (nsegs > 0);
@@ -1681,7 +1682,8 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
                     segs[s].row0, segs[s].len, segs[s].slot, segs[s].pos0);
             }
         } else {
-            k_qsa_score_blocks<<<M, 256, 0, st>>>(sc.idx_q, kv.idx_pages, row_slot_dev, row_pos_dev, sc.idx_scores, max_pages, max_blocks, M);
+            const int qsa_y = (M <= 16) ? 32 : 1;
+            k_qsa_score_blocks<<<dim3(M, qsa_y), 256, 0, st>>>(sc.idx_q, kv.idx_pages, row_slot_dev, row_pos_dev, sc.idx_scores, max_pages, max_blocks, M);
         }
         k_qsa_select_top512<<<M, 256, 0, st>>>(sc.idx_scores, row_pos_dev, sc.sel_blocks, sc.sel_counts, max_blocks, M);
     }

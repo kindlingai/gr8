@@ -28,6 +28,7 @@
 #include "../knobs-rs/gr8_knobs.h"
 #include "qw38_vision.cuh"
 #include "qw38_dflash.cuh"
+#include "qw38_strata.cuh"
 
 #include <algorithm>
 #include <chrono>
@@ -206,6 +207,20 @@ struct Image {
     uint8_t* dev = nullptr;
     int rank = 0;
 
+    // Strata-mode split placement: compact GPU VRAM + mapped pinned host RAM + temporary BF16 host staging
+    bool strata_mode = false;
+    uint8_t* pin_host = nullptr;
+    uint8_t* pin_dev = nullptr;
+    uint8_t* tmp_host = nullptr;
+    uint8_t* tmp_dev = nullptr;
+    enum RegionKind : uint8_t { REG_GPU = 0, REG_PIN = 1, REG_TMP = 2 };
+    struct Placement {
+        uint64_t pack_off = 0, nbytes = 0, dst_off = 0;
+        RegionKind reg = REG_GPU;
+    };
+    std::vector<Placement> placements;
+    std::unordered_map<uint64_t, size_t> off_to_place;
+
     struct Sink {
         uint8_t* dev = nullptr;
         std::mutex mu;
@@ -232,9 +247,125 @@ struct Image {
         }
     };
 
+    struct SplitSink {
+        uint8_t* dev_gpu = nullptr;
+        uint8_t* pin_host = nullptr;
+        uint8_t* tmp_host = nullptr;
+        const std::vector<Placement>* placements = nullptr;
+        std::mutex mu;
+        std::vector<cudaStream_t> streams;
+        static void* alloc(void*, size_t n) {
+            void* p = nullptr;
+            return cudaHostAlloc(&p, n, cudaHostAllocDefault) == cudaSuccess ? p : nullptr;
+        }
+        static void release(void*, void* p) { cudaFreeHost(p); }
+        static int copy(void* ctx, int w, uint64_t off, const void* src, size_t n) {
+            SplitSink& s = *static_cast<SplitSink*>(ctx);
+            const auto& pl = *s.placements;
+            // Binary search for first placement with pack_off + nbytes > off
+            size_t lo_i = 0, hi_i = pl.size();
+            while (lo_i < hi_i) {
+                const size_t mid = lo_i + ((hi_i - lo_i) >> 1);
+                if (pl[mid].pack_off + pl[mid].nbytes <= off) lo_i = mid + 1;
+                else hi_i = mid;
+            }
+            cudaStream_t st = nullptr;
+            auto get_stream = [&]() -> cudaStream_t {
+                if (st) return st;
+                std::lock_guard<std::mutex> lk(s.mu);
+                while (static_cast<int>(s.streams.size()) <= w) {
+                    cudaStream_t x;
+                    if (cudaStreamCreateWithFlags(&x, cudaStreamNonBlocking) != cudaSuccess) return nullptr;
+                    s.streams.push_back(x);
+                }
+                st = s.streams[static_cast<size_t>(w)];
+                return st;
+            };
+            uint64_t cur = off;
+            const uint64_t end = off + n;
+            size_t idx = lo_i;
+            while (cur < end && idx < pl.size()) {
+                const auto& p = pl[idx];
+                if (cur < p.pack_off) {
+                    cur = std::min(end, p.pack_off);
+                    if (cur >= end) break;
+                }
+                const uint64_t seg_end = std::min(end, p.pack_off + p.nbytes);
+                if (seg_end > cur) {
+                    const size_t len = static_cast<size_t>(seg_end - cur);
+                    const uint8_t* sp = static_cast<const uint8_t*>(src) + (cur - off);
+                    const uint64_t dst_off = p.dst_off + (cur - p.pack_off);
+                    if (p.reg == REG_PIN) {
+                        std::memcpy(s.pin_host + dst_off, sp, len);
+                    } else if (p.reg == REG_TMP) {
+                        std::memcpy(s.tmp_host + dst_off, sp, len);
+                    } else {
+                        cudaStream_t cs = get_stream();
+                        if (!cs) return 2;
+                        if (cudaMemcpyAsync(s.dev_gpu + dst_off, sp, len, cudaMemcpyHostToDevice, cs) != cudaSuccess) return 3;
+                        if (cudaStreamSynchronize(cs) != cudaSuccess) return 4;
+                    }
+                    cur = seg_end;
+                }
+                if (cur >= p.pack_off + p.nbytes) ++idx;
+            }
+            return 0;
+        }
+    };
+
     ~Image() {
         if (dev) cudaFree(dev);
+        if (pin_host) cudaFreeHost(pin_host);
+        if (tmp_host) cudaFreeHost(tmp_host);
         if (plan) g6l_plan_free(plan);
+    }
+
+    void free_temp_host() {
+        if (tmp_host) {
+            cudaFreeHost(tmp_host);
+            tmp_host = nullptr;
+            tmp_dev = nullptr;
+        }
+    }
+
+    static bool ends_with(const std::string& s, const char* suf) {
+        const size_t sl = std::strlen(suf);
+        return s.size() >= sl && s.compare(s.size() - sl, sl, suf) == 0;
+    }
+
+    static RegionKind classify_strata_tensor(const std::string& name, bool dense_fp8, bool pf_mxfp8, bool mtp_fast) {
+        if (ends_with(name, ".tr3.fc1") || ends_with(name, ".tr3.fc2") || name == "embed.weight") {
+            return REG_PIN;
+        }
+        // Move trunk BF16 HC down/up matrices (~1.27 GB) off GPU:
+        // when pf_mxfp8 is active, prefill runs on VRAM-resident fp8_down (MXFP8 TC) + fp8_up (FP8->BF16 TC),
+        // so BF16 originals are REG_TMP (freed right after quantization -> 0 PCIe traffic, -1.27 GB host RAM!).
+        if (dense_fp8) {
+            const RegionKind hc_rk = pf_mxfp8 ? REG_TMP : REG_PIN;
+            if (name == "hc_final.down" || name == "hc_final.up") return hc_rk;
+            const bool is_trunk_layer = (name.size() >= 5 && name[0] == 'L' && name[4] == '.' && name.compare(0, 5, "L048.") != 0);
+            if (is_trunk_layer && (ends_with(name, ".attn_hc.down") || ends_with(name, ".attn_hc.up") ||
+                                   ends_with(name, ".mlp_hc.down") || ends_with(name, ".mlp_hc.up"))) {
+                return hc_rk;
+            }
+        }
+        if (mtp_fast && (name == "L048.mtp_exp.gate_up" || name == "L048.mtp_exp.down")) {
+            return REG_TMP;
+        }
+        if (dense_fp8 && pf_mxfp8) {
+            if (name == "lm_head.weight") return REG_TMP;
+            const bool is_trunk_layer = (name.size() >= 5 && name[0] == 'L' && name[4] == '.' && name.compare(0, 5, "L048.") != 0);
+            if (is_trunk_layer) {
+                if (ends_with(name, ".attn.q_proj") || ends_with(name, ".attn.k_proj") ||
+                    ends_with(name, ".attn.v_proj") || ends_with(name, ".attn.o_proj") ||
+                    ends_with(name, ".gdn.in_proj_qkv") || ends_with(name, ".gdn.in_proj_z") ||
+                    ends_with(name, ".gdn.out_proj") || ends_with(name, ".shared.gate_proj") ||
+                    ends_with(name, ".shared.up_proj") || ends_with(name, ".shared.down_proj")) {
+                    return REG_TMP;
+                }
+            }
+        }
+        return REG_GPU;
     }
 
     void open(const std::string& release_dir, const std::string& widths_path, int nr, int r,
@@ -277,23 +408,99 @@ struct Image {
                      rank, st.image_bytes / 1e9, st.seconds, st.threads);
     }
 
+    void whole_strata(bool dense_fp8, bool pf_mxfp8, bool mtp_fast) {
+        strata_mode = true;
+        auto al4096 = [](uint64_t n) -> uint64_t { return (n + 4095ull) & ~4095ull; };
+        uint64_t gpu_cur = 0, pin_cur = 0, tmp_cur = 0;
+        placements.clear();
+        placements.reserve(pack.entries().size());
+        off_to_place.clear();
+        for (const auto& e : pack.entries()) {
+            const RegionKind rk = classify_strata_tensor(e.name, dense_fp8, pf_mxfp8, mtp_fast);
+            uint64_t dst = 0;
+            if (rk == REG_GPU) { dst = gpu_cur; gpu_cur = al4096(gpu_cur + e.nbytes); }
+            else if (rk == REG_PIN) { dst = pin_cur; pin_cur = al4096(pin_cur + e.nbytes); }
+            else { dst = tmp_cur; tmp_cur = al4096(tmp_cur + e.nbytes); }
+            off_to_place[e.offset] = placements.size();
+            placements.push_back({e.offset, e.nbytes, dst, rk});
+        }
+        std::fprintf(stderr,
+                     "# rank %d: qw38 strata split plan: GPU=%.2f GB, Pinned-UVA=%.2f GB, Temp-BF16-Host=%.2f GB (total %.2f GB)\n",
+                     rank, gpu_cur / 1e9, pin_cur / 1e9, tmp_cur / 1e9, pack.bytes() / 1e9);
+
+        void* d_gpu = nullptr;
+        QW38_CK(cudaMalloc(&d_gpu, gpu_cur ? gpu_cur : 4096));
+        dev = static_cast<uint8_t*>(d_gpu);
+        if (pin_cur > 0) {
+            void* p_h = nullptr;
+            void* p_d = nullptr;
+            QW38_CK(cudaHostAlloc(&p_h, pin_cur, cudaHostAllocMapped | cudaHostAllocPortable));
+            QW38_CK(cudaHostGetDevicePointer(&p_d, p_h, 0));
+            pin_host = static_cast<uint8_t*>(p_h);
+            pin_dev = static_cast<uint8_t*>(p_d);
+        }
+        if (tmp_cur > 0) {
+            void* t_h = nullptr;
+            void* t_d = nullptr;
+            QW38_CK(cudaHostAlloc(&t_h, tmp_cur, cudaHostAllocMapped | cudaHostAllocPortable));
+            QW38_CK(cudaHostGetDevicePointer(&t_d, t_h, 0));
+            tmp_host = static_cast<uint8_t*>(t_h);
+            tmp_dev = static_cast<uint8_t*>(t_d);
+        }
+
+        SplitSink sink;
+        sink.dev_gpu = dev;
+        sink.pin_host = pin_host;
+        sink.tmp_host = tmp_host;
+        sink.placements = &placements;
+        const g6l_sink s{&sink, &SplitSink::alloc, &SplitSink::release, &SplitSink::copy};
+        g6l_stats st{};
+        char err[1024] = "";
+        if (g6l_plan_load(plan, &s, &st, err, sizeof err))
+            die("rank " + std::to_string(rank) + ": strata split load: " + err);
+        for (cudaStream_t x : sink.streams) cudaStreamDestroy(x);
+        std::fprintf(stderr, "# rank %d: qw38 strata split loaded %.2f GB in %.2f s (%u threads)\n",
+                     rank, st.image_bytes / 1e9, st.seconds, st.threads);
+    }
+
     const g6::Entry* find(const std::string& name) const { return pack.find(name); }
     const g6::Entry& entry(const std::string& name) const {
         const g6::Entry* e = pack.find(name);
         if (!e) die("rank " + std::to_string(rank) + ": missing tensor " + name);
         return *e;
     }
+    const uint8_t* dev_addr(const g6::Entry& e) const {
+        if (!strata_mode) return dev + e.offset;
+        const auto& p = placements[off_to_place.at(e.offset)];
+        if (p.reg == REG_GPU) return dev + p.dst_off;
+        if (p.reg == REG_PIN) return pin_dev + p.dst_off;
+        return tmp_dev + p.dst_off;
+    }
+    uint8_t* host_addr_mut(const g6::Entry& e) const {
+        if (!strata_mode) return nullptr;
+        const auto& p = placements[off_to_place.at(e.offset)];
+        if (p.reg == REG_PIN) return pin_host + p.dst_off;
+        if (p.reg == REG_TMP) return tmp_host + p.dst_off;
+        return nullptr;
+    }
     template <class T> const T* get(const std::string& name) const {
-        return reinterpret_cast<const T*>(dev + entry(name).offset);
+        return reinterpret_cast<const T*>(dev_addr(entry(name)));
     }
     template <class T> const T* opt(const std::string& name) const {
         const g6::Entry* e = pack.find(name);
-        return e ? reinterpret_cast<const T*>(dev + e->offset) : nullptr;
+        return e ? reinterpret_cast<const T*>(dev_addr(*e)) : nullptr;
+    }
+    template <class T> T* host_mut(const std::string& name) const {
+        return reinterpret_cast<T*>(host_addr_mut(entry(name)));
     }
     template <class T> void read_host(const std::string& name, std::vector<T>& out) const {
         const g6::Entry& e = entry(name);
         out.resize(e.nbytes / sizeof(T));
-        QW38_CK(cudaMemcpy(out.data(), dev + e.offset, e.nbytes, cudaMemcpyDeviceToHost));
+        if (uint8_t* hp = host_addr_mut(e)) {
+            std::memcpy(out.data(), hp, e.nbytes);
+        } else {
+            QW38_CK(cudaMemcpy(out.data(), dev_addr(e), e.nbytes, cudaMemcpyDeviceToHost));
+        }
     }
 };
 
@@ -329,6 +536,7 @@ struct Options {
     int dfl_dp = 2;
     bool no_mtp = false;
     std::string tap_dump_path;
+    StrataConfig strata;
 };
 
 struct ProfileAccum {
@@ -381,6 +589,7 @@ struct Engine {
     // Weight paging pool (GR8_PTAB=1|2) and on-load FP8 dense arena (GR8_QW38_DENSE_FP8=1)
     ptab::Pool ptab_pool;
     qw38::Fp8Arena fp8_arena;
+    StrataExpertCache strata_cache;
 
     // Layer-1 PLE NVMe store + host context per slot
     qw38::PleStore ple_store;
@@ -441,6 +650,9 @@ struct Engine {
     qw38::MoeScratch moe_sc;
     qw38::HeadPackScratch head_sc;
     uint8_t* x8_scratch = nullptr;        // shared MXFP8 A-record scratch (GR8_QW38_PF_MXFP8=1)
+    uint8_t* stage_slab = nullptr;        // Strata-mode aliased scratch slab for mutually exclusive gdn/attn/moe/ple/head
+    size_t stage_slab_bytes = 0;
+    size_t mtp_sc_cap = 0;
     float* head_logits = nullptr;         // [max_rows, max_v_rows] FP32
     uint8_t* head_dev_pkt = nullptr;      // [max_rows * head_row_bytes(nc)]
     uint8_t* head_host_parts = nullptr;   // [nr * max_rows * head_row_bytes(nc)] pinned host staging (graph-safe D2H!)
@@ -488,8 +700,11 @@ struct Engine {
     std::vector<qw38::MtpHead2> mtp_head2;
     qw38::MtpHead2Scratch mtp_h2_sc;
     qw38::HeadArgmax* d_mtp_argmax = nullptr;    // [max_rows]
+    float* d_mtp_lp = nullptr;                   // [max_rows] top-64 softmax log-prob per step
     int* d_mtp_draft_out = nullptr;              // [max_rows * 8]
     int* h_mtp_draft_out = nullptr;              // [max_rows * 8] pinned host staging
+    float* d_mtp_draft_lp = nullptr;             // [max_rows * 8]
+    float* h_mtp_draft_lp = nullptr;             // [max_rows * 8] pinned host staging
     __nv_bfloat16* last_hyper = nullptr;         // [slots, 10240] BF16 (trunk final hyper state per slot)
     __nv_bfloat16* mtp_hid_in = nullptr;         // [slots, 10240] BF16 (gathered initial hyper for arbitrary S2 slot subsets)
     __nv_bfloat16* mtp_hid_cur = nullptr;        // [slots, 10240] BF16 (chained MTP draft hidden state)
@@ -521,13 +736,14 @@ struct Engine {
 
     // CUDA Graph cache for decode & MTP-verify steps (100% compatible with GR8_PTAB=1|2 & FAST_AR!)
     struct GraphKey {
-        int M, need_qsa, ns_attn, par, snap_k;
+        int M, need_qsa, ns_attn, par, snap_k, V;
         bool operator<(const GraphKey& b) const {
             if (M != b.M) return M < b.M;
             if (need_qsa != b.need_qsa) return need_qsa < b.need_qsa;
             if (ns_attn != b.ns_attn) return ns_attn < b.ns_attn;
             if (par != b.par) return par < b.par;
-            return snap_k < b.snap_k;
+            if (snap_k != b.snap_k) return snap_k < b.snap_k;
+            return V < b.V;
         }
     };
     struct GraphPair {
@@ -550,13 +766,14 @@ struct Engine {
     std::map<MtpGraphKey, cudaGraphExec_t> mtp_graphs;
 
     struct MtpKGraphKey {
-        int S, K, need_qsa, ns_attn, par;
+        int S, K, need_qsa, ns_attn, par, mode; // mode: 0=full, 1=lazy_head(defer idx restore), 2=lazy_tail(from mtp_hid_cur)
         bool operator<(const MtpKGraphKey& b) const {
             if (S != b.S) return S < b.S;
             if (K != b.K) return K < b.K;
             if (need_qsa != b.need_qsa) return need_qsa < b.need_qsa;
             if (ns_attn != b.ns_attn) return ns_attn < b.ns_attn;
-            return par < b.par;
+            if (par != b.par) return par < b.par;
+            return mode < b.mode;
         }
     };
     std::map<MtpKGraphKey, cudaGraphExec_t> mtp_k_graphs;
@@ -579,6 +796,7 @@ struct Engine {
         }
         mtp_k_graphs.clear();
         if (h_mtp_draft_out) cudaFreeHost(h_mtp_draft_out);
+        if (h_mtp_draft_lp) cudaFreeHost(h_mtp_draft_lp);
         if (ple_thr.joinable()) {
             {
                 std::unique_lock<std::mutex> lk(ple_mu);
@@ -605,6 +823,7 @@ struct Engine {
                          (long long)tap_dump_cnt, (long long)tap_dump_align_ok, (long long)tap_dump_cnt);
         }
         if (dfl_step_taps) cudaFree(dfl_step_taps);
+        if (stage_slab) cudaFree(stage_slab);
         if (head_host_parts) cudaFreeHost(head_host_parts);
         for (int b = 0; b < 2; ++b) {
             if (meta_h2d_done[b]) cudaEventDestroy(meta_h2d_done[b]);
@@ -678,6 +897,18 @@ struct Engine {
         }
         max_snap_k = std::max(o.mtp, o.dfl_k);
         const bool want_mtp = (o.mtp > 0 && !o.no_mtp);
+        if (!o.strata.enabled) {
+            const StrataConfig env_s = load_strata_config_from_env();
+            if (env_s.enabled) o.strata = env_s;
+        }
+        if (o.strata.enabled) {
+            if (o.nloc != 1 || o.nr != 1) die("qw38 strata mode currently supports TP=1 (single GPU)");
+            o.dense_fp8 = true;
+            o.pf_mxfp8 = true;
+            o.mtp_fast = true;
+            o.wide = true;
+            o.ptab_mode = ptab::OFF;
+        }
         if (knob::qw38_ple_cache_mib() >= 0) o.ple_cache_mib = size_t(knob::qw38_ple_cache_mib());
         if (o.ple_path.empty()) {
             const std::optional<std::string>& env_ple = knob::qw38_ple_path();
@@ -707,7 +938,8 @@ struct Engine {
             const int r = o.rank0 + i;
             img[size_t(i)] = std::make_unique<Image>();
             img[size_t(i)]->open(release_dir, o.widths_path, o.nr, r, o.layout_path, want_mtp);
-            img[size_t(i)]->whole();
+            if (o.strata.enabled) img[size_t(i)]->whole_strata(o.dense_fp8, o.pf_mxfp8, o.mtp_fast);
+            else img[size_t(i)]->whole();
             lm_head[size_t(i)] = img[size_t(i)]->get<__nv_bfloat16>("lm_head.weight");
             v_lo[size_t(i)] = geom::vocab_row0(o.nr, r);
             v_rows[size_t(i)] = geom::vocab_rows(o.nr, r);
@@ -720,107 +952,6 @@ struct Engine {
         final_hc.down = im0.get<__nv_bfloat16>("hc_final.down");
         final_hc.up = im0.get<__nv_bfloat16>("hc_final.up");
         final_hc.inject = nullptr;
-
-        // 2. Initialize Layer-1 PLE NVMe rowstore if layer 1 is active
-        for (int l : layer_ids) if (geom::is_ple(l)) has_ple = true;
-        ple_ctx.assign(size_t(o.slots), {geom::TOK_EOS, geom::TOK_EOS});
-        if (has_ple) {
-            ple_w.key_proj = im0.get<__nv_bfloat16>("L001.ple.key_proj");
-            ple_w.value_proj = im0.get<__nv_bfloat16>("L001.ple.value_proj");
-            ple_w.conv1d = im0.get<__nv_bfloat16>("L001.ple.conv1d");
-            ple_w.norm_query = im0.get<__nv_bfloat16>("L001.ple.norm_query");
-            ple_w.norm_key = im0.get<__nv_bfloat16>("L001.ple.norm_key");
-            ple_w.norm_conv = im0.get<__nv_bfloat16>("L001.ple.norm_conv");
-
-            std::vector<int64_t> mult, offs, vs;
-            im0.read_host("L001.ple.layer_multipliers", mult);
-            im0.read_host("L001.ple.ngram_heads_offsets", offs);
-            im0.read_host("L001.ple.ngram_heads_vocab_sizes", vs);
-            if (mult.size() != 3 || offs.size() != 16 || vs.size() != 16)
-                die("L001.ple hash tables have unexpected sizes");
-            ple_store.set_hash_params(mult.data(), offs.data(), vs.data(), geom::TOK_EOS);
-
-            const std::string ple_bin = qw38::resolve_ple_path(release_dir, o.ple_path);
-            qw38::PleStoreOpts po;
-            po.cache_bytes = o.ple_cache_mib << 20;
-            po.io_uring = o.ple_uring;
-            po.direct = o.ple_direct;
-            std::string perr;
-            if (!ple_store.open(ple_bin, po, &perr)) die(perr);
-            if (ple_store.is_row_trellis()) {
-                const auto& rt = ple_store.trellis_info();
-                if (rt.nc < geom::PLE_HEAD_DIM)
-                    die("L001.ple row-trellis nc=" + std::to_string(rt.nc) + " < PLE_HEAD_DIM");
-                std::fprintf(stderr,
-                             "# rank %d: qw38 PLE opened %s (row-trellis %s %s, %llu rows x %d cols, %zu B/row, "
-                             "resident=%d, direct=%d, uring=%d, cache=%zu MiB)\n",
-                             o.rank0, ple_bin.c_str(), rt.codebook.c_str(), rt.width_name.c_str(),
-                             (unsigned long long)ple_store.total_rows(), rt.nc, rt.row_bytes,
-                             int(ple_store.is_resident()), int(ple_store.is_direct()), int(ple_store.has_uring()),
-                             o.ple_cache_mib);
-            } else {
-                std::fprintf(stderr, "# rank %d: qw38 PLE opened %s (%llu rows, direct=%d, uring=%d, cache=%zu MiB)\n",
-                             o.rank0, ple_bin.c_str(), (unsigned long long)ple_store.total_rows(),
-                             int(ple_store.is_direct()), int(ple_store.has_uring()), o.ple_cache_mib);
-            }
-
-            ple_st.conv_hist = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::PLE_NHIST * geom::HC_D);
-            if (max_snap_k > 0) {
-                ple_st.conv_hist_snap = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(max_snap_k + 1) * geom::PLE_NHIST * geom::HC_D);
-                ple_st.snap_stride = max_snap_k;
-            }
-            ple_sc.emb = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::PLE_DIM);
-            ple_sc.key = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
-            ple_sc.query = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
-            ple_sc.val = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HID);
-            ple_sc.gv = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
-            ple_sc.gv_norm = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
-            if (ple_store.is_row_trellis()) {
-                const size_t max_ple_rows = size_t(o.max_rows) * geom::PLE_HEADS;
-                const size_t rb = ple_store.row_bytes();
-                for (int b = 0; b < 2; ++b) {
-                    QW38_CK(cudaHostAlloc(&ple_codes_pinned[b], max_ple_rows * rb, cudaHostAllocDefault));
-                    QW38_CK(cudaHostAlloc(&ple_svh_pinned[b], max_ple_rows * sizeof(uint16_t), cudaHostAllocDefault));
-                }
-                d_ple_codes = dalloc<uint8_t>(max_ple_rows * rb);
-                d_ple_svh = dalloc<__half>(max_ple_rows);
-                d_ple_suh = dalloc<__half>(ple_store.suh().size());
-                QW38_CK(cudaMemcpy(d_ple_suh, ple_store.suh().data(), ple_store.suh().size() * sizeof(uint16_t),
-                                   cudaMemcpyHostToDevice));
-            } else {
-                for (int b = 0; b < 2; ++b) {
-                    QW38_CK(cudaHostAlloc(&ple_pinned[b], size_t(o.max_rows) * geom::PLE_DIM * 2, cudaHostAllocDefault));
-                }
-            }
-            for (int b = 0; b < 2; ++b) {
-                QW38_CK(cudaEventCreateWithFlags(&ple_h2d_done[b], cudaEventDisableTiming));
-                ple_h2d_pending[b] = false;
-            }
-            if (o.ple_async) {
-                ple_thr = std::thread([this]() {
-                    for (;;) {
-                        std::unique_lock<std::mutex> lk(ple_mu);
-                        ple_cv.wait(lk, [&]() { return ple_has_job; });
-                        if (ple_stop) return;
-                        ple_has_job = false;
-                        const int buf = ple_job_buf;
-                        const bool is_pf = ple_job_is_prefetch;
-                        lk.unlock();
-                        const bool ok = is_pf
-                            ? ple_store.prefetch_rows(ple_job_ids.data(), ple_job_ids.size())
-                            : (ple_store.is_row_trellis()
-                                   ? ple_store.fetch_trellis_rows(ple_job_ids.data(), ple_job_ids.size(),
-                                                                  ple_codes_pinned[buf], ple_svh_pinned[buf])
-                                   : ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
-                                                          reinterpret_cast<uint8_t*>(ple_pinned[buf])));
-                        lk.lock();
-                        ple_job_ok = ok;
-                        ple_job_done = true;
-                        ple_done_cv.notify_one();
-                    }
-                });
-            }
-        }
 
         // 3. Bind layers + allocate per-layer KV / GDN states + build ptab::Table (GR8_PTAB=1|2)
         L.resize(layer_ids.size());
@@ -916,7 +1047,7 @@ struct Engine {
                 rl.moe_w.t_rows = static_cast<int>(im.entry(lname(l, "tr3.table")).shape[0]);
                 rl.moe_w.t_eb = g6nr::EB;
 
-                if (o.wide) {
+                if (o.wide && !o.strata.enabled) {
                     launch_tr3_widen(const_cast<uint8_t*>(rl.moe_w.t_fc1), rl.moe_w.t_tab, rl.moe_w.t_kmix,
                                      rl.moe_w.t_rows, rl.moe_w.t_eb, stream);
                     launch_tr4_widen(const_cast<uint8_t*>(rl.moe_w.t_fc1), rl.moe_w.t_tab, rl.moe_w.t_kmix,
@@ -925,6 +1056,9 @@ struct Engine {
                                       rl.moe_w.t_rows, rl.moe_w.t_eb, stream);
                     launch_tr4_widen2(const_cast<uint8_t*>(rl.moe_w.t_fc2), rl.moe_w.t_tab,
                                       rl.moe_w.t_rows, rl.moe_w.t_eb, stream);
+                    rl.moe_w.fc1_wide = 1;
+                    rl.moe_w.fc2_wide = 1;
+                } else if (o.strata.enabled) {
                     rl.moe_w.fc1_wide = 1;
                     rl.moe_w.fc2_wide = 1;
                 }
@@ -1012,20 +1146,25 @@ struct Engine {
                 mw.mtp_down = im.get<__nv_bfloat16>("L048.mtp_exp.down");
             }
             const size_t ms = size_t(std::max(o.max_rows, o.slots));
+            mtp_sc_cap = o.strata.enabled ? std::min<size_t>(ms, std::max<size_t>(1024, size_t(o.slots))) : ms;
+            const size_t mtp_moe_rows = o.strata.enabled ? std::max<size_t>(size_t(o.slots), 16) : ms;
             last_hyper = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::HC_D);
             mtp_hid_in = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::HC_D);
             mtp_hid_cur = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::HC_D);
-            mtp_sc.emb_raw = dalloc<__nv_bfloat16>(ms * geom::HID);
-            mtp_sc.emb_norm = dalloc<__nv_bfloat16>(ms * geom::HID);
-            mtp_sc.emb_proj = dalloc<__nv_bfloat16>(ms * geom::HID);
-            mtp_sc.hid_norm = dalloc<__nv_bfloat16>(ms * geom::HC_D);
-            mtp_sc.hid_proj = dalloc<__nv_bfloat16>(ms * geom::HC_D);
-            mtp_sc.mtp_hyper = dalloc<__nv_bfloat16>(ms * geom::HC_D);
-            mtp_sc.exp_mid = dalloc<__nv_bfloat16>(ms * geom::TOPK * geom::SHARED_I);
-            mtp_sc.exp_dn_part = dalloc<float>(ms * geom::TOPK * geom::HID);
-            d_mtp_argmax = dalloc<qw38::HeadArgmax>(ms);
-            d_mtp_draft_out = dalloc<int>(ms * 8);
-            QW38_CK(cudaHostAlloc(&h_mtp_draft_out, ms * 8 * sizeof(int), cudaHostAllocDefault));
+            mtp_sc.emb_raw = dalloc<__nv_bfloat16>(mtp_sc_cap * geom::HID);
+            mtp_sc.emb_norm = dalloc<__nv_bfloat16>(mtp_sc_cap * geom::HID);
+            mtp_sc.emb_proj = dalloc<__nv_bfloat16>(mtp_sc_cap * geom::HID);
+            mtp_sc.hid_norm = dalloc<__nv_bfloat16>(mtp_sc_cap * geom::HC_D);
+            mtp_sc.hid_proj = dalloc<__nv_bfloat16>(mtp_sc_cap * geom::HC_D);
+            mtp_sc.mtp_hyper = dalloc<__nv_bfloat16>(mtp_sc_cap * geom::HC_D);
+            mtp_sc.exp_mid = dalloc<__nv_bfloat16>(mtp_moe_rows * geom::TOPK * geom::SHARED_I);
+            mtp_sc.exp_dn_part = dalloc<float>(mtp_moe_rows * geom::TOPK * geom::HID);
+            d_mtp_argmax = dalloc<qw38::HeadArgmax>(mtp_moe_rows);
+            d_mtp_lp = dalloc<float>(mtp_moe_rows);
+            d_mtp_draft_out = dalloc<int>(mtp_moe_rows * 8);
+            d_mtp_draft_lp = dalloc<float>(mtp_moe_rows * 8);
+            QW38_CK(cudaHostAlloc(&h_mtp_draft_out, mtp_moe_rows * 8 * sizeof(int), cudaHostAllocDefault));
+            QW38_CK(cudaHostAlloc(&h_mtp_draft_lp, mtp_moe_rows * 8 * sizeof(float), cudaHostAllocDefault));
             std::fprintf(stderr, "# rank %d: qw38 MTP L048 drafter loaded (K=%d)\n", o.rank0, o.mtp);
         }
 
@@ -1033,15 +1172,15 @@ struct Engine {
         if (o.dense_fp8) {
             fp8_lm_head.resize(size_t(o.nloc));
             for (int i = 0; i < o.nloc; ++i) {
-                fp8_arena.add(lm_head[size_t(i)], fp8_lm_head[size_t(i)], v_rows[size_t(i)], geom::HID);
+                fp8_arena.add(lm_head[size_t(i)], fp8_lm_head[size_t(i)], v_rows[size_t(i)], geom::HID, false, o.strata.enabled);
             }
-            fp8_arena.add(final_hc.down, final_hc.fp8_down, geom::HC_RANK, geom::HC_D);
-            fp8_arena.add(final_hc.up, final_hc.fp8_up, geom::HC_D, geom::HC_RANK, true);
+            fp8_arena.add(final_hc.down, final_hc.fp8_down, geom::HC_RANK, geom::HC_D, false, o.strata.enabled);
+            fp8_arena.add(final_hc.up, final_hc.fp8_up, geom::HC_D, geom::HC_RANK, true, o.strata.enabled);
             for (auto& y : L) {
-                fp8_arena.add(y.attn_hc.down, y.attn_hc.fp8_down, geom::HC_RANK, geom::HC_D);
-                fp8_arena.add(y.attn_hc.up, y.attn_hc.fp8_up, geom::HC_D, geom::HC_RANK, true);
-                fp8_arena.add(y.mlp_hc.down, y.mlp_hc.fp8_down, geom::HC_RANK, geom::HC_D);
-                fp8_arena.add(y.mlp_hc.up, y.mlp_hc.fp8_up, geom::HC_D, geom::HC_RANK, true);
+                fp8_arena.add(y.attn_hc.down, y.attn_hc.fp8_down, geom::HC_RANK, geom::HC_D, false, o.strata.enabled);
+                fp8_arena.add(y.attn_hc.up, y.attn_hc.fp8_up, geom::HC_D, geom::HC_RANK, true, o.strata.enabled);
+                fp8_arena.add(y.mlp_hc.down, y.mlp_hc.fp8_down, geom::HC_RANK, geom::HC_D, false, o.strata.enabled);
+                fp8_arena.add(y.mlp_hc.up, y.mlp_hc.fp8_up, geom::HC_D, geom::HC_RANK, true, o.strata.enabled);
                 for (int i = 0; i < o.nloc; ++i) {
                     const int r = o.rank0 + i;
                     auto& rl = y.rk[size_t(i)];
@@ -1120,6 +1259,22 @@ struct Engine {
                 mtp_h2_sc.screen_max = dalloc<float>(h2_rows);
             }
             QW38_CK(cudaStreamSynchronize(stream));
+            if (o.strata.enabled) {
+                for (int i = 0; i < o.nloc; ++i) {
+                    img[size_t(i)]->free_temp_host();
+                    lm_head[size_t(i)] = nullptr;
+                }
+                if (o.pf_mxfp8) {
+                    final_hc.down = nullptr;
+                    final_hc.up = nullptr;
+                    for (auto& y : L) {
+                        y.attn_hc.down = nullptr;
+                        y.attn_hc.up = nullptr;
+                        y.mlp_hc.down = nullptr;
+                        y.mlp_hc.up = nullptr;
+                    }
+                }
+            }
             const double fp8_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fp8_t0).count();
             if (has_mtp && o.mtp_fast) {
                 std::fprintf(stderr,
@@ -1156,6 +1311,115 @@ struct Engine {
             if (tap_dump_fp) h_tap_dump.resize(size_t(dfl_step_taps_cap) * qw38::dfl::NT * geom::HID);
         }
 
+        // 3d. Initialize Layer-1 PLE store AFTER freeing temp BF16 host staging (-6.2 GiB peak host RAM in Strata mode)
+        for (int l : layer_ids) if (geom::is_ple(l)) has_ple = true;
+        ple_ctx.assign(size_t(o.slots), {geom::TOK_EOS, geom::TOK_EOS});
+        if (has_ple) {
+            ple_w.key_proj = im0.get<__nv_bfloat16>("L001.ple.key_proj");
+            ple_w.value_proj = im0.get<__nv_bfloat16>("L001.ple.value_proj");
+            ple_w.conv1d = im0.get<__nv_bfloat16>("L001.ple.conv1d");
+            ple_w.norm_query = im0.get<__nv_bfloat16>("L001.ple.norm_query");
+            ple_w.norm_key = im0.get<__nv_bfloat16>("L001.ple.norm_key");
+            ple_w.norm_conv = im0.get<__nv_bfloat16>("L001.ple.norm_conv");
+
+            std::vector<int64_t> mult, offs, vs;
+            im0.read_host("L001.ple.layer_multipliers", mult);
+            im0.read_host("L001.ple.ngram_heads_offsets", offs);
+            im0.read_host("L001.ple.ngram_heads_vocab_sizes", vs);
+            if (mult.size() != 3 || offs.size() != 16 || vs.size() != 16)
+                die("L001.ple hash tables have unexpected sizes");
+            ple_store.set_hash_params(mult.data(), offs.data(), vs.data(), geom::TOK_EOS);
+
+            const std::string ple_bin = qw38::resolve_ple_path(release_dir, o.ple_path);
+            qw38::PleStoreOpts po;
+            po.cache_bytes = o.ple_cache_mib << 20;
+            po.io_uring = o.ple_uring;
+            po.direct = o.ple_direct;
+            po.gguf_ram = knob::qw38_ple_ram();
+            po.gguf_no_warm = knob::qw38_ple_no_warm();
+            std::string perr;
+            if (!ple_store.open(ple_bin, po, &perr)) die(perr);
+            if (ple_store.is_row_trellis()) {
+                const auto& rt = ple_store.trellis_info();
+                if (rt.nc < geom::PLE_HEAD_DIM)
+                    die("L001.ple row-trellis nc=" + std::to_string(rt.nc) + " < PLE_HEAD_DIM");
+                std::fprintf(stderr,
+                             "# rank %d: qw38 PLE opened %s (row-trellis %s %s, %llu rows x %d cols, %zu B/row, "
+                             "resident=%d, direct=%d, uring=%d, cache=%zu MiB)\n",
+                             o.rank0, ple_bin.c_str(), rt.codebook.c_str(), rt.width_name.c_str(),
+                             (unsigned long long)ple_store.total_rows(), rt.nc, rt.row_bytes,
+                             int(ple_store.is_resident()), int(ple_store.is_direct()), int(ple_store.has_uring()),
+                             o.ple_cache_mib);
+            } else if (ple_store.is_gguf_iq4nl()) {
+                std::fprintf(stderr, "# rank %d: qw38 PLE opened %s (GGUF IQ4_NL RAM-mmap, %llu rows, 90 B/row = %.2f GiB)\n",
+                             o.rank0, ple_bin.c_str(), (unsigned long long)ple_store.total_rows(),
+                             (double(ple_store.total_rows()) * 90.0) / 1073741824.0);
+            } else {
+                std::fprintf(stderr, "# rank %d: qw38 PLE opened %s (%llu rows, direct=%d, uring=%d, cache=%zu MiB)\n",
+                             o.rank0, ple_bin.c_str(), (unsigned long long)ple_store.total_rows(),
+                             int(ple_store.is_direct()), int(ple_store.has_uring()), o.ple_cache_mib);
+            }
+
+            ple_st.conv_hist = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::PLE_NHIST * geom::HC_D);
+            if (max_snap_k > 0) {
+                ple_st.conv_hist_snap = dalloc<__nv_bfloat16>(size_t(o.slots) * size_t(max_snap_k + 1) * geom::PLE_NHIST * geom::HC_D);
+                ple_st.snap_stride = max_snap_k;
+            }
+            if (!o.strata.enabled) {
+                ple_sc.emb = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::PLE_DIM);
+                ple_sc.key = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
+                ple_sc.query = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
+                ple_sc.val = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HID);
+                ple_sc.gv = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
+                ple_sc.gv_norm = dalloc<__nv_bfloat16>(size_t(o.max_rows) * geom::HC_D);
+            }
+            if (ple_store.is_row_trellis()) {
+                const size_t max_ple_rows = size_t(o.max_rows) * geom::PLE_HEADS;
+                const size_t rb = ple_store.row_bytes();
+                for (int b = 0; b < 2; ++b) {
+                    QW38_CK(cudaHostAlloc(&ple_codes_pinned[b], max_ple_rows * rb, cudaHostAllocDefault));
+                    QW38_CK(cudaHostAlloc(&ple_svh_pinned[b], max_ple_rows * sizeof(uint16_t), cudaHostAllocDefault));
+                }
+                d_ple_codes = dalloc<uint8_t>(max_ple_rows * rb);
+                d_ple_svh = dalloc<__half>(max_ple_rows);
+                d_ple_suh = dalloc<__half>(ple_store.suh().size());
+                QW38_CK(cudaMemcpy(d_ple_suh, ple_store.suh().data(), ple_store.suh().size() * sizeof(uint16_t),
+                                   cudaMemcpyHostToDevice));
+            } else {
+                for (int b = 0; b < 2; ++b) {
+                    QW38_CK(cudaHostAlloc(&ple_pinned[b], size_t(o.max_rows) * geom::PLE_DIM * 2, cudaHostAllocDefault));
+                }
+            }
+            for (int b = 0; b < 2; ++b) {
+                QW38_CK(cudaEventCreateWithFlags(&ple_h2d_done[b], cudaEventDisableTiming));
+                ple_h2d_pending[b] = false;
+            }
+            if (o.ple_async) {
+                ple_thr = std::thread([this]() {
+                    for (;;) {
+                        std::unique_lock<std::mutex> lk(ple_mu);
+                        ple_cv.wait(lk, [&]() { return ple_has_job; });
+                        if (ple_stop) return;
+                        ple_has_job = false;
+                        const int buf = ple_job_buf;
+                        const bool is_pf = ple_job_is_prefetch;
+                        lk.unlock();
+                        const bool ok = is_pf
+                            ? ple_store.prefetch_rows(ple_job_ids.data(), ple_job_ids.size())
+                            : (ple_store.is_row_trellis()
+                                   ? ple_store.fetch_trellis_rows(ple_job_ids.data(), ple_job_ids.size(),
+                                                                  ple_codes_pinned[buf], ple_svh_pinned[buf])
+                                   : ple_store.fetch_rows(ple_job_ids.data(), ple_job_ids.size(),
+                                                          reinterpret_cast<uint8_t*>(ple_pinned[buf])));
+                        lk.lock();
+                        ple_job_ok = ok;
+                        ple_job_done = true;
+                        ple_done_cv.notify_one();
+                    }
+                });
+            }
+        }
+
         // 4. Allocate shared step scratch buffers
         const size_t M = size_t(o.max_rows);
         hyper = dalloc<__nv_bfloat16>(M * geom::HC_D);
@@ -1169,54 +1433,203 @@ struct Engine {
 
         const int max_nh_v = geom::gdn_vh(o.nr);
         const int max_qkv = (2 * geom::gdn_kh_max(o.nr) + max_nh_v) * geom::GDN_DK;
-        gdn_sc.qkv_raw = dalloc<__nv_bfloat16>(M * size_t(max_qkv));
-        gdn_sc.qkv_conv = dalloc<__nv_bfloat16>(M * size_t(max_qkv));
-        gdn_sc.z = dalloc<__nv_bfloat16>(M * size_t(max_nh_v) * geom::GDN_DV);
-        gdn_sc.a = dalloc<__nv_bfloat16>(M * size_t(max_nh_v));
-        gdn_sc.b = dalloc<__nv_bfloat16>(M * size_t(max_nh_v));
-        gdn_sc.core = dalloc<__nv_bfloat16>(M * size_t(max_nh_v) * geom::GDN_DV);
         const size_t max_wy_chunks = (M + qw38::GDN_WY_CH - 1) / qw38::GDN_WY_CH;
-        gdn_sc.wy_qe = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DK);
-        gdn_sc.wy_kd = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DK);
-        gdn_sc.wy_w = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DK);
-        gdn_sc.wy_u = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DV);
-        gdn_sc.wy_aq = dalloc<uint16_t>(size_t(max_nh_v) * M * qw38::GDN_WY_CH);
-        gdn_sc.wy_glast = dalloc<float>(size_t(max_nh_v) * max_wy_chunks);
-
         const int max_nh_q = geom::nh_q(o.nr);
         const int max_nh_kv = geom::nh_kv_max(o.nr);
-        attn_sc.q_gate = dalloc<__nv_bfloat16>(M * size_t(max_nh_q) * 512);
-        attn_sc.q = dalloc<__nv_bfloat16>(M * size_t(max_nh_q) * 256);
-        attn_sc.gate = dalloc<__nv_bfloat16>(M * size_t(max_nh_q) * 256);
-        attn_sc.k = dalloc<__nv_bfloat16>(M * size_t(max_nh_kv) * 256);
-        attn_sc.v = dalloc<__nv_bfloat16>(M * size_t(max_nh_kv) * 256);
-        attn_sc.idx_qk = dalloc<__nv_bfloat16>(M * geom::IDX_PROJ_OUT);
-        attn_sc.idx_q = dalloc<__nv_bfloat16>(M * geom::IDX_HEADS * geom::IDX_DIM);
-        attn_sc.attn_out = dalloc<__nv_bfloat16>(M * size_t(max_nh_q) * 256);
-        attn_sc.idx_scores = dalloc<float>(M * size_t(max_blocks));
-        attn_sc.sel_blocks = dalloc<int>(M * geom::IDX_TOP_BLOCKS);
-        attn_sc.sel_counts = dalloc<int>(M);
-        attn_sc.split_m = dalloc<float>(8 * size_t(max_nh_q) * 24);
-        attn_sc.split_l = dalloc<float>(8 * size_t(max_nh_q) * 24);
-        attn_sc.split_o = dalloc<float>(8 * size_t(max_nh_q) * 24 * 256);
+        const size_t fc2_f32_n = o.strata.enabled
+            ? std::max<size_t>(32 * geom::TOPK * geom::HID, (M * geom::TOPK * geom::HID + 1) / 2)
+            : (M * geom::TOPK * geom::HID);
+        constexpr size_t HEAD_CHUNK = 256;
+        const size_t HM = std::min<size_t>(M, HEAD_CHUNK);
 
-        moe_sc.router_logits = dalloc<float>(M * geom::NEXP);
-        moe_sc.topk_idx = dalloc<int>(M * geom::TOPK);
-        moe_sc.topk_w = dalloc<float>(M * geom::TOPK);
-        moe_sc.d_n_groups = dalloc<int>(1);
-        moe_sc.grp_exp = dalloc<int>(M * geom::TOPK);
-        moe_sc.grp_cnt = dalloc<int>(M * geom::TOPK);
-        moe_sc.grp_off = dalloc<int>(M * geom::TOPK);
-        moe_sc.grp_routes = dalloc<int>(M * geom::TOPK * 8);
-        moe_sc.x_had = dalloc<__half>(M * geom::HID);
-        moe_sc.fc1_part = dalloc<float>(8 * geom::TOPK * size_t(g6nr::EB) * 2 * 2 * 128);
-        moe_sc.fc1_act = dalloc<__half>(M * geom::TOPK * size_t(g6nr::EB) * 128);
-        moe_sc.fc2_part = dalloc<float>(M * geom::TOPK * geom::HID);
-        moe_sc.routed_acc = dalloc<float>(M * geom::HID);
-        moe_sc.sh_gate_buf = dalloc<__nv_bfloat16>(M * geom::SHARED_I);
-        moe_sc.sh_up_buf = dalloc<__nv_bfloat16>(M * geom::SHARED_I);
-        moe_sc.sh_out = dalloc<__nv_bfloat16>(M * geom::HID);
-        moe_sc.sh_scalar_gate = dalloc<float>(M);
+        if (o.strata.enabled) {
+            // Strata-mode: alias mutually exclusive stage scratch (gdn / attn / moe / ple / head_logits)
+            // into one shared VRAM slab (`max` instead of `sum`), reclaiming ~2.4 GB at M=8192 for ~1,360 extra experts!
+            auto al256 = [](size_t n) -> size_t { return (n + 255ull) & ~255ull; };
+            auto need_b = [&](size_t& cur, size_t elems, size_t elem_sz) {
+                cur = al256(cur + std::max<size_t>(1, elems) * elem_sz);
+            };
+            size_t b_gdn = 0, b_attn = 0, b_moe = 0, b_ple = 0, b_head = 0;
+            need_b(b_gdn, M * size_t(max_qkv), sizeof(__nv_bfloat16));
+            need_b(b_gdn, M * size_t(max_qkv), sizeof(__nv_bfloat16));
+            need_b(b_gdn, M * size_t(max_nh_v) * geom::GDN_DV, sizeof(__nv_bfloat16));
+            need_b(b_gdn, M * size_t(max_nh_v), sizeof(__nv_bfloat16));
+            need_b(b_gdn, M * size_t(max_nh_v), sizeof(__nv_bfloat16));
+            need_b(b_gdn, M * size_t(max_nh_v) * geom::GDN_DV, sizeof(__nv_bfloat16));
+            need_b(b_gdn, size_t(max_nh_v) * M * geom::GDN_DK, sizeof(uint16_t));
+            need_b(b_gdn, size_t(max_nh_v) * M * geom::GDN_DK, sizeof(uint16_t));
+            need_b(b_gdn, size_t(max_nh_v) * M * geom::GDN_DK, sizeof(uint16_t));
+            need_b(b_gdn, size_t(max_nh_v) * M * geom::GDN_DV, sizeof(uint16_t));
+            need_b(b_gdn, size_t(max_nh_v) * M * qw38::GDN_WY_CH, sizeof(uint16_t));
+            need_b(b_gdn, size_t(max_nh_v) * max_wy_chunks, sizeof(float));
+
+            need_b(b_attn, M * size_t(max_nh_q) * 512, sizeof(__nv_bfloat16));
+            need_b(b_attn, M * size_t(max_nh_q) * 256, sizeof(__nv_bfloat16));
+            need_b(b_attn, M * size_t(max_nh_q) * 256, sizeof(__nv_bfloat16));
+            need_b(b_attn, M * size_t(max_nh_kv) * 256, sizeof(__nv_bfloat16));
+            need_b(b_attn, M * size_t(max_nh_kv) * 256, sizeof(__nv_bfloat16));
+            need_b(b_attn, M * geom::IDX_PROJ_OUT, sizeof(__nv_bfloat16));
+            need_b(b_attn, M * geom::IDX_HEADS * geom::IDX_DIM, sizeof(__nv_bfloat16));
+            need_b(b_attn, M * size_t(max_nh_q) * 256, sizeof(__nv_bfloat16));
+            need_b(b_attn, M * size_t(max_blocks), sizeof(float));
+            need_b(b_attn, M * geom::IDX_TOP_BLOCKS, sizeof(int));
+            need_b(b_attn, M, sizeof(int));
+            need_b(b_attn, 8 * size_t(max_nh_q) * 24, sizeof(float));
+            need_b(b_attn, 8 * size_t(max_nh_q) * 24, sizeof(float));
+            need_b(b_attn, 8 * size_t(max_nh_q) * 24 * 256, sizeof(float));
+
+            need_b(b_moe, M * geom::NEXP, sizeof(float));
+            need_b(b_moe, M * geom::TOPK, sizeof(int));
+            need_b(b_moe, M * geom::TOPK, sizeof(float));
+            need_b(b_moe, 1, sizeof(int));
+            need_b(b_moe, M * geom::TOPK, sizeof(int));
+            need_b(b_moe, M * geom::TOPK, sizeof(int));
+            need_b(b_moe, M * geom::TOPK, sizeof(int));
+            need_b(b_moe, M * geom::TOPK * 8, sizeof(int));
+            need_b(b_moe, M * geom::HID, sizeof(__half));
+            need_b(b_moe, 8 * geom::TOPK * size_t(g6nr::EB) * 2 * 2 * 128, sizeof(float));
+            need_b(b_moe, M * geom::TOPK * size_t(g6nr::EB) * 128, sizeof(__half));
+            need_b(b_moe, fc2_f32_n, sizeof(float));
+            need_b(b_moe, M * geom::HID, sizeof(float));
+            need_b(b_moe, M * geom::SHARED_I, sizeof(__nv_bfloat16));
+            need_b(b_moe, M * geom::SHARED_I, sizeof(__nv_bfloat16));
+            need_b(b_moe, M * geom::HID, sizeof(__nv_bfloat16));
+            need_b(b_moe, M, sizeof(float));
+
+            if (has_ple) {
+                need_b(b_ple, M * geom::PLE_DIM, sizeof(__nv_bfloat16));
+                need_b(b_ple, M * geom::HC_D, sizeof(__nv_bfloat16));
+                need_b(b_ple, M * geom::HC_D, sizeof(__nv_bfloat16));
+                need_b(b_ple, M * geom::HID, sizeof(__nv_bfloat16));
+                need_b(b_ple, M * geom::HC_D, sizeof(__nv_bfloat16));
+                need_b(b_ple, M * geom::HC_D, sizeof(__nv_bfloat16));
+            }
+            need_b(b_head, HM * size_t(max_vr), sizeof(float));
+
+            stage_slab_bytes = std::max({b_gdn, b_attn, b_moe, b_ple, b_head, size_t(4096)});
+            stage_slab = dalloc<uint8_t>(stage_slab_bytes);
+            std::fprintf(stderr,
+                         "# rank %d: qw38 strata aliased stage_slab %.1f MiB (saved %.1f MiB: gdn=%.1f attn=%.1f moe=%.1f ple=%.1f head=%.1f)\n",
+                         o.rank0, stage_slab_bytes / 1048576.0,
+                         (b_gdn + b_attn + b_moe + b_ple + b_head - stage_slab_bytes) / 1048576.0,
+                         b_gdn / 1048576.0, b_attn / 1048576.0, b_moe / 1048576.0, b_ple / 1048576.0, b_head / 1048576.0);
+
+            auto take = [&]<class T>(size_t& cur, size_t elems) -> T* {
+                T* p = reinterpret_cast<T*>(stage_slab + cur);
+                cur = al256(cur + std::max<size_t>(1, elems) * sizeof(T));
+                return p;
+            };
+
+            size_t cur = 0;
+            gdn_sc.qkv_raw = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_qkv));
+            gdn_sc.qkv_conv = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_qkv));
+            gdn_sc.z = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_nh_v) * geom::GDN_DV);
+            gdn_sc.a = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_nh_v));
+            gdn_sc.b = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_nh_v));
+            gdn_sc.core = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_nh_v) * geom::GDN_DV);
+            gdn_sc.wy_qe = take.template operator()<uint16_t>(cur, size_t(max_nh_v) * M * geom::GDN_DK);
+            gdn_sc.wy_kd = take.template operator()<uint16_t>(cur, size_t(max_nh_v) * M * geom::GDN_DK);
+            gdn_sc.wy_w = take.template operator()<uint16_t>(cur, size_t(max_nh_v) * M * geom::GDN_DK);
+            gdn_sc.wy_u = take.template operator()<uint16_t>(cur, size_t(max_nh_v) * M * geom::GDN_DV);
+            gdn_sc.wy_aq = take.template operator()<uint16_t>(cur, size_t(max_nh_v) * M * qw38::GDN_WY_CH);
+            gdn_sc.wy_glast = take.template operator()<float>(cur, size_t(max_nh_v) * max_wy_chunks);
+
+            cur = 0;
+            attn_sc.q_gate = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_nh_q) * 512);
+            attn_sc.q = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_nh_q) * 256);
+            attn_sc.gate = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_nh_q) * 256);
+            attn_sc.k = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_nh_kv) * 256);
+            attn_sc.v = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_nh_kv) * 256);
+            attn_sc.idx_qk = take.template operator()<__nv_bfloat16>(cur, M * geom::IDX_PROJ_OUT);
+            attn_sc.idx_q = take.template operator()<__nv_bfloat16>(cur, M * geom::IDX_HEADS * geom::IDX_DIM);
+            attn_sc.attn_out = take.template operator()<__nv_bfloat16>(cur, M * size_t(max_nh_q) * 256);
+            attn_sc.idx_scores = take.template operator()<float>(cur, M * size_t(max_blocks));
+            attn_sc.sel_blocks = take.template operator()<int>(cur, M * geom::IDX_TOP_BLOCKS);
+            attn_sc.sel_counts = take.template operator()<int>(cur, M);
+            attn_sc.split_m = take.template operator()<float>(cur, 8 * size_t(max_nh_q) * 24);
+            attn_sc.split_l = take.template operator()<float>(cur, 8 * size_t(max_nh_q) * 24);
+            attn_sc.split_o = take.template operator()<float>(cur, 8 * size_t(max_nh_q) * 24 * 256);
+
+            cur = 0;
+            moe_sc.router_logits = take.template operator()<float>(cur, M * geom::NEXP);
+            moe_sc.topk_idx = take.template operator()<int>(cur, M * geom::TOPK);
+            moe_sc.topk_w = take.template operator()<float>(cur, M * geom::TOPK);
+            moe_sc.d_n_groups = take.template operator()<int>(cur, 1);
+            moe_sc.grp_exp = take.template operator()<int>(cur, M * geom::TOPK);
+            moe_sc.grp_cnt = take.template operator()<int>(cur, M * geom::TOPK);
+            moe_sc.grp_off = take.template operator()<int>(cur, M * geom::TOPK);
+            moe_sc.grp_routes = take.template operator()<int>(cur, M * geom::TOPK * 8);
+            moe_sc.x_had = take.template operator()<__half>(cur, M * geom::HID);
+            moe_sc.fc1_part = take.template operator()<float>(cur, 8 * geom::TOPK * size_t(g6nr::EB) * 2 * 2 * 128);
+            moe_sc.fc1_act = take.template operator()<__half>(cur, M * geom::TOPK * size_t(g6nr::EB) * 128);
+            moe_sc.fc2_part = take.template operator()<float>(cur, fc2_f32_n);
+            moe_sc.routed_acc = take.template operator()<float>(cur, M * geom::HID);
+            moe_sc.sh_gate_buf = take.template operator()<__nv_bfloat16>(cur, M * geom::SHARED_I);
+            moe_sc.sh_up_buf = take.template operator()<__nv_bfloat16>(cur, M * geom::SHARED_I);
+            moe_sc.sh_out = take.template operator()<__nv_bfloat16>(cur, M * geom::HID);
+            moe_sc.sh_scalar_gate = take.template operator()<float>(cur, M);
+
+            if (has_ple) {
+                cur = 0;
+                ple_sc.emb = take.template operator()<__nv_bfloat16>(cur, M * geom::PLE_DIM);
+                ple_sc.key = take.template operator()<__nv_bfloat16>(cur, M * geom::HC_D);
+                ple_sc.query = take.template operator()<__nv_bfloat16>(cur, M * geom::HC_D);
+                ple_sc.val = take.template operator()<__nv_bfloat16>(cur, M * geom::HID);
+                ple_sc.gv = take.template operator()<__nv_bfloat16>(cur, M * geom::HC_D);
+                ple_sc.gv_norm = take.template operator()<__nv_bfloat16>(cur, M * geom::HC_D);
+            }
+
+            cur = 0;
+            head_logits = take.template operator()<float>(cur, HM * size_t(max_vr));
+        } else {
+            gdn_sc.qkv_raw = dalloc<__nv_bfloat16>(M * size_t(max_qkv));
+            gdn_sc.qkv_conv = dalloc<__nv_bfloat16>(M * size_t(max_qkv));
+            gdn_sc.z = dalloc<__nv_bfloat16>(M * size_t(max_nh_v) * geom::GDN_DV);
+            gdn_sc.a = dalloc<__nv_bfloat16>(M * size_t(max_nh_v));
+            gdn_sc.b = dalloc<__nv_bfloat16>(M * size_t(max_nh_v));
+            gdn_sc.core = dalloc<__nv_bfloat16>(M * size_t(max_nh_v) * geom::GDN_DV);
+            gdn_sc.wy_qe = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DK);
+            gdn_sc.wy_kd = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DK);
+            gdn_sc.wy_w = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DK);
+            gdn_sc.wy_u = dalloc<uint16_t>(size_t(max_nh_v) * M * geom::GDN_DV);
+            gdn_sc.wy_aq = dalloc<uint16_t>(size_t(max_nh_v) * M * qw38::GDN_WY_CH);
+            gdn_sc.wy_glast = dalloc<float>(size_t(max_nh_v) * max_wy_chunks);
+
+            attn_sc.q_gate = dalloc<__nv_bfloat16>(M * size_t(max_nh_q) * 512);
+            attn_sc.q = dalloc<__nv_bfloat16>(M * size_t(max_nh_q) * 256);
+            attn_sc.gate = dalloc<__nv_bfloat16>(M * size_t(max_nh_q) * 256);
+            attn_sc.k = dalloc<__nv_bfloat16>(M * size_t(max_nh_kv) * 256);
+            attn_sc.v = dalloc<__nv_bfloat16>(M * size_t(max_nh_kv) * 256);
+            attn_sc.idx_qk = dalloc<__nv_bfloat16>(M * geom::IDX_PROJ_OUT);
+            attn_sc.idx_q = dalloc<__nv_bfloat16>(M * geom::IDX_HEADS * geom::IDX_DIM);
+            attn_sc.attn_out = dalloc<__nv_bfloat16>(M * size_t(max_nh_q) * 256);
+            attn_sc.idx_scores = dalloc<float>(M * size_t(max_blocks));
+            attn_sc.sel_blocks = dalloc<int>(M * geom::IDX_TOP_BLOCKS);
+            attn_sc.sel_counts = dalloc<int>(M);
+            attn_sc.split_m = dalloc<float>(8 * size_t(max_nh_q) * 24);
+            attn_sc.split_l = dalloc<float>(8 * size_t(max_nh_q) * 24);
+            attn_sc.split_o = dalloc<float>(8 * size_t(max_nh_q) * 24 * 256);
+
+            moe_sc.router_logits = dalloc<float>(M * geom::NEXP);
+            moe_sc.topk_idx = dalloc<int>(M * geom::TOPK);
+            moe_sc.topk_w = dalloc<float>(M * geom::TOPK);
+            moe_sc.d_n_groups = dalloc<int>(1);
+            moe_sc.grp_exp = dalloc<int>(M * geom::TOPK);
+            moe_sc.grp_cnt = dalloc<int>(M * geom::TOPK);
+            moe_sc.grp_off = dalloc<int>(M * geom::TOPK);
+            moe_sc.grp_routes = dalloc<int>(M * geom::TOPK * 8);
+            moe_sc.x_had = dalloc<__half>(M * geom::HID);
+            moe_sc.fc1_part = dalloc<float>(8 * geom::TOPK * size_t(g6nr::EB) * 2 * 2 * 128);
+            moe_sc.fc1_act = dalloc<__half>(M * geom::TOPK * size_t(g6nr::EB) * 128);
+            moe_sc.fc2_part = dalloc<float>(fc2_f32_n);
+            moe_sc.routed_acc = dalloc<float>(M * geom::HID);
+            moe_sc.sh_gate_buf = dalloc<__nv_bfloat16>(M * geom::SHARED_I);
+            moe_sc.sh_up_buf = dalloc<__nv_bfloat16>(M * geom::SHARED_I);
+            moe_sc.sh_out = dalloc<__nv_bfloat16>(M * geom::HID);
+            moe_sc.sh_scalar_gate = dalloc<float>(M);
+
+            head_logits = dalloc<float>(HM * size_t(max_vr));
+        }
 
         if (o.dense_fp8 && o.pf_mxfp8) {
             const size_t max_k_mx = std::max<size_t>(geom::HC_D, std::max<size_t>(size_t(max_nh_v) * geom::GDN_DV, size_t(max_nh_q) * geom::HEAD_DIM));
@@ -1228,9 +1641,6 @@ struct Engine {
             moe_sc.x8 = x8_scratch;
         }
 
-        constexpr size_t HEAD_CHUNK = 256;
-        const size_t HM = std::min<size_t>(M, HEAD_CHUNK);
-        head_logits = dalloc<float>(HM * size_t(max_vr));
         head_sc.blk_max = dalloc<float>(HM * qw38::HEAD_BLKS);
         head_sc.blk_cnt = dalloc<int>(HM * qw38::HEAD_BLKS);
         head_sc.blk_argmax = dalloc<int>(HM * qw38::HEAD_BLKS);
@@ -1264,8 +1674,108 @@ struct Engine {
             const int warm_v = std::min(v_rows[0], 256);
             cublasSetStream(blas, stream);
             qw38::gemm_bf16_nt(blas, warm_m, geom::HC_RANK, geom::HC_D, hc_sc.hn, final_hc.down, hc_sc.down);
-            qw38::gemm_bf16_nt_f32(blas, warm_m, warm_v, geom::HID, mixed, lm_head[0], head_logits);
+            if (lm_head[0]) {
+                qw38::gemm_bf16_nt_f32(blas, warm_m, warm_v, geom::HID, mixed, lm_head[0], head_logits);
+            }
             QW38_CK(cudaStreamSynchronize(stream));
+        }
+
+        // 5. Strata-mode: parallel CPU wide-reorder of pinned host routed experts + VRAM hot-expert cache init!
+        if (o.strata.enabled && !L.empty()) {
+            const Image& im = *img[0];
+            const size_t nl = L.size();
+            std::vector<const uint8_t*> h_fc1_v(nl), d_fc1_v(nl), h_fc2_v(nl), d_fc2_v(nl);
+            std::vector<std::vector<long long>> h_tabs(nl), h_kmixs(nl);
+            std::vector<int> rows_v(nl);
+            for (size_t li = 0; li < nl; ++li) {
+                const int l = L[li].l;
+                const auto& rl = L[li].rk[0];
+                h_fc1_v[li] = im.host_mut<uint8_t>(lname(l, "tr3.fc1"));
+                d_fc1_v[li] = rl.moe_w.t_fc1;
+                h_fc2_v[li] = im.host_mut<uint8_t>(lname(l, "tr3.fc2"));
+                d_fc2_v[li] = rl.moe_w.t_fc2;
+                rows_v[li] = rl.moe_w.t_rows;
+                im.read_host(lname(l, "tr3.table"), h_tabs[li]);
+                if (im.find(lname(l, "tr3.kmix")) != nullptr) {
+                    im.read_host(lname(l, "tr3.kmix"), h_kmixs[li]);
+                }
+            }
+            // Wide-reorder all routed experts in-place in pinned host RAM across CPU threads
+            const auto wt0 = std::chrono::steady_clock::now();
+            const unsigned nthr = std::max(1u, std::min<unsigned>(static_cast<unsigned>(nl), std::thread::hardware_concurrency()));
+            std::atomic<size_t> next_li{0};
+            std::vector<std::thread> wthrs;
+            for (unsigned t = 0; t < nthr; ++t) {
+                wthrs.emplace_back([&]() {
+                    for (;;) {
+                        const size_t li = next_li.fetch_add(1, std::memory_order_relaxed);
+                        if (li >= nl) break;
+                        widen_layer_experts_host(
+                            const_cast<uint8_t*>(h_fc1_v[li]),
+                            const_cast<uint8_t*>(h_fc2_v[li]),
+                            h_tabs[li].data(),
+                            h_kmixs[li].empty() ? nullptr : h_kmixs[li].data(),
+                            rows_v[li]);
+                    }
+                });
+            }
+            for (auto& th : wthrs) th.join();
+            const double ws = std::chrono::duration<double>(std::chrono::steady_clock::now() - wt0).count();
+            std::fprintf(stderr, "# rank %d: qw38 strata CPU wide-reorder %zu layers in %.2f s (%u threads)\n",
+                         o.rank0, nl, ws, nthr);
+
+            strata_cache.init(o.strata, static_cast<int>(nl), g6nr::EB, o.max_rows, layer_ids,
+                              h_fc1_v, d_fc1_v, h_fc2_v, d_fc2_v, h_tabs, h_kmixs, rows_v, stream);
+            {
+                std::vector<const __half*> d_sg_v(nl), d_v1b_v(nl), d_v2_v(nl), d_v3b_v(nl);
+                std::vector<size_t> v1b_cnt(nl), v2_cnt(nl), v3b_cnt(nl);
+                for (size_t li = 0; li < nl; ++li) {
+                    const int l = L[li].l;
+                    const auto& mw = L[li].rk[0].moe_w;
+                    d_sg_v[li] = mw.t_sg;
+                    d_v1b_v[li] = mw.t_v1b;
+                    d_v2_v[li] = mw.t_v2;
+                    d_v3b_v[li] = mw.t_v3b;
+                    v1b_cnt[li] = im.entry(lname(l, "tr3.v1b")).nbytes / sizeof(uint16_t);
+                    v2_cnt[li]  = im.entry(lname(l, "tr3.v2")).nbytes / sizeof(uint16_t);
+                    v3b_cnt[li] = im.entry(lname(l, "tr3.v3b")).nbytes / sizeof(uint16_t);
+                }
+                strata_cache.init_cpu_pool(h_fc1_v, h_fc2_v, h_tabs, h_kmixs,
+                                           d_sg_v, d_v1b_v, d_v2_v, d_v3b_v,
+                                           v1b_cnt, v2_cnt, v3b_cnt);
+            }
+            for (size_t li = 0; li < nl; ++li) {
+                auto& mw = L[li].rk[0].moe_w;
+                mw.t_ptab = strata_cache.layer_ptab(static_cast<int>(li));
+                mw.d_exp_hits = strata_cache.layer_hits(static_cast<int>(li));
+                mw.d_is_cold = strata_cache.layer_is_cold(static_cast<int>(li));
+                mw.cpu_bridge = strata_cache.cpu_bridge_dev();
+                mw.cpu_frac = strata_cache.cpu_moe_frac();
+                mw.strata_ctx = &strata_cache;
+                mw.strata_li = static_cast<int>(li);
+                mw.strata_pf_fn = &StrataExpertCache::prefill_moe_cb;
+            }
+            if (o.use_graph && o.nr == 1 && o.nloc == 1) {
+                const auto t_gw0 = std::chrono::steady_clock::now();
+                std::vector<int> dummy_toks(size_t(std::max(1, o.mtp + 1)), 0);
+                std::vector<RowOut> dummy_out;
+                int n_warm = 0;
+                const int qsa_pos[2] = {0, 3000};
+                for (int qi = 0; qi < 2; ++qi) {
+                    std::vector<qw38::StepSeg> s1 = {{0, 0, qsa_pos[qi], 1}};
+                    forward(s1, dummy_toks.data(), nullptr, dummy_out, false, 0, 0, nullptr, false, false, true);
+                    ++n_warm;
+                    if (o.mtp > 0) {
+                        for (int v = 2; v <= o.mtp + 1; ++v) {
+                            std::vector<qw38::StepSeg> sv = {{0, 0, qsa_pos[qi], v}};
+                            forward(sv, dummy_toks.data(), nullptr, dummy_out, false, o.mtp, 0, nullptr, false, false, true);
+                            ++n_warm;
+                        }
+                    }
+                }
+                const double gw_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_gw0).count();
+                std::fprintf(stderr, "# qw38 strata CUDA graphs pre-warmed: %d graphs in %.1f ms\n", n_warm, gw_ms);
+            }
         }
     }
 
@@ -1431,7 +1941,7 @@ struct Engine {
     void forward(const std::vector<qw38::StepSeg>& segs, const int* toks, const RowSample* samples,
                  std::vector<RowOut>& out, bool skip_head = false, int snap_k = 0,
                  int vis_n = 0, const int3* rope_thw = nullptr, bool head_last_only = false,
-                 bool exact_head = false) {
+                 bool exact_head = false, bool capture_only = false) {
         int M = 0;
         int max_pos = 0;
         bool all_len1 = true;
@@ -1446,25 +1956,29 @@ struct Engine {
         }
         if (M <= 0 || M > o.max_rows) die("forward: bad M=" + std::to_string(M));
         all_len1 = all_len1 && (static_cast<int>(segs.size()) == M);
+        // Commit any async expert promotions finished during the preceding MTP draft window (zero-delay 1-round adaptation!)
+        if (!capture_only && o.strata.enabled && M < 32) strata_cache.commit_ready_promotions(stream, false);
 
-        const int mb = meta_acquire();
-        int* h_tok_p = h_meta_pinned[mb];
-        int* h_slot_p = h_meta_pinned[mb] + o.max_rows;
-        int* h_pos_p = h_meta_pinned[mb] + 2 * o.max_rows;
-        std::memcpy(h_tok_p, toks, size_t(M) * sizeof(int));
-        for (const auto& g : segs) {
-            const int dlt = slot_mrope_delta[size_t(g.slot)];
-            for (int t = 0; t < g.len; ++t) {
-                h_slot_p[g.row0 + t] = g.slot;
-                h_pos_p[g.row0 + t] = g.pos0 + t;
-                if (!rope_thw) {
-                    const int rp = g.pos0 + t + dlt;
-                    h_rope_pinned[mb][g.row0 + t] = make_int3(rp, rp, rp);
+        if (!capture_only) {
+            const int mb = meta_acquire();
+            int* h_tok_p = h_meta_pinned[mb];
+            int* h_slot_p = h_meta_pinned[mb] + o.max_rows;
+            int* h_pos_p = h_meta_pinned[mb] + 2 * o.max_rows;
+            std::memcpy(h_tok_p, toks, size_t(M) * sizeof(int));
+            for (const auto& g : segs) {
+                const int dlt = slot_mrope_delta[size_t(g.slot)];
+                for (int t = 0; t < g.len; ++t) {
+                    h_slot_p[g.row0 + t] = g.slot;
+                    h_pos_p[g.row0 + t] = g.pos0 + t;
+                    if (!rope_thw) {
+                        const int rp = g.pos0 + t + dlt;
+                        h_rope_pinned[mb][g.row0 + t] = make_int3(rp, rp, rp);
+                    }
                 }
             }
+            if (rope_thw) std::memcpy(h_rope_pinned[mb], rope_thw, size_t(M) * sizeof(int3));
+            meta_upload(mb, M);
         }
-        if (rope_thw) std::memcpy(h_rope_pinned[mb], rope_thw, size_t(M) * sizeof(int3));
-        meta_upload(mb, M);
 
         const bool use_direct_ar = (o.nr > 1 && o.nloc == 1 && direct_send_dst && direct_ar_wait && direct_hc_inject);
         const bool use_direct_send = (use_direct_ar && (M > 8 || !direct_copy_ring_wait));
@@ -1477,13 +1991,15 @@ struct Engine {
         const int head_M = last_only ? 1 : M;
 
         // 0a. Notify multi-collective fabric step start (single enqueue_step for all collectives on TP>=2)
-        if (use_sp_hc) step_begin_sp(M, int(L.size()), sp_slice);
-        else if (step_begin) step_begin(M, skip_head, -1, head_M);
+        if (!capture_only) {
+            if (use_sp_hc) step_begin_sp(M, int(L.size()), sp_slice);
+            else if (step_begin) step_begin(M, skip_head, -1, head_M);
+        }
 
         // Mask <|image_pad|> -> TOK_EOS for Layer-1 PLE n-gram hashing (matches Qwen4ExpTextModel conv_mask).
         std::vector<int> ple_tok_buf;
         const int* ple_toks = toks;
-        if (has_ple && vis_n > 0) {
+        if (!capture_only && has_ple && vis_n > 0) {
             ple_tok_buf.assign(toks, toks + M);
             for (int& tk : ple_tok_buf) if (tk == qw38v::TOK_IMAGE) tk = geom::TOK_EOS;
             ple_toks = ple_tok_buf.data();
@@ -1493,7 +2009,7 @@ struct Engine {
         //     into the alternate double buffer BEFORE Layer 0 GPU compute!
         bool ple_in_flight = false;
         int ple_cur_buf = 0;
-        if (has_ple && o.ple_async && ple_thr.joinable()) {
+        if (!capture_only && has_ple && o.ple_async && ple_thr.joinable()) {
             bool pf_hit = false;
             if (ple_pf_valid && vis_n == 0 && segs.size() == 1 && segs[0].row0 == 0 &&
                 segs[0].slot == ple_pf_slot && segs[0].pos0 == ple_pf_pos0 && segs[0].len == ple_pf_len) {
@@ -1717,8 +2233,8 @@ struct Engine {
             }
         };
 
-        // Fast CUDA Graph path for decode (M <= 16, all_len1) AND MTP verify (M <= 64, all_verify)!
-        const int V_chk = snap_k + 1;
+        // Fast CUDA Graph path for decode (M <= 16, all_len1) AND MTP verify (M <= 64, all_verify, including KStopB V < snap_k+1)!
+        const int V_chk = (!segs.empty() && segs[0].len >= 2 && segs[0].len <= snap_k + 1) ? segs[0].len : (snap_k + 1);
         bool all_verify = (!all_len1 && snap_k > 0 && !segs.empty() && static_cast<int>(segs.size()) * V_chk == M);
         if (all_verify) {
             for (size_t s = 0; s < segs.size(); ++s) {
@@ -1734,11 +2250,52 @@ struct Engine {
             const int need_qsa = (((max_pos + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS) ? 1 : 0;
             const int ns_attn = qw38::gqa_split_count(M, geom::nh_kv(o.nr, o.rank0), max_pos, attn_sc.split_o != nullptr);
             const int par = step_parity ? step_parity() : 0;
-            const GraphKey gk{M, need_qsa, ns_attn, par, snap_k};
+            const GraphKey gk{M, need_qsa, ns_attn, par, snap_k, snap_k > 0 ? V_chk : 1};
             const bool split_l0_ple = (L.size() >= 2 && geom::is_ple(L[1].l) && has_ple);
 
+            if (capture_only) {
+                if (graphs.find(gk) != graphs.end()) return;
+                GraphPair gp{};
+                int coll = 0;
+                if (split_l0_ple) {
+                    cudaGraph_t ga = nullptr;
+                    QW38_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+                    qw38::k_embed_hc4<<<M, 256, 0, stream>>>(d_tok, embed, hyper, M);
+                    run_layer_gpu(0, coll);
+                    QW38_CK(cudaStreamEndCapture(stream, &ga));
+                    QW38_CK(cudaGraphInstantiate(&gp.exec_a, ga, nullptr, nullptr, 0));
+                    QW38_CK(cudaGraphDestroy(ga));
+
+                    cudaGraph_t gb = nullptr;
+                    QW38_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+                    run_ple_gpu();
+                    for (size_t li = 1; li < L.size(); ++li) run_layer_gpu(li, coll);
+                    run_head_gpu();
+                    QW38_CK(cudaStreamEndCapture(stream, &gb));
+                    QW38_CK(cudaGraphInstantiate(&gp.exec_b, gb, nullptr, nullptr, 0));
+                    QW38_CK(cudaGraphDestroy(gb));
+                } else {
+                    cudaGraph_t gb = nullptr;
+                    QW38_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+                    qw38::k_embed_hc4<<<M, 256, 0, stream>>>(d_tok, embed, hyper, M);
+                    for (size_t li = 0; li < L.size(); ++li) {
+                        if (geom::is_ple(L[li].l) && has_ple) run_ple_gpu();
+                        run_layer_gpu(li, coll);
+                    }
+                    run_head_gpu();
+                    QW38_CK(cudaStreamEndCapture(stream, &gb));
+                    QW38_CK(cudaGraphInstantiate(&gp.exec_b, gb, nullptr, nullptr, 0));
+                    QW38_CK(cudaGraphDestroy(gb));
+                }
+                graphs.emplace(gk, gp);
+                return;
+            }
+
+            if (o.strata.enabled && M <= 8) strata_cache.cpu_pool.begin_step();
+            const auto t_v0 = std::chrono::steady_clock::now();
             auto it = graphs.find(gk);
-            if (it == graphs.end()) {
+            const bool did_cap = (it == graphs.end());
+            if (did_cap) {
                 GraphPair gp{};
                 int coll = 0;
                 if (split_l0_ple) {
@@ -1797,6 +2354,18 @@ struct Engine {
             }
 
             QW38_CK(cudaStreamSynchronize(stream));
+            const auto t_v1 = std::chrono::steady_clock::now();
+            if (o.strata.enabled && M <= 8) strata_cache.cpu_pool.end_step();
+            if (o.strata.enabled) {
+                const uint64_t dt_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_v1 - t_v0).count());
+                if (did_cap) { strata_cache.stat_cap_ns += dt_ns; ++strata_cache.stat_cap_n; }
+                strata_cache.stat_verify_ns += dt_ns;
+                strata_cache.stat_verify_toks += uint64_t(M);
+                const auto t_m0 = std::chrono::steady_clock::now();
+                strata_cache.maintain_after_step(stream);
+                strata_cache.stat_maint_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t_m0).count());
+            }
             if (o.nr > 1 && gather_host) gather_host(static_cast<int>(2 * L.size()), head_host_parts, rank_pkt_bytes);
             if (step_end) step_end();
 
@@ -1815,6 +2384,10 @@ struct Engine {
         }
 
         // Eager / profiled / prefill path
+        if (capture_only) return;
+        const bool use_cpu_step = o.strata.enabled && (M <= 8 || (M >= 32 && M <= o.strata.pf_cpu_max_m));
+        const auto t_eg0 = std::chrono::steady_clock::now();
+        if (use_cpu_step) strata_cache.cpu_pool.begin_step(M >= 32);
         if (vis_n > 0) {
             qw38::k_embed_hc4_vis<<<M, 256, 0, stream>>>(d_tok, embed, vision.row_map(), vision.pool(), hyper, M);
         } else {
@@ -2078,6 +2651,10 @@ struct Engine {
         }
 
         if (skip_head) {
+            if (use_cpu_step) {
+                QW38_CK(cudaStreamSynchronize(stream));
+                strata_cache.cpu_pool.end_step();
+            }
             if (step_end) step_end();
             if (o.profile) { ++prof.steps; prof.tokens += M; }
             return;
@@ -2086,6 +2663,19 @@ struct Engine {
         t_start();
         run_head_gpu(hn_ready);
         QW38_CK(cudaStreamSynchronize(stream));
+        if (use_cpu_step) strata_cache.cpu_pool.end_step();
+        if (o.strata.enabled) {
+            if (M <= 8) {
+                strata_cache.stat_verify_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t_eg0).count());
+                strata_cache.stat_verify_toks += uint64_t(M);
+                ++strata_cache.stat_eager_n;
+            }
+            const auto t_m0 = std::chrono::steady_clock::now();
+            strata_cache.maintain_after_step(stream);
+            strata_cache.stat_maint_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_m0).count());
+        }
         if (o.nr > 1 && gather_host) gather_host(coll++, head_host_parts, rank_pkt_bytes);
         if (step_end) step_end();
 
@@ -2128,6 +2718,13 @@ struct Engine {
     // Only runs mtp_fuse + attn_hc + k/v/idx_k projections + KV scatter (ZERO q/attn/o/MoE/AR!).
     void mtp_sync_kv(int slot, int row0, int pos0, int len, const int* next_toks) {
         if (!has_mtp || len <= 0) return;
+        const int cap_chunk = mtp_sc_cap ? static_cast<int>(mtp_sc_cap) : len;
+        if (len > cap_chunk) {
+            for (int off = 0; off < len; off += cap_chunk) {
+                mtp_sync_kv(slot, row0 + off, pos0 + off, std::min(cap_chunk, len - off), next_toks + off);
+            }
+            return;
+        }
         const int mb = meta_acquire();
         int* h_tok_p = h_meta_pinned[mb];
         int* h_slot_p = h_meta_pinned[mb] + o.max_rows;
@@ -2454,13 +3051,34 @@ struct Engine {
         }
     }
 
+    void mtp_restore_idx_raw(int slot) {
+        if (!has_mtp) return;
+        const size_t idx_slot_b = 4 * geom::IDX_DIM * sizeof(__nv_bfloat16);
+        const size_t off = size_t(slot) * 4 * geom::IDX_DIM;
+        for (int li = 0; li < o.nloc; ++li) {
+            auto& kv = mtp_w.kv[size_t(li)];
+            if (kv.idx_raw && kv.idx_raw_snap) {
+                QW38_CK(cudaMemcpyAsync(kv.idx_raw + off, kv.idx_raw_snap + off, idx_slot_b, cudaMemcpyDeviceToDevice, stream));
+            }
+            if (kv.idx_raw_thw && kv.idx_raw_thw_snap) {
+                QW38_CK(cudaMemcpyAsync(kv.idx_raw_thw + size_t(slot), kv.idx_raw_thw_snap + size_t(slot),
+                                        sizeof(int3), cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+    }
+
     // Draft K tokens per session for an arbitrary subset of S2 `slots`, returning flat [slots.size() * K] token IDs.
     // `pos_in[i]` is the last committed trunk position q (whose hyper state is in `last_hyper[slots[i]]`),
     // and `tok_in[i]` is the golden token at position q + 1. Preserves L048 idx_raw across speculative k >= 1 steps.
+    // `mode`: 0 = normal full K, 1 = stage-1 lazy head (keeps mtp_hid_cur & defers idx_raw restore),
+    //         2 = stage-2 lazy tail (starts from mtp_hid_cur, restores idx_raw at end),
+    //         3 = lazy mid-step (starts from mtp_hid_cur, keeps mtp_hid_cur & defers idx_raw restore).
     void mtp_draft_k(const std::vector<int>& slots, const std::vector<int>& pos_in, const std::vector<int>& tok_in,
-                     const std::vector<RowSample>& base_sm, int K, std::vector<int>& out_flat) {
+                     const std::vector<RowSample>& base_sm, int K, std::vector<int>& out_flat,
+                     std::vector<float>* out_lp_flat = nullptr, int mode = 0) {
         const size_t S = slots.size();
         out_flat.assign(S * size_t(K), 0);
+        if (out_lp_flat) out_lp_flat->assign(S * size_t(K), 0.0f);
         if (S == 0 || K <= 0) return;
 
         bool all_greedy = true;
@@ -2473,7 +3091,7 @@ struct Engine {
         const bool use_greedy_draft = all_greedy || o.mtp_fast;
         const bool fast_k_graph = use_greedy_draft && o.mtp_fast && o.use_graph && !o.profile &&
                                   S <= 16 && K <= 8 && o.nloc == 1 &&
-                                  (o.nr == 1 || (static_cast<bool>(step_begin_mtp_k) &&
+                                  (o.nr == 1 || (mode == 0 && static_cast<bool>(step_begin_mtp_k) &&
                                                  static_cast<bool>(mtp_argmax_ar_chain) &&
                                                  static_cast<bool>(step_parity)));
         if (fast_k_graph) {
@@ -2499,23 +3117,29 @@ struct Engine {
             const int need_qsa = (((max_pos_k + 1) / geom::IDX_COMPRESS) > geom::IDX_TOP_BLOCKS) ? 1 : 0;
             const int ns_attn = qw38::gqa_split_count(M, geom::nh_kv(o.nr, o.rank0), max_pos_k, attn_sc.split_o != nullptr);
             const int par = step_parity ? step_parity() : 0;
-            const MtpKGraphKey kgk{M, K, need_qsa, ns_attn, par};
+            const MtpKGraphKey kgk{M, K, need_qsa, ns_attn, par, mode};
 
+            const auto t_mtp0 = std::chrono::steady_clock::now();
             auto it = mtp_k_graphs.find(kgk);
-            if (it == mtp_k_graphs.end()) {
+            const bool did_mtp_cap = (it == mtp_k_graphs.end());
+            if (did_mtp_cap) {
                 std::vector<qw38::StepSeg> segs_k(static_cast<size_t>(M));
                 for (int s = 0; s < M; ++s) segs_k[size_t(s)] = {0, s, max_pos_k, 1};
                 const size_t part_stride = size_t(M) * geom::HID;
                 const bool use_direct_ar = (o.nr > 1 && direct_send_dst && direct_ar_wait && direct_hc_inject);
                 const bool use_direct_send = (use_direct_ar && (M > 8 || !direct_copy_ring_wait));
 
+                const bool is_cont = (mode == 2 || mode == 3);
+                const bool keep_state = (mode == 1 || mode == 3);
                 cudaGraph_t kg = nullptr;
                 cudaGraphExec_t kexec = nullptr;
                 QW38_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
-                qw38::k_mtp_gather_hid<<<M, 256, 0, stream>>>(d_slot, last_hyper, mtp_hid_in, M);
+                if (!is_cont) {
+                    qw38::k_mtp_gather_hid<<<M, 256, 0, stream>>>(d_slot, last_hyper, mtp_hid_in, M);
+                }
 
                 for (int k = 0; k < K; ++k) {
-                    const __nv_bfloat16* hin = (k == 0) ? mtp_hid_in : mtp_hid_cur;
+                    const __nv_bfloat16* hin = (!is_cont && k == 0) ? mtp_hid_in : mtp_hid_cur;
                     qw38::k_gather_embed<<<M, 256, 0, stream>>>(d_tok, embed, mtp_sc.emb_raw, M);
                     qw38::k_rmsnorm_1pw<geom::HID><<<M, 256, 0, stream>>>(mtp_sc.emb_raw, mtp_w.pre_fc_norm_emb, mtp_sc.emb_norm, M, 1, geom::RMS_EPS);
                     qw38::k_rmsnorm_1pw<geom::HID><<<M * geom::HC, 256, 0, stream>>>(hin, mtp_w.pre_fc_norm_hid, mtp_sc.hid_norm, M, geom::HC, geom::RMS_EPS);
@@ -2560,7 +3184,7 @@ struct Engine {
                     }
 
                     // Save committed L048 idx_raw right after k=0 attention before speculative k>=1 steps touch it
-                    if (k == 0 && K > 1) {
+                    if (!is_cont && k == 0 && (K > 1 || keep_state)) {
                         auto& kv = mtp_w.kv[0];
                         qw38::k_mtp_idx_snap<true><<<M, 64, 0, stream>>>(
                             d_slot, kv.idx_raw, kv.idx_raw_snap, kv.idx_raw_thw, kv.idx_raw_thw_snap, M);
@@ -2592,7 +3216,7 @@ struct Engine {
                         qw38::k_hc_inject<<<M * 5, 64, 0, stream>>>(mtp_sc.mtp_hyper, parts, hc_sc.inj, M, o.nr, part_stride);
                     }
 
-                    if (k + 1 < K) {
+                    if (k + 1 < K || keep_state) {
                         QW38_CK(cudaMemcpyAsync(mtp_hid_cur, mtp_sc.mtp_hyper, size_t(M) * geom::HC_D * sizeof(__nv_bfloat16),
                                                 cudaMemcpyDeviceToDevice, stream));
                     }
@@ -2601,7 +3225,7 @@ struct Engine {
                     qw38::hc_prepare(blas, mtp_w.final_hc, mtp_sc.mtp_hyper, mixed, hc_sc, M, stream);
                     if (M <= 8 && !mtp_head2.empty() && mtp_head2[0].ready() && !fp8_lm_head.empty() && fp8_lm_head[0].q) {
                         qw38::mtp_head2_argmax_pair(mtp_head2[0], fp8_lm_head[0], mixed, head_logits,
-                                                    mtp_h2_sc, d_mtp_argmax, M, stream);
+                                                    mtp_h2_sc, d_mtp_argmax, M, stream, d_mtp_lp);
                     } else {
                         if (!fp8_lm_head.empty() && fp8_lm_head[0].q) {
                             qw38::launch_fp8_gemv_smallm<true>(mixed, fp8_lm_head[0], head_logits, M, stream);
@@ -2616,19 +3240,24 @@ struct Engine {
 
                     if (o.nr == 1) {
                         qw38::k_mtp_chain_tp1<<<1, 32, 0, stream>>>(
-                            d_mtp_argmax, d_mtp_draft_out, d_tok, d_pos, d_rope, M, K, k);
+                            d_mtp_argmax, d_mtp_draft_out, d_tok, d_pos, d_rope, M, K, k,
+                            d_mtp_lp, d_mtp_draft_lp);
                     } else {
                         mtp_argmax_ar_chain(coll, d_mtp_argmax, d_mtp_draft_out, d_tok, d_pos, d_rope, M, K, k);
                     }
                 }
 
-                if (K > 1) {
+                if ((mode == 0 && K > 1) || mode == 2) {
                     auto& kv = mtp_w.kv[0];
                     qw38::k_mtp_idx_snap<false><<<M, 64, 0, stream>>>(
                         d_slot, kv.idx_raw, kv.idx_raw_snap, kv.idx_raw_thw, kv.idx_raw_thw_snap, M);
                 }
                 QW38_CK(cudaMemcpyAsync(h_mtp_draft_out, d_mtp_draft_out, size_t(M) * size_t(K) * sizeof(int),
                                         cudaMemcpyDeviceToHost, stream));
+                if (o.nr == 1 && d_mtp_draft_lp && h_mtp_draft_lp) {
+                    QW38_CK(cudaMemcpyAsync(h_mtp_draft_lp, d_mtp_draft_lp, size_t(M) * size_t(K) * sizeof(float),
+                                            cudaMemcpyDeviceToHost, stream));
+                }
                 QW38_CK(cudaStreamEndCapture(stream, &kg));
                 QW38_CK(cudaGraphInstantiate(&kexec, kg, nullptr, nullptr, 0));
                 QW38_CK(cudaGraphDestroy(kg));
@@ -2639,8 +3268,18 @@ struct Engine {
             }
 
             QW38_CK(cudaStreamSynchronize(stream));
+            if (o.strata.enabled) {
+                const uint64_t dt_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t_mtp0).count());
+                if (did_mtp_cap) strata_cache.stat_mtp_cap_ns += dt_ns;
+                strata_cache.stat_mtp_ns += dt_ns;
+                ++strata_cache.stat_mtp_calls;
+            }
             if (o.nr > 1 && step_end) step_end();
             std::memcpy(out_flat.data(), h_mtp_draft_out, size_t(M) * size_t(K) * sizeof(int));
+            if (out_lp_flat && o.nr == 1 && h_mtp_draft_lp) {
+                std::memcpy(out_lp_flat->data(), h_mtp_draft_lp, size_t(M) * size_t(K) * sizeof(float));
+            }
             return;
         }
 

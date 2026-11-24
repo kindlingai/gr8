@@ -539,12 +539,13 @@ std::vector<std::string> split_csv(const std::string& s) {
 
 int main(int argc, char** argv) {
     using namespace qw38rt;
-    std::string dir, widths, layout, layers = "all", tokens, s2dir, set_id, ips, ips2, kv_keep = "all";
+    std::string dir, widths, layout, ple_path, layers = "all", tokens, s2dir, set_id, ips, ips2, kv_keep = "all";
     std::vector<std::string> kv_tiers;
     int rank = -1, proxy_cpu = -1, gen = 16, chunk = 8, prefill = 2048, nc = 256, cap = 65536, mtp = 0;
     int s2port = 7341, s2sess = 1, s2epoch = 0, kv_sys_after = 2;
     double kv_wlim = 0.0;
     bool reuse = false;
+    StrataConfig strata_cfg = load_strata_config_from_env();
     float temp = 0.f, top_p = 1.f;
     uint32_t seed = 1234;
 
@@ -562,6 +563,7 @@ int main(int argc, char** argv) {
         else if (a == "--manifest") (void)val();
         else if (a == "--widths") widths = val();
         else if (a == "--layout") layout = val();
+        else if (a == "--ple") ple_path = val();
         else if (a == "--layers") layers = val();
         else if (a == "--tokens") tokens = val();
         else if (a == "--gen") gen = std::atoi(val().c_str());
@@ -585,6 +587,10 @@ int main(int argc, char** argv) {
         else if (a == "--seed") seed = static_cast<uint32_t>(std::strtoul(val().c_str(), nullptr, 10));
         else if (a == "--graph" || a == "--no-graph") {}
         else if (a == "--grammar-dir") (void)val();
+        else if (a == "--strata") strata_cfg.enabled = true;
+        else if (a == "--expert-profile") strata_cfg.profile_path = val();
+        else if (a == "--vram-reserve-mib") strata_cfg.vram_reserve_mib = std::atoll(val().c_str());
+        else if (a == "--expert-cache-slots") strata_cfg.cache_slots_override = std::atoll(val().c_str());
         else die("unknown option " + a);
     }
     if (nc < 0 || nc > 2048 / G6_NR) die("--top-p-cands must be 0.." + std::to_string(2048 / G6_NR));
@@ -606,6 +612,8 @@ int main(int argc, char** argv) {
     o.layers = layers;
     o.widths_path = widths;
     o.layout_path = layout;
+    o.ple_path = ple_path;
+    o.strata = strata_cfg;
 
     Engine e;
     e.init(dir, o);
@@ -952,6 +960,7 @@ int main(int argc, char** argv) {
             }
         }
         std::fprintf(stderr, "\n");
+        if (e.o.strata.enabled) e.strata_cache.print_stats();
         if (e.o.profile) e.prof.print(rank);
         for (int s = 0; s < S; ++s) {
             std::printf("session %d:", s);

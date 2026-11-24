@@ -56,6 +56,8 @@ struct PleStoreOpts {
     int ways = 16;                    // 1..16
     int io_uring = 128;               // >0: io_uring QD; 0: pread
     bool direct = true;               // O_DIRECT when filesystem allows, else automatic fallback
+    bool gguf_ram = false;            // copy GGUF IQ4_NL table into anonymous THP RAM instead of file mmap
+    bool gguf_no_warm = false;        // skip 4-thread sequential warm-up pass on file-backed GGUF mmap
 };
 
 // Metadata for an exlr8 FORMAT v4 record-9 row-trellis lookup table.
@@ -362,6 +364,8 @@ public:
         opts_ = opts;
         const bool is_st = path.size() >= 12 && path.compare(path.size() - 12, 12, ".safetensors") == 0;
         if (is_st) return open_row_trellis(path, opts, err);
+        const bool is_gguf = path.size() >= 5 && path.compare(path.size() - 5, 5, ".gguf") == 0;
+        if (is_gguf) return open_gguf_iq4nl(path, opts, err);
         return open_raw_bin(path, opts, err);
     }
 
@@ -369,6 +373,7 @@ public:
     bool is_direct() const { return direct_; }
     bool has_uring() const { return uring_ != nullptr; }
     bool is_row_trellis() const { return row_trellis_; }
+    bool is_gguf_iq4nl() const { return gguf_iq4nl_; }
     bool is_resident() const { return resident_; }
     uint64_t total_rows() const { return total_rows_; }
     size_t row_bytes() const { return row_bytes_; }
@@ -518,11 +523,240 @@ private:
 
     bool open_raw_bin(const std::string& bin_path, const PleStoreOpts& opts, std::string* err) {
         row_trellis_ = false;
+        gguf_iq4nl_ = false;
         resident_ = false;
         row_bytes_ = PLE_ROW_BYTES;
         rows_base_off_ = 0;
         if (!open_fd_and_io(bin_path, opts, true, err)) return false;
         total_rows_ = file_bytes_ / PLE_ROW_BYTES;
+        return true;
+    }
+
+    static inline void decode_iq4nl_row_bf16(const uint8_t* src90, uint16_t* dst160) {
+        static constexpr int8_t KVAL[16] = {
+            -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+        };
+        for (int b = 0; b < 5; ++b) {
+            uint16_t dh = 0;
+            std::memcpy(&dh, src90, 2);
+            const float d = ple_fp16_to_f32(dh);
+            const uint8_t* qs = src90 + 2;
+            uint16_t* out = dst160 + b * 32;
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t q = qs[j];
+                out[j] = ple_f32_to_bf16(d * float(KVAL[q & 0x0Fu]));
+                out[j + 16] = ple_f32_to_bf16(d * float(KVAL[q >> 4]));
+            }
+            src90 += 18;
+        }
+    }
+
+    bool open_gguf_iq4nl(const std::string& gguf_path, const PleStoreOpts& opts, std::string* err) {
+        int bfd = ::open(gguf_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (bfd < 0) {
+            if (err) *err = "ple gguf open " + gguf_path + ": " + std::strerror(errno);
+            return false;
+        }
+        struct stat st{};
+        if (::fstat(bfd, &st) != 0) {
+            if (err) *err = "ple gguf fstat " + gguf_path + ": " + std::strerror(errno);
+            ::close(bfd);
+            return false;
+        }
+        const uint64_t fsz = uint64_t(st.st_size);
+        if (fsz < 64) {
+            if (err) *err = "ple gguf file too small: " + gguf_path;
+            ::close(bfd);
+            return false;
+        }
+        const size_t hdr_read = size_t(std::min<uint64_t>(fsz, 1ull << 20));
+        std::vector<uint8_t> hdr(hdr_read);
+        if (!pread_exact(bfd, hdr.data(), hdr_read, 0, err)) { ::close(bfd); return false; }
+
+        size_t pos = 0;
+        auto need = [&](size_t n) -> bool {
+            if (pos + n > hdr.size()) {
+                if (err) *err = "ple gguf header truncated";
+                return false;
+            }
+            return true;
+        };
+        auto rd_u32 = [&](uint32_t& v) -> bool { if (!need(4)) return false; std::memcpy(&v, hdr.data() + pos, 4); pos += 4; return true; };
+        auto rd_u64 = [&](uint64_t& v) -> bool { if (!need(8)) return false; std::memcpy(&v, hdr.data() + pos, 8); pos += 8; return true; };
+        auto rd_str = [&](std::string& s) -> bool {
+            uint64_t l = 0;
+            if (!rd_u64(l) || !need(size_t(l))) return false;
+            s.assign(reinterpret_cast<const char*>(hdr.data() + pos), size_t(l));
+            pos += size_t(l);
+            return true;
+        };
+        auto skip_val = [&](auto& self, uint32_t vt) -> bool {
+            switch (vt) {
+                case 0: case 1: case 7: return need(1) && ((pos += 1), true);
+                case 2: case 3: return need(2) && ((pos += 2), true);
+                case 4: case 5: case 6: return need(4) && ((pos += 4), true);
+                case 10: case 11: case 12: return need(8) && ((pos += 8), true);
+                case 8: { std::string tmp; return rd_str(tmp); }
+                case 9: {
+                    uint32_t et = 0; uint64_t cnt = 0;
+                    if (!rd_u32(et) || !rd_u64(cnt)) return false;
+                    for (uint64_t i = 0; i < cnt; ++i) if (!self(self, et)) return false;
+                    return true;
+                }
+                default:
+                    if (err) *err = "ple gguf unsupported kv type " + std::to_string(vt);
+                    return false;
+            }
+        };
+
+        if (std::memcmp(hdr.data(), "GGUF", 4) != 0) {
+            if (err) *err = "ple gguf bad magic in " + gguf_path;
+            ::close(bfd);
+            return false;
+        }
+        pos = 4;
+        uint32_t ver = 0;
+        uint64_t n_tensors = 0, n_kv = 0;
+        if (!rd_u32(ver) || !rd_u64(n_tensors) || !rd_u64(n_kv)) { ::close(bfd); return false; }
+        uint64_t align = 32;
+        for (uint64_t i = 0; i < n_kv; ++i) {
+            std::string key;
+            uint32_t vt = 0;
+            if (!rd_str(key) || !rd_u32(vt)) { ::close(bfd); return false; }
+            if (key == "general.alignment" && vt == 4) {
+                uint32_t a = 32;
+                if (!rd_u32(a)) { ::close(bfd); return false; }
+                if (a > 0) align = a;
+            } else {
+                if (!skip_val(skip_val, vt)) { ::close(bfd); return false; }
+            }
+        }
+
+        bool found = false;
+        uint64_t t_rows = 0, t_off = 0;
+        for (uint64_t i = 0; i < n_tensors; ++i) {
+            std::string tname;
+            uint32_t nd = 0, ttype = 0;
+            uint64_t off = 0;
+            if (!rd_str(tname) || !rd_u32(nd)) { ::close(bfd); return false; }
+            std::vector<uint64_t> dims(nd);
+            for (uint32_t d = 0; d < nd; ++d) if (!rd_u64(dims[d])) { ::close(bfd); return false; }
+            if (!rd_u32(ttype) || !rd_u64(off)) { ::close(bfd); return false; }
+            if (tname == "per_layer_token_embd.weight") {
+                if (nd != 2 || dims[0] != geom::PLE_HEAD_DIM || ttype != 20) {
+                    if (err) *err = "ple gguf unexpected per_layer_token_embd.weight shape/type (need [160, R] IQ4_NL=20)";
+                    ::close(bfd);
+                    return false;
+                }
+                found = true;
+                t_rows = dims[1];
+                t_off = off;
+            }
+        }
+        if (!found) {
+            if (err) *err = "ple gguf missing per_layer_token_embd.weight in " + gguf_path;
+            ::close(bfd);
+            return false;
+        }
+        const uint64_t data_base = ((uint64_t(pos) + align - 1) & ~(align - 1)) + t_off;
+        const uint64_t need_bytes = t_rows * 90ull;
+        if (data_base + need_bytes > fsz) {
+            if (err) *err = "ple gguf tensor exceeds file size";
+            ::close(bfd);
+            return false;
+        }
+
+        if (opts.gguf_ram) {
+            // Explicit anonymous THP copy (immune to page-cache reclaim).
+            rows_mmap_len_ = size_t(need_bytes);
+            void* rm = ::mmap(nullptr, rows_mmap_len_, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (rm == MAP_FAILED) {
+                if (err) *err = std::string("ple gguf anon mmap: ") + std::strerror(errno);
+                ::close(bfd);
+                rows_mmap_len_ = 0;
+                return false;
+            }
+#ifdef MADV_HUGEPAGE
+            ::madvise(rm, rows_mmap_len_, MADV_HUGEPAGE);
+#endif
+            const unsigned nt = 4;
+            const uint64_t per_t = (need_bytes + nt - 1) / nt;
+            std::atomic<int> io_err{0};
+            std::vector<std::thread> thrs;
+            uint8_t* dst_base = static_cast<uint8_t*>(rm);
+            for (unsigned t = 0; t < nt; ++t) {
+                const uint64_t o0 = uint64_t(t) * per_t;
+                const uint64_t o1 = std::min<uint64_t>(need_bytes, o0 + per_t);
+                if (o0 >= o1) continue;
+                thrs.emplace_back([&, o0, o1]() {
+                    constexpr size_t CH = 8ull << 20;
+                    uint64_t cur = o0;
+                    while (cur < o1 && io_err.load(std::memory_order_relaxed) == 0) {
+                        const size_t n = size_t(std::min<uint64_t>(CH, o1 - cur));
+                        const ssize_t r = ::pread(bfd, dst_base + cur, n, off_t(data_base + cur));
+                        if (r <= 0) { io_err.store(1, std::memory_order_relaxed); break; }
+                        cur += uint64_t(r);
+                    }
+                });
+            }
+            for (auto& th : thrs) th.join();
+            ::close(bfd);
+            if (io_err.load() != 0) {
+                ::munmap(rm, rows_mmap_len_);
+                rows_mmap_len_ = 0;
+                if (err) *err = "ple gguf pread failed for " + gguf_path;
+                return false;
+            }
+            rows_mmap_ = rm;
+            rows_ptr_ = static_cast<const uint8_t*>(rm);
+        } else {
+            // File-backed mmap + 4-thread sequential warm-up: stays warm in Linux page cache across runs,
+            // 100% reclaimable under cgroup memory pressure (never OOMs), and zero-fault once warm.
+            const size_t pg = size_t(::sysconf(_SC_PAGESIZE));
+            const uint64_t map_off = data_base & ~(uint64_t(pg) - 1);
+            const size_t delta = size_t(data_base - map_off);
+            rows_mmap_len_ = delta + size_t(need_bytes);
+            void* rm = ::mmap(nullptr, rows_mmap_len_, PROT_READ, MAP_PRIVATE, bfd, off_t(map_off));
+            ::close(bfd);
+            if (rm == MAP_FAILED) {
+                if (err) *err = std::string("ple gguf mmap: ") + std::strerror(errno);
+                rows_mmap_len_ = 0;
+                return false;
+            }
+            if (!opts.gguf_no_warm) {
+                ::madvise(rm, rows_mmap_len_, MADV_NORMAL);
+                const size_t n_pages = (rows_mmap_len_ + pg - 1) / pg;
+                const unsigned nt = 4;
+                std::atomic<uint64_t> sink{0};
+                std::vector<std::thread> thrs;
+                const size_t chunk = (n_pages + nt - 1) / nt;
+                const uint8_t* base_p = static_cast<const uint8_t*>(rm);
+                for (unsigned t = 0; t < nt; ++t) {
+                    const size_t p0 = size_t(t) * chunk;
+                    const size_t p1 = std::min(n_pages, p0 + chunk);
+                    if (p0 >= p1) continue;
+                    thrs.emplace_back([&, p0, p1]() {
+                        uint64_t acc = 0;
+                        for (size_t p = p0; p < p1; ++p) acc += base_p[p * pg];
+                        sink.fetch_add(acc, std::memory_order_relaxed);
+                    });
+                }
+                for (auto& th : thrs) th.join();
+                (void)sink.load(std::memory_order_relaxed);
+            }
+            ::madvise(rm, rows_mmap_len_, MADV_RANDOM);
+            rows_mmap_ = rm;
+            rows_ptr_ = static_cast<const uint8_t*>(rm) + delta;
+        }
+
+        row_trellis_ = false;
+        gguf_iq4nl_ = true;
+        resident_ = true;
+        row_bytes_ = PLE_ROW_BYTES;
+        rows_base_off_ = data_base;
+        total_rows_ = t_rows;
+        if (!open_fd_and_io(gguf_path, opts, false, err)) return false;
         return true;
     }
 
@@ -820,6 +1054,43 @@ private:
         s.req = n_ids;
         const size_t rb = row_bytes_;
 
+        // Fast path: RAM-resident mmap for GGUF IQ4_NL PLE table (zero HDD IOPS, instant BF16 dequant!)
+        if (gguf_iq4nl_ && resident_ && rows_ptr_) {
+            if (dst) {
+                auto work = [&](size_t i0, size_t i1) {
+                    for (size_t i = i0; i < i1; ++i) {
+                        const uint64_t id = ids[i];
+                        uint16_t* out = reinterpret_cast<uint16_t*>(dst + i * PLE_ROW_BYTES);
+                        if (id >= total_rows_) {
+                            std::memset(out, 0, PLE_ROW_BYTES);
+                        } else {
+                            decode_iq4nl_row_bf16(rows_ptr_ + id * 90ull, out);
+                        }
+                    }
+                };
+                if (n_ids >= 4096) {
+                    const unsigned nt = std::max(1u, std::min<unsigned>(8u, std::thread::hardware_concurrency()));
+                    std::vector<std::thread> thrs;
+                    thrs.reserve(nt - 1);
+                    const size_t step = (n_ids + nt - 1) / nt;
+                    for (unsigned t = 1; t < nt; ++t) {
+                        const size_t a = size_t(t) * step;
+                        const size_t b = std::min(n_ids, a + step);
+                        if (a < b) thrs.emplace_back(work, a, b);
+                    }
+                    work(0, std::min(n_ids, step));
+                    for (auto& th : thrs) th.join();
+                } else {
+                    work(0, n_ids);
+                }
+            }
+            s.hits = n_ids;
+            const auto t1 = std::chrono::steady_clock::now();
+            s.total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            if (st_out) *st_out = s;
+            return true;
+        }
+
         // Fast path: RAM-resident mmap for row-trellis tables that fit in cache_bytes
         if (resident_ && rows_ptr_) {
             if (dst || dst_svh) {
@@ -1097,6 +1368,7 @@ private:
     bool direct_ = false;
     bool has_hash_ = false;
     bool row_trellis_ = false;
+    bool gguf_iq4nl_ = false;
     bool resident_ = false;
     size_t align_ = 4096;
     size_t row_bytes_ = PLE_ROW_BYTES;

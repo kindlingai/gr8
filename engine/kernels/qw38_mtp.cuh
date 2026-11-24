@@ -221,17 +221,20 @@ __global__ void k_mtp_idx_snap(const int* __restrict__ d_slot,
     }
 }
 
-// On-GPU TP=1 greedy MTP draft chain: writes draft token into d_draft_out[m*K + k] and advances d_tok/d_pos/d_rope!
+// On-GPU TP=1 greedy MTP draft chain: writes draft token into d_draft_out[m*K + k] (and optional lp) and advances d_tok/d_pos/d_rope!
 __global__ void k_mtp_chain_tp1(const HeadArgmax* __restrict__ argmax,
                                 int* __restrict__ d_draft_out,
                                 int* __restrict__ d_tok,
                                 int* __restrict__ d_pos,
                                 int3* __restrict__ d_rope,
-                                int M, int K, int k) {
+                                int M, int K, int k,
+                                const float* __restrict__ d_lp = nullptr,
+                                float* __restrict__ d_draft_lp = nullptr) {
     const int m = threadIdx.x;
     if (m >= M) return;
     const int tok = argmax[m].id;
     d_draft_out[m * K + k] = tok;
+    if (d_lp && d_draft_lp) d_draft_lp[m * K + k] = d_lp[m];
     if (k + 1 < K) {
         d_tok[m] = tok;
         d_pos[m] += 1;

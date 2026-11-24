@@ -547,18 +547,20 @@ __global__ void __launch_bounds__(256) k_qw38_head2_pack_256(
     }
 }
 
-// Stage 4a: Reduce SL=64 exact rescored candidates -> HeadArgmax[M] (Grid M, Block 64).
+// Stage 4a: Reduce SL=64 exact rescored candidates -> HeadArgmax[M] (+ optional top-64 softmax log-prob for KStopB) (Grid M, Block 64).
 __global__ void __launch_bounds__(64) k_qw38_mtp_head2_argmax_pair(
     const float* __restrict__ cl,
     const int* __restrict__ cand,
     int v0,
-    HeadArgmax* __restrict__ out) {
+    HeadArgmax* __restrict__ out,
+    float* __restrict__ out_lp = nullptr) {
     const int m = blockIdx.x;
     const int t = threadIdx.x; // 0..63
     const int lane = t & 31, warp = t >> 5;
-    float mx = cl[static_cast<size_t>(m) * MtpHead2::SL + t];
-    int id = v0 + cand[static_cast<size_t>(m) * MtpHead2::SL + t];
-    if (!ink2::head_key(mx)) { mx = -INFINITY; id = 0x7fffffff; }
+    const float raw = cl[static_cast<size_t>(m) * MtpHead2::SL + t];
+    const bool fin = ink2::head_key(raw);
+    float mx = fin ? raw : -INFINITY;
+    int id = fin ? (v0 + cand[static_cast<size_t>(m) * MtpHead2::SL + t]) : 0x7fffffff;
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         const float om = __shfl_xor_sync(0xffffffffu, mx, off);
@@ -567,6 +569,7 @@ __global__ void __launch_bounds__(64) k_qw38_mtp_head2_argmax_pair(
     }
     __shared__ float smx[2];
     __shared__ int sid[2];
+    __shared__ float se[2];
     if (lane == 0) { smx[warp] = mx; sid[warp] = id; }
     __syncthreads();
     if (t == 0) {
@@ -574,6 +577,20 @@ __global__ void __launch_bounds__(64) k_qw38_mtp_head2_argmax_pair(
         int fi = sid[0];
         head_better(fm, fi, smx[1], sid[1]);
         out[m] = HeadArgmax{fm, fi};
+        smx[0] = fm;
+    }
+    if (out_lp) {
+        __syncthreads();
+        const float fm = smx[0];
+        float e = (fin && ink2::head_key(fm)) ? expf(raw - fm) : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) e += __shfl_xor_sync(0xffffffffu, e, off);
+        if (lane == 0) se[warp] = e;
+        __syncthreads();
+        if (t == 0) {
+            const float sum_e = se[0] + se[1];
+            out_lp[m] = (sum_e > 1.0f) ? -logf(sum_e) : 0.0f;
+        }
     }
 }
 
@@ -655,7 +672,7 @@ inline void launch_mtp_head2_screen(const MtpHead2& h2, const __nv_bfloat16* x, 
 
 inline void mtp_head2_argmax_pair(const MtpHead2& h2, const Fp8Mat& fp8_lm, const __nv_bfloat16* x,
                                   float* head_logits, MtpHead2Scratch& sc, HeadArgmax* out_pair,
-                                  int M, cudaStream_t st) {
+                                  int M, cudaStream_t st, float* out_lp = nullptr) {
     launch_mtp_head2_screen(h2, x, head_logits, M, st);
     k_qw38_head2_top<MtpHead2::SL, false><<<M, 1024, 0, st>>>(head_logits, h2.vr, sc.cand);
     if (fp8_lm.mx_sc) {
@@ -665,7 +682,7 @@ inline void mtp_head2_argmax_pair(const MtpHead2& h2, const Fp8Mat& fp8_lm, cons
         k_qw38_mtp_head2_rescore_fp8<false><<<dim3(M, 8), 256, 0, st>>>(
             fp8_lm.q, fp8_lm.sc, fp8_lm.mx_sc, x, sc.cand, head_logits, sc.cl, h2.vr, false);
     }
-    k_qw38_mtp_head2_argmax_pair<<<M, 64, 0, st>>>(sc.cl, sc.cand, h2.v0, out_pair);
+    k_qw38_mtp_head2_argmax_pair<<<M, 64, 0, st>>>(sc.cl, sc.cand, h2.v0, out_pair, out_lp);
 }
 
 inline void mtp_head2_pack(const MtpHead2& h2, const Fp8Mat& fp8_lm, const __nv_bfloat16* x,
