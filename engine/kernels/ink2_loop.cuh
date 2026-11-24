@@ -30,6 +30,7 @@ struct AttnResF32Args
 };
 
 // CTA = token. Unrounded fp32 depth attention (used for message_input Q=4, and pass>=1 attention_input / mlp_input).
+// Fuses all Q queries into a single read of rows[d] for dots and a single read for outputs (100% bit-exact!).
 __global__ void __launch_bounds__(NRT) k_ink2_attn_res_f32(AttnResF32Args a)
 {
     __shared__ float sm[NRT * MAX_DEPTH];
@@ -38,10 +39,11 @@ __global__ void __launch_bounds__(NRT) k_ink2_attn_res_f32(AttnResF32Args a)
     float v[MAX_DEPTH], r[MAX_DEPTH];
     for (int d = 0; d < D; ++d)
     {
+        const uint16_t* row = a.rows[d] + off;
         float s = 0.0f;
         for (int c = t; c < H; c += NRT)
         {
-            const float x = bf(a.rows[d][off + c]);
+            const float x = bf(__ldg(row + c));
             s = add_rn(s, mul_rn(x, x));
         }
         v[d] = s;
@@ -49,13 +51,14 @@ __global__ void __launch_bounds__(NRT) k_ink2_attn_res_f32(AttnResF32Args a)
     blk_sum_v<MAX_DEPTH>(v, D, sm, NRT);
     for (int d = 0; d < D; ++d) r[d] = rsq(add_rn(div_rn(v[d], static_cast<float>(H)), RMS_EPS));
     const float root_h = sqrtf(static_cast<float>(H));
-    for (int q = 0; q < a.Q; ++q)
+    if (a.Q == 1)
     {
-        const float* qr = a.query + static_cast<size_t>(q) * H;
+        const float* qr = a.query;
         for (int d = 0; d < D; ++d)
         {
+            const uint16_t* row = a.rows[d] + off;
             float s = 0.0f;
-            for (int c = t; c < H; c += NRT) s = add_rn(s, mul_rn(qr[c], mul_rn(bf(a.rows[d][off + c]), r[d])));
+            for (int c = t; c < H; c += NRT) s = add_rn(s, mul_rn(__ldg(qr + c), mul_rn(bf(__ldg(row + c)), r[d])));
             v[d] = s;
         }
         blk_sum_v<MAX_DEPTH>(v, D, sm, NRT);
@@ -71,13 +74,59 @@ __global__ void __launch_bounds__(NRT) k_ink2_attn_res_f32(AttnResF32Args a)
             den = add_rn(den, v[d]);
         }
         for (int d = 0; d < D; ++d) v[d] = div_rn(v[d], den);
-        float* o = a.out[q] + off;
+        float* o = a.out[0] + off;
         for (int c = t; c < H; c += NRT)
         {
             float s = 0.0f;
-            for (int d = 0; d < D; ++d) s = add_rn(s, mul_rn(v[d], mul_rn(bf(a.rows[d][off + c]), r[d])));
+            for (int d = 0; d < D; ++d) s = add_rn(s, mul_rn(v[d], mul_rn(bf(__ldg(a.rows[d] + off + c)), r[d])));
             o[c] = s;
         }
+        return;
+    }
+    __shared__ float s_wq[LOOP_MAX_Q][MAX_DEPTH];
+    for (int d = 0; d < D; ++d)
+    {
+        const uint16_t* row = a.rows[d] + off;
+        float sq[LOOP_MAX_Q];
+        #pragma unroll
+        for (int q = 0; q < LOOP_MAX_Q; ++q) sq[q] = 0.0f;
+        for (int c = t; c < H; c += NRT)
+        {
+            const float u = mul_rn(bf(__ldg(row + c)), r[d]);
+            for (int q = 0; q < a.Q; ++q)
+                sq[q] = add_rn(sq[q], mul_rn(__ldg(a.query + static_cast<size_t>(q) * H + c), u));
+        }
+        blk_sum_v<LOOP_MAX_Q>(sq, a.Q, sm, NRT);
+        if (t < a.Q) s_wq[t][d] = sq[t];
+    }
+    __syncthreads();
+    if (t < a.Q)
+    {
+        float mx = -INFINITY, den = 0.0f;
+        for (int d = 0; d < D; ++d)
+        {
+            s_wq[t][d] = div_rn(s_wq[t][d], root_h);
+            mx = fmaxf(mx, s_wq[t][d]);
+        }
+        for (int d = 0; d < D; ++d)
+        {
+            s_wq[t][d] = expf(s_wq[t][d] - mx);
+            den = add_rn(den, s_wq[t][d]);
+        }
+        for (int d = 0; d < D; ++d) s_wq[t][d] = div_rn(s_wq[t][d], den);
+    }
+    __syncthreads();
+    for (int c = t; c < H; c += NRT)
+    {
+        float acc[LOOP_MAX_Q];
+        #pragma unroll
+        for (int q = 0; q < LOOP_MAX_Q; ++q) acc[q] = 0.0f;
+        for (int d = 0; d < D; ++d)
+        {
+            const float u = mul_rn(bf(__ldg(a.rows[d] + off + c)), r[d]);
+            for (int q = 0; q < a.Q; ++q) acc[q] = add_rn(acc[q], mul_rn(s_wq[q][d], u));
+        }
+        for (int q = 0; q < a.Q; ++q) a.out[q][off + c] = acc[q];
     }
 }
 
@@ -89,6 +138,29 @@ __global__ void __launch_bounds__(NRT) k_ink2_msg_gate_prep(const float* h_f32, 
     const size_t off = static_cast<size_t>(blockIdx.x) * H;
     const size_t coff = static_cast<size_t>(blockIdx.x) * (2 * H);
     float ss[2] = {0.0f, 0.0f};
+    if (H <= NRT * 9)
+    {
+        float hr[9], mr[9];
+        int idx = 0;
+        for (int c = t; c < H; c += NRT, ++idx)
+        {
+            const float hv = h_f32[off + c], mv = msg_f32[off + c];
+            hr[idx] = hv;
+            mr[idx] = mv;
+            ss[0] = add_rn(ss[0], mul_rn(hv, hv));
+            ss[1] = add_rn(ss[1], mul_rn(mv, mv));
+        }
+        blk_sum_v<2>(ss, 2, sm, NRT);
+        const float rh = rsq(add_rn(div_rn(ss[0], static_cast<float>(H)), RMS_EPS));
+        const float rm = rsq(add_rn(div_rn(ss[1], static_cast<float>(H)), RMS_EPS));
+        idx = 0;
+        for (int c = t; c < H; c += NRT, ++idx)
+        {
+            cat_bf16[coff + c] = bf16(mul_rn(hr[idx], rh));
+            cat_bf16[coff + H + c] = bf16(mul_rn(mr[idx], rm));
+        }
+        return;
+    }
     for (int c = t; c < H; c += NRT)
     {
         const float hv = h_f32[off + c], mv = msg_f32[off + c];
@@ -102,6 +174,131 @@ __global__ void __launch_bounds__(NRT) k_ink2_msg_gate_prep(const float* h_f32, 
     {
         cat_bf16[coff + c] = bf16(mul_rn(h_f32[off + c], rh));
         cat_bf16[coff + H + c] = bf16(mul_rn(msg_f32[off + c], rm));
+    }
+}
+
+// Coalesced 128B-line warp-cooperative MessageGate apply+norm for R == 64 (and H <= 4096).
+// Every warp processes channels c = warp, warp+8, ...; all 32 lanes load 2 BF16s (4B) each = 128B coalesced line!
+__global__ void __launch_bounds__(NRT) k_ink2_msg_gate_apply_norm_r64(const float* __restrict__ h_f32, const float* __restrict__ msg_f32,
+                                                                      const uint16_t* __restrict__ g_bf16,
+                                                                      const uint16_t* __restrict__ forget_w, const uint16_t* __restrict__ gain_w,
+                                                                      const uint16_t* __restrict__ norm_w,
+                                                                      uint16_t* __restrict__ out_bf16, int H)
+{
+    __shared__ float s_val[4096];
+    __shared__ float sm[NRT];
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const size_t off = static_cast<size_t>(blockIdx.x) * H;
+    const uint32_t gpair = reinterpret_cast<const uint32_t*>(g_bf16 + static_cast<size_t>(blockIdx.x) * 64)[lane];
+    const float g0 = bf(static_cast<uint16_t>(gpair));
+    const float g1 = bf(static_cast<uint16_t>(gpair >> 16));
+
+    for (int c = warp; c < H; c += 8)
+    {
+        const uint32_t fp = __ldg(reinterpret_cast<const uint32_t*>(forget_w + static_cast<size_t>(c) * 64) + lane);
+        const uint32_t gp = __ldg(reinterpret_cast<const uint32_t*>(gain_w + static_cast<size_t>(c) * 64) + lane);
+        float sf = add_rn(mul_rn(bf(static_cast<uint16_t>(fp)), g0), mul_rn(bf(static_cast<uint16_t>(fp >> 16)), g1));
+        float sm_ = add_rn(mul_rn(bf(static_cast<uint16_t>(gp)), g0), mul_rn(bf(static_cast<uint16_t>(gp >> 16)), g1));
+        #pragma unroll
+        for (int off_ = 16; off_ > 0; off_ >>= 1)
+        {
+            sf = add_rn(sf, __shfl_xor_sync(0xffffffffu, sf, off_));
+            sm_ = add_rn(sm_, __shfl_xor_sync(0xffffffffu, sm_, off_));
+        }
+        if (lane == 0)
+        {
+            const float fg = tanhf(sf);
+            const float mg = tanhf(sm_);
+            s_val[c] = add_rn(mul_rn(add_rn(1.0f, -fg), h_f32[off + c]), mul_rn(mg, msg_f32[off + c]));
+        }
+    }
+    __syncthreads();
+    float ss = 0.0f;
+    for (int c = t; c < H; c += NRT)
+    {
+        const float v = s_val[c];
+        ss = add_rn(ss, mul_rn(v, v));
+    }
+    const float rn = rsq(add_rn(div_rn(blk_sum(ss, sm, NRT), static_cast<float>(H)), RMS_EPS));
+    for (int c = t; c < H; c += NRT) out_bf16[off + c] = bf16(mul_rn(bf(norm_w[c]), mul_rn(s_val[c], rn)));
+}
+
+// Batched dual-output coalesced GEMV for R == 64: reads forget_w[c] and gain_w[c] ONCE for up to MAX_M tokens
+// using the EXACT SAME 32-lane coalesced dot + warp reduction order as k_ink2_msg_gate_apply_norm_r64!
+template <int MAX_M>
+__global__ void __launch_bounds__(128) k_ink2_msg_gate_fg_r64(const uint16_t* __restrict__ g_bf16,
+                                                              const uint16_t* __restrict__ forget_w,
+                                                              const uint16_t* __restrict__ gain_w,
+                                                              float* __restrict__ sf_out,
+                                                              float* __restrict__ sm_out,
+                                                              int M, int H)
+{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int c = blockIdx.x * 4 + warp;
+    if (c >= H) return;
+    const int m0 = blockIdx.y * MAX_M;
+    const int m_rem = min(MAX_M, M - m0);
+    if (m_rem <= 0) return;
+
+    const uint32_t fp = __ldg(reinterpret_cast<const uint32_t*>(forget_w + static_cast<size_t>(c) * 64) + lane);
+    const uint32_t gp = __ldg(reinterpret_cast<const uint32_t*>(gain_w + static_cast<size_t>(c) * 64) + lane);
+    const float f0 = bf(static_cast<uint16_t>(fp)), f1 = bf(static_cast<uint16_t>(fp >> 16));
+    const float g0w = bf(static_cast<uint16_t>(gp)), g1w = bf(static_cast<uint16_t>(gp >> 16));
+
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m)
+    {
+        if (m < m_rem)
+        {
+            const uint32_t gpair = __ldg(reinterpret_cast<const uint32_t*>(g_bf16 + static_cast<size_t>(m0 + m) * 64) + lane);
+            const float x0 = bf(static_cast<uint16_t>(gpair));
+            const float x1 = bf(static_cast<uint16_t>(gpair >> 16));
+            float sf = add_rn(mul_rn(f0, x0), mul_rn(f1, x1));
+            float sm_ = add_rn(mul_rn(g0w, x0), mul_rn(g1w, x1));
+            #pragma unroll
+            for (int off_ = 16; off_ > 0; off_ >>= 1)
+            {
+                sf = add_rn(sf, __shfl_xor_sync(0xffffffffu, sf, off_));
+                sm_ = add_rn(sm_, __shfl_xor_sync(0xffffffffu, sm_, off_));
+            }
+            if (lane == 0)
+            {
+                const size_t o = static_cast<size_t>(m0 + m) * H + c;
+                sf_out[o] = sf;
+                sm_out[o] = sm_;
+            }
+        }
+    }
+}
+
+// CTA = token. Finish MessageGate apply + weighted RMSNorm from precomputed sf_in / sm_in [M][H].
+__global__ void __launch_bounds__(NRT) k_ink2_msg_gate_finish(const float* __restrict__ h_f32, const float* __restrict__ msg_f32,
+                                                              const float* __restrict__ sf_in, const float* __restrict__ sm_in,
+                                                              const uint16_t* __restrict__ norm_w,
+                                                              uint16_t* __restrict__ out_bf16, int H)
+{
+    __shared__ float sm[NRT];
+    const int t = threadIdx.x;
+    const size_t off = static_cast<size_t>(blockIdx.x) * H;
+    constexpr int MAX_REG = 20;
+    float vals[MAX_REG];
+    const bool in_reg = (H <= NRT * MAX_REG);
+    float ss = 0.0f;
+    int idx = 0;
+    for (int c = t; c < H; c += NRT, ++idx)
+    {
+        const float fg = tanhf(sf_in[off + c]);
+        const float mg = tanhf(sm_in[off + c]);
+        const float v = add_rn(mul_rn(add_rn(1.0f, -fg), h_f32[off + c]), mul_rn(mg, msg_f32[off + c]));
+        if (in_reg) vals[idx] = v;
+        ss = add_rn(ss, mul_rn(v, v));
+    }
+    const float rn = rsq(add_rn(div_rn(blk_sum(ss, sm, NRT), static_cast<float>(H)), RMS_EPS));
+    idx = 0;
+    for (int c = t; c < H; c += NRT, ++idx)
+    {
+        const float v = in_reg ? vals[idx] : add_rn(mul_rn(add_rn(1.0f, -tanhf(sf_in[off + c])), h_f32[off + c]), mul_rn(tanhf(sm_in[off + c]), msg_f32[off + c]));
+        out_bf16[off + c] = bf16(mul_rn(bf(norm_w[c]), mul_rn(v, rn)));
     }
 }
 
@@ -170,13 +367,289 @@ inline void attn_res_f32(const AttnResF32Args& a, int M, cudaStream_t st)
     k_ink2_attn_res_f32<<<M, NRT, 0, st>>>(a);
 }
 
+// Batched 3-controller MessageGate kernels (q, k, v) for M <= 64, R == 64:
+// Cuts 240 kernel launches per forward pass (15 -> 5 per gated layer) while staying 100% bit-exact!
+struct MsgGate3Args
+{
+    const float* h_f32[3];
+    const float* msg_f32[3];
+    const uint16_t* down_w[3];
+    const uint16_t* forget_w[3];
+    const uint16_t* gain_w[3];
+    const uint16_t* norm_w[3];
+    uint16_t* out_bf16[3];
+};
+
+__global__ void __launch_bounds__(NRT) k_ink2_msg_gate_prep_3(MsgGate3Args a, uint16_t* __restrict__ cat_bf16, int M, int H)
+{
+    __shared__ float sm[NRT * 2];
+    const int t = threadIdx.x;
+    const int m = blockIdx.x, ctrl = blockIdx.y;
+    const size_t off = static_cast<size_t>(m) * H;
+    const size_t coff = (static_cast<size_t>(ctrl) * M + m) * (2 * H);
+    const float* hf = a.h_f32[ctrl] + off;
+    const float* mf = a.msg_f32[ctrl] + off;
+    float ss[2] = {0.0f, 0.0f};
+    if (H <= NRT * 9)
+    {
+        float hr[9], mr[9];
+        int idx = 0;
+        for (int c = t; c < H; c += NRT, ++idx)
+        {
+            const float hv = __ldg(hf + c), mv = __ldg(mf + c);
+            hr[idx] = hv;
+            mr[idx] = mv;
+            ss[0] = add_rn(ss[0], mul_rn(hv, hv));
+            ss[1] = add_rn(ss[1], mul_rn(mv, mv));
+        }
+        blk_sum_v<2>(ss, 2, sm, NRT);
+        const float rh = rsq(add_rn(div_rn(ss[0], static_cast<float>(H)), RMS_EPS));
+        const float rm = rsq(add_rn(div_rn(ss[1], static_cast<float>(H)), RMS_EPS));
+        idx = 0;
+        for (int c = t; c < H; c += NRT, ++idx)
+        {
+            cat_bf16[coff + c] = bf16(mul_rn(hr[idx], rh));
+            cat_bf16[coff + H + c] = bf16(mul_rn(mr[idx], rm));
+        }
+        return;
+    }
+    for (int c = t; c < H; c += NRT)
+    {
+        const float hv = __ldg(hf + c), mv = __ldg(mf + c);
+        ss[0] = add_rn(ss[0], mul_rn(hv, hv));
+        ss[1] = add_rn(ss[1], mul_rn(mv, mv));
+    }
+    blk_sum_v<2>(ss, 2, sm, NRT);
+    const float rh = rsq(add_rn(div_rn(ss[0], static_cast<float>(H)), RMS_EPS));
+    const float rm = rsq(add_rn(div_rn(ss[1], static_cast<float>(H)), RMS_EPS));
+    for (int c = t; c < H; c += NRT)
+    {
+        cat_bf16[coff + c] = bf16(mul_rn(__ldg(hf + c), rh));
+        cat_bf16[coff + H + c] = bf16(mul_rn(__ldg(mf + c), rm));
+    }
+}
+
+template <int NT>
+__global__ void __launch_bounds__(32) k_ink2_msg_gate_down3_c128_splitk(const uint16_t* __restrict__ cat_bf16, MsgGate3Args a,
+                                                                        int M, int K, int SK, float* __restrict__ partial)
+{
+    __shared__ alignas(16) uint32_t sm_w[16][36];
+    const int lane = threadIdx.x & 31;
+    const int n0 = blockIdx.x * 16;
+    const int ctrl = blockIdx.y;
+    const int sk_id = blockIdx.z;
+    const int K64 = K >> 6;
+    const int k0 = ((sk_id * K64) / SK) << 6;
+    const int k1 = (((sk_id + 1) * K64) / SK) << 6;
+    const int r = lane >> 2, c = lane & 3;
+    const int lg = lane >> 3, lc = lane & 7;
+    const uint16_t* x = cat_bf16 + static_cast<size_t>(ctrl) * M * K;
+    const uint16_t* w = a.down_w[ctrl];
+    float acc[NT][4];
+    const uint16_t* xr[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
+        xr[t] = x + static_cast<size_t>(min(t * 8 + r, M - 1)) * K + 2 * c;
+    }
+    const uint16_t* wr[4];
+    #pragma unroll
+    for (int rr = 0; rr < 4; ++rr)
+        wr[rr] = w + static_cast<size_t>(n0 + rr * 4 + lg) * K;
+    for (int k = k0; k < k1; k += 64)
+    {
+        #pragma unroll
+        for (int rr = 0; rr < 4; ++rr)
+        {
+            const uint4 v = __ldg(reinterpret_cast<const uint4*>(wr[rr] + k) + lc);
+            *reinterpret_cast<uint4*>(&sm_w[rr * 4 + lg][lc * 4]) = v;
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int p = 0; p < 4; ++p)
+        {
+            const int kp = k + p * 16;
+            const u32 a0 = sm_w[r][p * 8 + c];
+            const u32 a1 = sm_w[r + 8][p * 8 + c];
+            const u32 a2 = sm_w[r][p * 8 + c + 4];
+            const u32 a3 = sm_w[r + 8][p * 8 + c + 4];
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+                if (t * 8 < M) mma_bf16(acc[t], a0, a1, a2, a3, ld32(xr[t] + kp), ld32(xr[t] + kp + 8));
+        }
+        __syncwarp();
+    }
+    float* pout = partial + (static_cast<size_t>(ctrl) * SK + sk_id) * M * 64;
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            const int m = t * 8 + 2 * c + (j & 1), n = n0 + r + 8 * (j >> 1);
+            if (m < M && n < 64) pout[static_cast<size_t>(m) * 64 + n] = acc[t][j];
+        }
+}
+
+__global__ void __launch_bounds__(256) k_ink2_msg_gate_down3_reduce(const float* __restrict__ partial, uint16_t* __restrict__ g_bf16, int M, int SK)
+{
+    const size_t mn = static_cast<size_t>(M) * 64;
+    const size_t i = static_cast<size_t>(blockIdx.x) * 256 + threadIdx.x;
+    if (i >= 3 * mn) return;
+    const int ctrl = static_cast<int>(i / mn);
+    const size_t loc = i - static_cast<size_t>(ctrl) * mn;
+    const float* base = partial + static_cast<size_t>(ctrl) * SK * mn + loc;
+    float z = base[0];
+    for (int s = 1; s < SK; ++s) z += base[static_cast<size_t>(s) * mn];
+    g_bf16[i] = bf16(z);
+}
+
+template <int MAX_M>
+__global__ void __launch_bounds__(128) k_ink2_msg_gate_fg_r64_3(const uint16_t* __restrict__ g_bf16, MsgGate3Args a,
+                                                                float* __restrict__ sf_out, float* __restrict__ sm_out,
+                                                                int M, int H)
+{
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int c = blockIdx.x * 4 + warp;
+    if (c >= H) return;
+    const int ctrl = blockIdx.z;
+    const int m0 = blockIdx.y * MAX_M;
+    const int m_rem = min(MAX_M, M - m0);
+    if (m_rem <= 0) return;
+
+    const uint32_t fp = __ldg(reinterpret_cast<const uint32_t*>(a.forget_w[ctrl] + static_cast<size_t>(c) * 64) + lane);
+    const uint32_t gp = __ldg(reinterpret_cast<const uint32_t*>(a.gain_w[ctrl] + static_cast<size_t>(c) * 64) + lane);
+    const float f0 = bf(static_cast<uint16_t>(fp)), f1 = bf(static_cast<uint16_t>(fp >> 16));
+    const float g0w = bf(static_cast<uint16_t>(gp)), g1w = bf(static_cast<uint16_t>(gp >> 16));
+    const uint16_t* g_ctrl = g_bf16 + static_cast<size_t>(ctrl) * M * 64;
+    float* sf_ctrl = sf_out + static_cast<size_t>(ctrl) * M * H;
+    float* sm_ctrl = sm_out + static_cast<size_t>(ctrl) * M * H;
+
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m)
+    {
+        if (m < m_rem)
+        {
+            const uint32_t gpair = __ldg(reinterpret_cast<const uint32_t*>(g_ctrl + static_cast<size_t>(m0 + m) * 64) + lane);
+            const float x0 = bf(static_cast<uint16_t>(gpair));
+            const float x1 = bf(static_cast<uint16_t>(gpair >> 16));
+            float sf = add_rn(mul_rn(f0, x0), mul_rn(f1, x1));
+            float sm_ = add_rn(mul_rn(g0w, x0), mul_rn(g1w, x1));
+            #pragma unroll
+            for (int off_ = 16; off_ > 0; off_ >>= 1)
+            {
+                sf = add_rn(sf, __shfl_xor_sync(0xffffffffu, sf, off_));
+                sm_ = add_rn(sm_, __shfl_xor_sync(0xffffffffu, sm_, off_));
+            }
+            if (lane == 0)
+            {
+                const size_t o = static_cast<size_t>(m0 + m) * H + c;
+                sf_ctrl[o] = sf;
+                sm_ctrl[o] = sm_;
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(NRT) k_ink2_msg_gate_finish_3(MsgGate3Args a, const float* __restrict__ sf_in,
+                                                                const float* __restrict__ sm_in, int M, int H)
+{
+    __shared__ float sm[NRT];
+    const int t = threadIdx.x;
+    const int m = blockIdx.x, ctrl = blockIdx.y;
+    const size_t off = static_cast<size_t>(m) * H;
+    const size_t soff = (static_cast<size_t>(ctrl) * M + m) * H;
+    const float* hf = a.h_f32[ctrl] + off;
+    const float* mf = a.msg_f32[ctrl] + off;
+    const float* sf = sf_in + soff;
+    const float* sm_ = sm_in + soff;
+    const uint16_t* nw = a.norm_w[ctrl];
+    uint16_t* out = a.out_bf16[ctrl] + off;
+    constexpr int MAX_REG = 20;
+    float vals[MAX_REG];
+    const bool in_reg = (H <= NRT * MAX_REG);
+    float ss = 0.0f;
+    int idx = 0;
+    for (int c = t; c < H; c += NRT, ++idx)
+    {
+        const float fg = tanhf(__ldg(sf + c));
+        const float mg = tanhf(__ldg(sm_ + c));
+        const float v = add_rn(mul_rn(add_rn(1.0f, -fg), __ldg(hf + c)), mul_rn(mg, __ldg(mf + c)));
+        if (in_reg) vals[idx] = v;
+        ss = add_rn(ss, mul_rn(v, v));
+    }
+    const float rn = rsq(add_rn(div_rn(blk_sum(ss, sm, NRT), static_cast<float>(H)), RMS_EPS));
+    idx = 0;
+    for (int c = t; c < H; c += NRT, ++idx)
+    {
+        const float v = in_reg ? vals[idx] : add_rn(mul_rn(add_rn(1.0f, -tanhf(__ldg(sf + c))), __ldg(hf + c)), mul_rn(tanhf(__ldg(sm_ + c)), __ldg(mf + c)));
+        out[c] = bf16(mul_rn(bf(__ldg(nw + c)), mul_rn(v, rn)));
+    }
+}
+
+inline void msg_gate_norm_3(const MsgGate3Args& a, uint16_t* cat_bf16, uint16_t* g_bf16,
+                            float* sf_buf, float* sm_buf, int M, int H, cudaStream_t st)
+{
+    k_ink2_msg_gate_prep_3<<<dim3(static_cast<unsigned>(M), 3), NRT, 0, st>>>(a, cat_bf16, M, H);
+    const int K = 2 * H;
+    const int sk = (gemm_c128_enabled() && (K % 64 == 0)) ? pick_splitk(4, K, M, 64) : 1;
+    if (sk > 1 && splitk_buf() != nullptr && static_cast<size_t>(3) * sk * 64 * 64 <= splitk_cap())
+    {
+        float* pbuf = splitk_buf();
+        if (M <= 8) k_ink2_msg_gate_down3_c128_splitk<1><<<dim3(4, 3, static_cast<unsigned>(sk)), 32, 0, st>>>(cat_bf16, a, M, K, sk, pbuf);
+        else if (M <= 16) k_ink2_msg_gate_down3_c128_splitk<2><<<dim3(4, 3, static_cast<unsigned>(sk)), 32, 0, st>>>(cat_bf16, a, M, K, sk, pbuf);
+        else if (M <= 32) k_ink2_msg_gate_down3_c128_splitk<4><<<dim3(4, 3, static_cast<unsigned>(sk)), 32, 0, st>>>(cat_bf16, a, M, K, sk, pbuf);
+        else k_ink2_msg_gate_down3_c128_splitk<8><<<dim3(4, 3, static_cast<unsigned>(sk)), 32, 0, st>>>(cat_bf16, a, M, K, sk, pbuf);
+        k_ink2_msg_gate_down3_reduce<<<cells_grid(static_cast<size_t>(3) * M * 64), 256, 0, st>>>(pbuf, g_bf16, M, sk);
+    }
+    else
+    {
+        for (int c = 0; c < 3; ++c)
+            gemm_bf16(cat_bf16 + static_cast<size_t>(c) * M * K, a.down_w[c], M, K, 64, g_bf16 + static_cast<size_t>(c) * M * 64, st);
+    }
+    const unsigned gx = static_cast<unsigned>((H + 3) / 4);
+    if (M == 1) k_ink2_msg_gate_fg_r64_3<1><<<dim3(gx, 1, 3), 128, 0, st>>>(g_bf16, a, sf_buf, sm_buf, M, H);
+    else if (M <= 4) k_ink2_msg_gate_fg_r64_3<4><<<dim3(gx, 1, 3), 128, 0, st>>>(g_bf16, a, sf_buf, sm_buf, M, H);
+    else if (M <= 8) k_ink2_msg_gate_fg_r64_3<8><<<dim3(gx, 1, 3), 128, 0, st>>>(g_bf16, a, sf_buf, sm_buf, M, H);
+    else if (M <= 16) k_ink2_msg_gate_fg_r64_3<16><<<dim3(gx, 1, 3), 128, 0, st>>>(g_bf16, a, sf_buf, sm_buf, M, H);
+    else k_ink2_msg_gate_fg_r64_3<16><<<dim3(gx, static_cast<unsigned>((M + 15) / 16), 3), 128, 0, st>>>(g_bf16, a, sf_buf, sm_buf, M, H);
+    k_ink2_msg_gate_finish_3<<<dim3(static_cast<unsigned>(M), 3), NRT, 0, st>>>(a, sf_buf, sm_buf, M, H);
+}
+
 inline void msg_gate_norm(const float* h_f32, const float* msg_f32, const uint16_t* down_w, const uint16_t* forget_w,
                           const uint16_t* gain_w, const uint16_t* norm_w, uint16_t* cat_bf16, uint16_t* g_bf16,
-                          uint16_t* out_bf16, int M, int H, int R, cudaStream_t st)
+                          uint16_t* out_bf16, int M, int H, int R, cudaStream_t st, float* sf_buf = nullptr, float* sm_buf = nullptr)
 {
     if (M < 1 || R < 1 || R > LOOP_MAX_RANK || (2 * H) % 16 != 0) throw std::runtime_error("ink2::msg_gate_norm: M, H or R");
     k_ink2_msg_gate_prep<<<M, NRT, 0, st>>>(h_f32, msg_f32, cat_bf16, H);
     gemm_bf16(cat_bf16, down_w, M, 2 * H, R, g_bf16, st);
+    if (R == 64 && H <= 4096)
+    {
+        static const bool prefill_fuse = []() {
+            const char* e = std::getenv("INK2_MSG_PREFILL_FUSE");
+            return (e && e[0] == '1' && e[1] == '\0');
+        }();
+        if (sf_buf == nullptr || sm_buf == nullptr || (M > 64 && prefill_fuse))
+        {
+            k_ink2_msg_gate_apply_norm_r64<<<M, NRT, 0, st>>>(h_f32, msg_f32, g_bf16, forget_w, gain_w, norm_w, out_bf16, H);
+            return;
+        }
+        if (M > 64)
+        {
+            gemm_f32(g_bf16, forget_w, M, R, H, sf_buf, st);
+            gemm_f32(g_bf16, gain_w, M, R, H, sm_buf, st);
+            k_ink2_msg_gate_finish<<<M, NRT, 0, st>>>(h_f32, msg_f32, sf_buf, sm_buf, norm_w, out_bf16, H);
+            return;
+        }
+        const unsigned gx = static_cast<unsigned>((H + 3) / 4);
+        if (M == 1) k_ink2_msg_gate_fg_r64<1><<<dim3(gx, 1), 128, 0, st>>>(g_bf16, forget_w, gain_w, sf_buf, sm_buf, M, H);
+        else if (M <= 4) k_ink2_msg_gate_fg_r64<4><<<dim3(gx, 1), 128, 0, st>>>(g_bf16, forget_w, gain_w, sf_buf, sm_buf, M, H);
+        else if (M <= 8) k_ink2_msg_gate_fg_r64<8><<<dim3(gx, 1), 128, 0, st>>>(g_bf16, forget_w, gain_w, sf_buf, sm_buf, M, H);
+        else if (M <= 16) k_ink2_msg_gate_fg_r64<16><<<dim3(gx, 1), 128, 0, st>>>(g_bf16, forget_w, gain_w, sf_buf, sm_buf, M, H);
+        else k_ink2_msg_gate_fg_r64<16><<<dim3(gx, (M + 15) / 16), 128, 0, st>>>(g_bf16, forget_w, gain_w, sf_buf, sm_buf, M, H);
+        k_ink2_msg_gate_finish<<<M, NRT, 0, st>>>(h_f32, msg_f32, sf_buf, sm_buf, norm_w, out_bf16, H);
+        return;
+    }
     k_ink2_msg_gate_apply_norm<<<M, NRT, 0, st>>>(h_f32, msg_f32, g_bf16, forget_w, gain_w, norm_w, out_bf16, H, R);
 }
 #endif   // __CUDACC__

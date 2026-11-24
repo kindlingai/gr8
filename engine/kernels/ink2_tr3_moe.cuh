@@ -15,6 +15,7 @@
 //   tr3.kmix   [NE] i64          0 when uniform per expert, else 4 bits per fc1 unit (2*b + mat)
 #pragma once
 #include "ink2_moe.cuh"
+#include "../runtime/ink2_prof.cuh"
 #ifdef __CUDACC__
 #include <cuda_fp16.h>
 #endif
@@ -239,7 +240,878 @@ struct Tr3Args
     void* ypart;              // [max_tiles * 8][H] fp32 (or BF16 if y_bf16)
     uint16_t* out;            // [M][H] BF16
     int H, eb, M, TK, y_bf16;
+    // Optional Wave 3 factorized + wide-load fields (null/0 = fallback to stock)
+    const __half* sg;         // [2][H] (in, out signs)
+    const __half* v1b;        // [nblk][2][HB]
+    const __half* v3b;        // [nblk][HB]
+    __half* x_had;            // [M][H] f16 pre-rotated H128(x * sg_in)
+    int wide;                 // 1 if fc1/fc2 widened in-place
 };
+
+// ---------------------------------------------------------------------------------------------- Wave 3: wide-load helpers & boot setup
+__device__ __forceinline__ u64 ld_nc64_tr3(const void* p)
+{
+    u64 v;
+    asm volatile("ld.global.nc.u64 %0, [%1];" : "=l"(v) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ uint4 ld_nc128_tr3(const void* p)
+{
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
+template <int BITS>
+__device__ __forceinline__ u32 trw_chunk_rt(const u64 (&w)[3], int p)
+{
+    constexpr int CB = 8 * BITS;
+    const int bit = CB * p, n = bit >> 6, sh = bit & 63;
+    u64 v = w[n] >> sh;
+    if constexpr (CB > 16)
+        if (sh > 64 - CB) v |= w[n + 1] << (64 - sh);
+    return static_cast<u32>(v) & static_cast<u32>((1ull << CB) - 1);
+}
+
+template <int BITS>
+__device__ __forceinline__ u32 trw_tile_chunk_rt(const uint8_t* tile, int lane)
+{
+    constexpr int CB = 8 * BITS, NW = 8 * BITS;
+    const int bit = lane * CB, wi = bit >> 5, off = bit & 31;
+    const u32* t = reinterpret_cast<const u32*>(tile);
+    const u64 m = (static_cast<u64>(t[wi]) << 32) | t[wi + 1 < NW ? wi + 1 : NW - 1];
+    return static_cast<u32>(m >> (64 - off - CB)) & static_cast<u32>((1ull << CB) - 1);
+}
+
+template <int BITS>
+__device__ __forceinline__ void trw_pack_rt(u64 (&v)[3], int p, u32 chunk)
+{
+    constexpr int CB = 8 * BITS;
+    const int bit = CB * p, n = bit >> 6, sh = bit & 63;
+    v[n] |= static_cast<u64>(chunk) << sh;
+    if constexpr (CB > 16)
+        if (sh > 64 - CB) v[n + 1] |= static_cast<u64>(chunk) >> (64 - sh);
+}
+
+template <int BITS>
+__device__ __forceinline__ void decode_pmcgx_m(u64 m, int s, u32 (&f0)[2], u32 (&f1)[2])
+{
+    u32 w[4];
+    #pragma unroll
+    for (int p = 0; p < 4; ++p) w[p] = static_cast<u32>(m >> (s - BITS * (2 * p + 1))) & 0xfffffu;
+    f0[0] = cb_pmcgx(w[0]);
+    f0[1] = cb_pmcgx(w[1]);
+    f1[0] = cb_pmcgx(w[2]);
+    f1[1] = cb_pmcgx(w[3]);
+}
+
+// In-place widen FC1 for runtime H (HB = H / 128). Run EXACTLY ONCE per physical layer!
+__global__ void __launch_bounds__(256) k_ink2_tr3_widen_fc1(uint8_t* fc1, const long long* tab, const long long* kmix, int eb, int H)
+{
+    const int HB = H / 128;
+    const int lane = threadIdx.x & 31, j = threadIdx.x >> 5;
+    const int hb = blockIdx.x % HB;
+    const int bm = (blockIdx.x / HB) % (2 * eb);
+    const int e = blockIdx.x / (HB * 2 * eb);
+    const long long* tr = tab + static_cast<size_t>(e) * 6;
+    if (bm >= 2 * static_cast<int>(tr[3])) return;
+    const uint8_t* mw_c = nullptr;
+    const int k = fc1_unit(fc1, kmix, e, tr, bm, H, mw_c);
+    uint8_t* grp = const_cast<uint8_t*>(mw_c) + static_cast<size_t>(hb) * (2048 * k);
+    if (k == 3)
+    {
+        u64 v[3] = {0, 0, 0};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) trw_pack_rt<3>(v, p, trw_tile_chunk_rt<3>(grp + (p * 8 + j) * 96, lane));
+        __syncthreads();
+        #pragma unroll
+        for (int n = 0; n < 3; ++n) *reinterpret_cast<u64*>(grp + (n * 8 + j) * 256 + lane * 8) = v[n];
+    }
+    else if (k == 2)
+    {
+        u64 v[3] = {0, 0, 0};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) trw_pack_rt<2>(v, p, trw_tile_chunk_rt<2>(grp + (p * 8 + j) * 64, lane));
+        __syncthreads();
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) *reinterpret_cast<u64*>(grp + (n * 8 + j) * 256 + lane * 8) = v[n];
+    }
+    else if (k == 4)
+    {
+        u32 w[8];
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) w[p] = *reinterpret_cast<const u32*>(grp + (p * 8 + j) * 128 + lane * 4);
+        __syncthreads();
+        *reinterpret_cast<uint4*>(grp + j * 1024 + lane * 16) = make_uint4(w[0], w[1], w[2], w[3]);
+        *reinterpret_cast<uint4*>(grp + j * 1024 + 512 + lane * 16) = make_uint4(w[4], w[5], w[6], w[7]);
+    }
+}
+
+// In-place widen FC2 for runtime H (HB = H / 128). Run EXACTLY ONCE per physical layer!
+__global__ void __launch_bounds__(256) k_ink2_tr3_widen_fc2(uint8_t* fc2, const long long* tab, int eb, int H)
+{
+    const int HB = H / 128;
+    const int lane = threadIdx.x & 31, j = threadIdx.x >> 5;
+    const int hb = blockIdx.x % HB;
+    const int b = (blockIdx.x / HB) % eb;
+    const int e = blockIdx.x / (HB * eb);
+    const long long* tr = tab + static_cast<size_t>(e) * 6;
+    if (b >= static_cast<int>(tr[3])) return;
+    const int k = static_cast<int>(tr[4]);
+    const int n_tile = hb * 8 + j;
+    uint8_t* nt = const_cast<uint8_t*>(fc2_block(fc2, tr, b, k, H)) + static_cast<size_t>(n_tile) * (256 * k);
+    if (k == 3)
+    {
+        u64 v[3] = {0, 0, 0};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) trw_pack_rt<3>(v, p, trw_tile_chunk_rt<3>(nt + p * 96, lane));
+        __syncwarp();
+        #pragma unroll
+        for (int n = 0; n < 3; ++n) *reinterpret_cast<u64*>(nt + n * 256 + lane * 8) = v[n];
+    }
+    else if (k == 2)
+    {
+        u64 v[3] = {0, 0, 0};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) trw_pack_rt<2>(v, p, trw_tile_chunk_rt<2>(nt + p * 64, lane));
+        __syncwarp();
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) *reinterpret_cast<u64*>(nt + n * 256 + lane * 8) = v[n];
+    }
+    else if (k == 4)
+    {
+        u32 w[8];
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) w[p] = *reinterpret_cast<const u32*>(nt + p * 128 + lane * 4);
+        __syncwarp();
+        *reinterpret_cast<uint4*>(nt + lane * 16) = make_uint4(w[0], w[1], w[2], w[3]);
+        *reinterpret_cast<uint4*>(nt + 512 + lane * 16) = make_uint4(w[4], w[5], w[6], w[7]);
+    }
+}
+
+// Extract sg[2][H] from v1/v3 (first non-zero row per channel). Grid: ceil(H / 256), Block: 256.
+__global__ void k_ink2_tr3_extract_sg(const __half* v1, const __half* v3, __half* sg, int nblk, int H)
+{
+    const int c = blockIdx.x * 256 + threadIdx.x;
+    if (c >= H) return;
+    uint16_t s_in = 0x3c00u;   // +1.0h
+    for (int r = 0; r < nblk * 2; ++r)
+    {
+        const uint16_t u = __half_as_ushort(v1[static_cast<size_t>(r) * H + c]);
+        if ((u & 0x7fffu) != 0)
+        {
+            s_in = (u & 0x8000u) ? 0xbc00u : 0x3c00u;
+            break;
+        }
+    }
+    uint16_t s_out = 0x3c00u;
+    for (int r = 0; r < nblk; ++r)
+    {
+        const uint16_t u = __half_as_ushort(v3[static_cast<size_t>(r) * H + c]);
+        if ((u & 0x7fffu) != 0)
+        {
+            s_out = (u & 0x8000u) ? 0xbc00u : 0x3c00u;
+            break;
+        }
+    }
+    sg[c] = __ushort_as_half(s_in);
+    sg[H + c] = __ushort_as_half(s_out);
+}
+
+// Extract v1b[nblk][2][HB], v3b[nblk][HB] and bit-exact verify every cell of v1 and v3!
+__global__ void k_ink2_tr3_extract_verify_bs(const __half* v1, const __half* v3, const __half* sg,
+                                             __half* v1b, __half* v3b, int* d_ok, int nblk, int H)
+{
+    const int HB = H / 128;
+    const int idx = blockIdx.x;
+    const int hb = idx % HB;
+    const int brow = idx / HB;
+    if (brow >= nblk) return;
+    const int c = hb * 128 + threadIdx.x;
+    const uint16_t sin_neg = __half_as_ushort(sg[c]) & 0x8000u;
+    const uint16_t sout_neg = __half_as_ushort(sg[H + c]) & 0x8000u;
+    const uint16_t sin0_neg = __half_as_ushort(sg[hb * 128]) & 0x8000u;
+    const uint16_t sout0_neg = __half_as_ushort(sg[H + hb * 128]) & 0x8000u;
+
+    for (int mat = 0; mat < 2; ++mat)
+    {
+        const size_t row = static_cast<size_t>(brow) * 2 + mat;
+        const uint16_t b0 = __half_as_ushort(v1[row * H + hb * 128]) ^ sin0_neg;
+        if (threadIdx.x == 0) v1b[row * HB + hb] = __ushort_as_half(b0);
+        const uint16_t got = __half_as_ushort(v1[row * H + c]);
+        const uint16_t exp = b0 ^ sin_neg;
+        if (got != exp && !(((got & 0x7fffu) == 0) && ((exp & 0x7fffu) == 0))) atomicAnd(d_ok, 0);
+    }
+    const uint16_t b3 = __half_as_ushort(v3[static_cast<size_t>(brow) * H + hb * 128]) ^ sout0_neg;
+    if (threadIdx.x == 0) v3b[static_cast<size_t>(brow) * HB + hb] = __ushort_as_half(b3);
+    const uint16_t got3 = __half_as_ushort(v3[static_cast<size_t>(brow) * H + c]);
+    const uint16_t exp3 = b3 ^ sout_neg;
+    if (got3 != exp3 && !(((got3 & 0x7fffu) == 0) && ((exp3 & 0x7fffu) == 0))) atomicAnd(d_ok, 0);
+}
+
+// Pre-rotate H128(x * sg_in) ONCE per token. Grid: M * HB, Block: 32.
+__global__ void __launch_bounds__(32) k_ink2_tr3_prerot_x(const uint16_t* __restrict__ x, const __half* __restrict__ sg_in,
+                                                          __half* __restrict__ x_had, int M, int H)
+{
+    const int HB = H / 128;
+    const int hb = blockIdx.x % HB;
+    const int m = blockIdx.x / HB;
+    if (m >= M) return;
+    const int lane = threadIdx.x;
+    const size_t off = static_cast<size_t>(m) * H + hb * 128 + lane * 4;
+    const uint2 xv = *reinterpret_cast<const uint2*>(x + off);
+    const uint2 sv = *reinterpret_cast<const uint2*>(sg_in + hb * 128 + lane * 4);
+    const float2 s0 = __half22float2(*reinterpret_cast<const __half2*>(&sv.x));
+    const float2 s1 = __half22float2(*reinterpret_cast<const __half2*>(&sv.y));
+    float v[4] = {
+        bf(static_cast<uint16_t>(xv.x)) * s0.x,
+        bf(static_cast<uint16_t>(xv.x >> 16)) * s0.y,
+        bf(static_cast<uint16_t>(xv.y)) * s1.x,
+        bf(static_cast<uint16_t>(xv.y >> 16)) * s1.y,
+    };
+    had128(v, lane);
+    uint2 ov;
+    *reinterpret_cast<__half2*>(&ov.x) = __floats2half2_rn(v[0], v[1]);
+    *reinterpret_cast<__half2*>(&ov.y) = __floats2half2_rn(v[2], v[3]);
+    *reinterpret_cast<uint2*>(x_had + off) = ov;
+}
+
+template <int BITS, int NT>
+__device__ __forceinline__ void pmcgx_fc1_hb_wide(const uint8_t* mw, int hb, int warp, int lane,
+                                                  const __half (&x_rot)[NT * 8][136], const int (&masks)[NT], int nt_here,
+                                                  float (&c)[NT][4])
+{
+    const int row0 = lane >> 2, col = lane & 3;
+    const int prev_lane = (lane + 31) & 31;
+    if constexpr (BITS == 4)
+    {
+        const uint8_t* wg = mw + static_cast<size_t>(hb) * 8192 + warp * 1024 + lane * 16;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            const uint4 wh = ld_nc128_tr3(wg + h * 512);
+            const u32 w[4] = {wh.x, wh.y, wh.z, wh.w};
+            #pragma unroll
+            for (int p = 0; p < 4; ++p)
+            {
+                const u32 ch = w[p];
+                const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+                u32 f0[2], f1[2];
+                decode_pmcgx_m<4>((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
+                const int kp = h * 4 + p;
+                #pragma unroll
+                for (int t = 0; t < NT; ++t)
+                {
+                    if (t < nt_here)
+                    {
+                        const bool act = ((masks[t] >> row0) & 1) != 0;
+                        const __half* xr = x_rot[t * 8 + row0] + kp * 16 + 2 * col;
+                        const u32 b0 = act ? *reinterpret_cast<const u32*>(xr) : 0u;
+                        const u32 b1 = act ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
+                        mma16816_f16(c[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        const uint8_t* wg = mw + static_cast<size_t>(hb) * (2048 * BITS) + warp * 256 + lane * 8;
+        u64 w[3] = {0, 0, 0};
+        #pragma unroll
+        for (int n = 0; n < BITS; ++n) w[n] = ld_nc64_tr3(wg + n * 2048);
+        #pragma unroll
+        for (int p = 0; p < 8; ++p)
+        {
+            const u32 ch = trw_chunk_rt<BITS>(w, p);
+            const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            u32 f0[2], f1[2];
+            decode_pmcgx_m<BITS>((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                if (t < nt_here)
+                {
+                    const bool act = ((masks[t] >> row0) & 1) != 0;
+                    const __half* xr = x_rot[t * 8 + row0] + p * 16 + 2 * col;
+                    const u32 b0 = act ? *reinterpret_cast<const u32*>(xr) : 0u;
+                    const u32 b1 = act ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
+                    mma16816_f16(c[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
+                }
+            }
+        }
+    }
+}
+
+template <int BITS, int NT>
+__device__ __forceinline__ void pmcgx_fc2_ntile_wide(const uint8_t* mw, int n_tile, int lane,
+                                                     const __half* x2_b_base, const int (&masks)[NT], int nt_here,
+                                                     float (&c)[NT][4])
+{
+    const int row0 = lane >> 2, col = lane & 3;
+    const int prev_lane = (lane + 31) & 31;
+    if constexpr (BITS == 4)
+    {
+        const uint8_t* wg = mw + static_cast<size_t>(n_tile) * 1024 + lane * 16;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            const uint4 wh = ld_nc128_tr3(wg + h * 512);
+            const u32 w[4] = {wh.x, wh.y, wh.z, wh.w};
+            #pragma unroll
+            for (int p = 0; p < 4; ++p)
+            {
+                const u32 ch = w[p];
+                const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+                u32 f0[2], f1[2];
+                decode_pmcgx_m<4>((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
+                const int ks = h * 4 + p;
+                #pragma unroll
+                for (int t = 0; t < NT; ++t)
+                {
+                    if (t < nt_here)
+                    {
+                        const bool act = ((masks[t] >> row0) & 1) != 0;
+                        const __half* xr = x2_b_base + (t * 8 + row0) * 136 + ks * 16 + 2 * col;
+                        const u32 b0 = act ? *reinterpret_cast<const u32*>(xr) : 0u;
+                        const u32 b1 = act ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
+                        mma16816_f16(c[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        const uint8_t* wg = mw + static_cast<size_t>(n_tile) * (256 * BITS) + lane * 8;
+        u64 w[3] = {0, 0, 0};
+        #pragma unroll
+        for (int n = 0; n < BITS; ++n) w[n] = ld_nc64_tr3(wg + n * 256);
+        #pragma unroll
+        for (int p = 0; p < 8; ++p)
+        {
+            const u32 ch = trw_chunk_rt<BITS>(w, p);
+            const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            u32 f0[2], f1[2];
+            decode_pmcgx_m<BITS>((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                if (t < nt_here)
+                {
+                    const bool act = ((masks[t] >> row0) & 1) != 0;
+                    const __half* xr = x2_b_base + (t * 8 + row0) * 136 + p * 16 + 2 * col;
+                    const u32 b0 = act ? *reinterpret_cast<const u32*>(xr) : 0u;
+                    const u32 b1 = act ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
+                    mma16816_f16(c[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
+                }
+            }
+        }
+    }
+}
+
+// Wide-load multi-tile PMCGX FC1 using pre-rotated x_had and block scales v1b.
+// Grid: (slots, eb), Block: 256 (8 warps). Processes NT * 8 tokens per trellis weight decode!
+template <int NT>
+__global__ void __launch_bounds__(256) k_ink2_tr3_fc1_wide(Tr3Args a)
+{
+    const int slot = blockIdx.x, b = blockIdx.y;
+    if (slot >= a.plan.counts[0]) return;
+    const int e = a.plan.slot_expert[slot];
+    const long long* tr = a.table + static_cast<size_t>(e) * 6;
+    if (b >= static_cast<int>(tr[3])) return;
+    const int tile0 = a.plan.slot_tile0[slot], nt = a.plan.slot_nt[slot];
+    const size_t brow = static_cast<size_t>(tr[2]) + b;
+    const int HB = a.H / 128;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row0 = lane >> 2, col = lane & 3;
+
+    const uint8_t *mw0 = nullptr, *mw1 = nullptr;
+    const int bits0 = fc1_unit(a.fc1, a.kmix, e, tr, 2 * b + 0, a.H, mw0);
+    const int bits1 = fc1_unit(a.fc1, a.kmix, e, tr, 2 * b + 1, a.H, mw1);
+
+    __shared__ __half x_rot[NT * 8][136];
+
+    for (int tg = 0; tg < nt; tg += NT)
+    {
+        const int nt_here = min(NT, nt - tg);
+        int masks[NT];
+        int w_tok[NT];
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            if (t < nt_here)
+            {
+                const int tile = tile0 + tg + t;
+                masks[t] = a.plan.tile_mask[tile];
+                w_tok[t] = ((masks[t] >> warp) & 1) ? a.plan.tile_tok[tile * 8 + warp] : 0;
+            }
+            else
+            {
+                masks[t] = 0;
+                w_tok[t] = 0;
+            }
+        }
+
+        // Pass 0: GATE -> transpose through x_rot -> had128 * sg -> stage in a.a_rot (halves static smem!)
+        {
+            float c[NT][4];
+            #pragma unroll
+            for (int t = 0; t < NT; ++t) c[t][0] = c[t][1] = c[t][2] = c[t][3] = 0.f;
+            for (int hb = 0; hb < HB; ++hb)
+            {
+                const __half2 bsh = __half2half2(a.v1b[(brow * 2 + 0) * HB + hb]);
+                #pragma unroll
+                for (int t = 0; t < NT; ++t)
+                {
+                    if (t < nt_here && ((masks[t] >> warp) & 1))
+                    {
+                        const uint2 xv = *reinterpret_cast<const uint2*>(a.x_had + static_cast<size_t>(w_tok[t]) * a.H + hb * 128 + lane * 4);
+                        uint2 ov;
+                        *reinterpret_cast<__half2*>(&ov.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsh);
+                        *reinterpret_cast<__half2*>(&ov.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsh);
+                        *reinterpret_cast<uint2*>(x_rot[t * 8 + warp] + lane * 4) = ov;
+                    }
+                }
+                __syncthreads();
+                if (bits0 == 3) pmcgx_fc1_hb_wide<3, NT>(mw0, hb, warp, lane, x_rot, masks, nt_here, c);
+                else if (bits0 == 4) pmcgx_fc1_hb_wide<4, NT>(mw0, hb, warp, lane, x_rot, masks, nt_here, c);
+                else pmcgx_fc1_hb_wide<2, NT>(mw0, hb, warp, lane, x_rot, masks, nt_here, c);
+                __syncthreads();
+            }
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                if (t < nt_here)
+                {
+                    const int t0 = 2 * col, t1 = 2 * col + 1;
+                    if ((masks[t] >> t0) & 1)
+                    {
+                        x_rot[t * 8 + t0][warp * 16 + row0] = __float2half_rn(c[t][0]);
+                        x_rot[t * 8 + t0][warp * 16 + row0 + 8] = __float2half_rn(c[t][2]);
+                    }
+                    if ((masks[t] >> t1) & 1)
+                    {
+                        x_rot[t * 8 + t1][warp * 16 + row0] = __float2half_rn(c[t][1]);
+                        x_rot[t * 8 + t1][warp * 16 + row0 + 8] = __float2half_rn(c[t][3]);
+                    }
+                }
+            }
+            __syncthreads();
+            const uint2 sgv = *reinterpret_cast<const uint2*>(a.v2 + (brow * 3 + 0) * 128 + lane * 4);
+            const float2 sg0 = __half22float2(*reinterpret_cast<const __half2*>(&sgv.x));
+            const float2 sg1 = __half22float2(*reinterpret_cast<const __half2*>(&sgv.y));
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                if (t < nt_here && ((masks[t] >> warp) & 1))
+                {
+                    const uint2 yv = *reinterpret_cast<const uint2*>(x_rot[t * 8 + warp] + lane * 4);
+                    const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&yv.x));
+                    const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&yv.y));
+                    float vg[4] = {f0.x, f0.y, f1.x, f1.y};
+                    had128(vg, lane);
+                    uint2 ov;
+                    *reinterpret_cast<__half2*>(&ov.x) = __floats2half2_rn(vg[0] * sg0.x, vg[1] * sg0.y);
+                    *reinterpret_cast<__half2*>(&ov.y) = __floats2half2_rn(vg[2] * sg1.x, vg[3] * sg1.y);
+                    const int tile = tile0 + tg + t;
+                    __half* dst = a.a_rot + (static_cast<size_t>(tile * 8 + warp) * a.eb + b) * 128 + lane * 4;
+                    *reinterpret_cast<uint2*>(dst) = ov;
+                }
+            }
+            __syncthreads();
+        }
+
+        // Pass 1: UP + softcapped SwiGLU + suh_d -> had128 -> a_rot
+        {
+            float c[NT][4];
+            #pragma unroll
+            for (int t = 0; t < NT; ++t) c[t][0] = c[t][1] = c[t][2] = c[t][3] = 0.f;
+            for (int hb = 0; hb < HB; ++hb)
+            {
+                const __half2 bsh = __half2half2(a.v1b[(brow * 2 + 1) * HB + hb]);
+                #pragma unroll
+                for (int t = 0; t < NT; ++t)
+                {
+                    if (t < nt_here && ((masks[t] >> warp) & 1))
+                    {
+                        const uint2 xv = *reinterpret_cast<const uint2*>(a.x_had + static_cast<size_t>(w_tok[t]) * a.H + hb * 128 + lane * 4);
+                        uint2 ov;
+                        *reinterpret_cast<__half2*>(&ov.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsh);
+                        *reinterpret_cast<__half2*>(&ov.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsh);
+                        *reinterpret_cast<uint2*>(x_rot[t * 8 + warp] + lane * 4) = ov;
+                    }
+                }
+                __syncthreads();
+                if (bits1 == 3) pmcgx_fc1_hb_wide<3, NT>(mw1, hb, warp, lane, x_rot, masks, nt_here, c);
+                else if (bits1 == 4) pmcgx_fc1_hb_wide<4, NT>(mw1, hb, warp, lane, x_rot, masks, nt_here, c);
+                else pmcgx_fc1_hb_wide<2, NT>(mw1, hb, warp, lane, x_rot, masks, nt_here, c);
+                __syncthreads();
+            }
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                if (t < nt_here)
+                {
+                    const int t0 = 2 * col, t1 = 2 * col + 1;
+                    if ((masks[t] >> t0) & 1)
+                    {
+                        x_rot[t * 8 + t0][warp * 16 + row0] = __float2half_rn(c[t][0]);
+                        x_rot[t * 8 + t0][warp * 16 + row0 + 8] = __float2half_rn(c[t][2]);
+                    }
+                    if ((masks[t] >> t1) & 1)
+                    {
+                        x_rot[t * 8 + t1][warp * 16 + row0] = __float2half_rn(c[t][1]);
+                        x_rot[t * 8 + t1][warp * 16 + row0 + 8] = __float2half_rn(c[t][3]);
+                    }
+                }
+            }
+            __syncthreads();
+            const uint2 suv = *reinterpret_cast<const uint2*>(a.v2 + (brow * 3 + 1) * 128 + lane * 4);
+            const uint2 sdv = *reinterpret_cast<const uint2*>(a.v2 + (brow * 3 + 2) * 128 + lane * 4);
+            const float2 su0 = __half22float2(*reinterpret_cast<const __half2*>(&suv.x));
+            const float2 su1 = __half22float2(*reinterpret_cast<const __half2*>(&suv.y));
+            const float2 sd0 = __half22float2(*reinterpret_cast<const __half2*>(&sdv.x));
+            const float2 sd1 = __half22float2(*reinterpret_cast<const __half2*>(&sdv.y));
+            const float su[4] = {su0.x, su0.y, su1.x, su1.y};
+            const float sd[4] = {sd0.x, sd0.y, sd1.x, sd1.y};
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                if (t < nt_here && ((masks[t] >> warp) & 1))
+                {
+                    const uint2 uv = *reinterpret_cast<const uint2*>(x_rot[t * 8 + warp] + lane * 4);
+                    const float2 uf0 = __half22float2(*reinterpret_cast<const __half2*>(&uv.x));
+                    const float2 uf1 = __half22float2(*reinterpret_cast<const __half2*>(&uv.y));
+                    float vu[4] = {uf0.x, uf0.y, uf1.x, uf1.y};
+                    had128(vu, lane);
+                    const int tile = tile0 + tg + t;
+                    __half* dst = a.a_rot + (static_cast<size_t>(tile * 8 + warp) * a.eb + b) * 128 + lane * 4;
+                    const uint2 gv = *reinterpret_cast<const uint2*>(dst);
+                    const float2 gf0 = __half22float2(*reinterpret_cast<const __half2*>(&gv.x));
+                    const float2 gf1 = __half22float2(*reinterpret_cast<const __half2*>(&gv.y));
+                    const float g_arr[4] = {gf0.x, gf0.y, gf1.x, gf1.y};
+                    float va[4];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        const float u = rnd_h(vu[i] * su[i]);
+                        const float act = bf(static_cast<uint16_t>(swiglu(g_arr[i], u)));
+                        va[i] = act * sd[i];
+                    }
+                    had128(va, lane);
+                    uint2 ov;
+                    *reinterpret_cast<__half2*>(&ov.x) = __floats2half2_rn(va[0], va[1]);
+                    *reinterpret_cast<__half2*>(&ov.y) = __floats2half2_rn(va[2], va[3]);
+                    *reinterpret_cast<uint2*>(dst) = ov;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Wide-load fused-b multi-HB PMCGX FC2 using dynamic smem for a_rot [nb][NT*8][136].
+// Grid: (slots, ceil(HB / HB_PER_CTA)), Block: 256 (8 warps).
+// Accumulates all b=0..nb-1 in Hadamard space BEFORE a SINGLE had128 (9x fewer had128, 0 barriers in b-loop)!
+template <int NT, int HB_PER_CTA>
+__global__ void __launch_bounds__(256) k_ink2_tr3_fc2_wide_mhb(Tr3Args a)
+{
+    const int slot = blockIdx.x, hbg = blockIdx.y;
+    if (slot >= a.plan.counts[0]) return;
+    const int HB = a.H / 128;
+    const int hb0 = hbg * HB_PER_CTA;
+    if (hb0 >= HB) return;
+    const int e = a.plan.slot_expert[slot];
+    const long long* tr = a.table + static_cast<size_t>(e) * 6;
+    const int nb = static_cast<int>(tr[3]);
+    const int bits = static_cast<int>(tr[4]);
+    const int tile0 = a.plan.slot_tile0[slot], nt = a.plan.slot_nt[slot];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row0 = lane >> 2, col = lane & 3;
+
+    extern __shared__ __half x2_dyn[];   // [nb][NT * 8][136]
+    __shared__ float y_raw[8][128];
+
+    for (int tg = 0; tg < nt; tg += NT)
+    {
+        const int nt_here = min(NT, nt - tg);
+        int masks[NT];
+        float rws[NT];
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            if (t < nt_here)
+            {
+                const int tile = tile0 + tg + t;
+                masks[t] = a.plan.tile_mask[tile];
+                rws[t] = ((masks[t] >> warp) & 1) ? a.plan.tile_w[tile * 8 + warp] : 0.f;
+            }
+            else
+            {
+                masks[t] = 0;
+                rws[t] = 0.f;
+            }
+        }
+
+        // Preload ALL nb blocks of a_rot for this tile-group into dynamic smem ONCE!
+        for (int b = 0; b < nb; ++b)
+        {
+            __half* xb = x2_dyn + static_cast<size_t>(b) * (NT * 8 * 136);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                if (t < nt_here && ((masks[t] >> warp) & 1))
+                {
+                    const int tile = tile0 + tg + t;
+                    const __half* src = a.a_rot + (static_cast<size_t>(tile * 8 + warp) * a.eb + b) * 128 + lane * 4;
+                    *reinterpret_cast<uint2*>(xb + (t * 8 + warp) * 136 + lane * 4) = *reinterpret_cast<const uint2*>(src);
+                }
+            }
+        }
+        __syncthreads();
+
+        for (int hi = 0; hi < HB_PER_CTA; ++hi)
+        {
+            const int hb = hb0 + hi;
+            if (hb >= HB) break;
+            const int n_tile = hb * 8 + warp;
+
+            float c_tot[NT][4];
+            #pragma unroll
+            for (int t = 0; t < NT; ++t) c_tot[t][0] = c_tot[t][1] = c_tot[t][2] = c_tot[t][3] = 0.f;
+
+            for (int b = 0; b < nb; ++b)
+            {
+                const uint8_t* mw = fc2_block(a.fc2, tr, b, bits, a.H);
+                const __half* xb = x2_dyn + static_cast<size_t>(b) * (NT * 8 * 136);
+                float cb[NT][4];
+                #pragma unroll
+                for (int t = 0; t < NT; ++t) cb[t][0] = cb[t][1] = cb[t][2] = cb[t][3] = 0.f;
+                if (bits == 3) pmcgx_fc2_ntile_wide<3, NT>(mw, n_tile, lane, xb, masks, nt_here, cb);
+                else if (bits == 4) pmcgx_fc2_ntile_wide<4, NT>(mw, n_tile, lane, xb, masks, nt_here, cb);
+                else pmcgx_fc2_ntile_wide<2, NT>(mw, n_tile, lane, xb, masks, nt_here, cb);
+                const size_t brow = static_cast<size_t>(tr[2]) + b;
+                const float bscale = __half2float(a.v3b[brow * HB + hb]);
+                #pragma unroll
+                for (int t = 0; t < NT; ++t)
+                {
+                    if (t < nt_here)
+                    {
+                        c_tot[t][0] = fmaf(rnd_h(cb[t][0]), bscale, c_tot[t][0]);
+                        c_tot[t][1] = fmaf(rnd_h(cb[t][1]), bscale, c_tot[t][1]);
+                        c_tot[t][2] = fmaf(rnd_h(cb[t][2]), bscale, c_tot[t][2]);
+                        c_tot[t][3] = fmaf(rnd_h(cb[t][3]), bscale, c_tot[t][3]);
+                    }
+                }
+            }
+
+            const uint2 sv = *reinterpret_cast<const uint2*>(a.sg + a.H + hb * 128 + lane * 4);
+            const float2 sf0 = __half22float2(*reinterpret_cast<const __half2*>(&sv.x));
+            const float2 sf1 = __half22float2(*reinterpret_cast<const __half2*>(&sv.y));
+            const float sg_v[4] = {sf0.x, sf0.y, sf1.x, sf1.y};
+
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                if (t < nt_here)
+                {
+                    const int t0 = 2 * col, t1 = 2 * col + 1;
+                    if ((masks[t] >> t0) & 1)
+                    {
+                        y_raw[t0][warp * 16 + row0] = c_tot[t][0];
+                        y_raw[t0][warp * 16 + row0 + 8] = c_tot[t][2];
+                    }
+                    if ((masks[t] >> t1) & 1)
+                    {
+                        y_raw[t1][warp * 16 + row0] = c_tot[t][1];
+                        y_raw[t1][warp * 16 + row0 + 8] = c_tot[t][3];
+                    }
+                    __syncthreads();
+
+                    if ((masks[t] >> warp) & 1)
+                    {
+                        float v[4];
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) v[i] = y_raw[warp][lane * 4 + i];
+                        had128(v, lane);
+                        const float rw = rws[t];
+                        const int tile = tile0 + tg + t;
+                        const size_t o = static_cast<size_t>(tile * 8 + warp) * a.H + hb * 128 + lane * 4;
+                        if (a.y_bf16)
+                        {
+                            uint16_t* dst = static_cast<uint16_t*>(a.ypart) + o;
+                            #pragma unroll
+                            for (int i = 0; i < 4; ++i) dst[i] = static_cast<uint16_t>(nv4::bf16_rne(rw * (v[i] * sg_v[i])));
+                        }
+                        else
+                        {
+                            *reinterpret_cast<float4*>(static_cast<float*>(a.ypart) + o) =
+                                make_float4(rw * (v[0] * sg_v[0]), rw * (v[1] * sg_v[1]), rw * (v[2] * sg_v[2]), rw * (v[3] * sg_v[3]));
+                        }
+                    }
+                    __syncthreads();
+                }
+            }
+        }
+    }
+}
+
+// High-occupancy streamed PMCGX FC2 for large M (prefill): loads 1 block b of a_rot into small static smem
+// x2_sm[NT*8][136] (12.8KB for NT=4, 21.5KB for NT=8 -> 3-4x higher occupancy than 82KB dynamic smem,
+// zero cudaFuncSetAttribute, and 2x fewer trellis weight decodes at M>=384!). 100% bit-identical to fc2_wide_mhb.
+template <int NT>
+__global__ void __launch_bounds__(256) k_ink2_tr3_fc2_wide_stream(Tr3Args a)
+{
+    const int slot = blockIdx.x, hb = blockIdx.y;
+    if (slot >= a.plan.counts[0]) return;
+    const int HB = a.H / 128;
+    if (hb >= HB) return;
+    const int e = a.plan.slot_expert[slot];
+    const long long* tr = a.table + static_cast<size_t>(e) * 6;
+    const int nb = static_cast<int>(tr[3]);
+    const int bits = static_cast<int>(tr[4]);
+    const int tile0 = a.plan.slot_tile0[slot], nt = a.plan.slot_nt[slot];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row0 = lane >> 2, col = lane & 3;
+    const int n_tile = hb * 8 + warp;
+
+    __shared__ __half x2_sm[NT * 8][136];
+    __shared__ float y_raw[8][128];
+
+    const uint2 sv = *reinterpret_cast<const uint2*>(a.sg + a.H + hb * 128 + lane * 4);
+    const float2 sf0 = __half22float2(*reinterpret_cast<const __half2*>(&sv.x));
+    const float2 sf1 = __half22float2(*reinterpret_cast<const __half2*>(&sv.y));
+    const float sg_v[4] = {sf0.x, sf0.y, sf1.x, sf1.y};
+
+    for (int tg = 0; tg < nt; tg += NT)
+    {
+        const int nt_here = min(NT, nt - tg);
+        int masks[NT];
+        float rws[NT];
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            if (t < nt_here)
+            {
+                const int tile = tile0 + tg + t;
+                masks[t] = a.plan.tile_mask[tile];
+                rws[t] = ((masks[t] >> warp) & 1) ? a.plan.tile_w[tile * 8 + warp] : 0.f;
+            }
+            else
+            {
+                masks[t] = 0;
+                rws[t] = 0.f;
+            }
+        }
+
+        float c_tot[NT][4];
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) c_tot[t][0] = c_tot[t][1] = c_tot[t][2] = c_tot[t][3] = 0.f;
+
+        for (int b = 0; b < nb; ++b)
+        {
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                if (t < nt_here && ((masks[t] >> warp) & 1))
+                {
+                    const int tile = tile0 + tg + t;
+                    const __half* src = a.a_rot + (static_cast<size_t>(tile * 8 + warp) * a.eb + b) * 128 + lane * 4;
+                    *reinterpret_cast<uint2*>(x2_sm[t * 8 + warp] + lane * 4) = *reinterpret_cast<const uint2*>(src);
+                }
+            }
+            __syncthreads();
+
+            const uint8_t* mw = fc2_block(a.fc2, tr, b, bits, a.H);
+            float cb[NT][4];
+            #pragma unroll
+            for (int t = 0; t < NT; ++t) cb[t][0] = cb[t][1] = cb[t][2] = cb[t][3] = 0.f;
+            if (bits == 3) pmcgx_fc2_ntile_wide<3, NT>(mw, n_tile, lane, &x2_sm[0][0], masks, nt_here, cb);
+            else if (bits == 4) pmcgx_fc2_ntile_wide<4, NT>(mw, n_tile, lane, &x2_sm[0][0], masks, nt_here, cb);
+            else pmcgx_fc2_ntile_wide<2, NT>(mw, n_tile, lane, &x2_sm[0][0], masks, nt_here, cb);
+            const size_t brow = static_cast<size_t>(tr[2]) + b;
+            const float bscale = __half2float(a.v3b[brow * HB + hb]);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                if (t < nt_here)
+                {
+                    c_tot[t][0] = fmaf(rnd_h(cb[t][0]), bscale, c_tot[t][0]);
+                    c_tot[t][1] = fmaf(rnd_h(cb[t][1]), bscale, c_tot[t][1]);
+                    c_tot[t][2] = fmaf(rnd_h(cb[t][2]), bscale, c_tot[t][2]);
+                    c_tot[t][3] = fmaf(rnd_h(cb[t][3]), bscale, c_tot[t][3]);
+                }
+            }
+            __syncthreads();
+        }
+
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            if (t < nt_here)
+            {
+                const int t0 = 2 * col, t1 = 2 * col + 1;
+                if ((masks[t] >> t0) & 1)
+                {
+                    y_raw[t0][warp * 16 + row0] = c_tot[t][0];
+                    y_raw[t0][warp * 16 + row0 + 8] = c_tot[t][2];
+                }
+                if ((masks[t] >> t1) & 1)
+                {
+                    y_raw[t1][warp * 16 + row0] = c_tot[t][1];
+                    y_raw[t1][warp * 16 + row0 + 8] = c_tot[t][3];
+                }
+                __syncthreads();
+
+                if ((masks[t] >> warp) & 1)
+                {
+                    float v[4];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) v[i] = y_raw[warp][lane * 4 + i];
+                    had128(v, lane);
+                    const float rw = rws[t];
+                    const int tile = tile0 + tg + t;
+                    const size_t o = static_cast<size_t>(tile * 8 + warp) * a.H + hb * 128 + lane * 4;
+                    if (a.y_bf16)
+                    {
+                        uint16_t* dst = static_cast<uint16_t*>(a.ypart) + o;
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) dst[i] = static_cast<uint16_t>(nv4::bf16_rne(rw * (v[i] * sg_v[i])));
+                    }
+                    else
+                    {
+                        *reinterpret_cast<float4*>(static_cast<float*>(a.ypart) + o) =
+                            make_float4(rw * (v[0] * sg_v[0]), rw * (v[1] * sg_v[1]), rw * (v[2] * sg_v[2]), rw * (v[3] * sg_v[3]));
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    }
+}
+
+// Vectorized float4 deterministic route combine (H % 4 == 0, y_bf16 == 0). Bit-exact with k_combine.
+__global__ void __launch_bounds__(256) k_ink2_tr3_combine_vec4(MoeArgs a)
+{
+    const size_t H4 = static_cast<size_t>(a.H >> 2);
+    const size_t i = static_cast<size_t>(blockIdx.x) * 256 + threadIdx.x;
+    if (i >= static_cast<size_t>(a.M) * H4) return;
+    const int m = static_cast<int>(i / H4), n4 = static_cast<int>(i % H4);
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+    const float* yp = static_cast<const float*>(a.ypart);
+    for (int k = 0; k < a.TK; ++k)
+    {
+        const size_t row = static_cast<size_t>(a.plan.tok_slot[m * a.TK + k] * 8 + a.plan.tok_col[m * a.TK + k]);
+        const float4 v = reinterpret_cast<const float4*>(yp + row * a.H)[n4];
+        s0 += v.x; s1 += v.y; s2 += v.z; s3 += v.w;
+    }
+    uint2 ov;
+    ov.x = nv4::bf16_rne(s0) | (nv4::bf16_rne(s1) << 16);
+    ov.y = nv4::bf16_rne(s2) | (nv4::bf16_rne(s3) << 16);
+    reinterpret_cast<uint2*>(a.out + static_cast<size_t>(m) * a.H)[n4] = ov;
+}
 
 // grid: (max_slots, eb), block: 256 (8 warps).
 // Computes fc1 (gate + up) -> H128 * svh -> Inkling-2 softcapped SwiGLU -> * suh_down -> H128 -> a_rot [row][eb][128].
@@ -434,14 +1306,75 @@ __global__ void __launch_bounds__(256) k_ink2_tr3_fc2(Tr3Args a)
 }
 
 template <int CB>
-inline void launch_tr3(const Tr3Args& a, int NE, cudaStream_t st)
+inline void launch_tr3(const Tr3Args& a, int NE, cudaStream_t st, Prof* prof = nullptr)
 {
     const int slots = plan_max_slots(a.M, a.TK, NE);
     const int HB = a.H / 128;
-    k_ink2_tr3_fc1<CB><<<dim3(slots, a.eb), 256, 0, st>>>(a);
-    k_ink2_tr3_fc2<CB><<<dim3(slots, HB), 256, 0, st>>>(a);
+    static const bool wide_on = []() {
+        const char* e = std::getenv("INK2_TR3_WIDE");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    const bool use_wide = (CB == CB_PMCGX && wide_on && a.wide && a.sg != nullptr && a.v1b != nullptr && a.v3b != nullptr && a.x_had != nullptr);
+    if (use_wide)
+    {
+        {
+            ProfScope _ps(prof, PS_MOE_FC1, st);
+            k_ink2_tr3_prerot_x<<<a.M * HB, 32, 0, st>>>(a.x, a.sg, a.x_had, a.M, a.H);
+            if (a.M <= 16) k_ink2_tr3_fc1_wide<1><<<dim3(slots, a.eb), 256, 0, st>>>(a);
+            else if (a.M < 128) k_ink2_tr3_fc1_wide<2><<<dim3(slots, a.eb), 256, 0, st>>>(a);
+            else if (a.M < 384) k_ink2_tr3_fc1_wide<4><<<dim3(slots, a.eb), 256, 0, st>>>(a);
+            else k_ink2_tr3_fc1_wide<8><<<dim3(slots, a.eb), 256, 0, st>>>(a);
+        }
+        {
+            ProfScope _ps(prof, PS_MOE_FC2, st);
+            if (a.M <= 16)
+            {
+                constexpr int HB_C = 2;
+                const size_t smem = static_cast<size_t>(a.eb) * 8 * 136 * sizeof(__half);
+                static size_t set1 = 0;
+                if (smem > 40000 && smem > set1)
+                {
+                    cudaFuncSetAttribute(k_ink2_tr3_fc2_wide_mhb<1, HB_C>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+                    set1 = smem;
+                }
+                k_ink2_tr3_fc2_wide_mhb<1, HB_C><<<dim3(slots, (HB + HB_C - 1) / HB_C), 256, smem, st>>>(a);
+            }
+            else if (a.M < 128)
+            {
+                constexpr int HB_C = 3;
+                const size_t smem = static_cast<size_t>(a.eb) * 16 * 136 * sizeof(__half);
+                static size_t set2 = 0;
+                if (smem > 40000 && smem > set2)
+                {
+                    cudaFuncSetAttribute(k_ink2_tr3_fc2_wide_mhb<2, HB_C>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+                    set2 = smem;
+                }
+                k_ink2_tr3_fc2_wide_mhb<2, HB_C><<<dim3(slots, (HB + HB_C - 1) / HB_C), 256, smem, st>>>(a);
+            }
+            else if (a.M < 384)
+            {
+                k_ink2_tr3_fc2_wide_stream<4><<<dim3(slots, HB), 256, 0, st>>>(a);
+            }
+            else
+            {
+                k_ink2_tr3_fc2_wide_stream<8><<<dim3(slots, HB), 256, 0, st>>>(a);
+            }
+        }
+    }
+    else
+    {
+        {
+            ProfScope _ps(prof, PS_MOE_FC1, st);
+            k_ink2_tr3_fc1<CB><<<dim3(slots, a.eb), 256, 0, st>>>(a);
+        }
+        {
+            ProfScope _ps(prof, PS_MOE_FC2, st);
+            k_ink2_tr3_fc2<CB><<<dim3(slots, HB), 256, 0, st>>>(a);
+        }
+    }
     if (a.out != nullptr)
     {
+        ProfScope _ps(prof, PS_MOE_COMBINE, st);
         MoeArgs ma{};
         ma.H = a.H;
         ma.M = a.M;
@@ -450,16 +1383,19 @@ inline void launch_tr3(const Tr3Args& a, int NE, cudaStream_t st)
         ma.ypart = a.ypart;
         ma.y_bf16 = a.y_bf16;
         ma.out = a.out;
-        k_combine<<<static_cast<unsigned>((static_cast<size_t>(a.M) * a.H + 255) / 256), 256, 0, st>>>(ma);
+        if (!a.y_bf16 && (a.H & 3) == 0)
+            k_ink2_tr3_combine_vec4<<<static_cast<unsigned>((static_cast<size_t>(a.M) * (a.H >> 2) + 255) / 256), 256, 0, st>>>(ma);
+        else
+            k_combine<<<static_cast<unsigned>((static_cast<size_t>(a.M) * a.H + 255) / 256), 256, 0, st>>>(ma);
     }
 }
 
-inline void moe_tr3(const Tr3Args& a, int cb, int NE, cudaStream_t st)
+inline void moe_tr3(const Tr3Args& a, int cb, int NE, cudaStream_t st, Prof* prof = nullptr)
 {
     if (a.H % 128 != 0 || a.eb < 1 || a.M < 1) throw std::runtime_error("ink2::tr3::moe_tr3: H, eb or M");
-    if (cb == CB_PMCGX) launch_tr3<CB_PMCGX>(a, NE, st);
-    else if (cb == CB_MUL1) launch_tr3<CB_MUL1>(a, NE, st);
-    else launch_tr3<CB_MCG>(a, NE, st);
+    if (cb == CB_PMCGX) launch_tr3<CB_PMCGX>(a, NE, st, prof);
+    else if (cb == CB_MUL1) launch_tr3<CB_MUL1>(a, NE, st, prof);
+    else launch_tr3<CB_MCG>(a, NE, st, prof);
 }
 #endif   // __CUDACC__
 }   // namespace tr3

@@ -143,7 +143,7 @@ int main(int argc, char** argv)
     using namespace ink2rt;
     std::string dir, layers = "all", variant, tokens, s2dir, set_id, ips, ips2, kv_keep = "all";
     std::vector<std::string> kv_tiers;
-    int rank = -1, proxy_cpu = -1, gen = 16, chunk = 8, prefill = 512, nc = 256, cap = 262144, mtp = 0, s2port = 7341, s2sess = 1, s2epoch = 0, kv_sys_after = 2;
+    int rank = -1, proxy_cpu = -1, gen = 16, chunk = 8, prefill = 512, nc = 256, cap = 262144, mtp = 0, s2port = 7341, s2sess = 1, s2epoch = 0, kv_sys_after = 2, graph_opt = -1;
     double kv_wlim = 0.0;
     bool reuse = false;
     float temp = 0.f, top_p = 1.f;
@@ -178,7 +178,8 @@ int main(int argc, char** argv)
         else if (a == "--s2-sessions") s2sess = atoi(val().c_str());
         else if (a == "--s2-epoch") s2epoch = atoi(val().c_str());
         else if (a == "--set-id") set_id = val();
-        else if (a == "--graph" || a == "--no-graph") {}   // the step is eager
+        else if (a == "--graph") graph_opt = 1;
+        else if (a == "--no-graph") graph_opt = 0;
         else if (a == "--reuse-prefix") reuse = true;
         else if (a == "--kv-store") kv_tiers.push_back(val());
         else if (a == "--kv-keep") kv_keep = val();
@@ -215,6 +216,7 @@ int main(int argc, char** argv)
     o.layers = layers;
     o.variant = variant;
     o.whole_image = true;
+    o.use_graph = graph_opt;
     // Image input (GR8_INK2_VISION, default 0, opt-in): with --serve the vision tower of the checkpoint is bound here, with
     // its workspace and a pool of image rows for one prefill step, so the ready memory counts it. Every rank runs the
     // tower on its own copy of the images. The head writes DIR/vision.s2 ("ink2"), so the shim's hello offers `vision`

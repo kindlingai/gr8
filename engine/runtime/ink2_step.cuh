@@ -21,6 +21,7 @@
 #include "../attn/ink2_attn.cuh"
 #include "../kernels/ink2_mtp.cuh"
 #include "../kernels/ink2_head.cuh"
+#include "ink2_prof.cuh"
 #include "../model_geom_ink2.h"
 #include "../loader/g6pack.h"
 #include "../loader-rs/g6load.h"
@@ -33,10 +34,12 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 
@@ -545,6 +548,9 @@ struct RankPart
     const __half *tr3_v1 = nullptr, *tr3_v2 = nullptr, *tr3_v3 = nullptr;
     const long long *tr3_tab = nullptr, *tr3_kmix = nullptr;
     int tr3_eb = 0;
+    int tr3_nblk = 0;
+    const __half *tr3_sg = nullptr, *tr3_v1b = nullptr, *tr3_v3b = nullptr;
+    int tr3_wide = 0;
 };
 struct CtrlWeights
 {
@@ -570,6 +576,8 @@ struct Layer
 struct MtpRank
 {
     const uint16_t *wq = nullptr, *wk = nullptr, *wv = nullptr, *wkc = nullptr, *wvc = nullptr, *wo = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
+    int8_t *wq_i8 = nullptr, *wk_i8 = nullptr, *wv_i8 = nullptr, *wo_i8 = nullptr, *gate_i8 = nullptr, *up_i8 = nullptr, *down_i8 = nullptr;
+    float *wq_sc = nullptr, *wk_sc = nullptr, *wv_sc = nullptr, *wo_sc = nullptr, *gate_sc = nullptr, *up_sc = nullptr, *down_sc = nullptr;
     uint16_t* ring = nullptr;      // [slots][2][window][nk] on a local layer
     uint16_t* pages = nullptr;     // [slots * max_pps][2][64][nk] on a global layer
     uint16_t* staging = nullptr;   // [slots][2][64][nk] on a global layer
@@ -584,6 +592,8 @@ struct MtpWork
 {
     uint16_t *q = nullptr, *og = nullptr, *kb = nullptr, *vb = nullptr, *gate = nullptr, *up = nullptr, *ck = nullptr, *cv = nullptr, *base = nullptr;
     uint16_t *fold_w = nullptr, *fold_b = nullptr;   // [vr][R], [vr]: lm_head . hidden_out
+    int8_t *lm_i8 = nullptr, *fold_w_i8 = nullptr;   // drafter-only per-row symmetric INT8 copies (2x less HBM)
+    float *lm_scale = nullptr, *fold_scale = nullptr;
     float *lg = nullptr, *part = nullptr;
     size_t part_floats = 0;
 };
@@ -651,6 +661,7 @@ struct Options
     bool vision = false; // run the vision tower when the checkpoint has one (image input)
     // the speed paths: -1 = what the knob says (GR8_INK2_*), 0 = off, 1 = on
     int fast_allreduce = -1, gpu_head_pack = -1, cublas_prefill = -1, tc_prefill_attn = -1;
+    int use_graph = -1;  // -1 = env INK2_GRAPH (default 1 on TP=1), 0 = off, 1 = on
 };
 
 class Engine
@@ -743,8 +754,10 @@ public:
             {
                 const size_t mt = static_cast<size_t>(ink2::plan_max_tiles(o.max_rows, c.TK, c.NE));
                 tr3_a_rot.push_back(dalloc<__half>(mt * 8 * static_cast<size_t>(max_tr3_eb) * 128));
+                tr3_x_had.push_back(dalloc<__half>(static_cast<size_t>(o.max_rows) * c.H));
             }
         }
+        if (max_tr3_eb > 0) init_tr3_wide();
         d_slot = dalloc<int>(o.max_rows);
         d_pos = dalloc<int>(o.max_rows);
         d_run0 = dalloc<int>(o.max_rows);
@@ -766,6 +779,8 @@ public:
             f32_mlp = dalloc<float>(mh);
             gate_cat = dalloc<uint16_t>(mh * 2);
             gate_g = dalloc<uint16_t>(static_cast<size_t>(o.max_rows) * c.loop_gate_rank);
+            gate_sf = dalloc<float>(mh);
+            gate_sm = dalloc<float>(mh);
         }
         part_stride = static_cast<size_t>(o.max_rows) * c.TK * c.H;
         parts = dalloc<float>(static_cast<size_t>(o.nr) * part_stride);
@@ -773,8 +788,59 @@ public:
         head_parts.resize(static_cast<size_t>(o.nr) * head_bytes(o.max_rows));
         if (use_blas && cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) die("cublasCreate failed");
         if (use_ghp) head_dev = dalloc<uint8_t>(head_bytes(std::max(o.max_rows, o.slots)));
+        h_arg_val = dalloc<float>(static_cast<size_t>(o.max_rows) * ink2::HEAD_ARGMAX_NG);
+        h_arg_id = dalloc<int>(static_cast<size_t>(o.max_rows) * ink2::HEAD_ARGMAX_NG);
+        if (ink2::splitk_buf() == nullptr)
+        {
+            constexpr size_t SK_CAP = 2u * 1024u * 1024u;   // 8 MiB workspace for deterministic Split-K c128 MMA
+            ink2::splitk_buf() = dalloc<float>(SK_CAP);
+            ink2::splitk_cap() = SK_CAP;
+        }
+        if (o.nr == 1 && o.nloc == 1)
+        {
+            INK2RT_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+            INK2RT_CK(cudaHostAlloc(&h_meta_pin, sizeof(int) * static_cast<size_t>(4) * o.max_rows, cudaHostAllocDefault));
+            INK2RT_CK(cudaHostAlloc(&h_head_pin, head_bytes(std::max(o.max_rows, o.slots)), cudaHostAllocDefault));
+            INK2RT_CK(cudaHostAlloc(&h_acc_pin, static_cast<size_t>(o.max_rows), cudaHostAllocDefault));
+            const char* eg = std::getenv("INK2_GRAPH");
+            if (o.use_graph == 0) use_graph = false;
+            else if (o.use_graph == 1) use_graph = true;
+            else use_graph = !(eg && eg[0] == '0' && eg[1] == '\0');
+        }
         if (o.mtp > 0) init_mtp();
+        if (o.nr == 1 && o.nloc == 1 && o.mtp > 0)
+        {
+            INK2RT_CK(cudaHostAlloc(&h_mtp_meta_pin, sizeof(int) * (static_cast<size_t>(4) * o.slots + static_cast<size_t>(o.slots) * c.mtp_block), cudaHostAllocDefault));
+            INK2RT_CK(cudaHostAlloc(&h_draft_out_pin, sizeof(int) * static_cast<size_t>(o.slots) * o.mtp, cudaHostAllocDefault));
+        }
+        if (o.nloc == 1 && !L.empty())
+        {
+            std::vector<ink2::CommitLayerDesc> hdesc;
+            hdesc.reserve(L.size());
+            for (const Layer& s : L)
+            {
+                const RankPart& x = s.rk[0];
+                ink2::CommitLayerDesc d{};
+                d.att = s.att;
+                d.mo = s.mo;
+                d.kp = x.wk.kp;
+                d.vp = x.wk.vp;
+                d.kv_new = x.wk.kv_new;
+                d.hist_a = s.hist_a;
+                d.hist_m = s.hist_m;
+                d.hist_k = x.as.hist_k;
+                d.hist_v = x.as.hist_v;
+                d.ring = x.as.ring;
+                d.nk = x.g.nh_kv * x.g.hd;
+                d.window = x.g.window;
+                d.is_local = x.g.global ? 0 : 1;
+                hdesc.push_back(d);
+            }
+            commit_descs = dalloc<ink2::CommitLayerDesc>(hdesc.size());
+            INK2RT_CK(cudaMemcpy(commit_descs, hdesc.data(), hdesc.size() * sizeof(ink2::CommitLayerDesc), cudaMemcpyHostToDevice));
+        }
         if (o.vision && a.find("V.proj_out.weight")) init_vision();
+        prof.init();
         INK2RT_CK(cudaDeviceSynchronize());
         fprintf(stderr, "# ink2: ranks %d..%d of %d, %zu layers (%d phys%s), H %d, %d experts top %d, vocab %d (%d rows a rank), %d slots, %d rows, cap %d\n", o.rank0,
                 o.rank0 + o.nloc - 1, o.nr, L.size(), c.n_layers, c.is_looped() ? " looped" : "", c.H, c.NE, c.TK, c.vocab, vr, o.slots, o.max_rows, o.cap);
@@ -818,6 +884,7 @@ public:
     // A new run on a slot: its convolution histories and rings read as zeros.
     void reset_slot(int slot)
     {
+        if (stream) INK2RT_CK(cudaStreamSynchronize(stream));
         if (slot < 0 || slot >= o.slots) die("reset_slot: slot");
         const size_t s = static_cast<size_t>(slot);
         for (Layer& y : L)
@@ -848,17 +915,41 @@ public:
     // One step over the rows of rh. No state changes before commit(). When samples is null (prefill), the head is skipped.
     // With the drafter on, the taps of the rows are kept for commit().
     // vis_rows [M][H] (stage_vision) or null: the row of an image token is read from it in place of its embedding.
-    void forward(const ink2::RowsHost& rh, const int* tk, const RowSample* samples, std::vector<RowOut>& out, const uint16_t* vis_rows = nullptr)
+    void forward(const ink2::RowsHost& rh, const int* tk, const RowSample* samples, std::vector<RowOut>& out, const uint16_t* vis_rows = nullptr, bool exact_head = false)
     {
         M = rh.rows();
         if (M < 1 || M > o.max_rows) die("step of " + std::to_string(M) + " rows");
         if (rh.max_pos >= o.cap) die("position " + std::to_string(rh.max_pos) + " is past the cap " + std::to_string(o.cap));
+        const cudaStream_t st = stream;
+        ink2::Prof* pf = prof.enabled ? &prof : nullptr;
+        if (pf) pf->begin_op(!samples ? 0 : (M == 1 ? 1 : 2), M);
         const size_t n = static_cast<size_t>(M) * c.H;
         const int T = o.nr;
-        INK2RT_CK(cudaMemcpy(d_slot, rh.slot.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
-        INK2RT_CK(cudaMemcpy(d_pos, rh.pos.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
-        INK2RT_CK(cudaMemcpy(d_run0, rh.run0.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
-        INK2RT_CK(cudaMemcpy(toks, tk, sizeof(int) * M, cudaMemcpyHostToDevice));
+        {
+            ink2::ProfScope _ps(pf, ink2::PS_H2D_META, st);
+            if (h_meta_pin)
+            {
+                int* p_slot = h_meta_pin;
+                int* p_pos = p_slot + o.max_rows;
+                int* p_run0 = p_pos + o.max_rows;
+                int* p_tok = p_run0 + o.max_rows;
+                memcpy(p_slot, rh.slot.data(), sizeof(int) * M);
+                memcpy(p_pos, rh.pos.data(), sizeof(int) * M);
+                memcpy(p_run0, rh.run0.data(), sizeof(int) * M);
+                memcpy(p_tok, tk, sizeof(int) * M);
+                INK2RT_CK(cudaMemcpyAsync(d_slot, p_slot, sizeof(int) * M, cudaMemcpyHostToDevice, st));
+                INK2RT_CK(cudaMemcpyAsync(d_pos, p_pos, sizeof(int) * M, cudaMemcpyHostToDevice, st));
+                INK2RT_CK(cudaMemcpyAsync(d_run0, p_run0, sizeof(int) * M, cudaMemcpyHostToDevice, st));
+                INK2RT_CK(cudaMemcpyAsync(toks, p_tok, sizeof(int) * M, cudaMemcpyHostToDevice, st));
+            }
+            else
+            {
+                INK2RT_CK(cudaMemcpy(d_slot, rh.slot.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
+                INK2RT_CK(cudaMemcpy(d_pos, rh.pos.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
+                INK2RT_CK(cudaMemcpy(d_run0, rh.run0.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
+                INK2RT_CK(cudaMemcpy(toks, tk, sizeof(int) * M, cudaMemcpyHostToDevice));
+            }
+        }
         const ink2::Rows rw{d_slot, d_pos, d_run0};
         if (T > 1 && step_begin)
         {
@@ -873,168 +964,299 @@ public:
         }
         const bool chunk = one_run(rh);   // a prefill chunk: the speed paths that depend on M are for these rows only
         const bool tc = use_tc && chunk && M >= 16;
-        const BlasScope blas_scope(use_blas && chunk && M >= 32 ? blas : nullptr);
-        ink2::embed_norm(toks, embed, embed_norm, vis_rows, c.image_token, h, M, c.H, 0);
-        int cur_nb = 0;
-        const int num_pre_blocks = c.is_looped() ? (c.loop_start / c.block) : 0;
-        for (size_t j = 0; j < L.size(); ++j)
-        {
-            Layer& s = L[j];
-            const int ji = static_cast<int>(j);
-            if (c.is_looped())
+        const bool want_blas = use_blas && chunk && M >= 32;
+        bool all_greedy = (samples != nullptr);
+        for (int m = 0; m < M && all_greedy; ++m)
+            if (samples[m].inv_temp > 0.f) all_greedy = false;
+        static const bool fast_greedy_head = []() {
+            const char* e = std::getenv("INK2_FAST_GREEDY_HEAD");
+            return !(e && e[0] == '0' && e[1] == '\0');
+        }();
+        const int head_mode = (T == 1 && o.nloc == 1 && use_ghp && fast_greedy_head && !exact_head && all_greedy) ? 1 : 0;
+        const size_t hb = head_bytes(M), rb = head_row_bytes(o.nc);
+
+        auto run_body_and_head = [&](bool async_head_d2h) {
             {
-                if (ji == c.loop_start) ink2::copy_bf16(h, pre_h, n, 0);
-                if (s.loop_pass >= 1 && s.loop_j == 0)
+                ink2::ProfScope _ps(pf, ink2::PS_EMBED, st);
+                ink2::embed_norm(toks, embed, embed_norm, vis_rows, c.image_token, h, M, c.H, st);
+            }
+            int cur_nb = 0;
+            const int num_pre_blocks = c.is_looped() ? (c.loop_start / c.block) : 0;
+            for (size_t j = 0; j < L.size(); ++j)
+            {
+                Layer& s = L[j];
+                const int ji = static_cast<int>(j);
+                if (c.is_looped() && (ji == c.loop_start || (s.loop_pass >= 1 && s.loop_j == 0)))
                 {
-                    for (int d = num_pre_blocks + 1; d < cur_nb; ++d)
-                        ink2::copy_bf16(states[static_cast<size_t>(d)], prev_states[static_cast<size_t>(d - (num_pre_blocks + 1))], n, 0);
-                    ink2::copy_bf16(h, prev_h, n, 0);
-                    ink2::copy_bf16(pre_h, h, n, 0);
-                    cur_nb = num_pre_blocks;
+                    ink2::ProfScope _ps(pf, ink2::PS_LOOP_COPY_TAPS, st);
+                    if (ji == c.loop_start) ink2::copy_bf16(h, pre_h, n, st);
+                    if (s.loop_pass >= 1 && s.loop_j == 0)
+                    {
+                        for (int d = num_pre_blocks + 1; d < cur_nb; ++d)
+                            ink2::copy_bf16(states[static_cast<size_t>(d)], prev_states[static_cast<size_t>(d - (num_pre_blocks + 1))], n, st);
+                        ink2::copy_bf16(h, prev_h, n, st);
+                        ink2::copy_bf16(pre_h, h, n, st);
+                        cur_nb = num_pre_blocks;
+                    }
+                }
+                const int tap_id = c.is_looped() ? ji : s.l;
+                for (int t = 0; t < ntaps; ++t)
+                    if (c.mtp_targets[static_cast<size_t>(t)] == tap_id)
+                    {
+                        ink2::ProfScope _ps(pf, ink2::PS_LOOP_COPY_TAPS, st);
+                        ink2::copy_bf16(h, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, st);
+                    }
+                const bool gated = s.loop_pass >= 1;
+                if (gated)
+                {
+                    {
+                        ink2::ProfScope _ps(pf, ink2::PS_ATTN_RES, st);
+                        ink2::AttnResF32Args ma{};
+                        const int np = static_cast<int>(prev_states.size());
+                        for (int d = 0; d < np; ++d) ma.rows[d] = prev_states[static_cast<size_t>(d)];
+                        ma.rows[np] = prev_h;
+                        ma.query = msg_queries + static_cast<size_t>(s.loop_j) * 4 * c.H;
+                        ma.D = np + 1;
+                        ma.Q = 4;
+                        ma.H = c.H;
+                        for (int q = 0; q < 4; ++q) ma.out[q] = f32_msg[q];
+                        ink2::attn_res_f32(ma, M, st);
+
+                        ink2::AttnResF32Args ar{};
+                        for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
+                        ar.rows[cur_nb] = h;
+                        ar.query = s.attn_query;
+                        ar.D = cur_nb + 1;
+                        ar.Q = s.glob ? 3 : 1;
+                        ar.H = c.H;
+                        for (int q = 0; q < ar.Q; ++q) ar.out[q] = f32_attn[q];
+                        ink2::attn_res_f32(ar, M, st);
+                    }
+                    {
+                        ink2::ProfScope _ps(pf, ink2::PS_LOOP_MSG_GATE, st);
+                        if (M <= 64 && c.loop_gate_rank == 64 && c.H <= 4096 && 3 * M <= o.max_rows && gate_sf != nullptr && gate_sm != nullptr)
+                        {
+                            ink2::MsgGate3Args mg3{};
+                            mg3.h_f32[0] = f32_attn[0];
+                            mg3.h_f32[1] = f32_attn[s.glob ? 1 : 0];
+                            mg3.h_f32[2] = f32_attn[s.glob ? 2 : 0];
+                            mg3.msg_f32[0] = f32_msg[0];
+                            mg3.msg_f32[1] = f32_msg[1];
+                            mg3.msg_f32[2] = f32_msg[2];
+                            mg3.down_w[0] = s.ctrl_q.down;
+                            mg3.down_w[1] = s.ctrl_k.down;
+                            mg3.down_w[2] = s.ctrl_v.down;
+                            mg3.forget_w[0] = s.ctrl_q.forget;
+                            mg3.forget_w[1] = s.ctrl_k.forget;
+                            mg3.forget_w[2] = s.ctrl_v.forget;
+                            mg3.gain_w[0] = s.ctrl_q.gain;
+                            mg3.gain_w[1] = s.ctrl_k.gain;
+                            mg3.gain_w[2] = s.ctrl_v.gain;
+                            mg3.norm_w[0] = s.glob ? s.q_norm : s.attn_norm;
+                            mg3.norm_w[1] = s.glob ? s.k_norm : s.attn_norm;
+                            mg3.norm_w[2] = s.glob ? s.v_norm : s.attn_norm;
+                            mg3.out_bf16[0] = qi;
+                            mg3.out_bf16[1] = ki;
+                            mg3.out_bf16[2] = vi;
+                            ink2::msg_gate_norm_3(mg3, gate_cat, gate_g, gate_sf, gate_sm, M, c.H, st);
+                        }
+                        else
+                        {
+                            ink2::msg_gate_norm(f32_attn[0], f32_msg[0], s.ctrl_q.down, s.ctrl_q.forget, s.ctrl_q.gain,
+                                                s.glob ? s.q_norm : s.attn_norm, gate_cat, gate_g, qi, M, c.H, c.loop_gate_rank, st, gate_sf, gate_sm);
+                            ink2::msg_gate_norm(f32_attn[s.glob ? 1 : 0], f32_msg[1], s.ctrl_k.down, s.ctrl_k.forget, s.ctrl_k.gain,
+                                                s.glob ? s.k_norm : s.attn_norm, gate_cat, gate_g, ki, M, c.H, c.loop_gate_rank, st, gate_sf, gate_sm);
+                            ink2::msg_gate_norm(f32_attn[s.glob ? 2 : 0], f32_msg[2], s.ctrl_v.down, s.ctrl_v.forget, s.ctrl_v.gain,
+                                                s.glob ? s.v_norm : s.attn_norm, gate_cat, gate_g, vi, M, c.H, c.loop_gate_rank, st, gate_sf, gate_sm);
+                        }
+                    }
+                }
+                else if (!s.attn_query)
+                {
+                    ink2::ProfScope _ps(pf, ink2::PS_ATTN_RES, st);
+                    ink2::rmsnorm(h, s.attn_norm, qi, M, c.H, st);
+                }
+                else
+                {
+                    ink2::ProfScope _ps(pf, ink2::PS_ATTN_RES, st);
+                    ink2::AttnResArgs ar{};
+                    for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
+                    ar.rows[cur_nb] = h;
+                    ar.query = s.attn_query;
+                    ar.D = cur_nb + 1;
+                    ar.Q = s.glob ? 3 : 1;
+                    ar.H = c.H;
+                    ar.norm[0] = s.glob ? s.q_norm : s.attn_norm;
+                    ar.norm[1] = s.k_norm;
+                    ar.norm[2] = s.v_norm;
+                    ar.out[0] = qi;
+                    ar.out[1] = ki;
+                    ar.out[2] = vi;
+                    ink2::attn_res(ar, M, st);
+                }
+                const bool split_kv = s.glob || gated;
+                for (int i = 0; i < o.nloc; ++i)
+                {
+                    RankPart& x = s.rk[i];
+                    ink2::attn_forward(x.g, x.aw, x.as, x.wk, rw, rh.max_pos, qi, split_kv ? ki : qi, split_kv ? vi : qi, M, T == 1 ? s.att : nullptr,
+                                       parts + static_cast<size_t>(o.rank0 + i) * n, st, tc, pf);
+                }
+                if (T > 1)
+                {
+                    if (gather) gather(2 * ji, parts, n * 4);
+                    ink2::sum_ranks(parts, T, n, s.att, st);
+                }
+                {
+                    ink2::ProfScope _ps(pf, ink2::PS_POST_ATTN_SCONV_RES, st);
+                    ink2::sconv_static(s.att, s.hist_a, rw, s.attn_sconv, M, c.H, a_, st);
+                    const bool bstart = (c.is_looped() ? s.l : ji) % c.block == 0;
+                    ink2::attn_block_step(h, a_, bstart, states[static_cast<size_t>(cur_nb)], mid, n, st);
+                    if (bstart) ++cur_nb;
+                }
+                if (gated)
+                {
+                    {
+                        ink2::ProfScope _ps(pf, ink2::PS_ATTN_RES, st);
+                        ink2::AttnResF32Args ar{};
+                        for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
+                        ar.rows[cur_nb] = mid;
+                        ar.query = s.mlp_query;
+                        ar.D = cur_nb + 1;
+                        ar.Q = 1;
+                        ar.H = c.H;
+                        ar.out[0] = f32_mlp;
+                        ink2::attn_res_f32(ar, M, st);
+                    }
+                    {
+                        ink2::ProfScope _ps(pf, ink2::PS_LOOP_MSG_GATE, st);
+                        ink2::msg_gate_norm(f32_mlp, f32_msg[3], s.ctrl_mlp.down, s.ctrl_mlp.forget, s.ctrl_mlp.gain,
+                                            s.mlp_norm, gate_cat, gate_g, xm, M, c.H, c.loop_gate_rank, st, gate_sf, gate_sm);
+                    }
+                }
+                else
+                {
+                    ink2::ProfScope _ps(pf, ink2::PS_ATTN_RES, st);
+                    ink2::AttnResArgs ar{};
+                    for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
+                    ar.rows[cur_nb] = mid;
+                    ar.query = s.mlp_query;
+                    ar.D = cur_nb + 1;
+                    ar.Q = 1;
+                    ar.H = c.H;
+                    ar.norm[0] = s.mlp_norm;
+                    ar.out[0] = xm;
+                    ink2::attn_res(ar, M, st);
+                }
+                if (s.exp_fmt >= 1 && s.exp_fmt <= 3) moe_tr3(s, ji, st);
+                else if (s.mx8) moe<ink2::Mx8Frag>(s, ji, st);
+                else moe<nv4::Frag>(s, ji, st);
+                {
+                    ink2::ProfScope _ps(pf, ink2::PS_POST_MLP_SCONV_RES, st);
+                    ink2::sconv_static(s.mo, s.hist_m, rw, s.mlp_sconv, M, c.H, ms, st);
+                    ink2::add_bf16(mid, ms, h, n, st);
                 }
             }
-            const int tap_id = c.is_looped() ? ji : s.l;
-            for (int t = 0; t < ntaps; ++t)
-                if (c.mtp_targets[static_cast<size_t>(t)] == tap_id) ink2::copy_bf16(h, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, 0);
-            const bool gated = s.loop_pass >= 1;
-            if (gated)
+            if (!samples && ntaps == 0) return;
             {
-                // Cross-pass message retrieval (MessageAttentionResidual): prev_states..., prev_h -> [q, k, v, mlp]
-                ink2::AttnResF32Args ma{};
-                const int np = static_cast<int>(prev_states.size());
-                for (int d = 0; d < np; ++d) ma.rows[d] = prev_states[static_cast<size_t>(d)];
-                ma.rows[np] = prev_h;
-                ma.query = msg_queries + static_cast<size_t>(s.loop_j) * 4 * c.H;
-                ma.D = np + 1;
-                ma.Q = 4;
-                ma.H = c.H;
-                for (int q = 0; q < 4; ++q) ma.out[q] = f32_msg[q];
-                ink2::attn_res_f32(ma, M, 0);
-
-                // Current-pass BlockAttentionResidual in fp32 (1 query local, 3 queries global)
-                ink2::AttnResF32Args ar{};
-                for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
-                ar.rows[cur_nb] = h;
-                ar.query = s.attn_query;
-                ar.D = cur_nb + 1;
-                ar.Q = s.glob ? 3 : 1;
-                ar.H = c.H;
-                for (int q = 0; q < ar.Q; ++q) ar.out[q] = f32_attn[q];
-                ink2::attn_res_f32(ar, M, 0);
-
-                // q, k, v MessageGate + RMSNorm
-                ink2::msg_gate_norm(f32_attn[0], f32_msg[0], s.ctrl_q.down, s.ctrl_q.forget, s.ctrl_q.gain,
-                                    s.glob ? s.q_norm : s.attn_norm, gate_cat, gate_g, qi, M, c.H, c.loop_gate_rank, 0);
-                ink2::msg_gate_norm(f32_attn[s.glob ? 1 : 0], f32_msg[1], s.ctrl_k.down, s.ctrl_k.forget, s.ctrl_k.gain,
-                                    s.glob ? s.k_norm : s.attn_norm, gate_cat, gate_g, ki, M, c.H, c.loop_gate_rank, 0);
-                ink2::msg_gate_norm(f32_attn[s.glob ? 2 : 0], f32_msg[2], s.ctrl_v.down, s.ctrl_v.forget, s.ctrl_v.gain,
-                                    s.glob ? s.v_norm : s.attn_norm, gate_cat, gate_g, vi, M, c.H, c.loop_gate_rank, 0);
-            }
-            else if (!s.attn_query) ink2::rmsnorm(h, s.attn_norm, qi, M, c.H, 0);
-            else
-            {
+                ink2::ProfScope _ps(pf, ink2::PS_FINAL_RES, st);
                 ink2::AttnResArgs ar{};
                 for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
                 ar.rows[cur_nb] = h;
-                ar.query = s.attn_query;
+                ar.query = output_query;
                 ar.D = cur_nb + 1;
-                ar.Q = s.glob ? 3 : 1;
+                ar.Q = 1;
                 ar.H = c.H;
-                ar.norm[0] = s.glob ? s.q_norm : s.attn_norm;
-                ar.norm[1] = s.k_norm;
-                ar.norm[2] = s.v_norm;
-                ar.out[0] = qi;
-                ar.out[1] = ki;
-                ar.out[2] = vi;
-                ink2::attn_res(ar, M, 0);
+                ar.norm[0] = final_norm;
+                ar.out[0] = hf;
+                ink2::attn_res(ar, M, st);
+                for (int t = 0; t < ntaps; ++t)
+                    if (c.mtp_targets[static_cast<size_t>(t)] == c.n_virtual_layers()) ink2::copy_bf16(hf, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, st);
             }
-            const bool split_kv = s.glob || gated;
+            if (!samples) return;
             for (int i = 0; i < o.nloc; ++i)
             {
-                RankPart& x = s.rk[i];
-                ink2::attn_forward(x.g, x.aw, x.as, x.wk, rw, rh.max_pos, qi, split_kv ? ki : qi, split_kv ? vi : qi, M, T == 1 ? s.att : nullptr,
-                                   parts + static_cast<size_t>(o.rank0 + i) * n, 0, tc);
+                const int r = o.rank0 + i;
+                {
+                    ink2::ProfScope _ps(pf, ink2::PS_TRUNK_LM_HEAD, st);
+                    ink2::lm_head(hf, lm[i], M, c.H, vr, r * vr, c.valid, logits[i], st);
+                }
+                if (head_mode == 1)
+                {
+                    {
+                        ink2::ProfScope _ps(pf, ink2::PS_TRUNK_HEAD_PACK, st);
+                        ink2::head_argmax_dev(logits[i], M, vr, r * vr, h_arg_val, h_arg_id, head_dev, rb, st);
+                    }
+                    if (async_head_d2h) INK2RT_CK(cudaMemcpyAsync(h_head_pin, head_dev, hb, cudaMemcpyDeviceToHost, st));
+                    else
+                    {
+                        INK2RT_CK(cudaMemcpyAsync(&head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost, st));
+                        INK2RT_CK(cudaStreamSynchronize(st));
+                    }
+                    continue;
+                }
+                if (use_ghp)
+                {
+                    {
+                        ink2::ProfScope _ps(pf, ink2::PS_TRUNK_HEAD_PACK, st);
+                        ink2::head_pack_dev(logits[i], M, vr, r * vr, o.nc, head_dev, rb, st);
+                    }
+                    if (async_head_d2h) INK2RT_CK(cudaMemcpyAsync(h_head_pin, head_dev, hb, cudaMemcpyDeviceToHost, st));
+                    else
+                    {
+                        INK2RT_CK(cudaMemcpyAsync(&head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost, st));
+                        INK2RT_CK(cudaStreamSynchronize(st));
+                    }
+                    continue;
+                }
+                INK2RT_CK(cudaMemcpyAsync(host_logits.data(), logits[i], sizeof(float) * static_cast<size_t>(M) * vr, cudaMemcpyDeviceToHost, st));
+                INK2RT_CK(cudaStreamSynchronize(st));
+                for (int m = 0; m < M; ++m) head_pack(&host_logits[static_cast<size_t>(m) * vr], vr, r * vr, o.nc, &head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(m) * rb]);
             }
-            if (T > 1)
+        };
+
+        const bool graph_ok = use_graph && !prof.enabled && T == 1 && o.nloc == 1 && st != nullptr && h_head_pin != nullptr &&
+                              samples != nullptr && !vis_rows && M <= 64 && !tc && !want_blas && use_ghp;
+        if (graph_ok)
+        {
+            const int sm_loc = ink2::attn_splits(false, c.window, rh.max_pos);
+            const int sm_glb = ink2::attn_splits(true, c.window, rh.max_pos);
+            const int loc_flag = (rh.max_pos < c.window) ? 1 : 0;
+            const FwdGraphKey gk{M, sm_loc, sm_glb, loc_flag, head_mode};
+            auto it = fwd_graphs.find(gk);
+            if (it == fwd_graphs.end())
             {
-                if (gather) gather(2 * ji, parts, n * 4);
-                ink2::sum_ranks(parts, T, n, s.att, 0);
-            }
-            ink2::sconv_static(s.att, s.hist_a, rw, s.attn_sconv, M, c.H, a_, 0);
-            const bool bstart = (c.is_looped() ? s.l : ji) % c.block == 0;
-            ink2::attn_block_step(h, a_, bstart, states[static_cast<size_t>(cur_nb)], mid, n, 0);
-            if (bstart) ++cur_nb;
-            if (gated)
-            {
-                ink2::AttnResF32Args ar{};
-                for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
-                ar.rows[cur_nb] = mid;
-                ar.query = s.mlp_query;
-                ar.D = cur_nb + 1;
-                ar.Q = 1;
-                ar.H = c.H;
-                ar.out[0] = f32_mlp;
-                ink2::attn_res_f32(ar, M, 0);
-                ink2::msg_gate_norm(f32_mlp, f32_msg[3], s.ctrl_mlp.down, s.ctrl_mlp.forget, s.ctrl_mlp.gain,
-                                    s.mlp_norm, gate_cat, gate_g, xm, M, c.H, c.loop_gate_rank, 0);
+                cudaGraph_t g = nullptr;
+                cudaGraphExec_t exec = nullptr;
+                INK2RT_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed));
+                run_body_and_head(true);
+                INK2RT_CK(cudaStreamEndCapture(st, &g));
+                INK2RT_CK(cudaGraphInstantiate(&exec, g, nullptr, nullptr, 0));
+                INK2RT_CK(cudaGraphDestroy(g));
+                fwd_graphs.emplace(gk, exec);
+                INK2RT_CK(cudaGraphLaunch(exec, st));
             }
             else
             {
-                ink2::AttnResArgs ar{};
-                for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
-                ar.rows[cur_nb] = mid;
-                ar.query = s.mlp_query;
-                ar.D = cur_nb + 1;
-                ar.Q = 1;
-                ar.H = c.H;
-                ar.norm[0] = s.mlp_norm;
-                ar.out[0] = xm;
-                ink2::attn_res(ar, M, 0);
+                INK2RT_CK(cudaGraphLaunch(it->second, st));
             }
-            if (s.exp_fmt >= 1 && s.exp_fmt <= 3) moe_tr3(s, ji);
-            else if (s.mx8) moe<ink2::Mx8Frag>(s, ji);
-            else moe<nv4::Frag>(s, ji);
-            ink2::sconv_static(s.mo, s.hist_m, rw, s.mlp_sconv, M, c.H, ms, 0);
-            ink2::add_bf16(mid, ms, h, n, 0);
-        }
-        if (!samples && ntaps == 0)
-        {
-            if (T > 1 && step_end) step_end();
-            out.clear();
+            INK2RT_CK(cudaStreamSynchronize(st));
+            out.resize(static_cast<size_t>(M));
+            for (int m = 0; m < M; ++m)
+            {
+                out[m] = head_merge(h_head_pin + static_cast<size_t>(m) * rb, rb, 1, o.nc);
+                out[m].tok = sample_row(out[m].top, samples[m]);
+            }
             return;
         }
-        ink2::AttnResArgs ar{};
-        for (int d = 0; d < cur_nb; ++d) ar.rows[d] = states[static_cast<size_t>(d)];
-        ar.rows[cur_nb] = h;
-        ar.query = output_query;
-        ar.D = cur_nb + 1;
-        ar.Q = 1;
-        ar.H = c.H;
-        ar.norm[0] = final_norm;
-        ar.out[0] = hf;
-        ink2::attn_res(ar, M, 0);
-        for (int t = 0; t < ntaps; ++t)
-            if (c.mtp_targets[static_cast<size_t>(t)] == c.n_virtual_layers()) ink2::copy_bf16(hf, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, 0);
+
+        const BlasScope blas_scope(want_blas ? blas : nullptr);
+        run_body_and_head(false);
         if (!samples)
         {
             if (T > 1 && step_end) step_end();
+            if (pf) pf->end_op(st);
             out.clear();
             return;
-        }
-        // the head: every rank's rows of lm_head, its candidates on the host, then the merge in rank order
-        const size_t hb = head_bytes(M), rb = head_row_bytes(o.nc);
-        for (int i = 0; i < o.nloc; ++i)
-        {
-            const int r = o.rank0 + i;
-            ink2::lm_head(hf, lm[i], M, c.H, vr, r * vr, c.valid, logits[i], 0);
-            if (use_ghp)
-            {
-                ink2::head_pack_dev(logits[i], M, vr, r * vr, o.nc, head_dev, rb, 0);
-                INK2RT_CK(cudaMemcpy(&head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost));
-                continue;
-            }
-            INK2RT_CK(cudaMemcpy(host_logits.data(), logits[i], sizeof(float) * static_cast<size_t>(M) * vr, cudaMemcpyDeviceToHost));
-            for (int m = 0; m < M; ++m) head_pack(&host_logits[static_cast<size_t>(m) * vr], vr, r * vr, o.nc, &head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(m) * rb]);
         }
         if (T > 1 && gather_head) gather_head(collectives() - 1, head_parts.data(), hb);
         if (T > 1 && step_end) step_end();
@@ -1046,22 +1268,53 @@ public:
             out[m] = head_merge(row.data(), rb, T, o.nc);
             out[m].tok = sample_row(out[m].top, samples ? samples[m] : RowSample{});
         }
+        if (pf) pf->end_op(st);
     }
 
     // Keep the rows of the last forward: all of them, or the ones acc marks.
     void commit(const std::vector<uint8_t>* acc = nullptr)
     {
+        const cudaStream_t st = stream;
+        ink2::Prof* pf = prof.enabled ? &prof : nullptr;
+        if (pf) pf->begin_op(3, M);
         const ink2::Rows rw{d_slot, d_pos, d_run0};
-        if (acc) INK2RT_CK(cudaMemcpy(acc_dev, acc->data(), static_cast<size_t>(M), cudaMemcpyHostToDevice));
-        const uint8_t* am = acc ? acc_dev : nullptr;
-        for (Layer& s : L)
+        if (acc)
         {
-            ink2::sconv_advance(s.att, s.hist_a, rw, am, M, c.H, 0);
-            ink2::sconv_advance(s.mo, s.hist_m, rw, am, M, c.H, 0);
-            for (RankPart& x : s.rk) ink2::attn_commit(x.g, x.as, x.wk, rw, am, M, 0);
+            if (h_acc_pin)
+            {
+                memcpy(h_acc_pin, acc->data(), static_cast<size_t>(M));
+                INK2RT_CK(cudaMemcpyAsync(acc_dev, h_acc_pin, static_cast<size_t>(M), cudaMemcpyHostToDevice, st));
+            }
+            else INK2RT_CK(cudaMemcpy(acc_dev, acc->data(), static_cast<size_t>(M), cudaMemcpyHostToDevice));
         }
-        if (o.mtp > 0) mtp_commit(rw, am);
-        INK2RT_CK(cudaDeviceSynchronize());
+        const uint8_t* am = acc ? acc_dev : nullptr;
+        {
+            ink2::ProfScope _ps(pf, ink2::PS_COMMIT_TRUNK, st);
+            static const bool batch_commit_on = []() {
+                const char* e = std::getenv("INK2_BATCH_COMMIT");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            if (batch_commit_on && commit_descs != nullptr && o.nloc == 1)
+            {
+                ink2::commit_all(commit_descs, static_cast<int>(L.size()), rw, am, M, c.H, st);
+            }
+            else
+            {
+                for (Layer& s : L)
+                {
+                    ink2::sconv_advance(s.att, s.hist_a, rw, am, M, c.H, st);
+                    ink2::sconv_advance(s.mo, s.hist_m, rw, am, M, c.H, st);
+                    for (RankPart& x : s.rk) ink2::attn_commit(x.g, x.as, x.wk, rw, am, M, st);
+                }
+            }
+        }
+        if (o.mtp > 0)
+        {
+            ink2::ProfScope _ps(pf, ink2::PS_COMMIT_MTP, st);
+            mtp_commit(rw, am, st);
+        }
+        INK2RT_CK(cudaStreamSynchronize(st));
+        if (pf) pf->end_op(st);
     }
 
     // K drafts (1 .. Options::mtp) per session: the tokens after `golden`, the token sampled at the session's last
@@ -1075,6 +1328,9 @@ public:
         if (o.mtp < 1) die("mtp_draft: the drafter is off");
         if (S < 1 || S > o.slots || K < 1 || K > o.mtp || q_pos.size() != slots.size() || golden.size() != slots.size() || samples.size() != slots.size())
             die("mtp_draft: sessions or drafts");
+        const cudaStream_t st = stream;
+        ink2::Prof* pf = prof.enabled ? &prof : nullptr;
+        if (pf) pf->begin_op(4, S);
         const int MB = S * B;
         std::vector<int> nctx(static_cast<size_t>(S)), pos(static_cast<size_t>(MB));
         int nctx_max = 0;
@@ -1085,11 +1341,32 @@ public:
             nctx_max = std::max(nctx_max, nctx[s]);
             for (int b = 0; b < B; ++b) pos[static_cast<size_t>(s) * B + b] = nctx[s] + b;
         }
-        INK2RT_CK(cudaMemcpy(m_slot, slots.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
-        INK2RT_CK(cudaMemcpy(m_nctx, nctx.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
-        INK2RT_CK(cudaMemcpy(m_gold, golden.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
-        INK2RT_CK(cudaMemcpy(m_prev, golden.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
-        INK2RT_CK(cudaMemcpy(m_pos, pos.data(), sizeof(int) * MB, cudaMemcpyHostToDevice));
+        if (h_mtp_meta_pin)
+        {
+            int* p_slot = h_mtp_meta_pin;
+            int* p_nctx = p_slot + o.slots;
+            int* p_gold = p_nctx + o.slots;
+            int* p_prev = p_gold + o.slots;
+            int* p_pos = p_prev + o.slots;
+            memcpy(p_slot, slots.data(), sizeof(int) * S);
+            memcpy(p_nctx, nctx.data(), sizeof(int) * S);
+            memcpy(p_gold, golden.data(), sizeof(int) * S);
+            memcpy(p_prev, golden.data(), sizeof(int) * S);
+            memcpy(p_pos, pos.data(), sizeof(int) * MB);
+            INK2RT_CK(cudaMemcpyAsync(m_slot, p_slot, sizeof(int) * S, cudaMemcpyHostToDevice, st));
+            INK2RT_CK(cudaMemcpyAsync(m_nctx, p_nctx, sizeof(int) * S, cudaMemcpyHostToDevice, st));
+            INK2RT_CK(cudaMemcpyAsync(m_gold, p_gold, sizeof(int) * S, cudaMemcpyHostToDevice, st));
+            INK2RT_CK(cudaMemcpyAsync(m_prev, p_prev, sizeof(int) * S, cudaMemcpyHostToDevice, st));
+            INK2RT_CK(cudaMemcpyAsync(m_pos, p_pos, sizeof(int) * MB, cudaMemcpyHostToDevice, st));
+        }
+        else
+        {
+            INK2RT_CK(cudaMemcpy(m_slot, slots.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
+            INK2RT_CK(cudaMemcpy(m_nctx, nctx.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
+            INK2RT_CK(cudaMemcpy(m_gold, golden.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
+            INK2RT_CK(cudaMemcpy(m_prev, golden.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
+            INK2RT_CK(cudaMemcpy(m_pos, pos.data(), sizeof(int) * MB, cudaMemcpyHostToDevice));
+        }
         const size_t n = static_cast<size_t>(MB) * H;
         if (T > 1 && step_begin)
         {
@@ -1097,103 +1374,240 @@ public:
             sz.insert(sz.end(), static_cast<size_t>(K), static_cast<uint32_t>((head_bytes(S) + 7) / 8 * 8));
             step_begin(sz);
         }
-        int coll = collectives();
-        ink2::k_ink2_mtp_block_init<<<MB, ink2::NRT, 0, 0>>>(m_gold, embed, embed_norm, mask_embed, m_res, B, H);
-        for (size_t l = 0; l < ML.size(); ++l)
+        bool all_greedy = (T == 1 && R % 8 == 0 && R <= 512 && m_arg_val != nullptr);
+        for (int s = 0; s < S && all_greedy; ++s)
+            if (samples[static_cast<size_t>(s)].inv_temp > 0.f) all_greedy = false;
+        static const bool mtp_fast_argmax_on = []() {
+            const char* e = std::getenv("INK2_MTP_FAST_ARGMAX");
+            return !(e && e[0] == '0' && e[1] == '\0');
+        }();
+        out.assign(static_cast<size_t>(S) * K, 0);
+
+        auto run_mtp_body_and_lm = [&](bool allow_blas) {
+            int coll = collectives();
+            {
+                ink2::ProfScope _ps(pf, ink2::PS_MTP_BODY, st);
+                const BlasScope mtp_blas_scope(allow_blas && use_blas && MB >= 16 ? blas : nullptr);
+                ink2::k_ink2_mtp_block_init<<<MB, ink2::NRT, 0, st>>>(m_gold, embed, embed_norm, mask_embed, m_res, B, H);
+                for (size_t l = 0; l < ML.size(); ++l)
+                {
+                    MtpLayer& y = ML[l];
+                    ink2::rmsnorm(m_res, y.input_norm, m_x, MB, H, st);
+                    for (int i = 0; i < o.nloc; ++i)
+                    {
+                        const MtpRank& x = y.rk[static_cast<size_t>(i)];
+                        MtpWork& w = mwk[static_cast<size_t>(i)];
+                        const ink2::AttnGeom g = rank_geom(o.rank0 + i, false);
+                        const int nq = g.nh_q * g.hd, nk = g.nh_kv * g.hd;
+                        if (x.wq_i8 != nullptr && MB <= 64)
+                        {
+                            const ink2::GemmTargetI8 tqkv_i8[3] = {
+                                {x.wq_i8, x.wq_sc, w.q, nq, 0},
+                                {x.wk_i8, x.wk_sc, w.kb, nk, 0},
+                                {x.wv_i8, x.wv_sc, w.vb, nk, 0},
+                            };
+                            ink2::gemm_multi_bf16_i8(m_x, tqkv_i8, 3, MB, H, st);
+                        }
+                        else
+                        {
+                            const ink2::GemmTarget tqkv[3] = {
+                                {x.wq, w.q, nq, ink2::GEMM_BF16, 0},
+                                {x.wk, w.kb, nk, ink2::GEMM_BF16, 0},
+                                {x.wv, w.vb, nk, ink2::GEMM_BF16, 0},
+                            };
+                            ink2::gemm_multi(m_x, tqkv, 3, MB, H, st);
+                        }
+                        ink2::mtp_head_norm_rope(w.q, y.q_norm, m_pos, inv_freq, MB, g.nh_q, g.hd, st);
+                        ink2::mtp_head_norm_rope(w.kb, y.k_norm, m_pos, inv_freq, MB, g.nh_kv, g.hd, st);
+                        ink2::MtpAttnArgs a{};
+                        a.q = w.q;
+                        a.kb = w.kb;
+                        a.vb = w.vb;
+                        a.ring = x.ring;
+                        a.pages = x.pages;
+                        a.page_table = mtp_page_table;
+                        a.slot = m_slot;
+                        a.nctx = m_nctx;
+                        a.og = w.og;
+                        a.B = B;
+                        a.nh_q = g.nh_q;
+                        a.q0 = g.q0;
+                        a.gqa = g.gqa;
+                        a.kv0 = g.kv0;
+                        a.nk = nk;
+                        a.hd = g.hd;
+                        a.window = c.mtp_window;
+                        a.global = y.glob ? 1 : 0;
+                        a.max_pps = max_pps;
+                        ink2::mtp_attn(a, MB, nctx_max, w.part, w.part_floats, st);
+                        if (T == 1)
+                        {
+                            if (x.wo_i8 != nullptr && MB <= 64) ink2::gemm_bf16_i8(w.og, x.wo_i8, x.wo_sc, MB, nq, H, m_red, st);
+                            else ink2::gemm_bf16(w.og, x.wo, MB, nq, H, m_red, st);
+                        }
+                        else ink2::gemm_f32(w.og, x.wo, MB, nq, H, mtp_parts + static_cast<size_t>(o.rank0 + i) * n, st);
+                    }
+                    if (T > 1)
+                    {
+                        if (gather) gather(coll++, mtp_parts, n * 4);
+                        ink2::sum_ranks(mtp_parts, T, n, m_red, st);
+                    }
+                    ink2::add_bf16(m_res, m_red, m_res, n, st);
+                    ink2::rmsnorm(m_res, y.post_norm, m_x, MB, H, st);
+                    const int iw = c.mtp_inter / T;
+                    for (int i = 0; i < o.nloc; ++i)
+                    {
+                        const MtpRank& x = y.rk[static_cast<size_t>(i)];
+                        MtpWork& w = mwk[static_cast<size_t>(i)];
+                        if (x.gate_i8 != nullptr && MB <= 64)
+                        {
+                            const ink2::GemmTargetI8 tgu_i8[2] = {
+                                {x.gate_i8, x.gate_sc, w.gate, iw, 0},
+                                {x.up_i8, x.up_sc, w.up, iw, 0},
+                            };
+                            ink2::gemm_multi_bf16_i8(m_x, tgu_i8, 2, MB, H, st);
+                        }
+                        else
+                        {
+                            const ink2::GemmTarget tgu[2] = {
+                                {x.gate, w.gate, iw, ink2::GEMM_BF16, 0},
+                                {x.up, w.up, iw, ink2::GEMM_BF16, 0},
+                            };
+                            ink2::gemm_multi(m_x, tgu, 2, MB, H, st);
+                        }
+                        const size_t cells = static_cast<size_t>(MB) * iw;
+                        ink2::k_ink2_mtp_swiglu<<<ink2::cells_grid(cells), 256, 0, st>>>(w.gate, w.up, cells);
+                        if (T == 1)
+                        {
+                            if (x.down_i8 != nullptr && MB <= 64) ink2::gemm_bf16_i8(w.gate, x.down_i8, x.down_sc, MB, iw, H, m_red, st);
+                            else ink2::gemm_bf16(w.gate, x.down, MB, iw, H, m_red, st);
+                        }
+                        else ink2::gemm_f32(w.gate, x.down, MB, iw, H, mtp_parts + static_cast<size_t>(o.rank0 + i) * n, st);
+                    }
+                    if (T > 1)
+                    {
+                        if (gather) gather(coll++, mtp_parts, n * 4);
+                        ink2::sum_ranks(mtp_parts, T, n, m_red, st);
+                    }
+                    ink2::add_bf16(m_res, m_red, m_res, n, st);
+                }
+                ink2::rmsnorm(m_res, mtp_norm, m_x, MB, H, st);
+                ink2::k_ink2_mtp_pick_rows<<<ink2::cells_grid(static_cast<size_t>(S) * K * H), 256, 0, st>>>(m_x, m_hid, S, B, K, H);
+                ink2::mtp_mix_norm(last_taps, static_cast<size_t>(ntaps) * H, static_cast<size_t>(H), m_slot, fuse_alpha + ML.size() * ntaps, head_dflare_norm, m_frnn, S, ntaps, H, st);
+                ink2::gemm_f32(m_hid, w_hid, S * K, H, G, m_hidp, st);
+                ink2::gemm_f32(m_frnn, w_frnn, S, H, G, m_frp, st);
+            }
+            {
+                ink2::ProfScope _ps(pf, ink2::PS_MTP_BASE_LM, st);
+                const BlasScope mtp_lm_blas(allow_blas && use_blas && S * K >= 16 ? blas : nullptr);
+                for (int i = 0; i < o.nloc; ++i)
+                {
+                    MtpWork& w = mwk[static_cast<size_t>(i)];
+                    if (w.lm_i8 != nullptr && w.lm_scale != nullptr && S * K <= 64)
+                        ink2::gemm_bf16_i8(m_hid, w.lm_i8, w.lm_scale, S * K, H, vr, w.base, st);
+                    else
+                        ink2::gemm_bf16(m_hid, lm[i], S * K, H, vr, w.base, st);
+                }
+            }
+            return coll;
+        };
+
+        const bool mtp_graph_ok = use_graph && !prof.enabled && T == 1 && o.nloc == 1 && st != nullptr && h_draft_out_pin != nullptr && all_greedy && mtp_fast_argmax_on;
+        if (mtp_graph_ok)
         {
-            MtpLayer& y = ML[l];
-            ink2::rmsnorm(m_res, y.input_norm, m_x, MB, H, 0);
-            for (int i = 0; i < o.nloc; ++i)
+            const int sm_loc = ink2::mtp_splits(false, c.mtp_window, nctx_max, B);
+            const int sm_glb = ink2::mtp_splits(true, c.mtp_window, nctx_max, B);
+            const MtpGraphKey mgk{S, K, sm_loc, sm_glb};
+            auto it = mtp_graphs.find(mgk);
+            if (it == mtp_graphs.end())
             {
-                const MtpRank& x = y.rk[static_cast<size_t>(i)];
-                MtpWork& w = mwk[static_cast<size_t>(i)];
-                const ink2::AttnGeom g = rank_geom(o.rank0 + i, false);
-                const int nq = g.nh_q * g.hd, nk = g.nh_kv * g.hd;
-                ink2::gemm_bf16(m_x, x.wq, MB, H, nq, w.q, 0);
-                ink2::gemm_bf16(m_x, x.wk, MB, H, nk, w.kb, 0);
-                ink2::gemm_bf16(m_x, x.wv, MB, H, nk, w.vb, 0);
-                ink2::mtp_head_norm_rope(w.q, y.q_norm, m_pos, inv_freq, MB, g.nh_q, g.hd, 0);
-                ink2::mtp_head_norm_rope(w.kb, y.k_norm, m_pos, inv_freq, MB, g.nh_kv, g.hd, 0);
-                ink2::MtpAttnArgs a{};
-                a.q = w.q;
-                a.kb = w.kb;
-                a.vb = w.vb;
-                a.ring = x.ring;
-                a.pages = x.pages;
-                a.page_table = mtp_page_table;
-                a.slot = m_slot;
-                a.nctx = m_nctx;
-                a.og = w.og;
-                a.B = B;
-                a.nh_q = g.nh_q;
-                a.q0 = g.q0;
-                a.gqa = g.gqa;
-                a.kv0 = g.kv0;
-                a.nk = nk;
-                a.hd = g.hd;
-                a.window = c.mtp_window;
-                a.global = y.glob ? 1 : 0;
-                a.max_pps = max_pps;
-                ink2::mtp_attn(a, MB, nctx_max, w.part, w.part_floats, 0);
-                if (T == 1) ink2::gemm_bf16(w.og, x.wo, MB, nq, H, m_red, 0);
-                else ink2::gemm_f32(w.og, x.wo, MB, nq, H, mtp_parts + static_cast<size_t>(o.rank0 + i) * n, 0);
+                cudaGraph_t g = nullptr;
+                cudaGraphExec_t exec = nullptr;
+                INK2RT_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed));
+                (void)run_mtp_body_and_lm(false);
+                INK2RT_CK(cudaMemsetAsync(m_state, 0, static_cast<size_t>(S) * R * 2, st));
+                constexpr int NG = 256;
+                MtpWork& w0 = mwk[0];
+                for (int step = 0; step < K; ++step)
+                {
+                    ink2::k_ink2_mtp_inp<<<ink2::cells_grid(static_cast<size_t>(S) * 2 * R), 256, 0, st>>>(m_state, markov_w1, m_prev, m_inp, S, R);
+                    ink2::gemm_f32(m_inp, w_rec, S, 2 * R, G, m_rec, st);
+                    ink2::k_ink2_mtp_gate<<<ink2::cells_grid(static_cast<size_t>(S) * R), 256, 0, st>>>(rnn_bias, m_hidp, m_frp, m_rec, m_state, m_latent, S, K, step, R);
+                    ink2::mtp_fold_argmax_launch(
+                        m_latent, w0.fold_w, w0.fold_w_i8, w0.fold_scale, w0.fold_b, w0.base,
+                        m_arg_val, m_arg_id, m_prev, m_draft_out, NG, S, K, step, R, vr, c.valid, st);
+                }
+                INK2RT_CK(cudaMemcpyAsync(h_draft_out_pin, m_draft_out, sizeof(int) * static_cast<size_t>(S) * K, cudaMemcpyDeviceToHost, st));
+                INK2RT_CK(cudaStreamEndCapture(st, &g));
+                INK2RT_CK(cudaGraphInstantiate(&exec, g, nullptr, nullptr, 0));
+                INK2RT_CK(cudaGraphDestroy(g));
+                mtp_graphs.emplace(mgk, exec);
+                INK2RT_CK(cudaGraphLaunch(exec, st));
             }
-            if (T > 1)
+            else
             {
-                if (gather) gather(coll++, mtp_parts, n * 4);
-                ink2::sum_ranks(mtp_parts, T, n, m_red, 0);
+                INK2RT_CK(cudaGraphLaunch(it->second, st));
             }
-            ink2::add_bf16(m_res, m_red, m_res, n, 0);
-            ink2::rmsnorm(m_res, y.post_norm, m_x, MB, H, 0);
-            const int iw = c.mtp_inter / T;
-            for (int i = 0; i < o.nloc; ++i)
-            {
-                const MtpRank& x = y.rk[static_cast<size_t>(i)];
-                MtpWork& w = mwk[static_cast<size_t>(i)];
-                ink2::gemm_bf16(m_x, x.gate, MB, H, iw, w.gate, 0);
-                ink2::gemm_bf16(m_x, x.up, MB, H, iw, w.up, 0);
-                const size_t cells = static_cast<size_t>(MB) * iw;
-                ink2::k_ink2_mtp_swiglu<<<ink2::cells_grid(cells), 256, 0, 0>>>(w.gate, w.up, cells);
-                if (T == 1) ink2::gemm_bf16(w.gate, x.down, MB, iw, H, m_red, 0);
-                else ink2::gemm_f32(w.gate, x.down, MB, iw, H, mtp_parts + static_cast<size_t>(o.rank0 + i) * n, 0);
-            }
-            if (T > 1)
-            {
-                if (gather) gather(coll++, mtp_parts, n * 4);
-                ink2::sum_ranks(mtp_parts, T, n, m_red, 0);
-            }
-            ink2::add_bf16(m_res, m_red, m_res, n, 0);
+            INK2RT_CK(cudaStreamSynchronize(st));
+            memcpy(out.data(), h_draft_out_pin, sizeof(int) * static_cast<size_t>(S) * K);
+            return;
         }
-        // the head: block row step + 1 gives draft step
-        ink2::rmsnorm(m_res, mtp_norm, m_x, MB, H, 0);
-        ink2::k_ink2_mtp_pick_rows<<<ink2::cells_grid(static_cast<size_t>(S) * K * H), 256, 0, 0>>>(m_x, m_hid, S, B, K, H);
-        ink2::mtp_mix_norm(last_taps, static_cast<size_t>(ntaps) * H, static_cast<size_t>(H), m_slot, fuse_alpha + ML.size() * ntaps, head_dflare_norm, m_frnn, S, ntaps, H, 0);
-        ink2::gemm_f32(m_hid, w_hid, S * K, H, G, m_hidp, 0);
-        ink2::gemm_f32(m_frnn, w_frnn, S, H, G, m_frp, 0);
-        for (int i = 0; i < o.nloc; ++i) ink2::gemm_bf16(m_hid, lm[i], S * K, H, vr, mwk[static_cast<size_t>(i)].base, 0);
-        INK2RT_CK(cudaMemset(m_state, 0, static_cast<size_t>(S) * R * 2));
+
+        int coll = run_mtp_body_and_lm(true);
+        INK2RT_CK(cudaMemsetAsync(m_state, 0, static_cast<size_t>(S) * R * 2, st));
+        if (all_greedy && mtp_fast_argmax_on)
+        {
+            constexpr int NG = 256;
+            MtpWork& w0 = mwk[0];
+            for (int step = 0; step < K; ++step)
+            {
+                ink2::ProfScope _ps(pf, ink2::PS_MTP_RNN_FOLD, st);
+                ink2::k_ink2_mtp_inp<<<ink2::cells_grid(static_cast<size_t>(S) * 2 * R), 256, 0, st>>>(m_state, markov_w1, m_prev, m_inp, S, R);
+                ink2::gemm_f32(m_inp, w_rec, S, 2 * R, G, m_rec, st);
+                ink2::k_ink2_mtp_gate<<<ink2::cells_grid(static_cast<size_t>(S) * R), 256, 0, st>>>(rnn_bias, m_hidp, m_frp, m_rec, m_state, m_latent, S, K, step, R);
+                ink2::mtp_fold_argmax_launch(
+                    m_latent, w0.fold_w, w0.fold_w_i8, w0.fold_scale, w0.fold_b, w0.base,
+                    m_arg_val, m_arg_id, m_prev, m_draft_out, NG, S, K, step, R, vr, c.valid, st);
+            }
+            INK2RT_CK(cudaMemcpyAsync(out.data(), m_draft_out, sizeof(int) * static_cast<size_t>(S) * K, cudaMemcpyDeviceToHost, st));
+            INK2RT_CK(cudaStreamSynchronize(st));
+            if (pf) pf->end_op(st);
+            return;
+        }
         const size_t hb = head_bytes(S), rb = head_row_bytes(o.nc);
         std::vector<uint8_t> row(static_cast<size_t>(T) * rb);
         std::vector<int> prev(static_cast<size_t>(S));
-        out.assign(static_cast<size_t>(S) * K, 0);
         for (int step = 0; step < K; ++step)
         {
-            ink2::k_ink2_mtp_inp<<<ink2::cells_grid(static_cast<size_t>(S) * 2 * R), 256, 0, 0>>>(m_state, markov_w1, m_prev, m_inp, S, R);
-            ink2::gemm_f32(m_inp, w_rec, S, 2 * R, G, m_rec, 0);
-            ink2::k_ink2_mtp_gate<<<ink2::cells_grid(static_cast<size_t>(S) * R), 256, 0, 0>>>(rnn_bias, m_hidp, m_frp, m_rec, m_state, m_latent, S, K, step, R);
+            {
+                ink2::ProfScope _ps(pf, ink2::PS_MTP_RNN_FOLD, st);
+                ink2::k_ink2_mtp_inp<<<ink2::cells_grid(static_cast<size_t>(S) * 2 * R), 256, 0, st>>>(m_state, markov_w1, m_prev, m_inp, S, R);
+                ink2::gemm_f32(m_inp, w_rec, S, 2 * R, G, m_rec, st);
+                ink2::k_ink2_mtp_gate<<<ink2::cells_grid(static_cast<size_t>(S) * R), 256, 0, st>>>(rnn_bias, m_hidp, m_frp, m_rec, m_state, m_latent, S, K, step, R);
+                for (int i = 0; i < o.nloc; ++i)
+                {
+                    const int r = o.rank0 + i;
+                    MtpWork& w = mwk[static_cast<size_t>(i)];
+                    ink2::gemm_f32(m_latent, w.fold_w, S, R, vr, w.lg, st);
+                    ink2::k_ink2_mtp_logits<<<ink2::cells_grid(static_cast<size_t>(S) * vr), 256, 0, st>>>(w.base, w.fold_b, w.lg, S, K, step, vr, r * vr, c.valid);
+                }
+            }
             for (int i = 0; i < o.nloc; ++i)
             {
                 const int r = o.rank0 + i;
                 MtpWork& w = mwk[static_cast<size_t>(i)];
-                ink2::gemm_f32(m_latent, w.fold_w, S, R, vr, w.lg, 0);
-                ink2::k_ink2_mtp_logits<<<ink2::cells_grid(static_cast<size_t>(S) * vr), 256, 0, 0>>>(w.base, w.fold_b, w.lg, S, K, step, vr, r * vr, c.valid);
                 if (use_ghp)
                 {
-                    ink2::head_pack_dev(w.lg, S, vr, r * vr, o.nc, head_dev, rb, 0);
-                    INK2RT_CK(cudaMemcpy(&mtp_head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost));
+                    {
+                        ink2::ProfScope _ps(pf, ink2::PS_MTP_HEAD_PACK, st);
+                        ink2::head_pack_dev(w.lg, S, vr, r * vr, o.nc, head_dev, rb, st);
+                    }
+                    INK2RT_CK(cudaMemcpyAsync(&mtp_head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost, st));
+                    INK2RT_CK(cudaStreamSynchronize(st));
                     continue;
                 }
-                INK2RT_CK(cudaMemcpy(mtp_host_logits.data(), w.lg, sizeof(float) * static_cast<size_t>(S) * vr, cudaMemcpyDeviceToHost));
+                INK2RT_CK(cudaMemcpyAsync(mtp_host_logits.data(), w.lg, sizeof(float) * static_cast<size_t>(S) * vr, cudaMemcpyDeviceToHost, st));
+                INK2RT_CK(cudaStreamSynchronize(st));
                 for (int s = 0; s < S; ++s)
                     head_pack(&mtp_host_logits[static_cast<size_t>(s) * vr], vr, r * vr, o.nc, &mtp_head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(s) * rb]);
             }
@@ -1206,9 +1620,10 @@ public:
                 prev[s] = sample_row(head_merge(row.data(), rb, T, o.nc).top, sm);
                 out[static_cast<size_t>(s) * K + step] = prev[s];
             }
-            if (step + 1 < K) INK2RT_CK(cudaMemcpy(m_prev, prev.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
+            if (step + 1 < K) INK2RT_CK(cudaMemcpyAsync(m_prev, prev.data(), sizeof(int) * S, cudaMemcpyHostToDevice, st));
         }
         if (T > 1 && step_end) step_end();
+        if (pf) pf->end_op(st);
     }
 
     // The state a KvStateDesc names (s2/kv_state_desc.h ink2_kv_state): bytes of one page row and of a slot's tail.
@@ -1253,6 +1668,7 @@ public:
     // Copies the unfinished page at `pos` of each full-attention layer to `staging` (before capture) or back (after restore).
     void stage_partial_page(int slot, uint32_t pos, bool to_staging, int i = 0)
     {
+        if (stream) INK2RT_CK(cudaStreamSynchronize(stream));
         if (slot < 0 || slot >= o.slots) die("stage_partial_page: slot");
         const uint32_t rem = pos % static_cast<uint32_t>(ink2::KV_PAGE_TOKENS);
         const uint32_t p = pos / static_cast<uint32_t>(ink2::KV_PAGE_TOKENS);
@@ -1450,6 +1866,7 @@ private:
                 x.tr3_v3 = im.get<__half>(N("tr3.v3"));
                 x.tr3_tab = im.get<long long>(N("tr3.table"));
                 x.tr3_kmix = im.opt<long long>(N("tr3.kmix"));
+                x.tr3_nblk = static_cast<int>(im.dim(N("tr3.v1"), 0));
                 const int nh_tot = c.I / 128;
                 x.tr3_eb = (nh_tot + o.nr - 1) / o.nr;
             }
@@ -1601,6 +2018,9 @@ private:
         m_gold = dalloc<int>(sl);
         m_prev = dalloc<int>(sl);
         m_pos = dalloc<int>(MBm);
+        m_arg_val = dalloc<float>(sl * 256);
+        m_arg_id = dalloc<int>(sl * 256);
+        m_draft_out = dalloc<int>(sl * static_cast<size_t>(o.mtp));
         mtp_parts = T > 1 ? dalloc<float>(static_cast<size_t>(T) * MBm * H) : nullptr;
         mtp_host_logits.resize(sl * vr);
         mtp_head_parts.resize(static_cast<size_t>(T) * head_bytes(o.slots));
@@ -1630,39 +2050,163 @@ private:
             w.fold_w = dalloc<uint16_t>(static_cast<size_t>(vr) * R);
             w.fold_b = dalloc<uint16_t>(static_cast<size_t>(vr));
             ink2::k_ink2_mtp_fold<<<vr, 256, 0, 0>>>(lm[static_cast<size_t>(i)], how, hob, w.fold_w, w.fold_b, H, R);
+            static const bool mtp_i8_on = []() {
+                const char* e = std::getenv("INK2_MTP_INT8_LM");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            if (mtp_i8_on && (H % 64 == 0) && (R % 8 == 0))
+            {
+                w.lm_i8 = dalloc<int8_t>(static_cast<size_t>(vr) * H);
+                w.lm_scale = dalloc<float>(static_cast<size_t>(vr));
+                w.fold_w_i8 = dalloc<int8_t>(static_cast<size_t>(vr) * R);
+                w.fold_scale = dalloc<float>(static_cast<size_t>(vr));
+                const unsigned gx_q = static_cast<unsigned>((vr + 3) / 4);
+                ink2::k_ink2_quant_row_i8<<<gx_q, 128, 0, 0>>>(lm[static_cast<size_t>(i)], w.lm_i8, w.lm_scale, vr, H);
+                ink2::k_ink2_quant_row_i8<<<gx_q, 128, 0, 0>>>(w.fold_w, w.fold_w_i8, w.fold_scale, vr, R);
+            }
+        }
+        size_t mtp_body_i8_bytes = 0;
+        {
+            static const bool mtp_i8_on = []() {
+                const char* e = std::getenv("INK2_MTP_INT8_LM");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            const int iw_l = c.mtp_inter / T;
+            if (mtp_i8_on && T == 1 && (H % 128 == 0) && (iw_l % 128 == 0))
+            {
+                auto qmat = [&](const uint16_t* src, int N, int K, int8_t*& dst, float*& sc) {
+                    dst = dalloc<int8_t>(static_cast<size_t>(N) * K);
+                    sc = dalloc<float>(static_cast<size_t>(N));
+                    ink2::k_ink2_quant_row_i8<<<static_cast<unsigned>((N + 3) / 4), 128, 0, 0>>>(src, dst, sc, N, K);
+                    mtp_body_i8_bytes += static_cast<size_t>(N) * K + static_cast<size_t>(N) * sizeof(float);
+                };
+                for (int l = 0; l < nl; ++l)
+                {
+                    MtpLayer& y = ML[static_cast<size_t>(l)];
+                    for (int i = 0; i < o.nloc; ++i)
+                    {
+                        MtpRank& x = y.rk[static_cast<size_t>(i)];
+                        const ink2::AttnGeom g = rank_geom(o.rank0 + i, false);
+                        const int nq_l = g.nh_q * g.hd, nk_l = g.nh_kv * g.hd;
+                        if ((nq_l % 128 == 0) && (nk_l % 16 == 0))
+                        {
+                            qmat(x.wq, nq_l, H, x.wq_i8, x.wq_sc);
+                            qmat(x.wk, nk_l, H, x.wk_i8, x.wk_sc);
+                            qmat(x.wv, nk_l, H, x.wv_i8, x.wv_sc);
+                            qmat(x.wo, H, nq_l, x.wo_i8, x.wo_sc);
+                            qmat(x.gate, iw_l, H, x.gate_i8, x.gate_sc);
+                            qmat(x.up, iw_l, H, x.up_i8, x.up_sc);
+                            qmat(x.down, H, iw_l, x.down_i8, x.down_sc);
+                        }
+                    }
+                }
+            }
         }
         INK2RT_CK(cudaDeviceSynchronize());
+        if (!mwk.empty() && mwk[0].lm_i8 != nullptr)
+            fprintf(stderr, "# ink2: drafter INT8 lm_head + fold_w + body enabled (%.1f MiB, exact BF16 trunk verification)\n",
+                    (static_cast<size_t>(vr) * (H + R) + static_cast<size_t>(vr) * 8 + mtp_body_i8_bytes) / (1024.0 * 1024.0));
         fprintf(stderr, "# ink2: drafter of %d layers, %d taps, block %d, %d drafts a round, window %d, rank %d\n", nl, ntaps, B, o.mtp, c.mtp_window, R);
     }
     // The context rows of the accepted rows of the last forward, per drafter layer, and the slots' last taps.
-    void mtp_commit(const ink2::Rows& rw, const uint8_t* am)
+    void mtp_commit(const ink2::Rows& rw, const uint8_t* am, cudaStream_t st = 0)
     {
         const int H = c.H;
         const size_t tap_stride = static_cast<size_t>(o.max_rows) * H;
         for (size_t l = 0; l < ML.size(); ++l)
         {
             MtpLayer& y = ML[l];
-            ink2::mtp_mix_norm(step_taps, static_cast<size_t>(H), tap_stride, nullptr, fuse_alpha + l * ntaps, y.dflare_norm, ctx_x, M, ntaps, H, 0);
+            ink2::mtp_mix_norm(step_taps, static_cast<size_t>(H), tap_stride, nullptr, fuse_alpha + l * ntaps, y.dflare_norm, ctx_x, M, ntaps, H, st);
             for (int i = 0; i < o.nloc; ++i)
             {
                 MtpRank& x = y.rk[static_cast<size_t>(i)];
                 MtpWork& w = mwk[static_cast<size_t>(i)];
                 const ink2::AttnGeom g = rank_geom(o.rank0 + i, false);
                 const int nk = g.nh_kv * g.hd;
-                ink2::gemm_bf16(ctx_x, x.wkc, M, H, nk, w.ck, 0);
-                ink2::gemm_bf16(ctx_x, x.wvc, M, H, nk, w.cv, 0);
-                ink2::mtp_head_norm_rope(w.ck, y.k_norm_ctx, rw.pos, inv_freq, M, g.nh_kv, g.hd, 0);
-                ink2::k_ink2_mtp_ctx_store<<<ink2::cells_grid(static_cast<size_t>(M) * nk), 256, 0, 0>>>(w.ck, w.cv, x.ring, x.pages, mtp_page_table, max_pps, rw, am, M, nk,
-                                                                                                        c.mtp_window);
+                const ink2::GemmTarget tkv[2] = {
+                    {x.wkc, w.ck, nk, ink2::GEMM_BF16, 0},
+                    {x.wvc, w.cv, nk, ink2::GEMM_BF16, 0},
+                };
+                ink2::gemm_multi(ctx_x, tkv, 2, M, H, st);
+                ink2::mtp_head_norm_rope(w.ck, y.k_norm_ctx, rw.pos, inv_freq, M, g.nh_kv, g.hd, st);
+                ink2::k_ink2_mtp_ctx_store<<<ink2::cells_grid(static_cast<size_t>(M) * nk), 256, 0, st>>>(w.ck, w.cv, x.ring, x.pages, mtp_page_table, max_pps, rw, am, M, nk,
+                                                                                                         c.mtp_window);
             }
         }
-        ink2::k_ink2_mtp_last_taps<<<ink2::cells_grid(static_cast<size_t>(M) * ntaps * H), 256, 0, 0>>>(step_taps, tap_stride, last_taps, rw, am, M, ntaps, H);
+        ink2::k_ink2_mtp_last_taps<<<ink2::cells_grid(static_cast<size_t>(M) * ntaps * H), 256, 0, st>>>(step_taps, tap_stride, last_taps, rw, am, M, ntaps, H);
     }
-    void moe_tr3(Layer& s, int j)
+    void init_tr3_wide()
+    {
+        const char* e = std::getenv("INK2_TR3_WIDE");
+        if (e && e[0] == '0' && e[1] == '\0') return;
+        const int HB = c.H / 128;
+        if (c.H % 128 != 0) return;
+        struct PhysTr3 { const __half *sg = nullptr, *v1b = nullptr, *v3b = nullptr; int wide = 0; bool done = false; };
+        std::vector<PhysTr3> phys(static_cast<size_t>(c.n_layers) * o.nloc);
+        int* d_ok = dalloc<int>(1);
+        int n_widened = 0;
+        for (Layer& s : L)
+        {
+            if (s.exp_fmt != 3) continue;
+            for (int i = 0; i < o.nloc; ++i)
+            {
+                RankPart& x = s.rk[i];
+                PhysTr3& pt = phys[static_cast<size_t>(s.l) * o.nloc + i];
+                if (!pt.done)
+                {
+                    pt.done = true;
+                    if (x.tr3_nblk > 0 && x.tr3_eb > 0)
+                    {
+                        __half* sg = dalloc<__half>(static_cast<size_t>(2) * c.H);
+                        __half* v1b = dalloc<__half>(static_cast<size_t>(x.tr3_nblk) * 2 * HB);
+                        __half* v3b = dalloc<__half>(static_cast<size_t>(x.tr3_nblk) * HB);
+                        int one = 1;
+                        INK2RT_CK(cudaMemcpy(d_ok, &one, sizeof(int), cudaMemcpyHostToDevice));
+                        ink2::tr3::k_ink2_tr3_extract_sg<<<(c.H + 255) / 256, 256, 0, 0>>>(x.tr3_v1, x.tr3_v3, sg, x.tr3_nblk, c.H);
+                        ink2::tr3::k_ink2_tr3_extract_verify_bs<<<x.tr3_nblk * HB, 128, 0, 0>>>(x.tr3_v1, x.tr3_v3, sg, v1b, v3b, d_ok, x.tr3_nblk, c.H);
+                        int h_ok = 0;
+                        INK2RT_CK(cudaMemcpy(&h_ok, d_ok, sizeof(int), cudaMemcpyDeviceToHost));
+                        if (h_ok == 1)
+                        {
+                            ink2::tr3::k_ink2_tr3_widen_fc1<<<c.NE * x.tr3_eb * 2 * HB, 256, 0, 0>>>(
+                                const_cast<uint8_t*>(x.tr3_fc1), x.tr3_tab, x.tr3_kmix, x.tr3_eb, c.H);
+                            ink2::tr3::k_ink2_tr3_widen_fc2<<<c.NE * x.tr3_eb * HB, 256, 0, 0>>>(
+                                const_cast<uint8_t*>(x.tr3_fc2), x.tr3_tab, x.tr3_eb, c.H);
+                            pt.sg = sg;
+                            pt.v1b = v1b;
+                            pt.v3b = v3b;
+                            pt.wide = 1;
+                            ++n_widened;
+                        }
+                        else
+                        {
+                            cudaFree(sg);
+                            cudaFree(v1b);
+                            cudaFree(v3b);
+                        }
+                    }
+                }
+                x.tr3_sg = pt.sg;
+                x.tr3_v1b = pt.v1b;
+                x.tr3_v3b = pt.v3b;
+                x.tr3_wide = pt.wide;
+            }
+        }
+        cudaFree(d_ok);
+        INK2RT_CK(cudaDeviceSynchronize());
+        if (n_widened > 0)
+            fprintf(stderr, "# ink2: tr3 wide+factorized enabled on %d physical PMCGX layers (H=%d, HB=%d)\n", n_widened, c.H, HB);
+    }
+
+    void moe_tr3(Layer& s, int j, cudaStream_t st = 0)
     {
         ink2::Work& w0 = mw[0];
         const int T = o.nr;
-        ink2::route(xm, s.router_w, s.router_bias, M, c.H, c.NE, c.TK, c.route_scale, w0.score, w0.idx, w0.wt, w0.plan, 0);
+        ink2::Prof* pf = prof.enabled ? &prof : nullptr;
+        {
+            ink2::ProfScope _ps(pf, ink2::PS_ROUTER, st);
+            ink2::route(xm, s.router_w, s.router_bias, M, c.H, c.NE, c.TK, c.route_scale, w0.score, w0.idx, w0.wt, w0.plan, st);
+        }
         const int cb = s.exp_fmt == 3 ? ink2::tr3::CB_PMCGX : s.exp_fmt == 2 ? ink2::tr3::CB_MUL1 : ink2::tr3::CB_MCG;
         const size_t picks = static_cast<size_t>(M) * c.TK * c.H;
         for (int i = 0; i < o.nloc; ++i)
@@ -1686,33 +2230,38 @@ private:
             ta.M = M;
             ta.TK = c.TK;
             ta.y_bf16 = 0;
-            ink2::tr3::moe_tr3(ta, cb, c.NE, 0);
+            ta.sg = x.tr3_sg;
+            ta.v1b = x.tr3_v1b;
+            ta.v3b = x.tr3_v3b;
+            ta.x_had = tr3_x_had[static_cast<size_t>(i)];
+            ta.wide = x.tr3_wide;
+            ink2::tr3::moe_tr3(ta, cb, c.NE, st, pf);
             if (T == 1) return;
             PickArgs pa{static_cast<const float*>(mw[i].ypart), w0.plan, M, c.H, c.TK, parts + static_cast<size_t>(o.rank0 + i) * picks};
-            k_ink2rt_picks<<<ink2::cells_grid(picks), 256, 0, 0>>>(pa);
+            k_ink2rt_picks<<<ink2::cells_grid(picks), 256, 0, st>>>(pa);
         }
         if (gather) gather(2 * j + 1, parts, picks * 4);
-        k_ink2rt_pick_sum<<<ink2::cells_grid(static_cast<size_t>(M) * c.H), 256, 0, 0>>>(parts, T, picks, M, c.H, c.TK, s.mo);
+        k_ink2rt_pick_sum<<<ink2::cells_grid(static_cast<size_t>(M) * c.H), 256, 0, st>>>(parts, T, picks, M, c.H, c.TK, s.mo);
     }
-    template <class F> void moe(Layer& s, int j)
+    template <class F> void moe(Layer& s, int j, cudaStream_t st = 0)
     {
         ink2::Work& w0 = mw[0];
         const int T = o.nr;
-        ink2::route(xm, s.router_w, s.router_bias, M, c.H, c.NE, c.TK, c.route_scale, w0.score, w0.idx, w0.wt, w0.plan, 0);
+        ink2::route(xm, s.router_w, s.router_bias, M, c.H, c.NE, c.TK, c.route_scale, w0.score, w0.idx, w0.wt, w0.plan, st);
         const size_t picks = static_cast<size_t>(M) * c.TK * c.H;
         for (int i = 0; i < o.nloc; ++i)
         {
             const RankPart& x = s.rk[i];
             ink2::MoeArgs ma = mw[i].args(x.fc1, x.fc2, x.s1, x.s2, M, T == 1 ? s.mo : scratch);
             ma.plan = w0.plan;   // one routing for every rank
-            if (M <= 8) ink2::moe_decode<F>(ma, xm, c.NE, 0);
-            else ink2::moe_prefill<F>(ma, xm, c.NE, 0);
+            if (M <= 8) ink2::moe_decode<F>(ma, xm, c.NE, st);
+            else ink2::moe_prefill<F>(ma, xm, c.NE, st);
             if (T == 1) return;
             PickArgs pa{static_cast<const float*>(mw[i].ypart), w0.plan, M, c.H, c.TK, parts + static_cast<size_t>(o.rank0 + i) * picks};
-            k_ink2rt_picks<<<ink2::cells_grid(picks), 256, 0, 0>>>(pa);
+            k_ink2rt_picks<<<ink2::cells_grid(picks), 256, 0, st>>>(pa);
         }
         if (gather) gather(2 * j + 1, parts, picks * 4);
-        k_ink2rt_pick_sum<<<ink2::cells_grid(static_cast<size_t>(M) * c.H), 256, 0, 0>>>(parts, T, picks, M, c.H, c.TK, s.mo);
+        k_ink2rt_pick_sum<<<ink2::cells_grid(static_cast<size_t>(M) * c.H), 256, 0, st>>>(parts, T, picks, M, c.H, c.TK, s.mo);
     }
 
     std::vector<std::unique_ptr<Image>> img;
@@ -1779,9 +2328,11 @@ private:
     const float* output_query = nullptr;
     const float* msg_queries = nullptr;   // looped only: [n_loop][4][H] fp32
     uint16_t *pre_h = nullptr, *prev_h = nullptr, *gate_cat = nullptr, *gate_g = nullptr;
+    float *gate_sf = nullptr, *gate_sm = nullptr;
     std::vector<uint16_t*> prev_states;
     float *f32_attn[3] = {}, *f32_msg[4] = {}, *f32_mlp = nullptr;
     std::vector<__half*> tr3_a_rot;       // exlr8 tr3 per-local-rank activation scratch
+    std::vector<__half*> tr3_x_had;       // exlr8 tr3 per-local-rank pre-rotated input scratch
     int *d_slot = nullptr, *d_pos = nullptr, *d_run0 = nullptr, *toks = nullptr;
     uint8_t* acc_dev = nullptr;
     uint16_t *h = nullptr, *qi = nullptr, *ki = nullptr, *vi = nullptr, *a_ = nullptr, *mid = nullptr, *xm = nullptr, *ms = nullptr, *hf = nullptr, *scratch = nullptr;
@@ -1802,5 +2353,19 @@ private:
     uint16_t *m_res = nullptr, *m_x = nullptr, *m_red = nullptr, *m_hid = nullptr, *m_frnn = nullptr, *m_state = nullptr, *m_latent = nullptr, *m_inp = nullptr;
     float *m_hidp = nullptr, *m_frp = nullptr, *m_rec = nullptr, *mtp_parts = nullptr;
     int *m_slot = nullptr, *m_nctx = nullptr, *m_gold = nullptr, *m_prev = nullptr, *m_pos = nullptr;
+    float *m_arg_val = nullptr;
+    int *m_arg_id = nullptr, *m_draft_out = nullptr;
+    float *h_arg_val = nullptr;
+    int *h_arg_id = nullptr;
+    cudaStream_t stream = nullptr;
+    int *h_meta_pin = nullptr, *h_mtp_meta_pin = nullptr, *h_draft_out_pin = nullptr;
+    uint8_t *h_head_pin = nullptr, *h_acc_pin = nullptr;
+    bool use_graph = false;
+    using FwdGraphKey = std::tuple<int, int, int, int, int>;
+    using MtpGraphKey = std::tuple<int, int, int, int>;
+    std::map<FwdGraphKey, cudaGraphExec_t> fwd_graphs;
+    std::map<MtpGraphKey, cudaGraphExec_t> mtp_graphs;
+    ink2::CommitLayerDesc* commit_descs = nullptr;
+    ink2::Prof prof;
 };
 }   // namespace ink2rt
