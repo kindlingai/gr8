@@ -599,7 +599,7 @@ int main(int argc, char** argv) {
     o.rank0 = rank;
     o.nloc = 1;
     o.slots = s2sess;
-    o.max_rows = std::max(prefill, std::max(chunk, o.slots * (mtp + 1)));
+    o.max_rows = std::max(prefill, std::max(chunk, o.slots * (std::max(mtp, 7) + 1)));
     o.cap = cap;
     o.nc = std::max(nc, 1);
     o.mtp = mtp;
@@ -694,11 +694,13 @@ int main(int argc, char** argv) {
                 wire.fast_ag_assemble(c, mx, M, sr, e.stream);
             };
             e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.fast_host(c, p, b); };
+            e.gather_raw = [&](uint8_t* p, size_t b) { wire.exchange_host(0, p, b); };
             e.step_end = [&]() { wire.fast_end(e.stream); };
             e.step_parity = [&]() -> int { return static_cast<int>(wire.step & 1); };
         } else {
             e.gather_dev = [&](int c, __nv_bfloat16* p, size_t b) { wire.exchange_dev(c, p, b); };
             e.gather_host = [&](int c, uint8_t* p, size_t b) { wire.exchange_host(c, p, b); };
+            e.gather_raw = [&](uint8_t* p, size_t b) { wire.exchange_host(0, p, b); };
         }
     }
 
@@ -731,6 +733,93 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // High-throughput batched multi-prompt inline .qtap capture (--tokens @@prompts_file, loads model ONCE!)
+    if (tokens.size() > 2 && tokens[0] == '@' && tokens[1] == '@') {
+        std::ifstream bf(tokens.substr(2));
+        if (!bf) die("cannot open --tokens batch file: " + tokens.substr(2));
+        std::vector<std::vector<int>> batch_prompts;
+        std::string line;
+        while (std::getline(bf, line)) {
+            for (char& ch : line) if (ch == ',' || ch == '\t' || ch == '\r') ch = ' ';
+            std::stringstream ss(line);
+            std::vector<int> pr;
+            int tid = 0;
+            while (ss >> tid) pr.push_back(tid);
+            if (!pr.empty()) batch_prompts.push_back(std::move(pr));
+        }
+        const int S = std::max(1, s2sess);
+        const float inv_temp = temp > 0.f ? 1.f / temp : 0.f;
+        const auto tb0 = std::chrono::steady_clock::now();
+        int64_t tot_gen_toks = 0;
+        for (size_t base = 0; base < batch_prompts.size(); base += size_t(S)) {
+            const int B = static_cast<int>(std::min<size_t>(size_t(S), batch_prompts.size() - base));
+            std::vector<std::vector<uint8_t>> slot_bufs(static_cast<size_t>(B));
+            std::vector<int> next_tok(static_cast<size_t>(B), 0);
+            std::vector<int> cur_pos(static_cast<size_t>(B), 0);
+            std::vector<RowOut> out;
+            // Prefill each slot in the batch
+            for (int s = 0; s < B; ++s) {
+                const auto& pr = batch_prompts[base + size_t(s)];
+                const int P = static_cast<int>(pr.size());
+                e.reset_slot(s);
+                for (int p = 0; p < P; p += prefill) {
+                    const int n = std::min(prefill, P - p);
+                    const bool last = (p + n == P);
+                    std::vector<qw38::StepSeg> segs = {{s, 0, p, n}};
+                    std::vector<RowSample> sm(static_cast<size_t>(n));
+                    for (int i = 0; i < n; ++i) sm[size_t(i)] = RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};
+                    e.forward(segs, &pr[size_t(p)], sm.data(), out, !last, 0, 0, nullptr, true);
+                    if (e.tap_dump_fp) {
+                        // Only pass `out` for the last row when head_last_only=true; prompt rows store nxt=-1 except last!
+                        std::vector<RowOut> padded;
+                        if (last) {
+                            padded.resize(static_cast<size_t>(n));
+                            padded[static_cast<size_t>(n - 1)] = out[static_cast<size_t>(n - 1)];
+                        }
+                        e.tap_dump_rows(p, n, &pr[size_t(p)], last ? &padded : nullptr, -1, &slot_bufs[size_t(s)]);
+                    }
+                    if (last) next_tok[size_t(s)] = out[size_t(n - 1)].tok;
+                }
+                cur_pos[size_t(s)] = P;
+            }
+            // Batched M=B decode for `gen - 1` steps!
+            for (int g = 1; g < gen; ++g) {
+                std::vector<qw38::StepSeg> segs;
+                std::vector<RowSample> sm;
+                std::vector<int> tok_in = next_tok;
+                for (int s = 0; s < B; ++s) {
+                    segs.push_back({s, s, cur_pos[size_t(s)], 1});
+                    sm.push_back(RowSample{inv_temp, top_p, seed, uint32_t(cur_pos[size_t(s)] + 1)});
+                }
+                e.forward(segs, tok_in.data(), sm.data(), out, false);
+                if (e.tap_dump_fp) {
+                    e.tap_dump_batch_rows(B, cur_pos.data(), tok_in.data(), out, slot_bufs);
+                }
+                for (int s = 0; s < B; ++s) {
+                    next_tok[size_t(s)] = out[size_t(s)].tok;
+                    cur_pos[size_t(s)] += 1;
+                }
+                tot_gen_toks += B;
+            }
+            if (e.tap_dump_fp) {
+                for (int s = 0; s < B; ++s) {
+                    if (!slot_bufs[size_t(s)].empty()) {
+                        std::fwrite(slot_bufs[size_t(s)].data(), 1, slot_bufs[size_t(s)].size(), e.tap_dump_fp);
+                    }
+                }
+                std::fflush(e.tap_dump_fp);
+            }
+            if (rank == 0) {
+                const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb0).count();
+                std::fprintf(stderr, "# batch capture: %zu/%zu prompts, %lld gen_toks in %.1fs (%.1f tok/s agg)\n",
+                             std::min(base + size_t(B), batch_prompts.size()), batch_prompts.size(),
+                             (long long)tot_gen_toks, el, tot_gen_toks / (el + 1e-9));
+            }
+        }
+        if (G6_NR > 1) wire.fab.stop_proxy();
+        return 0;
+    }
+
     // Standalone cluster smoke / benchmark run (supports --sessions 1..8)
     std::vector<int> prompt;
     if (!tokens.empty()) {
@@ -758,13 +847,17 @@ int main(int argc, char** argv) {
     const auto t_pf0 = std::chrono::steady_clock::now();
     for (int s = 0; s < S; ++s) {
         e.reset_slot(s);
+        if (s == 0 && e.has_dfl) e.dfl_begin_prompt(P);
         for (int p = 0; p < P; p += prefill) {
             const int n = std::min(prefill, P - p);
             const bool last = (p + n == P);
             std::vector<qw38::StepSeg> segs = {{s, 0, p, n}};
             std::vector<RowSample> sm(static_cast<size_t>(n));
             for (int i = 0; i < n; ++i) sm[size_t(i)] = RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};
-            e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last, 0, 0, nullptr, true);
+            e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last, 0, 0, nullptr, !e.tap_dump_fp);
+            if (s == 0 && e.tap_dump_fp) {
+                e.tap_dump_rows(p, n, &prompt[size_t(p)], last ? &out : nullptr, -1);
+            }
             if (!last) {
                 const int next_p = p + n;
                 const int next_n = std::min(prefill, P - next_p);
@@ -777,15 +870,25 @@ int main(int argc, char** argv) {
             }
             if (last) next[size_t(s)] = out[size_t(n - 1)].tok;
         }
+        if (s == 0 && e.has_dfl) e.dfl_finish_prompt();
     }
     QW38_CK(cudaStreamSynchronize(e.stream));
     const auto t_pf1 = std::chrono::steady_clock::now();
 
     const auto t_dec0 = std::chrono::steady_clock::now();
     int total_drafted = 0, total_accepted = 0, mtp_rounds = 0;
+    std::vector<int> acc_hist(8, 0);
     if (gen > 0) {
         for (int s = 0; s < S; ++s) said[size_t(s)].push_back(next[size_t(s)]);
-        if (e.has_mtp && mtp > 0) {
+        if (e.has_dfl && S == 1 && !e.tap_dump_fp) {
+            int pos0 = P;
+            int cur0 = next[0];
+            while (static_cast<int>(said[0].size()) < gen) {
+                e.dfl_round(e.o.dfl_k, cur0, pos0, inv_temp, top_p, seed, said[0], total_drafted, total_accepted, &acc_hist);
+                ++mtp_rounds;
+            }
+            if (static_cast<int>(said[0].size()) > gen) said[0].resize(size_t(gen));
+        } else if (e.has_mtp && mtp > 0 && !e.tap_dump_fp) {
             std::vector<int> pos(static_cast<size_t>(S), P);
             auto all_done = [&]() {
                 for (int s = 0; s < S; ++s)
@@ -800,13 +903,25 @@ int main(int argc, char** argv) {
                 if (static_cast<int>(said[size_t(s)].size()) > gen) said[size_t(s)].resize(size_t(gen));
         } else {
             for (int g = 1; g < gen; ++g) {
+                int l48_t1 = -1;
+                if (e.tap_dump_fp && e.has_mtp && S == 1) {
+                    std::vector<int> ds = {0}, dq = {P + g - 2}, dg = {next[0]}, dout1;
+                    std::vector<RowSample> dsm = {RowSample{inv_temp, top_p, seed, uint32_t(P + g)}};
+                    e.mtp_draft_k(ds, dq, dg, dsm, 1, dout1);
+                    if (!dout1.empty()) l48_t1 = dout1[0];
+                }
                 std::vector<qw38::StepSeg> segs;
                 std::vector<RowSample> sm;
                 for (int s = 0; s < S; ++s) {
                     segs.push_back({s, s, P + g - 1, 1});
                     sm.push_back(RowSample{inv_temp, top_p, seed, uint32_t(P + g)});
                 }
+                const int tok_in0 = next[0];
                 e.forward(segs, next.data(), sm.data(), out, false);
+                if (e.tap_dump_fp && S == 1) {
+                    e.tap_dump_rows(P + g - 1, 1, &tok_in0, &out, l48_t1);
+                    if (e.has_mtp) e.mtp_save_last_hyper(0, 0);
+                }
                 for (int s = 0; s < S; ++s) {
                     next[size_t(s)] = out[size_t(s)].tok;
                     said[size_t(s)].push_back(next[size_t(s)]);
@@ -821,12 +936,20 @@ int main(int argc, char** argv) {
     const double dec_ms = std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count();
     if (rank == 0) {
         const double tps_s = gen > 1 ? ((gen - 1) / (dec_ms / 1e3 + 1e-9)) : 0.0;
-        std::fprintf(stderr, "# g6m4_qw38 TP=%d P=%d gen=%d sess=%d mtp=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s/sess, %.2f agg tok/s)",
-                     G6_NR, P, gen, S, mtp, pf_ms, (P * S) / (pf_ms / 1e3 + 1e-9), dec_ms, tps_s, tps_s * S);
+        std::fprintf(stderr, "# g6m4_qw38 TP=%d P=%d gen=%d sess=%d mtp=%d%s: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s/sess, %.2f agg tok/s)",
+                     G6_NR, P, gen, S, mtp, e.has_dfl ? (" dfl_k=" + std::to_string(e.o.dfl_k) + " dp=" + std::to_string(e.o.dfl_dp)).c_str() : "",
+                     pf_ms, (P * S) / (pf_ms / 1e3 + 1e-9), dec_ms, tps_s, tps_s * S);
         if (mtp_rounds > 0) {
             const double acc_rate = total_drafted > 0 ? (100.0 * total_accepted / total_drafted) : 0.0;
             const double tok_per_round = double(S * mtp_rounds + total_accepted) / double(S * mtp_rounds);
-            std::fprintf(stderr, " [mtp acc=%.1f%%, %.2f tok/round, %d rounds]", acc_rate, tok_per_round, mtp_rounds);
+            std::fprintf(stderr, " [%s acc=%.1f%%, %.2f tok/round, %d rounds]",
+                         (e.has_dfl && S == 1) ? "qspine-df2" : "mtp", acc_rate, tok_per_round, mtp_rounds);
+            if (e.has_dfl && S == 1) {
+                std::fprintf(stderr, " avgK=%.2f draft=%.2fms/r verify=%.2fms/r hist=[",
+                             double(total_drafted) / mtp_rounds, e.dfl_draft_ms / mtp_rounds, e.dfl_verify_ms / mtp_rounds);
+                for (int k = 0; k <= e.o.dfl_k; ++k) std::fprintf(stderr, "%s%d", k ? "," : "", acc_hist[size_t(k)]);
+                std::fprintf(stderr, "]");
+            }
         }
         std::fprintf(stderr, "\n");
         if (e.o.profile) e.prof.print(rank);

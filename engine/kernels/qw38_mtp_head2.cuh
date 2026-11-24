@@ -25,6 +25,11 @@ struct HeadArgmax {
     int id;
 };
 
+struct Cand16 {
+    float logit;
+    int id;
+};
+
 struct MtpHead2 {
     static constexpr int NCH = geom::HID / 64; // 40
     static constexpr int NG = geom::HID / 32;  // 80
@@ -697,6 +702,45 @@ inline void trunk_head2_pack(const MtpHead2& h2, const Fp8Mat& fp8_lm, const __n
     }
     k_qw38_head2_pack_256<<<M, 256, 0, st>>>(
         h2sc.cl, h2sc.cand, h2sc.tail_dsum, h2sc.screen_max, h2.v0, NC, out_pkt, rb);
+}
+
+// Stage 4c (QSpine-DF2): Extract exact sorted top-16 (logit desc, id asc) from SL=64 exact FP8 rescored finalists.
+__global__ void __launch_bounds__(64) k_qw38_mtp_head2_top16(
+    const float* __restrict__ cl,
+    const int* __restrict__ cand,
+    int v0,
+    Cand16* __restrict__ out) {
+    const int m = blockIdx.x;
+    const int t = threadIdx.x; // 0..63
+    __shared__ float sv[MtpHead2::SL];
+    __shared__ int si[MtpHead2::SL];
+    float lv = cl[static_cast<size_t>(m) * MtpHead2::SL + t];
+    int iv = v0 + cand[static_cast<size_t>(m) * MtpHead2::SL + t];
+    if (!ink2::head_key(lv)) { lv = -INFINITY; iv = 0x7fffffff; }
+    sv[t] = lv;
+    si[t] = iv;
+    __syncthreads();
+    int rank = 0;
+    #pragma unroll
+    for (int j = 0; j < MtpHead2::SL; ++j) {
+        if (sv[j] > lv || (sv[j] == lv && si[j] < iv)) ++rank;
+    }
+    if (rank < 16) out[static_cast<size_t>(m) * 16 + rank] = Cand16{lv, iv};
+}
+
+inline void mtp_head2_top16(const MtpHead2& h2, const Fp8Mat& fp8_lm, const __nv_bfloat16* x,
+                            float* head_logits, MtpHead2Scratch& sc, Cand16* out_cands,
+                            int M, cudaStream_t st) {
+    launch_mtp_head2_screen(h2, x, head_logits, M, st);
+    k_qw38_head2_top<MtpHead2::SL, false><<<M, 1024, 0, st>>>(head_logits, h2.vr, sc.cand);
+    if (fp8_lm.mx_sc) {
+        k_qw38_mtp_head2_rescore_fp8<true><<<dim3(M, 8), 256, 0, st>>>(
+            fp8_lm.q, fp8_lm.sc, fp8_lm.mx_sc, x, sc.cand, head_logits, sc.cl, h2.vr, false);
+    } else {
+        k_qw38_mtp_head2_rescore_fp8<false><<<dim3(M, 8), 256, 0, st>>>(
+            fp8_lm.q, fp8_lm.sc, fp8_lm.mx_sc, x, sc.cand, head_logits, sc.cl, h2.vr, false);
+    }
+    k_qw38_mtp_head2_top16<<<M, MtpHead2::SL, 0, st>>>(sc.cl, sc.cand, h2.v0, out_cands);
 }
 
 } // namespace qw38

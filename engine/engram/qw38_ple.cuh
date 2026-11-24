@@ -31,6 +31,7 @@ struct PleWeights {
 struct PleState {
     __nv_bfloat16* conv_hist = nullptr;      // [slots, 9, 10240] BF16 (oldest..newest: [t-9..t-1])
     __nv_bfloat16* conv_hist_snap = nullptr; // optional [slots, max_K, 9, 10240] BF16 (for MTP rollback)
+    int snap_stride = 0;
 };
 
 struct PleScratch {
@@ -199,7 +200,7 @@ __global__ void k_ple_dilated_conv_add_verify_batch(const __nv_bfloat16* __restr
                                                     __nv_bfloat16* __restrict__ hyper_in,
                                                     const int* __restrict__ d_slot,
                                                     const int* __restrict__ d_pos,
-                                                    int S, int V, int snap_k, bool update_state) {
+                                                    int S, int V, int snap_k, int snap_stride, bool update_state) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= S * geom::HC_D) return;
     const int s = idx / geom::HC_D;
@@ -221,9 +222,9 @@ __global__ void k_ple_dilated_conv_add_verify_batch(const __nv_bfloat16* __restr
         h[k] = (pos0 > 0) ? __bfloat162float(hbase[static_cast<size_t>(k) * geom::HC_D + c]) : 0.0f;
     }
 
-    const int snap_stride = snap_k + 1;
+    const int ss = (snap_stride > 0 ? snap_stride : snap_k) + 1;
     if (conv_snap && snap_k > 0) {
-        __nv_bfloat16* sb0 = conv_snap + (static_cast<size_t>(slot) * snap_stride) * geom::PLE_NHIST * geom::HC_D;
+        __nv_bfloat16* sb0 = conv_snap + (static_cast<size_t>(slot) * ss) * geom::PLE_NHIST * geom::HC_D;
         #pragma unroll
         for (int k = 0; k < geom::PLE_NHIST; ++k) sb0[static_cast<size_t>(k) * geom::HC_D + c] = __float2bfloat16(h[k]);
     }
@@ -241,7 +242,7 @@ __global__ void k_ple_dilated_conv_add_verify_batch(const __nv_bfloat16* __restr
         h[geom::PLE_NHIST - 1] = x;
 
         if (conv_snap && t < V - 1 && t < snap_k) {
-            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * snap_stride + (t + 1)) * geom::PLE_NHIST * geom::HC_D;
+            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * ss + (t + 1)) * geom::PLE_NHIST * geom::HC_D;
             #pragma unroll
             for (int k = 0; k < geom::PLE_NHIST; ++k) sb[static_cast<size_t>(k) * geom::HC_D + c] = __float2bfloat16(h[k]);
         }
@@ -499,8 +500,9 @@ inline void ple_forward(cublasHandle_t blas, const PleWeights& w, PleState& st_b
     } else if (all_verify) {
         k_ple_dilated_conv_add_verify_batch<<<(nsegs * geom::HC_D + 255) / 256, 256, 0, st>>>(
             sc.gv, sc.gv_norm, w.conv1d, st_buf.conv_hist, st_buf.conv_hist_snap, hyper_in,
-            d_slot, d_pos, nsegs, V, snap_k, update_state);
+            d_slot, d_pos, nsegs, V, snap_k, st_buf.snap_stride, update_state);
     } else {
+        const int ss = st_buf.snap_stride > 0 ? st_buf.snap_stride : snap_k;
         for (int s = 0; s < nsegs; ++s) {
             if (segs[s].len <= 0) continue;
             if (segs[s].len >= 16 && snap_k == 0) {
@@ -514,7 +516,7 @@ inline void ple_forward(cublasHandle_t blas, const PleWeights& w, PleState& st_b
             } else {
                 k_ple_dilated_conv_add_seg<<<(geom::HC_D + 255) / 256, 256, 0, st>>>(
                     sc.gv, sc.gv_norm, w.conv1d, st_buf.conv_hist, snap_k > 0 ? st_buf.conv_hist_snap : nullptr, hyper_in,
-                    segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, snap_k, update_state);
+                    segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, snap_k > 0 ? ss : 0, update_state);
             }
         }
     }
