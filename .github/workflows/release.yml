@@ -28,13 +28,21 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
       should_build: ${{ steps.changes.outputs.should_build }}
+    env:
+      HAS_APP: ${{ secrets.RELEASE_PLEASE_APP_ID != '' && secrets.RELEASE_PLEASE_APP_PRIVATE_KEY != '' }}
     steps:
+      - id: app-token
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc  # v3.4.0
+        with:
+          client-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
       - id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
         with:
-          # Use a PAT/GitHub App token if configured so Release PRs automatically trigger pull_request
-          # workflows (ci.yml, pr-title.yml); falls back to GITHUB_TOKEN otherwise.
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          # Mint a GitHub App installation token when configured so Release PRs automatically trigger
+          # pull_request workflows (ci.yml, pr-title.yml); falls back to GITHUB_TOKEN otherwise.
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
       - name: Check whether CI build is needed

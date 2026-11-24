@@ -156,9 +156,10 @@ include those details in the PR commit messages (`BREAKING CHANGE:` footer when 
    Also walk the keep-current checklist in [AGENTS.md](AGENTS.md#keeping-docs-and-recipes-current) (`README.md`, model
    pages, `KNOBS.md`, `KNOWN-ISSUES.md`, `CREDITS.md`, `recipes.json`, and `docs/cards/`).
 3. Review the Release PR (optionally adding measured benchmark highlights or upgrade notes to its `CHANGELOG.md` diff).
-   If `RELEASE_PLEASE_TOKEN` is configured as a repository secret, `ci.yml` and `pr-title.yml` trigger automatically on
-   the Release PR; otherwise (using the default `GITHUB_TOKEN`), close and reopen the Release PR once so GitHub triggers
-   the required PR checks. Comment `/ready` and squash-merge the Release PR.
+   When the org GitHub App secrets (`RELEASE_PLEASE_APP_ID` and `RELEASE_PLEASE_APP_PRIVATE_KEY`) are configured,
+   `ci.yml` and `pr-title.yml` trigger automatically on the Release PR; otherwise (using the default `GITHUB_TOKEN`),
+   close and reopen the Release PR once so GitHub triggers the required PR checks. Comment `/ready` and squash-merge
+   the Release PR.
 4. Merging the Release PR runs `.github/workflows/release.yml`, which creates `<tag>` and its GitHub Release, then runs
    `.github/workflows/ci.yml` once to test, build all engine legs, push `ghcr.io/kindlingai/gr8:<tag>`, upload
    `gr8-<short-sha>.zip` + `.sha256` with provenance attestations, and append the immutable `@sha256:<digest>` block to
