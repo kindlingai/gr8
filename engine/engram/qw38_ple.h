@@ -55,6 +55,7 @@ struct PleStoreOpts {
     size_t cache_bytes = 4ull << 30;  // 4 GiB RAM LRU cache (~13.4M raw rows or ~33M K4 row-trellis rows)
     int ways = 16;                    // 1..16
     int io_uring = 128;               // >0: io_uring QD; 0: pread
+    int io_uring_pad = ds41::engram::kUringPadAuto; // GR8_URING_PAD: -1 = auto probe, 0/1 = off, 2..64 = pad modulus
     bool direct = true;               // O_DIRECT when filesystem allows, else automatic fallback
 };
 
@@ -368,6 +369,8 @@ public:
     bool is_open() const { return fd_ >= 0; }
     bool is_direct() const { return direct_; }
     bool has_uring() const { return uring_ != nullptr; }
+    unsigned uring_pad() const { return uring_ ? uring_->pad_mod() : 0u; }
+    const ds41::engram::PadProbeResult& pad_probe() const { return pad_probe_; }
     bool is_row_trellis() const { return row_trellis_; }
     bool is_resident() const { return resident_; }
     uint64_t total_rows() const { return total_rows_; }
@@ -503,12 +506,18 @@ private:
             if (need_cache && opts.cache_bytes >= row_bytes_ * size_t(opts.ways)) {
                 if (!cache_.init(opts.cache_bytes, opts.ways, row_bytes_, err)) return false;
             }
+            pad_probe_ = {};
             const size_t io_slot_bytes = std::max<size_t>(8192, ((row_bytes_ + 2 * align_ - 1) / align_) * align_);
             if (opts.io_uring > 0) {
+                const unsigned explicit_pad =
+                    (direct_ && file_bytes_ >= align_ && opts.io_uring_pad > 1) ? unsigned(opts.io_uring_pad) : 0u;
                 auto u = std::make_unique<ds41::engram::UringReader>();
-                if (u->start(unsigned(opts.io_uring), unsigned(io_slot_bytes), align_) == 0) {
+                if (u->start(unsigned(opts.io_uring), unsigned(io_slot_bytes), align_, explicit_pad) == 0) {
+                    if (direct_ && file_bytes_ >= align_ && opts.io_uring_pad == ds41::engram::kUringPadAuto &&
+                        file_bytes_ > rows_base_off_) {
+                        u->probe_pad_mod(fd_, rows_base_off_, file_bytes_ - rows_base_off_, &pad_probe_);
+                    }
                     uring_ = std::move(u);
-                    iobuf_slots_ = opts.io_uring;
                 }
             }
             if (!uring_) start_pool(64);
@@ -905,27 +914,15 @@ private:
 
             if (uring_) {
                 int first_err = 0;
-                // Pad O_DIRECT io_uring submissions to a multiple of 8 (dummy 4 KiB read at offset 0)
-                // to avoid the ~200 us NVMe IRQ-coalescing cliff on small / non-mod-8 batches.
-                const size_t n_real = spans_.size();
-                const bool pad8 = direct_ && file_bytes_ >= align_ && iobuf_slots_ >= 8 && (n_real & 7u) != 0;
-                const size_t n_sub = pad8 ? ((n_real + 7u) & ~size_t(7u)) : n_real;
                 const int rc = uring_->run(
-                    n_sub,
+                    spans_.size(),
                     [&](size_t idx, io_uring_sqe& sqe) {
-                        if (idx >= n_real) {
-                            sqe.fd = fd_;
-                            sqe.off = 0;
-                            sqe.len = unsigned(align_);
-                            return;
-                        }
                         const IoSpan& sp = spans_[idx];
                         sqe.fd = fd_;
                         sqe.off = sp.off;
                         sqe.len = unsigned(sp.len);
                     },
                     [&](size_t idx, const uint8_t* buf, int res) {
-                        if (idx >= n_real) return;
                         const IoSpan& sp = spans_[idx];
                         const int need = int(sp.need_end - sp.off);
                         if (res < need) {
@@ -1114,8 +1111,8 @@ private:
     const uint8_t* rows_ptr_ = nullptr;
     PleRowCache cache_;
     std::unique_ptr<ds41::engram::UringReader> uring_;
+    ds41::engram::PadProbeResult pad_probe_{};
     void* iobuf_ = nullptr;
-    int iobuf_slots_ = 0;
     int64_t mult_[3] = {};
     int64_t offsets_[16] = {};
     int64_t vsizes_[16] = {};

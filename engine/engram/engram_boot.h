@@ -41,6 +41,7 @@ inline bool read_knobs(Knobs* k, std::string* err)
     k->store.ways = (int)knob::ds_engram_ways();
     k->store.io_threads = (int)knob::ds_engram_io_threads();
     k->store.io_uring = (int)knob::ds_engram_io_uring();
+    k->store.io_uring_pad = parse_uring_pad(knob::uring_pad());
     k->store.keepalive_ms = (int)knob::ds_engram_keepalive_ms();
     k->verbose = knob::ds_engram_verbose();
     k->lookahead = knob::ds_engram_lookahead();

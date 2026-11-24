@@ -67,7 +67,8 @@ struct StoreOpts
     int ways = 16;                     // GR8_DS_ENGRAM_WAYS, 1..16
     int io_threads = 32;               // GR8_DS_ENGRAM_IO_THREADS (64 is fastest for prefill)
     int io_uring = 128;                  // GR8_DS_ENGRAM_IO_URING: 0 = pread pool; positive = queue depth
-    size_t block = 4096;               // smallest read; raised to the file's dio_offset_align if that is larger
+    int io_uring_pad = kUringPadAuto;    // GR8_URING_PAD: -1 = auto boot probe, 0/1 = off, 2..64 = pad modulus
+    size_t block = 4096;                 // smallest read; raised to the file's dio_offset_align if that is larger
     bool direct = true;                // false: buffered pread (tmpfs, or a filesystem that refuses O_DIRECT)
     int keepalive_ms = 0;              // GR8_DS_ENGRAM_KEEPALIVE_MS (boot default 15); 0 = no keepalive thread
 };
@@ -288,10 +289,14 @@ public:
         block_ = b;
         align = std::max(align, block_);
         if (!cache_.init(o.cache_bytes, o.ways, err)) return false;
+        pad_probe_ = {};
         if (o.io_uring > 0)
         {
+            bool all_direct = !tab_.empty();
+            for (const auto& t : tab_) all_direct = all_direct && t.direct;
+            const unsigned explicit_pad = (all_direct && o.io_uring_pad > 1) ? (unsigned)o.io_uring_pad : 0u;
             uring_.reset(new UringReader());
-            const int e = uring_->start((unsigned)o.io_uring, block_, align);
+            const int e = uring_->start((unsigned)o.io_uring, block_, align, explicit_pad);
             if (e)
             {
                 uring_.reset();
@@ -299,6 +304,18 @@ public:
                 std::call_once(unavailable, [e] {
                     fprintf(stderr, "# ds41 engram io_uring unavailable errno=%d, using pread pool\n", e);
                 });
+            }
+            else if (all_direct && o.io_uring_pad == kUringPadAuto)
+            {
+                const Run* best = nullptr;
+                uint64_t best_bytes = 0;
+                for (const auto& t : tab_)
+                    for (const auto& r : t.runs)
+                    {
+                        const uint64_t bytes = r.rows > 0 ? (uint64_t)r.rows * kRowBytes : 0;
+                        if (r.fd >= 0 && bytes > best_bytes) { best = &r; best_bytes = bytes; }
+                    }
+                if (best) uring_->probe_pad_mod(best->fd, best->off, best_bytes, &pad_probe_);
             }
         }
         if (!uring_)
@@ -308,7 +325,14 @@ public:
         }
         static std::once_flag reader;
         std::call_once(reader, [&] {
-            if (uring_) fprintf(stderr, "# ds41 engram reader=uring qd=%d\n", o.io_uring);
+            if (uring_)
+            {
+                if (pad_probe_.ran)
+                    fprintf(stderr, "# ds41 engram reader=uring qd=%d pad=%u (auto: n1=%.1fus n8=%.1fus probe=%.2fms)\n",
+                            o.io_uring, uring_->pad_mod(), pad_probe_.n1_us, pad_probe_.n8_us, pad_probe_.probe_ms);
+                else
+                    fprintf(stderr, "# ds41 engram reader=uring qd=%d pad=%u\n", o.io_uring, uring_->pad_mod());
+            }
             else fprintf(stderr, "# ds41 engram reader=pread threads=%d\n", std::max(1, o.io_threads));
         });
         start_keepalive(o.keepalive_ms, align);
@@ -316,6 +340,8 @@ public:
     }
 
     bool using_uring() const { return bool(uring_); }
+    unsigned uring_pad() const { return uring_ ? uring_->pad_mod() : 0u; }
+    const PadProbeResult& pad_probe() const { return pad_probe_; }
     size_t block() const { return block_; }
     bool direct(int table) const { return tab_[table].direct; }
     const RowCache& cache() const { return cache_; }
@@ -606,6 +632,7 @@ private:
     RowCache cache_;
     std::unique_ptr<IoPool> pool_;
     std::unique_ptr<UringReader> uring_;
+    PadProbeResult pad_probe_{};
     std::mutex mu_;
     FetchStats total_;
     uint64_t nfetch_ = 0;

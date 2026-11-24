@@ -169,7 +169,14 @@ fn allowed(spec: &Spec, v: &Value) -> Result<(), String> {
         Value::Floats(l) => l.clone(),
         Value::Text(s) => {
             let s = s.to_str().unwrap();
-            return if values.split('|').any(|w| w == s) { Ok(()) } else { Err(format!("is not one of {values}")) };
+            let ok = values.split('|').any(|w| match w.split_once("..") {
+                Some((lo, hi)) => int(s).is_some_and(|i| {
+                    (lo.is_empty() || int(lo).is_some_and(|lo| i >= lo))
+                        && (hi.is_empty() || int(hi).is_some_and(|hi| i <= hi))
+                }),
+                None => w == s,
+            });
+            return if ok { Ok(()) } else { Err(format!("is not one of {values}")) };
         }
     };
     let ok = |x: f64| match values.split_once("..") {
