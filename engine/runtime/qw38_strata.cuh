@@ -30,32 +30,12 @@
 #include <utility>
 #include <vector>
 #include "../model_geom_qw38.h"
+#include "../knobs-rs/gr8_knobs.h"
 #include "../kernels/tr3.cuh"
 #include "../kernels/tr3_wide.cuh"
 #include "../kernels/qw38_moe.cuh"
 
 namespace qw38rt {
-
-// ------------------------------------------------------------------------------------------------ Env helpers
-inline bool strata_env_bool(const char* name, bool def) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return def;
-    return !(std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 || std::strcmp(v, "off") == 0);
-}
-inline int64_t strata_env_i64(const char* name, int64_t def) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return def;
-    return std::atoll(v);
-}
-inline float strata_env_f32(const char* name, float def) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return def;
-    return static_cast<float>(std::atof(v));
-}
-inline std::string strata_env_str(const char* name, const std::string& def) {
-    const char* v = std::getenv(name);
-    return (v && *v) ? std::string(v) : def;
-}
 
 // ------------------------------------------------------------------------------------------------ Host wide-order reorder (K2/K3/K4)
 template <int BITS>
@@ -230,26 +210,26 @@ struct StrataConfig {
 
 inline StrataConfig load_strata_config_from_env() {
     StrataConfig c;
-    c.enabled = strata_env_bool("GR8_QW38_STRATA", false);
-    c.vram_reserve_mib = strata_env_i64("GR8_QW38_VRAM_RESERVE_MIB", 1920);
-    c.cache_slots_override = strata_env_i64("GR8_QW38_EXPERT_CACHE_SLOTS", -1);
-    c.profile_path = strata_env_str("GR8_QW38_EXPERT_PROFILE", "");
-    c.adaptive = strata_env_bool("GR8_QW38_ADAPTIVE", true);
-    c.async_promote = strata_env_bool("GR8_QW38_PROMOTE_ASYNC", true);
-    c.promote_max_experts = static_cast<int>(strata_env_i64("GR8_QW38_PROMOTE_MAX", 32));
-    c.promote_hyst = strata_env_f32("GR8_QW38_PROMOTE_HYST", 1.10f);
-    c.heat_decay = strata_env_f32("GR8_QW38_HEAT_DECAY", 0.94f);
-    c.heat_cap = strata_env_f32("GR8_QW38_HEAT_CAP", 16.0f);
-    c.min_promote_heat = strata_env_f32("GR8_QW38_MIN_PROMOTE_HEAT", 1.5f);
-    c.static_pin_frac = strata_env_f32("GR8_QW38_STATIC_PIN_FRAC", 0.20f);
-    c.pf_stage_experts = static_cast<int>(strata_env_i64("GR8_QW38_PF_STAGE_EXPS", 32));
-    c.pf_d2d_promote = static_cast<int>(strata_env_i64("GR8_QW38_PF_D2D_PROMOTE", 64));
-    c.pf_warm_heat = strata_env_bool("GR8_QW38_PF_WARM_HEAT", true);
-    c.cpu_moe = strata_env_bool("GR8_QW38_CPU_MOE", true);
-    c.cpu_moe_threads = static_cast<int>(strata_env_i64("GR8_QW38_CPU_THREADS", 14));
-    c.cpu_moe_frac = strata_env_f32("GR8_QW38_CPU_FRAC", 0.70f);
-    c.pf_cpu_max_m = static_cast<int>(strata_env_i64("GR8_QW38_PF_CPU_MAX_M", 512));
-    c.pf_cpu_frac = strata_env_f32("GR8_QW38_PF_CPU_FRAC", 0.55f);
+    c.enabled = knob::qw38_strata();
+    c.vram_reserve_mib = knob::qw38_vram_reserve_mib();
+    c.cache_slots_override = knob::qw38_expert_cache_slots();
+    if (const auto& p = knob::qw38_expert_profile(); p && !p->empty()) c.profile_path = *p;
+    c.adaptive = knob::qw38_adaptive();
+    c.async_promote = knob::qw38_promote_async();
+    c.promote_max_experts = static_cast<int>(knob::qw38_promote_max());
+    c.promote_hyst = static_cast<float>(knob::qw38_promote_hyst());
+    c.heat_decay = static_cast<float>(knob::qw38_heat_decay());
+    c.heat_cap = static_cast<float>(knob::qw38_heat_cap());
+    c.min_promote_heat = static_cast<float>(knob::qw38_min_promote_heat());
+    c.static_pin_frac = static_cast<float>(knob::qw38_static_pin_frac());
+    c.pf_stage_experts = static_cast<int>(knob::qw38_pf_stage_exps());
+    c.pf_d2d_promote = static_cast<int>(knob::qw38_pf_d2d_promote());
+    c.pf_warm_heat = knob::qw38_pf_warm_heat();
+    c.cpu_moe = knob::qw38_cpu_moe();
+    c.cpu_moe_threads = static_cast<int>(knob::qw38_cpu_threads());
+    c.cpu_moe_frac = static_cast<float>(knob::qw38_cpu_frac());
+    c.pf_cpu_max_m = static_cast<int>(knob::qw38_pf_cpu_max_m());
+    c.pf_cpu_frac = static_cast<float>(knob::qw38_pf_cpu_frac());
     return c;
 }
 

@@ -482,12 +482,34 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_QO_CACHE` | path | unset |  | With GR8_PF_OWN=3, the first boot writes each layer's full-head q_b, o_proj, UK and UV tensors to DIR/<layer>.qo.bin and later boots read them instead of decoding them. Same bits. |
 | `GR8_QO_DUMP` | flag | `0` |  | Prints an FNV-64 hash of the prefill attention q to stderr on every call (skipped inside a graph capture). |
 | `GR8_QO_ROPECHK` | flag | `0` |  | Checks the prefill rope table against the decode rope function once at bind and prints the mismatch count to stderr. |
+| `GR8_QW38_ADAPTIVE` | flag | `1` | 0\|1 | 1 (the default) = enable adaptive heat-based VRAM expert cache promotion/eviction in Strata mode. 0 = keep the initial expert placement static. |
+| `GR8_QW38_CPU_FRAC` | float | `0.70` | 0..1 | Fraction of decode cold experts dispatched to the Strata CPU K3 MoE worker pool in parallel with GPU PCIe. |
+| `GR8_QW38_CPU_MOE` | flag | `1` | 0\|1 | 1 (the default) = enable hybrid AVX-512 BF16/VBMI2 CPU K3 cold-expert offload in Strata mode on x86-64 hosts supporting AVX-512 BF16/VBMI2. 0 = run all cold experts on GPU over UVA/PCIe. |
+| `GR8_QW38_CPU_THREADS` | int | `14` | 0..256 | Worker thread count for Strata-mode hybrid CPU K3 MoE offload. |
 | `GR8_QW38_DFL_PACK` | path | QSpine-DF2 drafter disabled |  | Path to Qwen3.8 QSpine-DF2 drafter pack (.q4_0.pack or adapted pack). When set with GR8_QW38_DFL=1, enables parallel B=8 DFlash2 speculative drafting reusing PR #599's 2-bit lm_head screen and read-only GDN replay. |
+| `GR8_QW38_EXPERT_CACHE_SLOTS` | int | `-1` | -1.. | Override total Strata-mode VRAM expert cache slots (-1 = auto-size from free VRAM minus reserve). |
+| `GR8_QW38_EXPERT_PROFILE` | path | round-robin initial expert fill |  | Optional path to a Strata STRP v1 expert frequency profile used to rank initial VRAM expert placement and static core pinning. |
+| `GR8_QW38_HEAT_CAP` | float | `16.0` | 0.. | Maximum dynamic heat value for an expert in Strata mode so stale sessions do not lock out new ones. |
+| `GR8_QW38_HEAT_DECAY` | float | `0.94` | 0..1 | Per-step exponential decay factor applied to Strata-mode expert heat counters. |
+| `GR8_QW38_MIN_PROMOTE_HEAT` | float | `1.5` | 0.. | Minimum heat score before a cold expert is eligible for Strata-mode VRAM promotion. |
+| `GR8_QW38_PF_CPU_FRAC` | float | `0.55` | 0..1 | Fraction of small-prefill cold experts dispatched to the Strata CPU K3 MoE worker pool. |
+| `GR8_QW38_PF_CPU_MAX_M` | int | `512` | 0.. | Maximum prefill chunk size M for Strata-mode hybrid CPU cold-expert offload. |
+| `GR8_QW38_PF_D2D_PROMOTE` | int | `64` | 0.. | Maximum cold experts per layer promoted via zero-PCIe device-to-device copy from the prefill staging buffer in Strata mode. |
+| `GR8_QW38_PF_STAGE_EXPS` | int | `32` | 1.. | Number of cold experts per double-buffered H2D staging batch during Strata-mode prefill. |
+| `GR8_QW38_PF_WARM_HEAT` | flag | `1` | 0\|1 | 1 (the default) = warm Strata expert heat scores during prompt prefill. 0 = update heat only during decode. |
 | `GR8_QW38_PLE_ASYNC` | flag | `1` | 0\|1 | 1 (the default) = prefetch Layer-1 PLE n-gram rows on a background thread concurrently with Layer-0 GPU execution. 0 = synchronous PLE fetch at Layer-1 entry. |
 | `GR8_QW38_PLE_CACHE_MIB` | int | `1024` | 0..131072 | RAM LRU cache size in MiB for the Layer-1 PLE NVMe rowstore (raw exlr8-ple-L001.bin or exlr8 row-trellis safetensors). 0 disables caching and reads every row directly from NVMe. For row-trellis tables whose compressed rows fit within this budget, the rows tensor is mmap-resident with zero NVMe I/O. Default: 1024 MiB. |
+| `GR8_QW38_PLE_NO_WARM` | flag | `0` | 0\|1 | 1 = skip the 4-thread sequential page-cache warm-up pass when mmap-loading a GGUF IQ4_NL Layer-1 PLE table. 0 (the default) = warm the mapped pages at load time. |
 | `GR8_QW38_PLE_PATH` | path | use <release>/ple/exlr8-ple-L001.bin if present, else auto-detect row-trellis safetensors under <release>/ple/ |  | Optional path to the Layer-1 PLE embedding table (raw BF16 .bin or exlr8 FORMAT v4 record-9 row-trellis .safetensors). When unset, raw ple/exlr8-ple-L001.bin is used if present; otherwise row-trellis safetensors (exlr8-ple-L001.{k5,k4p5,k4}.safetensors, exlr8-ple-L001.safetensors, rows.safetensors) are auto-detected. |
+| `GR8_QW38_PLE_RAM` | flag | `0` | 0\|1 | 1 = copy a GGUF IQ4_NL Layer-1 PLE table into anonymous transparent-hugepage RAM at load time instead of file-backed mmap (immune to page-cache reclaim). 0 (the default) = file-backed mmap. |
 | `GR8_QW38_PROFILE` | flag | `0` | 0\|1 | 1 = record CUDA event timings per component (HC, GDN, Full Attn+QSA, MoE, PLE I/O, PLE GPU, AllReduce, Head) and print a summary breakdown on rank 0 at the end of a standalone run. 0 (the default) = off. |
+| `GR8_QW38_PROMOTE_ASYNC` | flag | `1` | 0\|1 | 1 (the default) = asynchronously H2D-promote hot experts into ring slots on the dedicated transfer stream in Strata mode. 0 = synchronous promotion. |
+| `GR8_QW38_PROMOTE_HYST` | float | `1.10` | 0.. | Hysteresis ratio required for a cold expert's heat score to evict the coldest dynamic VRAM resident in Strata mode. |
+| `GR8_QW38_PROMOTE_MAX` | int | `32` | 0.. | Maximum cold experts promoted per decode round in Strata mode. |
+| `GR8_QW38_STATIC_PIN_FRAC` | float | `0.20` | 0..1 | Fraction of profile-ranked Strata VRAM cache slots pinned as a static core immune to eviction. |
+| `GR8_QW38_STRATA` | flag | `0` | 0\|1 | 1 = enable single-GPU Strata mode (pinned UVA host-RAM routed experts, adaptive VRAM expert cache, stage_slab aliasing, and optional AVX-512 K3 CPU MoE offload). 0 (the default) = standard VRAM-resident loading. |
 | `GR8_QW38_TAP_DUMP` | path | off |  | Optional output path for inline contiguous 5-layer HC-mean tap + greedy target capture (.qtap stream). |
+| `GR8_QW38_VRAM_RESERVE_MIB` | int | `1920` | 0.. | VRAM headroom in MiB left free after sizing the Strata-mode VRAM routed-expert cache pool. |
 | `GR8_QW38_WIDTHS` | path | auto-detect manifests/exlr8-manifest-bit300.json (or bit400/bit200) in the release directory |  | Path to an exlr8 width manifest JSON file when --widths is not passed on the command line. |
 | `GR8_RESID_DUMP` | path | unset |  | Writes rank 0's residual stream after the embedding and after every attention and MLP sublayer of each offline main step to this file, in the m4sim dump format. |
 | `GR8_REUSE_HDUMP` | path | unset |  | Writes every layer's KV cache bytes for the prefilled rows of each sequence GR8_REUSE_HDUMP_SEQ lists to DIR/hd.<q>.r<rank>.bin, a prefix-reuse diagnostic (reuse_hdump.cuh). |

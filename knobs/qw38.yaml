@@ -175,3 +175,186 @@ knobs:
     legacy: []
     doc: >-
       Optional output path for inline contiguous 5-layer HC-mean tap + greedy target capture (.qtap stream).
+  GR8_QW38_PLE_RAM:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = copy a GGUF IQ4_NL Layer-1 PLE table into anonymous transparent-hugepage RAM at load time instead of
+      file-backed mmap (immune to page-cache reclaim). 0 (the default) = file-backed mmap.
+  GR8_QW38_PLE_NO_WARM:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = skip the 4-thread sequential page-cache warm-up pass when mmap-loading a GGUF IQ4_NL Layer-1 PLE table.
+      0 (the default) = warm the mapped pages at load time.
+  GR8_QW38_STRATA:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = enable single-GPU Strata mode (pinned UVA host-RAM routed experts, adaptive VRAM expert cache, stage_slab
+      aliasing, and optional AVX-512 K3 CPU MoE offload). 0 (the default) = standard VRAM-resident loading.
+  GR8_QW38_VRAM_RESERVE_MIB:
+    scope: local
+    kind: int
+    default: "1920"
+    values: "0.."
+    legacy: []
+    doc: >-
+      VRAM headroom in MiB left free after sizing the Strata-mode VRAM routed-expert cache pool.
+  GR8_QW38_EXPERT_CACHE_SLOTS:
+    scope: local
+    kind: int
+    default: "-1"
+    values: "-1.."
+    legacy: []
+    doc: >-
+      Override total Strata-mode VRAM expert cache slots (-1 = auto-size from free VRAM minus reserve).
+  GR8_QW38_EXPERT_PROFILE:
+    scope: local
+    kind: path
+    unset: "round-robin initial expert fill"
+    legacy: []
+    doc: >-
+      Optional path to a Strata STRP v1 expert frequency profile used to rank initial VRAM expert placement and
+      static core pinning.
+  GR8_QW38_ADAPTIVE:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = enable adaptive heat-based VRAM expert cache promotion/eviction in Strata mode.
+      0 = keep the initial expert placement static.
+  GR8_QW38_PROMOTE_ASYNC:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = asynchronously H2D-promote hot experts into ring slots on the dedicated transfer stream in
+      Strata mode. 0 = synchronous promotion.
+  GR8_QW38_PROMOTE_MAX:
+    scope: local
+    kind: int
+    default: "32"
+    values: "0.."
+    legacy: []
+    doc: >-
+      Maximum cold experts promoted per decode round in Strata mode.
+  GR8_QW38_PROMOTE_HYST:
+    scope: local
+    kind: float
+    default: "1.10"
+    values: "0.."
+    legacy: []
+    doc: >-
+      Hysteresis ratio required for a cold expert's heat score to evict the coldest dynamic VRAM resident in Strata mode.
+  GR8_QW38_HEAT_DECAY:
+    scope: local
+    kind: float
+    default: "0.94"
+    values: "0..1"
+    legacy: []
+    doc: >-
+      Per-step exponential decay factor applied to Strata-mode expert heat counters.
+  GR8_QW38_HEAT_CAP:
+    scope: local
+    kind: float
+    default: "16.0"
+    values: "0.."
+    legacy: []
+    doc: >-
+      Maximum dynamic heat value for an expert in Strata mode so stale sessions do not lock out new ones.
+  GR8_QW38_MIN_PROMOTE_HEAT:
+    scope: local
+    kind: float
+    default: "1.5"
+    values: "0.."
+    legacy: []
+    doc: >-
+      Minimum heat score before a cold expert is eligible for Strata-mode VRAM promotion.
+  GR8_QW38_STATIC_PIN_FRAC:
+    scope: local
+    kind: float
+    default: "0.20"
+    values: "0..1"
+    legacy: []
+    doc: >-
+      Fraction of profile-ranked Strata VRAM cache slots pinned as a static core immune to eviction.
+  GR8_QW38_PF_STAGE_EXPS:
+    scope: local
+    kind: int
+    default: "32"
+    values: "1.."
+    legacy: []
+    doc: >-
+      Number of cold experts per double-buffered H2D staging batch during Strata-mode prefill.
+  GR8_QW38_PF_D2D_PROMOTE:
+    scope: local
+    kind: int
+    default: "64"
+    values: "0.."
+    legacy: []
+    doc: >-
+      Maximum cold experts per layer promoted via zero-PCIe device-to-device copy from the prefill staging buffer in
+      Strata mode.
+  GR8_QW38_PF_WARM_HEAT:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = warm Strata expert heat scores during prompt prefill. 0 = update heat only during decode.
+  GR8_QW38_CPU_MOE:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = enable hybrid AVX-512 BF16/VBMI2 CPU K3 cold-expert offload in Strata mode on x86-64 hosts
+      supporting AVX-512 BF16/VBMI2. 0 = run all cold experts on GPU over UVA/PCIe.
+  GR8_QW38_CPU_THREADS:
+    scope: local
+    kind: int
+    default: "14"
+    values: "0..256"
+    legacy: []
+    doc: >-
+      Worker thread count for Strata-mode hybrid CPU K3 MoE offload.
+  GR8_QW38_CPU_FRAC:
+    scope: local
+    kind: float
+    default: "0.70"
+    values: "0..1"
+    legacy: []
+    doc: >-
+      Fraction of decode cold experts dispatched to the Strata CPU K3 MoE worker pool in parallel with GPU PCIe.
+  GR8_QW38_PF_CPU_MAX_M:
+    scope: local
+    kind: int
+    default: "512"
+    values: "0.."
+    legacy: []
+    doc: >-
+      Maximum prefill chunk size M for Strata-mode hybrid CPU cold-expert offload.
+  GR8_QW38_PF_CPU_FRAC:
+    scope: local
+    kind: float
+    default: "0.55"
+    values: "0..1"
+    legacy: []
+    doc: >-
+      Fraction of small-prefill cold experts dispatched to the Strata CPU K3 MoE worker pool.

@@ -1335,6 +1335,8 @@ struct Engine {
             po.cache_bytes = o.ple_cache_mib << 20;
             po.io_uring = o.ple_uring;
             po.direct = o.ple_direct;
+            po.gguf_ram = knob::qw38_ple_ram();
+            po.gguf_no_warm = knob::qw38_ple_no_warm();
             std::string perr;
             if (!ple_store.open(ple_bin, po, &perr)) die(perr);
             if (ple_store.is_row_trellis()) {

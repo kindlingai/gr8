@@ -56,6 +56,8 @@ struct PleStoreOpts {
     int ways = 16;                    // 1..16
     int io_uring = 128;               // >0: io_uring QD; 0: pread
     bool direct = true;               // O_DIRECT when filesystem allows, else automatic fallback
+    bool gguf_ram = false;            // copy GGUF IQ4_NL table into anonymous THP RAM instead of file mmap
+    bool gguf_no_warm = false;        // skip 4-thread sequential warm-up pass on file-backed GGUF mmap
 };
 
 // Metadata for an exlr8 FORMAT v4 record-9 row-trellis lookup table.
@@ -664,8 +666,7 @@ private:
             return false;
         }
 
-        const char* use_anon = std::getenv("GR8_QW38_PLE_RAM");
-        if (use_anon && std::strcmp(use_anon, "1") == 0) {
+        if (opts.gguf_ram) {
             // Explicit anonymous THP copy (immune to page-cache reclaim).
             rows_mmap_len_ = size_t(need_bytes);
             void* rm = ::mmap(nullptr, rows_mmap_len_, PROT_READ | PROT_WRITE,
@@ -723,8 +724,7 @@ private:
                 rows_mmap_len_ = 0;
                 return false;
             }
-            const char* no_warm = std::getenv("GR8_QW38_PLE_NO_WARM");
-            if (!no_warm || std::strcmp(no_warm, "1") != 0) {
+            if (!opts.gguf_no_warm) {
                 ::madvise(rm, rows_mmap_len_, MADV_NORMAL);
                 const size_t n_pages = (rows_mmap_len_ + pg - 1) / pg;
                 const unsigned nt = 4;
