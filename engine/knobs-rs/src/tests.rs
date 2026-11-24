@@ -44,6 +44,9 @@ fn values() {
     assert!(parse(k, "0.5,,0.9").is_err());
     let k = &TABLE[find("KVB")]; // bf16|fp8
     assert!(parse(k, "fp8").is_ok() && parse(k, "fp4").is_err());
+    let k = &TABLE[find("URING_PAD")]; // auto|0..64
+    assert!(parse(k, "auto").is_ok() && parse(k, "0").is_ok() && parse(k, "8").is_ok() && parse(k, "64").is_ok());
+    assert!(parse(k, "-1").is_err() && parse(k, "65").is_err() && parse(k, "bogus").is_err());
 }
 
 #[test]

@@ -241,3 +241,16 @@ knobs:
     values: "0.."
     doc: >-
       With GR8_KV_CHUNKS=1, pages per resizable KV chunk below place (0 = default 256 pages, clamped to place).
+  GR8_URING_PAD:
+    scope: local
+    kind: text
+    default: "auto"
+    values: "auto|0..64"
+    legacy: []
+    doc: >-
+      Pad O_DIRECT io_uring read batches up to a multiple of N with dummy 4 KiB reads ignored on completion, avoiding
+      the ~200 us NVMe interrupt-coalescing cliff on non-multiple-of-8 batches (e.g. Samsung OEM NVMe drives with
+      io_poll=0). auto (the default) runs a <3 ms boot-time O_DIRECT probe comparing 8x n=1 vs 8x n=8 latency on the
+      actual file descriptor and enables pad=8 only when n=8 beats n=1 by >50 us and >1.15x (0 on non-coalescing drives).
+      0 or 1 disables padding; 2..64 forces that modulus. Applies to all UringReader callers (DeepSeek Engram and
+      Qwen 3.8 PLE) with identical output bytes.

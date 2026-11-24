@@ -81,7 +81,7 @@ static void expect_fail(const char* name, const std::string& dir, const std::str
 // read_knobs in a child with the GR8_DS_ENGRAM knobs set to env (name, value pairs; the rest unset): 0 when check(k) holds,
 // 1 when it does not, 2 when the knob table refuses a value. A knob is read once per process, so each case runs in its own child.
 static const char* const kKnobNames[] = {"GR8_DS_ENGRAM", "GR8_DS_ENGRAM_CACHE_MIB", "GR8_DS_ENGRAM_WAYS", "GR8_DS_ENGRAM_IO_THREADS", "GR8_DS_ENGRAM_IO_URING",
-                                         "GR8_DS_ENGRAM_KEEPALIVE_MS", "GR8_DS_ENGRAM_COL_SHARD", "GR8_DS_ENGRAM_VERBOSE", "GR8_DS_ENGRAM_LOOKAHEAD", "GR8_DS_ENGRAM_PREFIX"};
+                                         "GR8_URING_PAD", "GR8_DS_ENGRAM_KEEPALIVE_MS", "GR8_DS_ENGRAM_COL_SHARD", "GR8_DS_ENGRAM_VERBOSE", "GR8_DS_ENGRAM_LOOKAHEAD", "GR8_DS_ENGRAM_PREFIX"};
 static int knob_case(std::initializer_list<std::pair<const char*, const char*>> env, bool (*check)(const Knobs&))
 {
     fflush(stdout);
@@ -125,17 +125,26 @@ int main(int argc, char** argv)
         CHECK(knob_case({{"GR8_DS_ENGRAM_IO_URING", "128"}}, [](const Knobs& k) { return k.store.io_uring == 128; }) == 0, "uring depth");
         CHECK(knob_case({{"GR8_DS_ENGRAM_IO_URING", "-1"}}, [](const Knobs&) { return true; }) == 2, "negative uring refused");
         CHECK(knob_case({{"GR8_DS_ENGRAM_IO_URING", "32769"}}, [](const Knobs&) { return true; }) == 2, "oversize uring refused");
+        CHECK(knob_case({{"GR8_URING_PAD", "auto"}}, [](const Knobs& k) { return k.store.io_uring_pad == kUringPadAuto; }) == 0, "uring pad auto");
+        CHECK(knob_case({{"GR8_URING_PAD", "0"}}, [](const Knobs& k) { return k.store.io_uring_pad == 0; }) == 0, "uring pad off");
+        CHECK(knob_case({{"GR8_URING_PAD", "1"}}, [](const Knobs& k) { return k.store.io_uring_pad == 0; }) == 0, "uring pad 1 disables");
+        CHECK(knob_case({{"GR8_URING_PAD", "8"}}, [](const Knobs& k) { return k.store.io_uring_pad == 8; }) == 0, "uring pad 8");
+        CHECK(knob_case({{"GR8_URING_PAD", "16"}}, [](const Knobs& k) { return k.store.io_uring_pad == 16; }) == 0, "uring pad 16");
+        CHECK(knob_case({{"GR8_URING_PAD", "64"}}, [](const Knobs& k) { return k.store.io_uring_pad == 64; }) == 0, "uring pad 64");
+        CHECK(knob_case({{"GR8_URING_PAD", "-1"}}, [](const Knobs&) { return true; }) == 2, "negative uring pad refused");
+        CHECK(knob_case({{"GR8_URING_PAD", "65"}}, [](const Knobs&) { return true; }) == 2, "oversize uring pad refused");
+        CHECK(knob_case({{"GR8_URING_PAD", "bogus"}}, [](const Knobs&) { return true; }) == 2, "bogus uring pad refused");
         CHECK(knob_case({{"GR8_DS_ENGRAM_KEEPALIVE_MS", "0"}}, [](const Knobs& k) { return k.store.keepalive_ms == 0; }) == 0, "keepalive off");
         CHECK(knob_case({{"GR8_DS_ENGRAM_KEEPALIVE_MS", "1000"}}, [](const Knobs& k) { return k.store.keepalive_ms == 1000; }) == 0, "keepalive 1000");
         CHECK(knob_case({{"GR8_DS_ENGRAM_KEEPALIVE_MS", "-1"}}, [](const Knobs&) { return true; }) == 2, "negative keepalive refused");
-        CHECK(knob_case({{"GR8_DS_ENGRAM_KEEPALIVE_MS", "1001"}}, [](const Knobs&) { return true; }) == 2, "keepalive 1001 refused");
+        CHECK(knob_case({{"GR8_DS_ENGRAM_KEEPALIVE_MS", "1001"}}, [](const Knobs&) { return true; }) == 2, "oversize keepalive refused");
         CHECK(knob_case({{"GR8_DS_ENGRAM_COL_SHARD", "0"}}, [](const Knobs& k) { return !k.col_shard && knob::signature().find("DS_ENGRAM_COL_SHARD=0") != std::string::npos; }) == 0, "col shard off and in rank agreement");
         CHECK(knob_case({{"GR8_DS_ENGRAM_COL_SHARD", "2"}}, [](const Knobs&) { return true; }) == 2, "col shard 2 refused");
         CHECK(knob_case({{"GR8_DS_ENGRAM_LOOKAHEAD", "2"}}, [](const Knobs&) { return true; }) == 2, "lookahead 2 refused");
         CHECK(knob_case({{"GR8_DS_ENGRAM_WAYS", "17"}}, [](const Knobs&) { return true; }) == 2, "ways 17 refused");
         CHECK(knob_case({}, [](const Knobs& k) { return !k.on && k.col_shard && !k.lookahead && !k.verbose && k.store.cache_bytes == (4ull << 30) && k.store.ways == 16 &&
-                                                        k.store.io_threads == 32 && k.store.io_uring == 128 && k.store.keepalive_ms == 15 && k.prefix.empty(); }) == 0,
-              "knob defaults (off, lookahead off, 4 GiB, 16 ways, 32 fallback threads, col shard on, uring 128, no prefix)");
+                                                        k.store.io_threads == 32 && k.store.io_uring == 128 && k.store.io_uring_pad == kUringPadAuto && k.store.keepalive_ms == 15 && k.prefix.empty(); }) == 0,
+              "knob defaults (off, lookahead off, 4 GiB, 16 ways, 32 fallback threads, col shard on, uring 128, pad auto, no prefix)");
     }
 
     if (argc == 1)

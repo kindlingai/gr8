@@ -705,24 +705,33 @@ struct Engine {
             qw38::PleStoreOpts po;
             po.cache_bytes = o.ple_cache_mib << 20;
             po.io_uring = o.ple_uring;
+            po.io_uring_pad = ds41::engram::parse_uring_pad(knob::uring_pad());
             po.direct = o.ple_direct;
             std::string perr;
             if (!ple_store.open(ple_bin, po, &perr)) die(perr);
+            char pad_info[96] = "";
+            if (ple_store.pad_probe().ran) {
+                const auto& pr = ple_store.pad_probe();
+                std::snprintf(pad_info, sizeof pad_info, " (auto: n1=%.1fus n8=%.1fus probe=%.2fms)",
+                              pr.n1_us, pr.n8_us, pr.probe_ms);
+            }
             if (ple_store.is_row_trellis()) {
                 const auto& rt = ple_store.trellis_info();
                 if (rt.nc < geom::PLE_HEAD_DIM)
                     die("L001.ple row-trellis nc=" + std::to_string(rt.nc) + " < PLE_HEAD_DIM");
                 std::fprintf(stderr,
                              "# rank %d: qw38 PLE opened %s (row-trellis %s %s, %llu rows x %d cols, %zu B/row, "
-                             "resident=%d, direct=%d, uring=%d, cache=%zu MiB)\n",
+                             "resident=%d, direct=%d, uring=%d, pad=%u%s, cache=%zu MiB)\n",
                              o.rank0, ple_bin.c_str(), rt.codebook.c_str(), rt.width_name.c_str(),
                              (unsigned long long)ple_store.total_rows(), rt.nc, rt.row_bytes,
                              int(ple_store.is_resident()), int(ple_store.is_direct()), int(ple_store.has_uring()),
-                             o.ple_cache_mib);
+                             ple_store.uring_pad(), pad_info, o.ple_cache_mib);
             } else {
-                std::fprintf(stderr, "# rank %d: qw38 PLE opened %s (%llu rows, direct=%d, uring=%d, cache=%zu MiB)\n",
+                std::fprintf(stderr,
+                             "# rank %d: qw38 PLE opened %s (%llu rows, direct=%d, uring=%d, pad=%u%s, cache=%zu MiB)\n",
                              o.rank0, ple_bin.c_str(), (unsigned long long)ple_store.total_rows(),
-                             int(ple_store.is_direct()), int(ple_store.has_uring()), o.ple_cache_mib);
+                             int(ple_store.is_direct()), int(ple_store.has_uring()), ple_store.uring_pad(),
+                             pad_info, o.ple_cache_mib);
             }
 
             ple_st.conv_hist = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::PLE_NHIST * geom::HC_D);

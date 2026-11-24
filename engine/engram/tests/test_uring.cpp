@@ -16,6 +16,8 @@
 #include <cerrno>
 
 static int setup_error = 0, setup_calls = 0, enter_calls = 0;
+static size_t enter_submitted_sqes = 0;
+static unsigned inject_delay_n1_us = 0, inject_delay_n8_us = 0;
 static bool inject_interrupt = false, inject_partial = false, inject_enter_error = false, inject_cqe_eintr = false;
 static io_uring_params last_params{};
 static long test_syscall(long op, ...)
@@ -42,8 +44,11 @@ static long test_syscall(long op, ...)
             assert(n > 1 && syscall(op, fd, 1u, 0u, 0u, nullptr, 0) == 1);
             errno = EIO; rc = -1;
         } else {
+            if (n == 1 && inject_delay_n1_us) usleep(inject_delay_n1_us);
+            else if (n == 8 && inject_delay_n8_us) usleep(inject_delay_n8_us);
             if (inject_partial && n > 1) n = 1;
             rc = syscall(op, fd, n, min, flags, nullptr, 0);
+            if (rc > 0) enter_submitted_sqes += (size_t)rc;
             if (rc >= 0 && inject_cqe_eintr) {
                 // Test-only alias of the kernel CQ: make one completed read report
                 // EINTR. The production reader must retry its unchanged task/slot.
@@ -91,7 +96,7 @@ static void fill(Temp& f, size_t rows)
 }
 static StoreOpts options(int qd)
 {
-    StoreOpts o; o.io_threads = 4; o.io_uring = qd; o.cache_bytes = 32ull << 20; return o;
+    StoreOpts o; o.io_threads = 4; o.io_uring = qd; o.io_uring_pad = 8; o.cache_bytes = 32ull << 20; return o;
 }
 static void open_store(RowStore& s, const TableFile& f, int qd, bool require)
 {
@@ -204,6 +209,63 @@ int main(int argc,char** argv)
         assert(dst==std::vector<uint8_t>(3*256,0xa5));
         assert(broken.fetch(0,ids,3,dst.data())==EIO);
         puts("PASS fatal enter after accepted I/O: drain before teardown, no partial dst, fail-closed retry");
+        // Verify mod-8 SQE padding counts (small decode, mod-8 exact, >QD prefill wraparound, pad=0 rollback, qd<pad).
+        struct PadCase { int qd; int pad; size_t blocks; size_t want_sqes; };
+        const PadCase cases[] = {
+            {128, 8,   1,   8},
+            {128, 8,   7,   8},
+            {128, 8,   8,   8},
+            {128, 8,  13,  16},
+            {128, 8, 128, 128},
+            {128, 8, 131, 136},
+            { 17, 8,  17,  24},
+            { 12, 8,   9,  16},
+            {128, 0,   1,   1},
+            {128, 0, 131, 131},
+            {  3, 8,   1,   1},
+        };
+        for (const auto& pc : cases) {
+            RowStore s; std::string e; auto o = options(pc.qd); o.io_uring_pad = pc.pad;
+            assert(s.open({full}, o, &e) && s.direct(0) && s.using_uring());
+            std::vector<uint32_t> bids(pc.blocks);
+            for (size_t i = 0; i < pc.blocks; ++i) bids[i] = (uint32_t)(i * 16); // distinct 4 KiB blocks
+            std::vector<uint8_t> out(pc.blocks * kRowBytes, 0xa5);
+            FetchStats st;
+            enter_submitted_sqes = 0;
+            assert(!s.fetch(0, bids.data(), bids.size(), out.data(), &st));
+            assert(st.blocks == pc.blocks && st.bytes == pc.blocks * 4096);
+            assert(enter_submitted_sqes == pc.want_sqes);
+            for (size_t i = 0; i < pc.blocks; ++i)
+                for (unsigned j = 0; j < kRowBytes; ++j)
+                    assert(out[i * kRowBytes + j] == value(bids[i], j));
+        }
+        puts("PASS uring pad8 SQE counts (small, mod8, >QD tail wraparound, pad=0 rollback, qd<pad)");
+        // Verify boot-time O_DIRECT auto-probe threshold (>50 us AND >1.15x -> pad=8, else pad=0).
+        {
+            assert(StoreOpts{}.io_uring_pad == kUringPadAuto);
+            struct AutoCase { int qd; unsigned d1_us; unsigned d8_us; unsigned want_pad; bool want_ran; };
+            const AutoCase acases[] = {
+                {128, 300,   0, 8, true},   // coalescing cliff (>50 us and >1.15x) -> pad=8
+                {128, 400, 280, 8, true},   // congested post-load cliff (+120 us, ~1.4x > 1.15x) -> pad=8
+                {128,   0, 120, 0, true},   // non-coalescing drive (n=8 slower) -> pad=0
+                {128, 120, 120, 0, true},   // equal latency -> pad=0
+                {128, 760, 700, 0, true},   // >50 us delta (~60 us) but <1.15x ratio (~1.08x) -> pad=0
+                {  4, 300,   0, 0, false},  // qd < 8 skips probe I/O -> pad=0
+            };
+            for (const auto& ac : acases) {
+                RowStore s; std::string e;
+                StoreOpts o; o.io_threads = 4; o.io_uring = ac.qd; o.cache_bytes = 32ull << 20; // default kUringPadAuto
+                inject_delay_n1_us = ac.d1_us;
+                inject_delay_n8_us = ac.d8_us;
+                const int before_enters = enter_calls;
+                assert(s.open({full}, o, &e) && s.direct(0) && s.using_uring());
+                inject_delay_n1_us = inject_delay_n8_us = 0;
+                assert(s.pad_probe().ran == ac.want_ran);
+                assert(s.uring_pad() == ac.want_pad);
+                if (!ac.want_ran) assert(enter_calls == before_enters);
+            }
+            puts("PASS uring auto-probe thresholds (cliff->8, no-cliff->0, low-ratio->0, qd<8 skip)");
+        }
     }
     for(int e : {EPERM,ENOSYS}) {
         setup_error=e;parity(contiguous,rows,128,false);short_read(128,false);setup_error=0;
