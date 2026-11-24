@@ -10,7 +10,9 @@ and what is involved) and ask its setup questions before you change a box or boo
 
 ## How changes land
 
-One change per PR, with a gates table (before on `main`, after, same boot conditions), a review, then a squash merge.
+One change per PR, with a [Conventional Commits](https://www.conventionalcommits.org/) PR title (`feat:`, `fix:`,
+`perf:`, `docs:`, `ci:`, `chore:`, etc., checked by `.github/workflows/pr-title.yml`), a gates table (before on `main`,
+after, same boot conditions), a review, then a squash merge.
 The rules, short:
 
 1. No lost wins: prefill, decode, TTFT, context and memory headroom stay within noise of `main` (about 3% on one boot's
@@ -18,6 +20,12 @@ The rules, short:
 2. A change that cannot keep the numbers, or changes a design choice, stops and goes to the maintainers first.
 3. Keep each change to what its issue or PR describes.
 4. Every topology builds (`GR8_NR=4`, `6` and `3`), and the others' behaviour does not change unless the issue says so.
+5. **Conventional Commit PR titles are required** (checked by `.github/workflows/pr-title.yml`): because `main` uses
+   squash merges and `release-please` derives version bumps and `CHANGELOG.md` from PR titles, always format PR titles
+   as `<type>(<optional-scope>): <description>` — e.g. `feat(qw38): ...`, `fix(kvman): ...`, `perf(glm53): ...`,
+   `docs: ...`, `ci: ...`, `refactor(launch): ...`, `chore: ...`, and add `!` (e.g. `feat!: ...`) or a
+   `BREAKING CHANGE:` body footer for breaking changes. Do not use bare subsystem prefixes like `qw38: ...` or
+   `kvman: ...` without a Conventional Commit type.
 
 Before anything leaves your machine, scrub it: no IP addresses, hostnames, box names, usernames, keys or paths from
 your own setup. The config examples use placeholders for a reason.
@@ -25,15 +33,13 @@ your own setup. The config examples use placeholders for a reason.
 ## Releases
 
 `main` is the single integration branch for pull requests: do not keep long-lived model or topology branches, and do
-not ship recipes as patch stacks on top of an older commit. A protected fast-forward-only `stable` branch tracks the
-newest `main` commit that passes the nightly gate (wrong results anywhere or a speed regression on `gr8`'s default
-`GLM-5.3` `TP=4` setup block `stable`; a failed night rolls forward a fix first, bisecting and reverting only if
-needed, and after two failed nights only fixes for the failure or reverts merge). After `v1.0`, numbered
-`vMAJOR.MINOR.PATCH` releases are immutable annotated tags cut only from `stable` after the full harness gate (`PATCH`
-for compatible fixes, `MINOR` for compatible features and validated default speedups, `MAJOR` for breaking changes),
-and every release updates its GitHub Release, [`CHANGELOG.md`](CHANGELOG.md), [`releases/<tag>.json`](releases/README.md),
-and [`README.md#building-on-gr8`](README.md#building-on-gr8) with `Breaking changes` (`None.` when compatible) plus any
-default or cache-key changes.
+not ship recipes as patch stacks on top of an older commit. Pull request titles follow Conventional Commits (checked by
+`.github/workflows/pr-title.yml`), and `release-please` (`release-please-config.json`, `.release-please-manifest.json`,
+`.github/workflows/release.yml`) maintains automated Release PRs updating [`CHANGELOG.md`](CHANGELOG.md) and cuts
+immutable `vMAJOR.MINOR.PATCH` tags and GitHub Releases on merge (`fix:` / `perf:` for `PATCH`, `feat:` for `MINOR`,
+`!:` / `BREAKING CHANGE:` for `MAJOR`, or `Release-As: X.Y.Z`), triggering `.github/workflows/ci.yml` once to build
+and publish the container image, tester archive, and attestations. Optional curated version specs live in
+[`releases/<tag>.json`](releases/README.md) (validated whenever present).
 Deployable tuned recipes live in standalone repositories, pin an immutable `v*` tag or an exact merged `main`/`stable`
 commit SHA by submodule or `ghcr.io/kindlingai/gr8` `@sha256:<digest>` (never a moving branch or floating tag such as
 `:latest`, `:main`, or `:stable`), and record their engine pin in `kindling.json` for the `README.md` freshness
@@ -57,11 +63,11 @@ Update the matching items in the same PR as a change (or during each `v*` releas
       and [`docs/cards/make.sh`](docs/cards/make.sh) from [`recipes.json`](recipes.json) for `gr8`'s README cards, plus
       [`docs/cards/switch_card.py`](docs/cards/switch_card.py) from `docs/cards/switching.json` when model-switching
       times change).
-- [ ] **Release notes, changelog, and version spec on every release:** For every `v*` tag, publish the GitHub Release
-      and update [`CHANGELOG.md`](CHANGELOG.md), [`releases/<tag>.json`](releases/README.md), and
-      [`README.md#building-on-gr8`](README.md#building-on-gr8) with highlights and measured numbers, `Breaking changes`,
-      default or cache-key changes, verified commit SHA and image digest, and toolchain/Dockerfile sync notes
-      ([RELEASING.md](RELEASING.md#required-github-release-sections-and-in-repo-release-records)).
+- [ ] **Release notes, changelog, and optional version spec on every release:** Review the `release-please` Release PR
+      (adding highlights, default/cache-key notes, or `Dockerfile`/toolchain sync notes to [`CHANGELOG.md`](CHANGELOG.md)
+      when relevant), optionally update [`README.md#building-on-gr8`](README.md#building-on-gr8) and add a curated
+      [`releases/<tag>.json`](releases/README.md) once the tagged image digest is published
+      ([RELEASING.md](RELEASING.md#automated-release-records-and-optional-version-specs)).
 - [ ] **Recipe table links and dates:** Keep [`recipes.json`](recipes.json) and the
       [README.md](README.md#all-recipes) recipe section current — repository links, measurement dates, and each recipe's
       pinned engine freshness against the newest release and `stable`.

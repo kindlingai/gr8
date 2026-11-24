@@ -44,40 +44,53 @@ complementary sources of stability:
 
 ## 2. Numbered releases
 
-Following `v1.0`, releases use `vMAJOR.MINOR.PATCH` (`v1.0.1`, `v1.1.0`, `v2.0.0`) as annotated Git tags cut **only
-from `stable` commits** that have passed the Level-3 release gate:
+Following `v1.0`, releases use `vMAJOR.MINOR.PATCH` (`v1.0.1`, `v1.1.0`, `v2.0.0`) and are automated with
+`release-please` (`release-please-config.json`, `.release-please-manifest.json`, `.github/workflows/release.yml`).
+Pull request titles follow [Conventional Commits](https://www.conventionalcommits.org/) (checked on every PR by
+`.github/workflows/pr-title.yml`), because `gr8` squash-merges PRs to `main` and `release-please` derives version bumps
+and [`CHANGELOG.md`](CHANGELOG.md) entries from commit subjects on `main`:
 
-- **`PATCH` (`v1.0.1`):** Bug fixes, test or documentation updates, and internal improvements that keep all existing CLI
-  flags, config files, HTTP endpoints, weight/steering formats, and default numerical behavior compatible.
-- **`MINOR` (`v1.1.0`):** Backward-compatible additions: new models or TP topologies, new optional flags or knobs in
-  `knobs/*.yaml`, additive HTTP fields, or validated default speedups that keep existing launch commands working (with
-  any numerical trade documented and reversible by flags).
-- **`MAJOR` (`v2.0.0`):** Any breaking change (section 3) that requires users, clients, or recipes to update their
-  commands, config files, container setup, or stored artifacts.
-- **Pre-releases (`vX.Y.Z-rc.N` or `beta-*`):** Optional test cuts on `stable` before a release; recipes for general use
-  avoid pre-release tags. (Note that in `.github/workflows/ci.yml`, `docker/metadata-action` uses its default
-  `latest=auto` flavor on tag pushes, so pushing any `v*` or `beta-*` tag — including a pre-release or an older-series
-  patch tag — also moves `ghcr.io/kindlingai/gr8:latest`.)
+- **`PATCH` (`fix:`, `perf:`, `revert:` — e.g. `v1.2.1`):** Bug fixes, compatible performance improvements, and internal
+  changes that keep all existing CLI flags, config files, HTTP endpoints, weight/steering formats, and default numerical
+  behavior compatible.
+- **`MINOR` (`feat:` — e.g. `v1.3.0`):** Backward-compatible additions: new models or TP topologies, new optional flags
+  or knobs in `knobs/*.yaml`, additive HTTP fields, or validated default speedups that keep existing launch commands
+  working (with any numerical trade documented and reversible by flags).
+- **`MAJOR` (`!:` or `BREAKING CHANGE:` footer — e.g. `v2.0.0`):** Any breaking change (section 3) that requires users,
+  clients, or recipes to update their commands, config files, container setup, or stored artifacts.
+- **Explicit version override:** Include a `Release-As: X.Y.Z` footer in a commit message to request a specific version
+  in the next Release PR.
+- **Pre-releases (`vX.Y.Z-rc.N` or `beta-*`):** Optional test cuts before a release; recipes for general use avoid
+  pre-release tags. Pre-release tags and older-series tag backfills never move `ghcr.io/kindlingai/gr8:latest` or `:main`.
 
-Published release tags are immutable: never delete or force-move a `v*` tag. Ship fixes via `main -> stable` in the next
-`PATCH` release.
+Published release tags are immutable: never delete or force-move a `v*` tag. Ship fixes via `main` in the next `PATCH`
+release.
 
-### What tagging a release builds
+### What cutting a release builds
 
-Pushing an annotated `v*` tag on `stable` runs the full release pipeline in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+Every push to `main` runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which runs `release-please`
+first (updating the open Release PR, or creating the `vX.Y.Z` tag and GitHub Release when a Release PR merges) and then
+invokes [`.github/workflows/ci.yml`](.github/workflows/ci.yml) once via `workflow_call` (passing `tag` when a release
+was cut, and skipping non-release pushes that touch only `**.md`). For a tagged release, `ci.yml` runs the full
+pipeline once without duplicating builds:
 
 1. CPU tests (`frontend` and `engine`) and `tools/env_lint.py`.
-2. Arm64 Rust binaries and all six engine build legs at each leg's supported TP widths (`1, 2, 3, 4, 5, 6, 8` for
-   GLM-5.3 `fp8` and `int4`, `1, 2, 3, 4` for Flash `fp8` and `int4`, `4` for `ds41`, plus the GPU test binaries).
+2. Arm64 Rust binaries and all engine build legs at each leg's supported TP widths (`1, 2, 3, 4, 5, 6, 8` for GLM-5.3
+   `fp8` and `int4`, `1, 2, 3, 4` for Flash `fp8` and `int4` and `qw38`, `4` for `ds41`, `1, 4, 6` for `ink2`, plus
+   the GPU test binaries).
 3. Reproducible tester archive (`gr8-<short-sha>.zip` + `.sha256` via `scripts/make_zip.py`), uploaded as an Actions
-   workflow artifact on the tag run.
-4. Runtime container image `ghcr.io/kindlingai/gr8:<tag>` (and `sha-<commit>`), smoke-tested and pushed with build
-   provenance attestation.
+   workflow artifact and attached to the GitHub Release with build-provenance attestation.
+4. Runtime container image `ghcr.io/kindlingai/gr8:<tag>` (and `sha-<commit>`, plus `:latest` and `:main` when the
+   commit is still `main`'s head and not a pre-release), smoke-tested and pushed with build-provenance attestation.
+5. Updates the GitHub Release body with the immutable `ghcr.io/kindlingai/gr8:<tag>@sha256:<digest>` reference,
+   attached tester archive filenames, and `gh attestation verify` commands.
 
-Note that `ghcr.io/kindlingai/gr8:main` moves on every non-Markdown merge to `main`, `:latest` moves on non-Markdown
-merges to `main` as well as on `v*` / `beta-*` tag pushes (`docker/metadata-action` default `latest=auto`), and any
-`:stable` image tag moves with the `stable` branch; none of them is an immutable release pin.
+To republish or backfill an existing `v*` tag manually (for example after a transient CI failure), trigger
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) via `workflow_dispatch` with the `tag` input set to that tag.
+
+Note that `ghcr.io/kindlingai/gr8:main` and `:latest` move on non-Markdown merges to `main` (never on pre-releases or
+backfills of older tags), and any `:stable` image tag moves with the `stable` branch; none of them is an immutable
+release pin.
 
 ## 3. Breaking changes and release notes
 
@@ -103,58 +116,47 @@ A change counts as **breaking** (requiring `MAJOR`, plus migration steps) if it 
 upgrade is not a breaking change, provided no manual cleanup is required, though release notes must call out the
 one-time rebuild time and disk use.)*
 
-### Required GitHub Release sections and in-repo release records
+### Automated release records and optional version specs
 
-Every tagged `v*` release publishes three matching records:
+Every `v*` release cut by `release-please` automatically produces:
 
-- a **GitHub Release** on `<tag>`,
-- a `## [<tag>] — YYYY-MM-DD` section in [`CHANGELOG.md`](CHANGELOG.md), and
-- a machine-readable version spec in [`releases/<tag>.json`](releases/README.md) (`schema_version: 1`).
+- a **Release PR** (`chore(main): release X.Y.Z`) updating [`.release-please-manifest.json`](.release-please-manifest.json)
+  and [`CHANGELOG.md`](CHANGELOG.md) from merged Conventional Commits (`feat`, `fix`, `perf`, `revert`, and breaking
+  changes),
+- a **Git tag and GitHub Release** on `<tag>` when that Release PR is squash-merged to `main`, and
+- **attached build artifacts and verification notes** added by `.github/workflows/ci.yml` once the release build
+  finishes (`gr8-<short-sha>.zip`, `.zip.sha256`, build-provenance attestations, and the immutable
+  `ghcr.io/kindlingai/gr8:<tag>@sha256:<digest>` reference).
 
-Both the GitHub Release and the [`CHANGELOG.md`](CHANGELOG.md) entry carry four required sections:
+Machine-readable [`releases/<tag>.json`](releases/README.md) version specs (`schema_version: 1`) are optional for
+automated `release-please` releases (preserved for `v1.0`–`v1.2.0` and available for curated major/milestone records).
+Whenever a `releases/v*.json` file is present, `python3 scripts/make_zip.py --check` validates its schema and date
+parity with [`CHANGELOG.md`](CHANGELOG.md) on every pull request (and keeps strict 4-subsection + commit/digest sync
+for historical manual `## [vX.Y.Z] — YYYY-MM-DD` entries).
 
-1. **Highlights and measured numbers** — what improved or was added, with model, TP width, and boot conditions
-   ([AGENTS.md](AGENTS.md#the-gate)).
-2. **`Breaking changes`** — always present. Write `None.` when the release is backward-compatible; otherwise list each
-   changed flag, file, endpoint, or requirement with the exact before/after migration command or config line.
-3. **Default or cache-key changes** — any changed default knob, any numerical trade with its exact rollback flags, and
-   any cache key that triggers a one-time rebuild on upgrade.
-4. **Toolchain / Dockerfile sync** — any change to `CUDA_VERSION`, `rust-toolchain.toml` (`RUST_VERSION`), or runtime
-   apt packages in `Dockerfile` that downstream recipe Dockerfiles mirror.
-
-[`releases/<tag>.json`](releases/README.md) records the same release facts in structured JSON (`tag`, `version`, `date`,
-40-character `commit`, GHCR `container.image` and `sha256` `digest`, `toolchain`, shipped `binaries`, `api` ports and
-endpoints, served `models` with supported `TP` widths and default settings, `breaking_changes`,
-`default_or_cache_changes`, `prs`, and headline `benchmarks`). `python3 scripts/make_zip.py --check` validates every
-`releases/v*.json` file and checks 1-to-1 parity with [`CHANGELOG.md`](CHANGELOG.md) on every pull request.
+For significant releases (new defaults, numerical trade-offs, cache-key resets, or `Dockerfile` / toolchain changes),
+include those details in the PR commit messages (`BREAKING CHANGE:` footer when breaking) or edit the Release PR's
+`CHANGELOG.md` entry before merging.
 
 ### Cutting a release
 
-1. Confirm the candidate commit is on `stable` (having already passed CI on `main` and the Level-2 nightly gate) and has
-   passed the Level-3 full harness gate across the supported `TP=N` model configurations.
-2. Walk the keep-current checklist in [AGENTS.md](AGENTS.md#keeping-docs-and-recipes-current) so `README.md`, model
-   pages (`docs/GLM-5.3.md`, `docs/FLASH.md`, `docs/DEEPSEEK.md`, `docs/SWITCHING.md`), `KNOBS.md`, `KNOWN-ISSUES.md`,
-   `CREDITS.md`, `recipes.json`, and `docs/cards/` graphics match on `stable`. (Pushes to `main` that touch only
-   `**.md` skip `ci` via `paths-ignore`, whereas pushing the `v*` tag always runs the full `ci` build.)
-3. Create and push an annotated tag on the verified `stable` commit:
-   ```bash
-   git checkout stable && git pull --ff-only origin stable
-   git tag -a v1.1.0 -m "gr8 v1.1.0"
-   git push origin v1.1.0
-   ```
-4. Wait for the tag's `ci` workflow run to publish `ghcr.io/kindlingai/gr8:<tag>` and verify its `sha256` manifest
-   digest. Publish the GitHub Release on `<tag>` with the four required sections and the image digest, then open the
-   release-record pull request on `main` updating all three in-repo files together (since the tag's 40-character commit
-   SHA and GHCR `sha256` digest are immutable only once `<tag>`'s build finishes):
-   - [`CHANGELOG.md`](CHANGELOG.md) — add `## [<tag>] — YYYY-MM-DD` with the tag commit, `ghcr.io/kindlingai/gr8:<tag>@sha256:<digest>`, link to `releases/<tag>.json`, and the four required sections;
-   - [`releases/<tag>.json`](releases/README.md) — add the version spec file for `<tag>` with verified `commit`, `container.digest`, `toolchain`, `binaries`, `models`, compatibility/default deltas, `prs`, and `benchmarks`;
-   - [`README.md`](README.md#building-on-gr8) — update the current release link and `compose.yaml` / `Dockerfile` pin example to `<tag>@sha256:<digest>`.
-   Run `python3 -m unittest bench/tests/test_releases.py` on the working tree, commit the release-record branch, and run
-   `python3 scripts/make_zip.py --check` (`make_zip.py` reads `git archive HEAD`, so run it **after** committing) before
-   opening the pull request.
-5. Check the blessed standalone recipes against `<tag>`: open pin-bump pull requests for the recipes whose correctness
-   and speed hold, and leave any recipe that measures slower on its prior pin (reflected in `README.md`'s recipe
-   freshness column) until re-tuned.
+1. Land changes on `main` via normal pull requests with Conventional Commit titles (verified by `pr-title.yml`).
+   `release-please` automatically opens and updates the pending Release PR (`chore(main): release X.Y.Z`) on every push
+   to `main`.
+2. Before merging the Release PR, verify the Level-3 hardware gate across the supported `TP=N` model configurations and
+   walk the keep-current checklist in [AGENTS.md](AGENTS.md#keeping-docs-and-recipes-current) (`README.md`, model pages,
+   `KNOBS.md`, `KNOWN-ISSUES.md`, `CREDITS.md`, `recipes.json`, and `docs/cards/`).
+3. Review the Release PR (optionally adding measured benchmark highlights or upgrade notes to its `CHANGELOG.md` diff).
+   If `RELEASE_PLEASE_TOKEN` is configured as a repository secret, `ci.yml` and `pr-title.yml` trigger automatically on
+   the Release PR; otherwise (using the default `GITHUB_TOKEN`), close and reopen the Release PR once so GitHub triggers
+   the required PR checks. Comment `/ready` and squash-merge the Release PR.
+4. Merging the Release PR runs `.github/workflows/release.yml`, which creates `<tag>` and its GitHub Release, then runs
+   `.github/workflows/ci.yml` once to test, build all engine legs, push `ghcr.io/kindlingai/gr8:<tag>`, upload
+   `gr8-<short-sha>.zip` + `.sha256` with provenance attestations, and append the immutable `@sha256:<digest>` block to
+   the GitHub Release notes.
+5. Optionally update [`README.md`](README.md#building-on-gr8) with the new `<tag>@sha256:<digest>` pin example (and add
+   a curated [`releases/<tag>.json`](releases/README.md) if desired), then check standalone recipes against `<tag>` and
+   open pin-bump pull requests where correctness and speed hold.
 
 ## 4. How recipes pin `gr8`
 

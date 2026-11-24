@@ -1,0 +1,19 @@
+# Checks that pull request titles follow Conventional Commits, since this repository uses squash merges
+# and release-please derives version bumps and CHANGELOG entries from commit subjects on main.
+name: pr-title
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  pr-title:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: amannn/action-semantic-pull-request@c5e23b7e584519ee15caa684cf60d056aa9f035f  # v6.1.3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

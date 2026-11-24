@@ -1,8 +1,10 @@
 # Version specs (`releases/<tag>.json`)
 
-Each numbered `v*` release of `gr8` has a machine-readable JSON specification in this directory named `releases/<tag>.json`
-(for example, [`v1.0.json`](v1.0.json) and [`v1.0.1.json`](v1.0.1.json)), paired with its human-readable section in
-[`../CHANGELOG.md`](../CHANGELOG.md) and its GitHub Release ([`../RELEASING.md`](../RELEASING.md)).
+Curated `gr8` releases can carry a machine-readable JSON specification in this directory named `releases/<tag>.json`
+(for example, [`v1.0.json`](v1.0.json) through [`v1.2.0.json`](v1.2.0.json)), paired with [`../CHANGELOG.md`](../CHANGELOG.md)
+and the matching GitHub Release ([`../RELEASING.md`](../RELEASING.md)). For releases automated by `release-please`,
+adding a `releases/<tag>.json` spec is optional; whenever one is present, CI still validates it against
+`schema_version: 1`.
 
 Recipes, deployment tools, dashboards, and agents can read `releases/<tag>.json` with standard-library JSON parsers or
 `jq` to inspect a release's immutable commit SHA, GHCR image digest, toolchain pins, shipped binaries, supported models
@@ -39,5 +41,6 @@ Every `releases/<tag>.json` file carries these top-level fields:
 ## Validation
 
 `python3 scripts/make_zip.py --check` (run by CI on every pull request) and
-`python3 -m unittest bench/tests/test_releases.py` check that every `releases/v*.json` file conforms to `schema_version: 1`
-and stays in 1-to-1 sync with [`../CHANGELOG.md`](../CHANGELOG.md).
+`python3 -m unittest bench/tests/test_releases.py` check that every present `releases/v*.json` file conforms to
+`schema_version: 1` and matches its [`../CHANGELOG.md`](../CHANGELOG.md) entry (while allowing `release-please`
+entries in `CHANGELOG.md` without a `releases/<tag>.json` file).

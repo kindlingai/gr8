@@ -1,0 +1,84 @@
+# Runs release-please on pushes to main to maintain a Release PR (CHANGELOG.md, .release-please-manifest.json)
+# and, once merged, create the vX.Y.Z tag and GitHub Release. Then calls ci.yml via workflow_call so each
+# non-Markdown main push builds once — either as a normal main build or, when release-please just created a
+# release, as a full tagged release (avoiding GITHUB_TOKEN's tag-push event-chaining restriction and avoiding
+# duplicate 8-leg CUDA builds).
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: release-please
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      should_build: ${{ steps.changes.outputs.should_build }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
+        with:
+          # Use a PAT/GitHub App token if configured so Release PRs automatically trigger pull_request
+          # workflows (ci.yml, pr-title.yml); falls back to GITHUB_TOKEN otherwise.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      - name: Check whether CI build is needed
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_CREATED" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Building tagged release $TAG_NAME"
+            exit 0
+          fi
+          # Mirror ci.yml's paths-ignore: ['**.md'] on main pushes so Markdown-only merges
+          # do not trigger the 8-leg arm64 CUDA build.
+          should_build=true
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            if json=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$SHA" 2>/dev/null); then
+              total=$(jq '.files | length' <<< "$json")
+              non_md=$(jq '[.files[].filename | select(endswith(".md") | not)] | length' <<< "$json")
+              if [ "$total" -gt 0 ] && [ "$total" -lt 300 ] && [ "$non_md" -eq 0 ]; then
+                should_build=false
+              fi
+            fi
+          fi
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build"
+
+  ci:
+    needs: release-please
+    if: needs.release-please.outputs.should_build == 'true'
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      pull-requests: read
+      issues: read
+      checks: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      tag: ${{ needs.release-please.outputs.release_created == 'true' && needs.release-please.outputs.tag_name || '' }}
+    secrets: inherit

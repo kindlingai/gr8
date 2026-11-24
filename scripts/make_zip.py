@@ -37,13 +37,21 @@ SHIP = {'README.md', 'CHANGELOG.md', 'LICENSE', 'KNOWN-ISSUES.md', 'PROTOCOL.md'
         'gr8', 'KNOBS.md', 'AGENTS.md', 'model.yaml', 'recipes.json', 'smoketest', 'CREDITS.md', 'knobs',
         'rust-toolchain.toml'}
 # Not shipped: repo plumbing.
-SKIP = {'.github', '.gitignore'}
+SKIP = {'.github', '.gitignore', '.release-please-manifest.json', 'release-please-config.json'}
 
 TAG_RE = re.compile(r'^v[0-9]+(?:\.[0-9]+){1,2}(?:-[0-9A-Za-z.-]+)?$')
 DATE_RE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
 SHA40_RE = re.compile(r'^[0-9a-f]{40}$')
 DIGEST_RE = re.compile(r'^sha256:[0-9a-f]{64}$')
 CHANGELOG_REL_LINE_RE = re.compile(r'^## \[(v[^\]]+)\] — ([0-9]{4}-[0-9]{2}-[0-9]{2})\s*$')
+# release-please emits H2 for minor/major and H3 for patch releases:
+#   ## [1.3.0](https://.../compare/v1.2.0...v1.3.0) (2026-11-24)
+#   ### [1.2.1](https://.../compare/v1.2.0...v1.2.1) (2026-11-24)
+#   ## 1.3.0 (2026-11-24)
+RP_CHANGELOG_REL_LINE_RE = re.compile(
+    r'^###? (?:\[(v?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)\]\([^)]+\)'
+    r'|(v?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)) \(([0-9]{4}-[0-9]{2}-[0-9]{2})\)\s*$'
+)
 REQUIRED_CHANGELOG_SUBSECTIONS = (
     '### Highlights and measured numbers',
     '### Breaking changes',
@@ -84,40 +92,47 @@ def check_release_records(raw_files):
     if has_changelog:
         text = raw_files['CHANGELOG.md'].decode('utf-8')
         lines = text.splitlines(keepends=True)
-        h2_sections = []
+        rel_headers = []
         in_fence = False
         offset = 0
         for line in lines:
             stripped = line.strip()
             if stripped.startswith('```'):
                 in_fence = not in_fence
-            elif not in_fence and line.startswith('## '):
-                h2_sections.append((offset, offset + len(line), stripped))
+            elif not in_fence and (line.startswith('## ') or (line.startswith('### ') and RP_CHANGELOG_REL_LINE_RE.match(stripped))):
+                rel_headers.append((offset, offset + len(line), stripped))
             offset += len(line)
         rel_entries = []
-        for idx, (start, body_start, heading) in enumerate(h2_sections):
-            end = h2_sections[idx + 1][0] if idx + 1 < len(h2_sections) else len(text)
+        for idx, (start, body_start, heading) in enumerate(rel_headers):
+            end = rel_headers[idx + 1][0] if idx + 1 < len(rel_headers) else len(text)
             if heading == '## [Unreleased]':
                 continue
             m = CHANGELOG_REL_LINE_RE.match(heading)
-            if not m:
-                errors.append(
-                    f'CHANGELOG.md: malformed H2 heading "{heading}" '
-                    '(expected "## [Unreleased]" or "## [vX.Y.Z] — YYYY-MM-DD")'
-                )
+            if m:
+                rel_entries.append((m.group(1), m.group(2), text[body_start:end], 'manual'))
                 continue
-            rel_entries.append((m.group(1), m.group(2), text[body_start:end]))
+            rp = RP_CHANGELOG_REL_LINE_RE.match(heading)
+            if rp:
+                ver = rp.group(1) or rp.group(2)
+                tag = ver if ver.startswith('v') else f'v{ver}'
+                rel_entries.append((tag, rp.group(3), text[body_start:end], 'release-please'))
+                continue
+            errors.append(
+                f'CHANGELOG.md: malformed H2 heading "{heading}" '
+                '(expected "## [Unreleased]", "## [vX.Y.Z] — YYYY-MM-DD", or a release-please "## [X.Y.Z](url) (YYYY-MM-DD)" heading)'
+            )
         if not rel_entries:
-            errors.append('CHANGELOG.md has no "## [vX.Y.Z] — YYYY-MM-DD" release headings')
-        for tag, date, body in rel_entries:
+            errors.append('CHANGELOG.md has no release headings')
+        for tag, date, body, kind in rel_entries:
             if not TAG_RE.match(tag):
                 errors.append(f'CHANGELOG.md: invalid release tag "{tag}"')
             if tag in changelog_sections:
                 errors.append(f'CHANGELOG.md: duplicate section for {tag}')
-            changelog_sections[tag] = (date, body)
-            for heading in REQUIRED_CHANGELOG_SUBSECTIONS:
-                if heading not in body:
-                    errors.append(f'CHANGELOG.md ({tag}): missing "{heading}"')
+            changelog_sections[tag] = (date, body, kind)
+            if kind == 'manual':
+                for heading in REQUIRED_CHANGELOG_SUBSECTIONS:
+                    if heading not in body:
+                        errors.append(f'CHANGELOG.md ({tag}): missing "{heading}"')
 
     specs = {}
     for path in spec_paths:
@@ -223,7 +238,8 @@ def check_release_records(raw_files):
         specs[file_tag] = spec
 
     if has_changelog and specs:
-        only_cl = sorted(set(changelog_sections) - set(specs))
+        manual_cl_tags = {t for t, (_, _, kind) in changelog_sections.items() if kind == 'manual'}
+        only_cl = sorted(manual_cl_tags - set(specs))
         only_sp = sorted(set(specs) - set(changelog_sections))
         if only_cl:
             errors.append('CHANGELOG.md entries missing releases/<tag>.json: ' + ', '.join(only_cl))
@@ -251,16 +267,17 @@ def check_release_records(raw_files):
                     visited.add(cur)
                     cur = specs[cur]['previous_tag']
             if tag in changelog_sections:
-                cl_date, cl_body = changelog_sections[tag]
+                cl_date, cl_body, cl_kind = changelog_sections[tag]
                 if cl_date != spec['date']:
                     errors.append(f'{tag}: CHANGELOG.md date {cl_date} != releases/{tag}.json date {spec["date"]}')
-                if isinstance(spec['commit'], str) and spec['commit'] not in cl_body:
-                    errors.append(f'{tag}: CHANGELOG.md section does not mention commit {spec["commit"]}')
-                digest = spec['container'].get('digest', '') if isinstance(spec['container'], dict) else ''
-                if isinstance(digest, str) and digest and digest not in cl_body:
-                    errors.append(f'{tag}: CHANGELOG.md section does not mention digest {digest}')
-                if f'releases/{tag}.json' not in cl_body:
-                    errors.append(f'{tag}: CHANGELOG.md section does not link releases/{tag}.json')
+                if cl_kind == 'manual':
+                    if isinstance(spec['commit'], str) and spec['commit'] not in cl_body:
+                        errors.append(f'{tag}: CHANGELOG.md section does not mention commit {spec["commit"]}')
+                    digest = spec['container'].get('digest', '') if isinstance(spec['container'], dict) else ''
+                    if isinstance(digest, str) and digest and digest not in cl_body:
+                        errors.append(f'{tag}: CHANGELOG.md section does not mention digest {digest}')
+                    if f'releases/{tag}.json' not in cl_body:
+                        errors.append(f'{tag}: CHANGELOG.md section does not link releases/{tag}.json')
     return errors
 
 
