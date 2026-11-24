@@ -53,6 +53,7 @@ struct FullLayerKv {
     // Optional staging pages for StashPool partial-page checkpoints
     __nv_bfloat16* kv_staging = nullptr;
     __nv_bfloat16* idx_staging = nullptr;
+    int snap_stride = 0;
 };
 
 struct FullAttnScratch {
@@ -987,7 +988,7 @@ __global__ void k_qsa_k_update_verify_batch(const __nv_bfloat16* __restrict__ id
                                             __nv_bfloat16* __restrict__ idx_pages,
                                             const int* __restrict__ row_slot,
                                             const int* __restrict__ row_pos,
-                                            int max_pages, int S, int V, int snap_k, float eps,
+                                            int max_pages, int S, int V, int snap_k, int snap_stride, float eps,
                                             int3* __restrict__ idx_raw_thw = nullptr,
                                             int3* __restrict__ idx_raw_thw_snap = nullptr,
                                             const int3* __restrict__ row_rope = nullptr) {
@@ -1001,13 +1002,13 @@ __global__ void k_qsa_k_update_verify_batch(const __nv_bfloat16* __restrict__ id
     __shared__ float sm[4];
     __shared__ float kf[128];
 
-    const int snap_stride = snap_k + 1;
+    const int ss = (snap_stride > 0 ? snap_stride : snap_k) + 1;
     if (idx_raw_snap && snap_k > 0) {
-        __nv_bfloat16* sb0 = idx_raw_snap + (static_cast<size_t>(slot) * snap_stride) * 4 * 128;
+        __nv_bfloat16* sb0 = idx_raw_snap + (static_cast<size_t>(slot) * ss) * 4 * 128;
         #pragma unroll
         for (int k = 0; k < 4; ++k) sb0[k * 128 + d] = raw_slot[k * 128 + d];
         if (idx_raw_thw_snap && idx_raw_thw && d == 0) {
-            idx_raw_thw_snap[static_cast<size_t>(slot) * snap_stride] = idx_raw_thw[slot];
+            idx_raw_thw_snap[static_cast<size_t>(slot) * ss] = idx_raw_thw[slot];
         }
     }
 
@@ -1051,11 +1052,11 @@ __global__ void k_qsa_k_update_verify_batch(const __nv_bfloat16* __restrict__ id
             __syncthreads();
         }
         if (idx_raw_snap && t < V - 1 && t < snap_k) {
-            __nv_bfloat16* sb = idx_raw_snap + (static_cast<size_t>(slot) * snap_stride + (t + 1)) * 4 * 128;
+            __nv_bfloat16* sb = idx_raw_snap + (static_cast<size_t>(slot) * ss + (t + 1)) * 4 * 128;
             #pragma unroll
             for (int k = 0; k < 4; ++k) sb[k * 128 + d] = raw_slot[k * 128 + d];
             if (idx_raw_thw_snap && idx_raw_thw && d == 0) {
-                idx_raw_thw_snap[static_cast<size_t>(slot) * snap_stride + (t + 1)] = idx_raw_thw[slot];
+                idx_raw_thw_snap[static_cast<size_t>(slot) * ss + (t + 1)] = idx_raw_thw[slot];
             }
         }
     }
@@ -1655,13 +1656,15 @@ inline void full_attn_forward(cublasHandle_t blas, const FullAttnWeights& w, Ful
                                                     kv.idx_raw_thw, row_rope_dev);
     } else if (all_verify) {
         k_qsa_k_update_verify_batch<<<nsegs, 128, 0, st>>>(sc.idx_qk, w.idx_k_norm, kv.idx_raw, kv.idx_raw_snap, kv.idx_pages,
-                                                           row_slot_dev, row_pos_dev, max_pages, nsegs, V, snap_k, geom::RMS_EPS,
+                                                           row_slot_dev, row_pos_dev, max_pages, nsegs, V, snap_k, kv.snap_stride, geom::RMS_EPS,
                                                            kv.idx_raw_thw, kv.idx_raw_thw_snap, row_rope_dev);
     } else {
+        const int ss = kv.snap_stride > 0 ? kv.snap_stride : snap_k;
         for (int s = 0; s < nsegs; ++s) {
             if (segs[s].len <= 0) continue;
             qsa_k_update_seg_fast(sc.idx_qk, w.idx_k_norm, kv.idx_raw, kv.idx_raw_snap, kv.idx_pages,
-                                  max_pages, segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len, snap_k, geom::RMS_EPS, st,
+                                  max_pages, segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len,
+                                  snap_k > 0 ? ss : 0, geom::RMS_EPS, st,
                                   kv.idx_raw_thw, kv.idx_raw_thw_snap, row_rope_dev);
         }
     }

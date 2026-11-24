@@ -57,7 +57,8 @@ struct GdnLayerState {
     __nv_bfloat16* v_a = nullptr;   // optional [slots, v_stride, nh_v] BF16
     __nv_bfloat16* v_b = nullptr;   // optional [slots, v_stride, nh_v] BF16
     int* v_pos0 = nullptr;          // optional [slots] INT32
-    int v_stride = 0;               // max_V = o.mtp + 1
+    int v_stride = 0;               // max_V = max_snap_k + 1
+    int snap_stride = 0;            // max_snap_k for conv_snap indexing
 };
 
 struct GdnScratch {
@@ -499,7 +500,7 @@ __global__ void k_gdn_conv1d_verify_batch(const __nv_bfloat16* __restrict__ qkv_
                                           __nv_bfloat16* __restrict__ v_qkv,
                                           const int* __restrict__ d_slot,
                                           const int* __restrict__ d_pos,
-                                          int S, int V, int snap_k, int v_stride, int qkv_dim, bool update_state) {
+                                          int S, int V, int snap_k, int snap_stride, int v_stride, int qkv_dim, bool update_state) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= S * qkv_dim) return;
     const int s = idx / qkv_dim;
@@ -519,9 +520,9 @@ __global__ void k_gdn_conv1d_verify_batch(const __nv_bfloat16* __restrict__ qkv_
     float h1 = (pos0 > 0) ? __bfloat162float(hbase[1 * qkv_dim + c]) : 0.0f;
     float h2 = (pos0 > 0) ? __bfloat162float(hbase[2 * qkv_dim + c]) : 0.0f;
 
-    const int snap_stride = snap_k + 1;
+    const int ss = (snap_stride > 0 ? snap_stride : snap_k) + 1;
     if (conv_snap && snap_k > 0) {
-        __nv_bfloat16* sb0 = conv_snap + (static_cast<size_t>(slot) * snap_stride) * 3 * qkv_dim;
+        __nv_bfloat16* sb0 = conv_snap + (static_cast<size_t>(slot) * ss) * 3 * qkv_dim;
         sb0[0 * qkv_dim + c] = __float2bfloat16(h0);
         sb0[1 * qkv_dim + c] = __float2bfloat16(h1);
         sb0[2 * qkv_dim + c] = __float2bfloat16(h2);
@@ -540,7 +541,7 @@ __global__ void k_gdn_conv1d_verify_batch(const __nv_bfloat16* __restrict__ qkv_
         h1 = h2;
         h2 = x;
         if (conv_snap && t < V - 1 && t < snap_k) {
-            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * snap_stride + (t + 1)) * 3 * qkv_dim;
+            __nv_bfloat16* sb = conv_snap + (static_cast<size_t>(slot) * ss + (t + 1)) * 3 * qkv_dim;
             sb[0 * qkv_dim + c] = __float2bfloat16(h0);
             sb[1 * qkv_dim + c] = __float2bfloat16(h1);
             sb[2 * qkv_dim + c] = __float2bfloat16(h2);
@@ -1481,7 +1482,7 @@ inline void gdn_forward(cublasHandle_t blas, const GdnWeights& w, GdnLayerState&
     } else if (all_verify) {
         k_gdn_conv1d_verify_batch<<<(nsegs * qkv_dim + 255) / 256, 256, 0, st>>>(
             sc.qkv_raw, w.conv1d, st_buf.conv, st_buf.conv_snap, sc.qkv_conv, st_buf.v_qkv,
-            d_slot, d_pos, nsegs, V, snap_k, st_buf.v_stride, qkv_dim, update_state);
+            d_slot, d_pos, nsegs, V, snap_k, st_buf.snap_stride, st_buf.v_stride, qkv_dim, update_state);
         k_gdn_rec_verify_batch<<<nsegs * nh_v, 256, 0, st>>>(
             sc.qkv_conv, sc.a, sc.b, sc.z, w.A_log, w.dt_bias, w.norm, st_buf.S,
             st_buf.v_a, st_buf.v_b, st_buf.v_pos0, sc.core,
@@ -1507,9 +1508,10 @@ inline void gdn_forward(cublasHandle_t blas, const GdnWeights& w, GdnLayerState&
                     st_buf.S, sc.core, nh_v, g.slot, g.row0, g.pos0, g.len, nchunks, g.len, update_state);
             } else {
                 const bool defer_s = (snap_k > 0 && g.len > 1 && st_buf.v_qkv != nullptr);
+                const int ss = st_buf.snap_stride > 0 ? st_buf.snap_stride : snap_k;
                 k_gdn_conv1d_seg<<<(qkv_dim + 255) / 256, 256, 0, st>>>(
                     sc.qkv_raw, w.conv1d, st_buf.conv, snap_k > 0 ? st_buf.conv_snap : nullptr, sc.qkv_conv,
-                    qkv_dim, g.slot, g.row0, g.pos0, g.len, snap_k, update_state,
+                    qkv_dim, g.slot, g.row0, g.pos0, g.len, ss, update_state,
                     defer_s ? st_buf.v_qkv : nullptr, defer_s ? st_buf.v_stride : 0);
                 k_gdn_recurrent_seg<<<nh_v, 256, 0, st>>>(
                     sc.qkv_conv, sc.a, sc.b, w.A_log, w.dt_bias, st_buf.S,

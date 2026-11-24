@@ -123,3 +123,55 @@ knobs:
     doc: >-
       1 = load dense/vision-bf16.safetensors (Qwen4ExpVisionModel, 27-layer BF16 ViT) on every rank and accept
       multimodal image prompts with 3D MRoPE. 0 (the default) = text-only boot. Every rank must agree.
+  GR8_QW38_DFL_PACK:
+    scope: local
+    kind: path
+    unset: "QSpine-DF2 drafter disabled"
+    legacy: []
+    doc: >-
+      Path to Qwen3.8 QSpine-DF2 drafter pack (.q4_0.pack or adapted pack). When set with GR8_QW38_DFL=1, enables
+      parallel B=8 DFlash2 speculative drafting reusing PR #599's 2-bit lm_head screen and read-only GDN replay.
+  GR8_QW38_DFL:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default when GR8_QW38_DFL_PACK is set) = enable QSpine-DF2 parallel block drafter. 0 = disable and
+      fall back to L048 MTP. Every rank must agree.
+  GR8_QW38_DFL_DP:
+    scope: agree
+    kind: int
+    default: "2"
+    values: "0|1|2"
+    legacy: []
+    doc: >-
+      QSpine-DF2 candidate path selection mode: 0 = stock myopic greedy walk at fixed K; 1 = Calibrated Expected-Reach
+      Viterbi DP at fixed K; 2 (default) = Calibrated Expected-Reach Viterbi DP + per-round dynamic K* in 1..K maximizing
+      expected tok/s = E[tau(K)] / (T_draft + T_verify(K)). Every rank must agree.
+  GR8_QW38_DFL_K:
+    scope: agree
+    kind: int
+    default: "7"
+    values: "1..7"
+    legacy: []
+    doc: >-
+      Maximum draft prefix length verified per QSpine-DF2 round (1..7; the drafter always executes its frozen
+      bidirectional B=8 block forward and truncates only proposals/verify). Every rank must agree.
+  GR8_QW38_NO_MTP:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = omit loading Layer-48 MTP weights and KV pages (saves ~4-6 GB VRAM in QSpine-DF2-only mode).
+      0 (the default) = load Layer-48 MTP when --mtp > 0. Every rank must agree.
+  GR8_QW38_TAP_DUMP:
+    scope: local
+    kind: path
+    unset: "off"
+    legacy: []
+    doc: >-
+      Optional output path for inline contiguous 5-layer HC-mean tap + greedy target capture (.qtap stream).
