@@ -1536,29 +1536,11 @@ class Supervisor:
             if bad:
                 raise RuntimeError('; '.join(bad))
             if s.get('live'):
+                # no engine module installs switch_width yet (#156), so an in-process cutover cannot happen: --live says
+                # why and runs the drain/restart scale below
                 ok, why = live_switch_capable(self.o, models.of(self.o))
-                s2_dir = os.path.join(self.out, 's2')
-                if not ok:
-                    log(f'scale {s["id"]}: --live requested but not live-capable ({why}); '
-                        'falling back to Phase A drain/restart')
-                elif not os.path.isdir(s2_dir):
-                    log(f'scale {s["id"]}: --live requested but {s2_dir} missing; '
-                        'falling back to Phase A drain/restart')
-                elif not set(s['members']) <= set(s['old_members']):
-                    log(f'scale {s["id"]}: --live requested with new joiners outside active fabric pool; '
-                        'falling back to Phase A drain/restart')
-                else:
-                    s['phase'] = 'switch'
-                    epoch = int(self.hs.get('epoch') or 1)
-                    group_id = (epoch << 16) | (self.scale_n & 0xffff)
-                    cmd_path = write_s2_switch_cmd(s2_dir, epoch, group_id, len(s['members']))
-                    log(f'scale {s["id"]}: in-process live switch announced ({os.path.basename(cmd_path)}: '
-                        f'group={group_id} target_nr={len(s["members"])}); front-end stays connected')
-                    s['drain_s'] = 0.0
-                    s['pause_s'] = 0.0
-                    s['timeline'] = 'live-switch (in-process fence)'
-                    s['phase'] = 'done'
-                    return
+                log(f'scale {s["id"]}: --live: {why if not ok else "the engine has no in-process width switch yet"}; '
+                    'falling back to the drain/restart scale')
             s['phase'] = 'drain'
             self.front_hold(s['drain'] + s['boot_s'])
             s['held'] = time.time()
@@ -2415,28 +2397,12 @@ def live_switch_capable(o, model):
     ptab = kv.get('GR8_PTAB', '0')
     if not ptab.isdigit() or int(ptab) < 1:
         missing.append('GR8_PTAB>=1')
-    kv_key = 'GR8_GLM53F_KV_CHUNKS' if getattr(model, 'name', '') == 'flash' else 'GR8_KV_CHUNKS'
+    kv_key = 'GR8_GLM53F_KV_CHUNKS' if model.build == 'flash' else 'GR8_KV_CHUNKS'   # build, not name: Flash is glm53f
     if kv.get(kv_key, '0') in ('', '0'):
         missing.append(f'{kv_key}=1')
     if missing:
         return False, 'missing ' + ', '.join(missing)
     return True, ''
-
-
-def write_s2_switch_cmd(s2_dir, epoch, group_id, target_nr):
-    """Atomically write the next `cmd.<n>` ingress file containing `SWITCH <epoch> <group_id> <target_nr>`."""
-    hi = -1
-    for name in os.listdir(s2_dir):
-        if name.startswith('cmd.'):
-            tail_s = name[4:]
-            if tail_s.isdigit():
-                hi = max(hi, int(tail_s))
-    path = os.path.join(s2_dir, f'cmd.{hi + 1}')
-    tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        f.write(f'SWITCH {int(epoch)} {int(group_id)} {int(target_nr)}\n')
-    os.replace(tmp, path)
-    return path
 
 
 def layout_file(d, text):

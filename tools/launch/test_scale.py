@@ -483,7 +483,7 @@ class StorePrep(unittest.TestCase):
 
 
 class LiveSwitchCapabilityTest(unittest.TestCase):
-    """Phase B --live capability check & S2 SWITCH ingress writer (#156); runs without loopback aliases."""
+    """Phase B --live capability check (#156); runs without loopback aliases."""
 
     class _FakeOpt:
         def __init__(self, extra=''):
@@ -492,13 +492,8 @@ class LiveSwitchCapabilityTest(unittest.TestCase):
         def get(self, k):
             return self._extra if k == 'EXTRA_ENV' else None
 
-    class _FakeModel:
-        def __init__(self, name):
-            self.name = name
-
     def test_live_switch_capable_requires_all_three_primitives(self):
-        glm = self._FakeModel('glm53')
-        flash = self._FakeModel('flash')
+        glm, flash = sv.models.GLM53, sv.models.GLM53F   # the real models: Flash's name is glm53f, its build flash
         ok, why = sv.live_switch_capable(self._FakeOpt(''), glm)
         self.assertFalse(ok)
         self.assertIn('GR8_FABRIC_POOL=1', why)
@@ -520,20 +515,6 @@ class LiveSwitchCapabilityTest(unittest.TestCase):
         ok, why = sv.live_switch_capable(self._FakeOpt('GR8_FABRIC_POOL=1 GR8_PTAB=1 GR8_GLM53F_KV_CHUNKS=1'), flash)
         self.assertTrue(ok)
         self.assertEqual(why, '')
-
-    def test_write_s2_switch_cmd_increments_atomically(self):
-        t = tempfile.mkdtemp(prefix='gr8s2sw-')
-        self.addCleanup(shutil.rmtree, t, True)
-        # Empty directory starts at cmd.0 (Ingress starts at 0)
-        p0 = sv.write_s2_switch_cmd(t, epoch=9, group_id=100, target_nr=3)
-        self.assertEqual(os.path.basename(p0), 'cmd.0')
-        self.assertEqual(read(p0), 'SWITCH 9 100 3\n')
-        with open(os.path.join(t, 'cmd.7'), 'w') as f:
-            f.write('CANCEL 9 1\n')
-        p = sv.write_s2_switch_cmd(t, epoch=9, group_id=4242, target_nr=3)
-        self.assertEqual(os.path.basename(p), 'cmd.8')
-        self.assertEqual(read(p), 'SWITCH 9 4242 3\n')
-        self.assertFalse(os.path.exists(p + '.tmp'))
 
 
 if __name__ == '__main__':
