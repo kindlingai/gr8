@@ -63,5 +63,21 @@ void* g6l_qw38_plan(const char* release_dir, const char* widths, uint32_t nr, ui
 int g6l_plan_read(void* plan, uint64_t off, uint64_t n, void* dst, char* err, size_t errlen);
 // Loads a planned image through sink, like g6l_load. Returns 0, or 1 with a message in err.
 int g6l_plan_load(void* plan, const g6l_sink* sink, g6l_stats* stats, char* err, size_t errlen);
+// Loads only the image byte ranges in keep[0..nkeep) from a planned image through sink (EL3 #151 delta piece-prefetch:
+// skips chunks and source ranges outside keep so resident expert slabs are never re-read). Returns 0, or 1 + err.
+int g6l_plan_load_ranges(void* plan, const g6l_extent* keep, size_t nkeep, const g6l_sink* sink, g6l_stats* stats,
+                         char* err, size_t errlen);
 void g6l_plan_free(void* plan);
+
+// Layout-to-layout piece-delta resolver (EL3 #151 Stage 3). old_layout / new_layout may be NULL or "" to use the
+// width's formula ownership; old_nr == 0 denotes a joiner box with no resident pieces.
+void* g6l_delta_new(const char* old_layout, uint32_t old_nr, uint32_t old_rank,
+                    const char* new_layout, uint32_t new_nr, uint32_t new_rank, char* err, size_t errlen);
+// Queries one (layer, expert) row's piece delta. kept_old/kept_new receive *n_kept pairs (each <= 16), added receives
+// *n_added target block indices, dropped receives *n_dropped old block indices. Returns 0, or 1 + err.
+int g6l_delta_halves(const void* delta, uint32_t layer, uint32_t expert,
+                     uint8_t* kept_old, uint8_t* kept_new, uint32_t* n_kept,
+                     uint8_t* added, uint32_t* n_added,
+                     uint8_t* dropped, uint32_t* n_dropped, char* err, size_t errlen);
+void g6l_delta_free(void* delta);
 }

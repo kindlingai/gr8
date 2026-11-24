@@ -674,6 +674,12 @@ run_job ptab_pool_test '
   g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined "$REPO/engine/kernels/tests/ptab_pool_test.cpp" -o "$D/ptab_pool_test"
   "$D/ptab_pool_test"
 '
+# EL3 (#151 Stage 3) delta piece-prefetch planner + g6l_delta C FFI (4->3, 3->4, joiner, mid-prefetch rollback)
+run_job ptab_delta_test '
+  g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined "$REPO/engine/kernels/tests/ptab_delta_test.cpp" "$GL" \
+    -lpthread -ldl -lm -o "$D/ptab_delta_test"
+  "$D/ptab_delta_test"
+'
 
 wait
 for name in "${ORDER[@]}"; do
