@@ -864,6 +864,13 @@ inline void attn_check(const AttnGeom& g)
 // out_f32 [M][H] = the rank's partial of the wo sum.
 #include "ink2_attn_tc.cuh"   // in this namespace: the tensor-core kernel of a prefill chunk
 
+// Set once at runtime startup; standalone kernel users retain the default dispatch.
+inline bool& local_grp_enabled()
+{
+    static bool on = false;
+    return on;
+}
+
 // tc: the rows are one run of one slot at consecutive positions (a prefill chunk), and the caller wants the
 // tensor-core kernel for them (ink2_attn_tc.cuh). Geometries it does not cover take the stock kernels.
 inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnState& s, AttnWork& wk, const Rows& rw, int max_pos, const uint16_t* qi,
@@ -943,10 +950,7 @@ inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnStat
         const int lq1 = std::min(g.nh_q, (g.kv0 + lkv + 1) * g.gqa - g.q0);
         if (lq1 - lq0 > max_gq) max_gq = lq1 - lq0;
     }
-    static const bool local_grp_on = []() {
-        const char* e = std::getenv("INK2_LOCAL_GRP");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
+    const bool local_grp_on = local_grp_enabled();
     AttnCoreArgs a{wk.q_raw, wk.r_raw, wk.gate, wk.sink, w.q_clip, w.rel_clip, w.rel_proj, wk.kv_new, s.ring, s.pages, s.page_table, rw, wk.og, wk.part,
                    0, 0, g.nh_q, g.q0, g.gqa, g.kv0, nk, hd, g.rel_dim, g.rel_win, g.window, g.log_scale_base, g.global ? 1 : 0, s.max_pps, smax};
     const bool use_tc = tc && hd == TC_HD && g.rel_dim == TC_RD && g.gqa <= TC_MAX_GQ;

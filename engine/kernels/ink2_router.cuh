@@ -286,12 +286,9 @@ inline size_t& splitk_cap()
     static size_t n = 0;
     return n;
 }
-inline bool splitk_enabled()
+inline bool& splitk_enabled()
 {
-    static const bool on = []() {
-        const char* e = std::getenv("INK2_SPLITK");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
+    static bool on = true;
     return on;
 }
 // Deterministic split-K factor depending ONLY on (total_tiles, K, total_n) — NEVER on M — for M <= 64!
@@ -646,13 +643,14 @@ inline void route_check(int M, int H, int NE, int TK)
         throw std::runtime_error("ink2 router: M < 1, H % 16, NE % 16, NE > 1024 or TK > 8");
 }
 // routes -> plan
+inline bool& fast_router_enabled()
+{
+    static bool on = true;
+    return on;
+}
 inline void plan(const Plan& p, const int* idx, const float* wt, int M, int NE, int TK, cudaStream_t st)
 {
-    static const bool fast_router = []() {
-        const char* e = std::getenv("INK2_FAST_ROUTER");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    if (fast_router && NE <= 128) k_plan_fast<<<1, 256, 0, st>>>(p, idx, wt, M, TK, NE);
+    if (fast_router_enabled() && NE <= 128) k_plan_fast<<<1, 256, 0, st>>>(p, idx, wt, M, TK, NE);
     else k_plan<<<1, NE, 0, st>>>(p, idx, wt, M, TK, NE);
 }
 // x [M][H] BF16 -> score [M][NE], idx / wt [M][TK], and the plan.
@@ -660,11 +658,7 @@ inline void route(const uint16_t* x, const uint16_t* gate_w, const float* bias, 
                   int* idx, float* wt, const Plan& p, cudaStream_t st)
 {
     route_check(M, H, NE, TK);
-    static const bool fast_router = []() {
-        const char* e = std::getenv("INK2_FAST_ROUTER");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    if (fast_router)
+    if (fast_router_enabled())
     {
         const unsigned gx1 = static_cast<unsigned>(NE / 16);
         const bool c128 = (H % 64 == 0) && ((reinterpret_cast<uintptr_t>(gate_w) & 15u) == 0);

@@ -617,12 +617,14 @@ inline void msg_gate_norm_3(const MsgGate3Args& a, uint16_t* cat_bf16, uint16_t*
 }
 
 // Opt-in experimental replay of the stock serial-rank reduction, not a global exactness guarantee.
-inline bool stock_msg_gate_enabled()
+inline bool& stock_msg_gate_enabled()
 {
-    static const bool enabled = []() {
-        const char* e = std::getenv("INK2_STOCK_MSG_GATE");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
+    static bool enabled = false;
+    return enabled;
+}
+inline bool& msg_prefill_fuse_enabled()
+{
+    static bool enabled = false;
     return enabled;
 }
 inline void msg_gate_norm(const float* h_f32, const float* msg_f32, const uint16_t* down_w, const uint16_t* forget_w,
@@ -634,10 +636,7 @@ inline void msg_gate_norm(const float* h_f32, const float* msg_f32, const uint16
     gemm_bf16(cat_bf16, down_w, M, 2 * H, R, g_bf16, st);
     if (!stock_msg_gate_enabled() && R == 64 && H <= 4096)
     {
-        static const bool prefill_fuse = []() {
-            const char* e = std::getenv("INK2_MSG_PREFILL_FUSE");
-            return (e && e[0] == '1' && e[1] == '\0');
-        }();
+        const bool prefill_fuse = msg_prefill_fuse_enabled();
         if (sf_buf == nullptr || sm_buf == nullptr || (M > 64 && prefill_fuse))
         {
             k_ink2_msg_gate_apply_norm_r64<<<M, NRT, 0, st>>>(h_f32, msg_f32, g_bf16, forget_w, gain_w, norm_w, out_bf16, H);

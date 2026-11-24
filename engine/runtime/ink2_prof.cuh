@@ -100,15 +100,10 @@ struct Prof
     int cur_rows = 0;
     std::chrono::steady_clock::time_point wall_t0;
 
-    void init()
+    void init(bool enable = false, int every = 20)
     {
-        const char* e = std::getenv("INK2_PROFILE");
-        enabled = (e && e[0] && e[0] != '0');
-        if (const char* pe = std::getenv("INK2_PROFILE_EVERY"))
-        {
-            const int v = std::atoi(pe);
-            if (v > 0) print_every = v;
-        }
+        enabled = enable;
+        if (every > 0) print_every = every;
         if (enabled)
         {
             // Pre-allocate enough events for a 48-layer forward (~1600 events)

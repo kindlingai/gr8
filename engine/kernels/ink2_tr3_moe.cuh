@@ -1305,16 +1305,19 @@ __global__ void __launch_bounds__(256) k_ink2_tr3_fc2(Tr3Args a)
     }
 }
 
+// Set once at runtime startup; standalone kernel users retain the default dispatch.
+inline bool& tr3_wide_enabled()
+{
+    static bool on = true;
+    return on;
+}
+
 template <int CB>
 inline void launch_tr3(const Tr3Args& a, int NE, cudaStream_t st, Prof* prof = nullptr)
 {
     const int slots = plan_max_slots(a.M, a.TK, NE);
     const int HB = a.H / 128;
-    static const bool wide_on = []() {
-        const char* e = std::getenv("INK2_TR3_WIDE");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
-    const bool use_wide = (CB == CB_PMCGX && wide_on && a.wide && a.sg != nullptr && a.v1b != nullptr && a.v3b != nullptr && a.x_had != nullptr);
+    const bool use_wide = (CB == CB_PMCGX && tr3_wide_enabled() && a.wide && a.sg != nullptr && a.v1b != nullptr && a.v3b != nullptr && a.x_had != nullptr);
     if (use_wide)
     {
         {

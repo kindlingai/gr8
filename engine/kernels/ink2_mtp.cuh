@@ -1057,6 +1057,13 @@ inline void mtp_head_norm_rope(uint16_t* x, const uint16_t* w, const int* pos, c
     k_ink2_mtp_head_norm_rope<<<M * heads, ACT, 0, st>>>(x, w, pos, inv_freq, heads, hd);
 }
 
+// Set once at runtime startup; standalone kernel users retain the default dispatch.
+inline bool& mtp_attn_grp_enabled()
+{
+    static bool on = true;
+    return on;
+}
+
 // The block attention of MB = S * B rows. part: room for the split partials, part_floats floats; the rows go in as many
 // launches as that takes. nctx_max = the largest context count among the sessions.
 inline void mtp_attn(MtpAttnArgs a, int MB, int nctx_max, float* part, size_t part_floats, cudaStream_t st)
@@ -1066,10 +1073,7 @@ inline void mtp_attn(MtpAttnArgs a, int MB, int nctx_max, float* part, size_t pa
     const size_t per_row = static_cast<size_t>(a.nh_q) * a.smax * (a.hd + 2);
     const int mb = a.smax == 1 ? MB : static_cast<int>(part_floats / per_row < static_cast<size_t>(MB) ? part_floats / per_row : static_cast<size_t>(MB));
     if (mb < 1) throw std::runtime_error("ink2::mtp_attn: the partial buffer is too small for one row at this position");
-    static const bool grp_on = []() {
-        const char* e = std::getenv("INK2_MTP_ATTN_GRP");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
+    const bool grp_on = mtp_attn_grp_enabled();
     const int nh_kv = a.nk / a.hd;
     int max_gq = 1;
     for (int lkv = 0; lkv < nh_kv; ++lkv)

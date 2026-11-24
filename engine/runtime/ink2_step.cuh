@@ -661,7 +661,7 @@ struct Options
     bool vision = false; // run the vision tower when the checkpoint has one (image input)
     // the speed paths: -1 = what the knob says (GR8_INK2_*), 0 = off, 1 = on
     int fast_allreduce = -1, gpu_head_pack = -1, cublas_prefill = -1, tc_prefill_attn = -1;
-    int use_graph = -1;  // -1 = env INK2_GRAPH (default 1 on TP=1), 0 = off, 1 = on
+    int use_graph = -1;  // -1 = knob GR8_INK2_GRAPH (default 1 on TP=1), 0 = off, 1 = on
 };
 
 class Engine
@@ -717,6 +717,17 @@ public:
         use_ghp = (o.gpu_head_pack < 0 ? knob::ink2_gpu_head_pack() : o.gpu_head_pack != 0) && o.nc <= ink2::INK2_HEAD_MAX_NC;
         use_blas = o.cublas_prefill < 0 ? knob::ink2_cublas_prefill() : o.cublas_prefill != 0;
         use_tc = o.tc_prefill_attn < 0 ? knob::ink2_tc_prefill_attn() : o.tc_prefill_attn != 0;
+        ink2::narrow_mma_cta() = knob::ink2_mma_narrow_cta();
+        ink2::local_grp_enabled() = knob::ink2_local_grp();
+        ink2::stock_msg_gate_enabled() = knob::ink2_stock_msg_gate();
+        ink2::msg_prefill_fuse_enabled() = knob::ink2_msg_prefill_fuse();
+        ink2::mtp_attn_grp_enabled() = knob::ink2_mtp_attn_grp();
+        ink2::fast_gemv_enabled() = knob::ink2_fast_gemv();
+        ink2::gemm_c128_enabled() = knob::ink2_gemm_c128();
+        ink2::fused_qkv_enabled() = knob::ink2_fused_qkv();
+        ink2::splitk_enabled() = knob::ink2_splitk();
+        ink2::fast_router_enabled() = knob::ink2_fast_router();
+        ink2::tr3::tr3_wide_enabled() = knob::ink2_tr3_wide();
         const size_t mh = static_cast<size_t>(o.max_rows) * c.H;
         embed = a.get<uint16_t>("G.embed");
         embed_norm = a.get<uint16_t>("G.embed_norm");
@@ -802,10 +813,7 @@ public:
             INK2RT_CK(cudaHostAlloc(&h_meta_pin, sizeof(int) * static_cast<size_t>(4) * o.max_rows, cudaHostAllocDefault));
             INK2RT_CK(cudaHostAlloc(&h_head_pin, head_bytes(std::max(o.max_rows, o.slots)), cudaHostAllocDefault));
             INK2RT_CK(cudaHostAlloc(&h_acc_pin, static_cast<size_t>(o.max_rows), cudaHostAllocDefault));
-            const char* eg = std::getenv("INK2_GRAPH");
-            if (o.use_graph == 0) use_graph = false;
-            else if (o.use_graph == 1) use_graph = true;
-            else use_graph = !(eg && eg[0] == '0' && eg[1] == '\0');
+            use_graph = o.use_graph < 0 ? knob::ink2_graph() : o.use_graph != 0;
         }
         if (o.mtp > 0) init_mtp();
         if (o.nr == 1 && o.nloc == 1 && o.mtp > 0)
@@ -840,7 +848,7 @@ public:
             INK2RT_CK(cudaMemcpy(commit_descs, hdesc.data(), hdesc.size() * sizeof(ink2::CommitLayerDesc), cudaMemcpyHostToDevice));
         }
         if (o.vision && a.find("V.proj_out.weight")) init_vision();
-        prof.init();
+        prof.init(knob::ink2_profile(), static_cast<int>(knob::ink2_profile_every()));
         INK2RT_CK(cudaDeviceSynchronize());
         fprintf(stderr, "# ink2: ranks %d..%d of %d, %zu layers (%d phys%s), H %d, %d experts top %d, vocab %d (%d rows a rank), %d slots, %d rows, cap %d\n", o.rank0,
                 o.rank0 + o.nloc - 1, o.nr, L.size(), c.n_layers, c.is_looped() ? " looped" : "", c.H, c.NE, c.TK, c.vocab, vr, o.slots, o.max_rows, o.cap);
@@ -968,10 +976,7 @@ public:
         bool all_greedy = (samples != nullptr);
         for (int m = 0; m < M && all_greedy; ++m)
             if (samples[m].inv_temp > 0.f) all_greedy = false;
-        static const bool fast_greedy_head = []() {
-            const char* e = std::getenv("INK2_FAST_GREEDY_HEAD");
-            return !(e && e[0] == '0' && e[1] == '\0');
-        }();
+        const bool fast_greedy_head = knob::ink2_fast_greedy_head();
         const int head_mode = (T == 1 && o.nloc == 1 && use_ghp && fast_greedy_head && !exact_head && all_greedy) ? 1 : 0;
         const size_t hb = head_bytes(M), rb = head_row_bytes(o.nc);
 
@@ -1290,10 +1295,7 @@ public:
         const uint8_t* am = acc ? acc_dev : nullptr;
         {
             ink2::ProfScope _ps(pf, ink2::PS_COMMIT_TRUNK, st);
-            static const bool batch_commit_on = []() {
-                const char* e = std::getenv("INK2_BATCH_COMMIT");
-                return !(e && e[0] == '0' && e[1] == '\0');
-            }();
+            const bool batch_commit_on = knob::ink2_batch_commit();
             if (batch_commit_on && commit_descs != nullptr && o.nloc == 1)
             {
                 ink2::commit_all(commit_descs, static_cast<int>(L.size()), rw, am, M, c.H, st);
@@ -1377,10 +1379,7 @@ public:
         bool all_greedy = (T == 1 && R % 8 == 0 && R <= 512 && m_arg_val != nullptr);
         for (int s = 0; s < S && all_greedy; ++s)
             if (samples[static_cast<size_t>(s)].inv_temp > 0.f) all_greedy = false;
-        static const bool mtp_fast_argmax_on = []() {
-            const char* e = std::getenv("INK2_MTP_FAST_ARGMAX");
-            return !(e && e[0] == '0' && e[1] == '\0');
-        }();
+        const bool mtp_fast_argmax_on = knob::ink2_mtp_fast_argmax();
         out.assign(static_cast<size_t>(S) * K, 0);
 
         auto run_mtp_body_and_lm = [&](bool allow_blas) {
@@ -2050,10 +2049,7 @@ private:
             w.fold_w = dalloc<uint16_t>(static_cast<size_t>(vr) * R);
             w.fold_b = dalloc<uint16_t>(static_cast<size_t>(vr));
             ink2::k_ink2_mtp_fold<<<vr, 256, 0, 0>>>(lm[static_cast<size_t>(i)], how, hob, w.fold_w, w.fold_b, H, R);
-            static const bool mtp_i8_on = []() {
-                const char* e = std::getenv("INK2_MTP_INT8_LM");
-                return !(e && e[0] == '0' && e[1] == '\0');
-            }();
+            const bool mtp_i8_on = knob::ink2_mtp_int8_lm();
             if (mtp_i8_on && (H % 64 == 0) && (R % 8 == 0))
             {
                 w.lm_i8 = dalloc<int8_t>(static_cast<size_t>(vr) * H);
@@ -2067,10 +2063,7 @@ private:
         }
         size_t mtp_body_i8_bytes = 0;
         {
-            static const bool mtp_i8_on = []() {
-                const char* e = std::getenv("INK2_MTP_INT8_LM");
-                return !(e && e[0] == '0' && e[1] == '\0');
-            }();
+            const bool mtp_i8_on = knob::ink2_mtp_int8_lm();
             const int iw_l = c.mtp_inter / T;
             if (mtp_i8_on && T == 1 && (H % 128 == 0) && (iw_l % 128 == 0))
             {
@@ -2137,8 +2130,7 @@ private:
     }
     void init_tr3_wide()
     {
-        const char* e = std::getenv("INK2_TR3_WIDE");
-        if (e && e[0] == '0' && e[1] == '\0') return;
+        if (!knob::ink2_tr3_wide()) return;
         const int HB = c.H / 128;
         if (c.H % 128 != 0) return;
         struct PhysTr3 { const __half *sg = nullptr, *v1b = nullptr, *v3b = nullptr; int wide = 0; bool done = false; };

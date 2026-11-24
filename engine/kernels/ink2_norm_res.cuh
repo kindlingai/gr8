@@ -625,30 +625,21 @@ __global__ void __launch_bounds__(128) k_ink2_gemv_1warp(const uint16_t* __restr
     }
 }
 
-inline bool fast_gemv_enabled()
+inline bool& fast_gemv_enabled()
 {
-    static const bool on = []() {
-        const char* e = std::getenv("INK2_FAST_GEMV");
-        return e && e[0] == '1' && e[1] == '\0';
-    }();
+    static bool on = false;
     return on;
 }
 
-inline bool gemm_c128_enabled()
+inline bool& gemm_c128_enabled()
 {
-    static const bool on = []() {
-        const char* e = std::getenv("INK2_GEMM_C128");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
+    static bool on = true;
     return on;
 }
 
-inline bool fused_qkv_enabled()
+inline bool& fused_qkv_enabled()
 {
-    static const bool on = []() {
-        const char* e = std::getenv("INK2_FUSED_QKV");
-        return !(e && e[0] == '0' && e[1] == '\0');
-    }();
+    static bool on = true;
     return on;
 }
 
