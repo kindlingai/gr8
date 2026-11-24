@@ -1483,12 +1483,26 @@ __global__ void __launch_bounds__(128) k_ink2_gemv_1warp_multi(const uint16_t* _
     }
 }
 
+// Set once at runtime startup; standalone kernel users retain the original dispatch.
+inline bool& narrow_mma_cta()
+{
+    static bool enabled = false;
+    return enabled;
+}
 inline void gemm(const uint16_t* x, const uint16_t* w, int M, int K, int N, void* y, int mode, int v0, int valid, cudaStream_t st)
 {
     if (M < 1 || N < 1 || K < 16 || K % 16) throw std::runtime_error("ink2::gemm: M < 1, N < 1 or K % 16");
     if (mode != GEMM_SOFTCAP)
         if (GemmHook hk = gemm_hook())
             if (hk(x, w, M, K, N, y, mode, st)) return;
+    // Keep each warp's m16n8k16 operand and accumulation sequence; spread small
+    // grids across more SMs by scheduling one independent output tile per CTA.
+    if (narrow_mma_cta() && M <= 56 && N <= 4096 && N > 16) {
+        const unsigned nx = (N + 15) / 16;
+        if (M <= 8) k_ink2_gemm<1,1><<<dim3(nx,1),32,0,st>>>(x,w,M,K,N,y,mode,v0,valid);
+        else k_ink2_gemm<4,1><<<dim3(nx,(M+31)/32),32,0,st>>>(x,w,M,K,N,y,mode,v0,valid);
+        return;
+    }
     if (fast_gemv_enabled() && M <= 64 && (((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(w)) & 15u) == 0))
     {
         const unsigned gx = static_cast<unsigned>((N + 3) / 4);

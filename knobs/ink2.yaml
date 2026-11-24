@@ -62,3 +62,13 @@ knobs:
     doc: >-
       Optional exlr8 width-manifest variant name or path (manifests/exlr8-manifest-NAME.json) used when --variant is
       not passed on the command line. Every rank must agree.
+  GR8_INK2_MMA_NARROW_CTA:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = for BF16 engine projections with at most 56 rows and output width 17 through 4096, schedule one
+      independent MMA output warp per CTA. The operands and accumulation order within each warp do not
+      change. 0 (the default) uses the original multi-warp CTA.

@@ -1034,7 +1034,7 @@ public:
                     }
                     {
                         ink2::ProfScope _ps(pf, ink2::PS_LOOP_MSG_GATE, st);
-                        if (M <= 64 && c.loop_gate_rank == 64 && c.H <= 4096 && 3 * M <= o.max_rows && gate_sf != nullptr && gate_sm != nullptr)
+                        if (!ink2::stock_msg_gate_enabled() && M <= 64 && c.loop_gate_rank == 64 && c.H <= 4096 && 3 * M <= o.max_rows && gate_sf != nullptr && gate_sm != nullptr)
                         {
                             ink2::MsgGate3Args mg3{};
                             mg3.h_f32[0] = f32_attn[0];

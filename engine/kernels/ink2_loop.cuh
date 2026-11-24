@@ -616,6 +616,15 @@ inline void msg_gate_norm_3(const MsgGate3Args& a, uint16_t* cat_bf16, uint16_t*
     k_ink2_msg_gate_finish_3<<<dim3(static_cast<unsigned>(M), 3), NRT, 0, st>>>(a, sf_buf, sm_buf, M, H);
 }
 
+// Opt-in experimental replay of the stock serial-rank reduction, not a global exactness guarantee.
+inline bool stock_msg_gate_enabled()
+{
+    static const bool enabled = []() {
+        const char* e = std::getenv("INK2_STOCK_MSG_GATE");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    return enabled;
+}
 inline void msg_gate_norm(const float* h_f32, const float* msg_f32, const uint16_t* down_w, const uint16_t* forget_w,
                           const uint16_t* gain_w, const uint16_t* norm_w, uint16_t* cat_bf16, uint16_t* g_bf16,
                           uint16_t* out_bf16, int M, int H, int R, cudaStream_t st, float* sf_buf = nullptr, float* sm_buf = nullptr)
@@ -623,7 +632,7 @@ inline void msg_gate_norm(const float* h_f32, const float* msg_f32, const uint16
     if (M < 1 || R < 1 || R > LOOP_MAX_RANK || (2 * H) % 16 != 0) throw std::runtime_error("ink2::msg_gate_norm: M, H or R");
     k_ink2_msg_gate_prep<<<M, NRT, 0, st>>>(h_f32, msg_f32, cat_bf16, H);
     gemm_bf16(cat_bf16, down_w, M, 2 * H, R, g_bf16, st);
-    if (R == 64 && H <= 4096)
+    if (!stock_msg_gate_enabled() && R == 64 && H <= 4096)
     {
         static const bool prefill_fuse = []() {
             const char* e = std::getenv("INK2_MSG_PREFILL_FUSE");

@@ -202,6 +202,7 @@ int main(int argc, char** argv)
     if (kv_sys_after < 1 || kv_wlim < 0.0) die("--kv-system-after >= 1, --kv-write-limit >= 0");
     if (!ip2.empty() && ip2.size() != ip.size()) die("--ips2 must name as many addresses as --ips");
     knob::init();
+    ink2::narrow_mma_cta() = knob::ink2_mma_narrow_cta();
     INK2RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
 
     Options o;
