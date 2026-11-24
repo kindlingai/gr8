@@ -6074,7 +6074,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         const Tensor &tab = T.t[T_TR3_TAB], &v1 = T.t[T_TR3_V1], &v2 = T.t[T_TR3_V2], &v3 = T.t[T_TR3_V3], &bias = T.t[T_ROUTER_BIAS];
         const Tensor &sgn = T.t[T_TR3_SG], &v1b = T.t[T_TR3_V1B], &v3b = T.t[T_TR3_V3B];
         const bool bsf = v1b.p != nullptr;           // block-scale hidden-side vectors (exlr8 v2, with the trellis shared expert)
-        if (!T.t[T_TR3_FC1].p || !T.t[T_TR3_FC2].p || !v2.p || !bias.p || (bsf ? !sgn.p || !v3b.p : !v1.p || !v3.p))
+        if ((!T.ptab && (!T.t[T_TR3_FC1].p || !T.t[T_TR3_FC2].p)) || !v2.p || !bias.p || (bsf ? !sgn.p || !v3b.p : !v1.p || !v3.p))
             return "MoE layer without tr3.fc1/fc2/v2, v1/v3 (or sg/v1b/v3b) or router.bias";
         if (bsf != (T.sh_trellis != 0)) return "block-scale hidden-side vectors go with the trellis shared expert, and only with it";
         const long long nrow = v2.shape[0];

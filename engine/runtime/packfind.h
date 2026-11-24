@@ -3,11 +3,13 @@
 // with the same sha256 and size share one device copy, so replicated tensors are held once.
 // M5 replaces this by the builder's g6::DevImage (the pack streamed straight into one device allocation).
 #pragma once
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <unistd.h>
 #include "rank.cuh"
 #include "../knobs-rs/gr8_knobs.h"
@@ -76,12 +78,192 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
     };
 }
 
+// EL3 (#151) direct slab load (GR8_PTAB=3): non-expert tensors live in a compact DevImage at dense_off[name], while
+// routed-expert tensors (L%03d.tr3.fc1 / tr3.fc2) stream straight from the Rust loader into contiguous-per-expert
+// slabs inside `pool`, without ever allocating tr3.fc1 / tr3.fc2 in DevImage.
+struct DirectPtab
+{
+    std::shared_ptr<ptab::Pool> pool;
+    std::map<int, std::shared_ptr<ptab::Table>> tables;
+    std::unordered_map<std::string, uint64_t> dense_off;
+    uint64_t dense_bytes = 0, expert_bytes = 0;
+    bool active() const { return !tables.empty(); }
+};
+
+inline Find direct_image_find(const g6::Pack& pack, const g6::DevImage& img, const DirectPtab& direct)
+{
+    return [&pack, &img, &direct](const std::string& name) {
+        TensorRef t;
+        const g6::Entry* e = pack.find(name);
+        if (!e) return t;
+        if (e->shape.size() > 4) die("too many dims: " + name);
+        int lyr = -1; bool is_fc2 = false;
+        if (ptab::parse_tr3_layer_name(name, lyr, is_fc2) && direct.tables.count(lyr))
+        {
+            t.p = nullptr;   // bytes live in direct.tables[lyr] slabs, not in DevImage
+        }
+        else
+        {
+            auto it = direct.dense_off.find(name);
+            t.p = it != direct.dense_off.end() ? (img.base() + it->second) : img.ptr(*e);
+        }
+        t.nd = (int)e->shape.size();
+        for (int i = 0; i < t.nd; ++i) t.shape[i] = e->shape[i];
+        t.bf16 = e->dtype == g6::DType::BF16;
+        t.fp32 = e->dtype == g6::DType::F32;
+        t.fmt = e->expert_format;
+        return t;
+    };
+}
+
 #ifdef G6_RS_LOADER
 #include <mutex>
 #include "../loader-rs/g6load.h"
 #if G6_MODEL_DS41
 #include "../loader-rs/ds41.h"
 #endif
+
+// Routed Rust-loader sink for GR8_PTAB=3 direct slab loading: dispatches each staged chunk [off, off + n) through
+// ptab::RouteMap directly to either the compact dense DevImage or each routed expert's ptab::Pool slab.
+struct RoutedRsSink
+{
+    const ptab::RouteMap* route = nullptr;
+    std::mutex mu;
+    std::vector<cudaStream_t> streams;
+
+    static void* alloc(void*, size_t n)
+    {
+        void* p = nullptr;
+        return cudaHostAlloc(&p, n, cudaHostAllocDefault) == cudaSuccess ? p : nullptr;
+    }
+    static void release(void*, void* p) { cudaFreeHost(p); }
+    static int copy(void* ctx, int w, uint64_t off, const void* src, size_t n)
+    {
+        RoutedRsSink& s = *(RoutedRsSink*)ctx;
+        cudaStream_t st;
+        {
+            std::lock_guard<std::mutex> lk(s.mu);
+            while ((int)s.streams.size() <= w)
+            {
+                cudaStream_t x;
+                if (cudaStreamCreateWithFlags(&x, cudaStreamNonBlocking) != cudaSuccess) return 2;
+                s.streams.push_back(x);
+            }
+            st = s.streams[w];
+        }
+        const int rc = s.route->dispatch(off, static_cast<const uint8_t*>(src), n, [&](uint8_t* dst, const uint8_t* p, size_t len) {
+            return cudaMemcpyAsync(dst, p, len, cudaMemcpyHostToDevice, st) == cudaSuccess ? 0 : 3;
+        });
+        if (rc) return rc;
+        return cudaStreamSynchronize(st) == cudaSuccess ? 0 : 4;
+    }
+};
+
+// Direct slab load of a planned pack (GR8_PTAB=3, EL3 #151): reads each MoE layer's tiny tr3.table / tr3.kmix through
+// read_fn, allocates a compact DevImage for non-expert tensors only and contiguous-per-expert slabs in direct.pool,
+// then runs load_fn through RoutedRsSink so routed-expert bytes never enter DevImage.
+template <class ReadFn, class LoadFn>
+void rs_fill_direct_ptab(const g6::Pack& pack, g6::DevImage& img, DirectPtab& direct, int rank, const char* what,
+                         ReadFn read_fn, LoadFn load_fn)
+{
+    struct LayerSpec { const g6::Entry *fc1 = nullptr, *fc2 = nullptr, *tab = nullptr, *kmix = nullptr; };
+    std::map<int, LayerSpec> moe_layers;
+    for (const g6::Entry& e : pack.entries())
+    {
+        int lyr = -1; bool is_fc2 = false;
+        if (ptab::parse_tr3_layer_name(e.name, lyr, is_fc2))
+        {
+            LayerSpec& sp = moe_layers[lyr];
+            if (is_fc2) sp.fc2 = &e; else sp.fc1 = &e;
+        }
+    }
+    for (auto it = moe_layers.begin(); it != moe_layers.end(); )
+    {
+        char nm[64];
+        snprintf(nm, sizeof nm, "L%03d.tr3.table", it->first);
+        it->second.tab = pack.find(nm);
+        snprintf(nm, sizeof nm, "L%03d.tr3.kmix", it->first);
+        it->second.kmix = pack.find(nm);
+        if (!it->second.fc1 || !it->second.fc2 || !it->second.tab || it->second.tab->shape.size() != 2 || it->second.tab->shape[1] != 6)
+            it = moe_layers.erase(it);
+        else ++it;
+    }
+
+    // Compact dense image: every tensor EXCEPT L%03d.tr3.fc1 / tr3.fc2 of routed MoE layers.
+    uint64_t dense_bytes = 0;
+    direct.dense_off.clear();
+    for (const g6::Entry& e : pack.entries())
+    {
+        int lyr = -1; bool is_fc2 = false;
+        if (ptab::parse_tr3_layer_name(e.name, lyr, is_fc2) && moe_layers.count(lyr)) continue;
+        dense_bytes = (dense_bytes + 255ull) & ~255ull;
+        direct.dense_off[e.name] = dense_bytes;
+        dense_bytes += e.nbytes;
+    }
+    dense_bytes = std::max<uint64_t>((dense_bytes + 255ull) & ~255ull, 256ull);
+    direct.dense_bytes = dense_bytes;
+
+    void* dev = nullptr;
+    void (*release)(void*) = nullptr;
+    static const long vmm = (long)knob::img_vmm();
+    if (vmm > 0)
+    {
+        std::string why;
+        const size_t chunk = vmm > 1 ? (size_t)vmm << 20 : 0;
+        if ((dev = g6vmm::alloc(dense_bytes, chunk, why))) release = [](void* p) { g6vmm::release(p); };
+    }
+    if (!dev && cudaMalloc(&dev, dense_bytes) != cudaSuccess)
+        die("GR8_PTAB=3 direct load: cudaMalloc of compact dense image (" + std::to_string(dense_bytes) + " B) failed");
+
+    ptab::RouteMap route;
+    for (const g6::Entry& e : pack.entries())
+    {
+        auto it = direct.dense_off.find(e.name);
+        if (it != direct.dense_off.end()) route.add(e.offset, e.nbytes, static_cast<uint8_t*>(dev) + it->second);
+    }
+
+    if (!direct.pool) direct.pool = std::make_shared<ptab::Pool>();
+    direct.pool->vmm = vmm > 0;
+    direct.tables.clear();
+    direct.expert_bytes = 0;
+    cudaStream_t st = nullptr;
+    G6RT_CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+    for (const auto& [lyr, sp] : moe_layers)
+    {
+        const int rows = static_cast<int>(sp.tab->shape[0]);
+        std::vector<long long> h(static_cast<size_t>(rows) * 6, 0);
+        std::vector<long long> k;
+        read_fn(sp.tab->offset, sp.tab->nbytes, h.data());
+        if (sp.kmix && sp.kmix->nbytes)
+        {
+            k.assign(static_cast<size_t>(rows), 0);
+            read_fn(sp.kmix->offset, sp.kmix->nbytes, k.data());
+        }
+        auto t = std::make_shared<ptab::Table>();
+        if (const char* e = ptab::alloc_direct(*t, h, k, rows, g6nr::EB, *direct.pool, sp.fc1->offset, sp.fc2->offset, route, st))
+            die("GR8_PTAB=3 direct load layer " + std::to_string(lyr) + ": " + e);
+        direct.expert_bytes += t->slab_bytes;
+        direct.tables[lyr] = std::move(t);
+    }
+    G6RT_CK(cudaStreamDestroy(st));
+
+    std::string rerr;
+    if (!route.finalize(rerr)) die(rerr);
+
+    RoutedRsSink sink;
+    sink.route = &route;
+    const g6l_sink s{&sink, &RoutedRsSink::alloc, &RoutedRsSink::release, &RoutedRsSink::copy};
+    g6l_stats stats{};
+    char err[1024] = "";
+    if (load_fn(&s, &stats, err, sizeof err)) die(std::string("Rust loader (direct ptab): ") + err);
+    for (cudaStream_t x : sink.streams) cudaStreamDestroy(x);
+    img.adopt(pack, static_cast<uint8_t*>(dev), dense_bytes, release);
+    fprintf(stderr, "# rank %d: %s -> GR8_PTAB=3 direct slab load: compact dense %.2f GB + %zu MoE layers %.2f GB slabs "
+            "(pool held %.2f GB, VMM %d; %s, %u threads) in %.1f s (%.2f GB/s)\n",
+            rank, what, dense_bytes / 1e9, direct.tables.size(), direct.expert_bytes / 1e9, direct.pool->held / 1e9,
+            direct.pool->vmm ? 1 : 0, stats.mode ? "read" : "mmap", stats.threads, stats.seconds,
+            stats.image_bytes / 1e9 / std::max(stats.seconds, 1e-6));
+}
 
 // The Rust loader's sink: pinned staging buffers and one stream per worker into the device image. Each chunk is summed
 // in staging for the weight check (weight_check.cuh).
@@ -160,11 +342,31 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
 
 // The pack -> one device image with the Rust loader: parallel reads, no checksum (the files are checked offline).
 // GR8_LOADER=cpp, or a pack streamed on stdin, takes the C++ path instead.
-inline bool rs_load_image(g6::Pack& pack, g6::DevImage& img, const std::string& file, int rank)
+inline bool rs_load_image(g6::Pack& pack, g6::DevImage& img, const std::string& file, int rank,
+                          DirectPtab* direct = nullptr)
 {
     if (knob::loader() == "cpp" || file == "-") return false;
     std::vector<g6l_extent> ext;
     for (const g6::Entry& e : pack.entries()) ext.push_back({e.offset, e.nbytes});
+#if !G6_MODEL_DS41
+    if (direct && ptab::mode_env() == ptab::CONTIG && !wcheck::enabled())
+    {
+        FILE* fp = fopen(file.c_str(), "rb");
+        if (!fp) die(file + ": " + strerror(errno));
+        rs_fill_direct_ptab(pack, img, *direct, rank, "pack",
+            [&](uint64_t off, uint64_t n, void* dst) {
+                if (fseeko(fp, static_cast<off_t>(off), SEEK_SET) != 0 || fread(dst, 1, n, fp) != n)
+                    die(file + ": short read of tr3 metadata");
+            },
+            [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
+                return g6l_load(file.c_str(), pack.bytes(), ext.data(), ext.size(), "", "", s, st, err, n);
+            });
+        fclose(fp);
+        return true;
+    }
+#else
+    (void)direct;
+#endif
     rs_fill(pack, img, rank, "pack", [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
         return g6l_load(file.c_str(), pack.bytes(), ext.data(), ext.size(), "", "", s, st, err, n);
     });
@@ -189,7 +391,7 @@ inline std::string planned_manifest(int rank, const char* what)
 // loader plans the image from the base manifest, the index slices and the width manifest, and writes the image's
 // manifest to $TMPDIR (default /tmp) for `pack` to read. Its sha256 fields are zero, so only this loader loads it.
 inline void rs_load_v2(g6::Pack& pack, g6::DevImage& img, const std::string& manifest, const std::string& file, int rank,
-                       const V2Src& v2)
+                       const V2Src& v2, DirectPtab* direct = nullptr)
 {
     const std::string planned = planned_manifest(rank, "v2");
     char err[1024] = "";
@@ -201,6 +403,23 @@ inline void rs_load_v2(g6::Pack& pack, g6::DevImage& img, const std::string& man
     unlink(planned.c_str());
     if (!opened) die(planned + ": " + e);
     if (pack.rank() != rank) die(manifest + ": manifest says rank " + std::to_string(pack.rank()));
+#if !G6_MODEL_DS41
+    if (direct && ptab::mode_env() == ptab::CONTIG && !wcheck::enabled())
+    {
+        rs_fill_direct_ptab(pack, img, *direct, rank, "base pack + v2 files",
+            [&](uint64_t off, uint64_t n, void* dst) {
+                char rerr[1024] = "";
+                if (g6l_plan_read(h, off, n, dst, rerr, sizeof rerr)) die(std::string("v2 plan read: ") + rerr);
+            },
+            [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
+                return g6l_plan_load(h, s, st, err, n);
+            });
+        g6l_plan_free(h);
+        return;
+    }
+#else
+    (void)direct;
+#endif
     rs_fill(pack, img, rank, "base pack + v2 files", [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
         return g6l_plan_load(h, s, st, err, n);
     });
@@ -231,9 +450,26 @@ inline void* rs_plan_release(g6::Pack& pack, int rank, const V2Src& v2)
     return h;
 }
 
-inline void rs_load_release(g6::Pack& pack, g6::DevImage& img, int rank, const V2Src& v2)
+inline void rs_load_release(g6::Pack& pack, g6::DevImage& img, int rank, const V2Src& v2, DirectPtab* direct = nullptr)
 {
     void* h = rs_plan_release(pack, rank, v2);
+#if !G6_MODEL_DS41
+    if (direct && ptab::mode_env() == ptab::CONTIG && !wcheck::enabled())
+    {
+        rs_fill_direct_ptab(pack, img, *direct, rank, "exlr8 release",
+            [&](uint64_t off, uint64_t n, void* dst) {
+                char rerr[1024] = "";
+                if (g6l_plan_read(h, off, n, dst, rerr, sizeof rerr)) die(std::string("release plan read: ") + rerr);
+            },
+            [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
+                return g6l_plan_load(h, s, st, err, n);
+            });
+        g6l_plan_free(h);
+        return;
+    }
+#else
+    (void)direct;
+#endif
     rs_fill(pack, img, rank, "exlr8 release", [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
         return g6l_plan_load(h, s, st, err, n);
     });
@@ -293,7 +529,7 @@ inline Find plan_find(const g6::Pack& pack, PlanStore& store, int r)
 
 // manifest + pack stream ("-" = stdin) -> device image
 inline void load_image(g6::Pack& pack, g6::DevImage& img, const std::string& manifest, const std::string& file, int rank,
-                       bool hash = true, const V2Src& v2 = {})
+                       bool hash = true, const V2Src& v2 = {}, DirectPtab* direct = nullptr)
 {
 #if G6_MODEL_DS41
     if (!v2.dir.empty() || !v2.dense.empty())   // DS41: --v2-dense RELEASE_DIR alone (rs_plan_release -> g6l_ds41_plan)
@@ -302,8 +538,8 @@ inline void load_image(g6::Pack& pack, g6::DevImage& img, const std::string& man
 #endif
     {
 #ifdef G6_RS_LOADER
-        if (!v2.dense.empty()) return rs_load_release(pack, img, rank, v2);
-        return rs_load_v2(pack, img, manifest, file, rank, v2);
+        if (!v2.dense.empty()) return rs_load_release(pack, img, rank, v2, direct);
+        return rs_load_v2(pack, img, manifest, file, rank, v2, direct);
 #else
         die("--v2 needs the Rust loader (scripts/build.sh links it when cargo is installed)");
 #endif
@@ -312,7 +548,7 @@ inline void load_image(g6::Pack& pack, g6::DevImage& img, const std::string& man
     if (!pack.open_manifest(manifest, err)) die(err);
     if (pack.rank() != rank) die(manifest + ": manifest says rank " + std::to_string(pack.rank()));
 #ifdef G6_RS_LOADER
-    if (rs_load_image(pack, img, file, rank)) return;
+    if (rs_load_image(pack, img, file, rank, direct)) return;
 #endif
     g6::LoadOpts lo;
     g6::LoadStats st;

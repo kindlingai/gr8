@@ -111,7 +111,8 @@ __device__ __forceinline__ void trw_widen_ntile(uint8_t* nt, int lane)
 // matrix), 4 bits at bit 4 * (2b + m); 0 = all at bits, as without kmix). grid = E * nb * 2 * (KSH / 8), nb = max
 // blocks per expert (g6nr::EB: 3 at TP6, 4 at TP4), block = 256.
 // Run k_tr3_widen exactly once per tensor: a second run would scramble the bits.
-__global__ void __launch_bounds__(256) k_tr3_widen(uint8_t* fc1, const long long* tab, const long long* kmix, int nb)
+__global__ void __launch_bounds__(256) k_tr3_widen(uint8_t* fc1, const long long* tab, const long long* kmix, int nb,
+                                                   const uint8_t* const* ptab = nullptr)
 {
     const int lane = threadIdx.x & 31, j = threadIdx.x >> 5;
     const int g = blockIdx.x % (KSH / 8);
@@ -121,20 +122,34 @@ __global__ void __launch_bounds__(256) k_tr3_widen(uint8_t* fc1, const long long
     if (bm >= 2 * static_cast<int>(tr[3])) return;
     const long long km = kmix ? kmix[e] : 0;
     int k = static_cast<int>(tr[4]);
-    size_t off = static_cast<size_t>(bm) * k * (TR3W_MAT / 3);
-    if (km)
+    uint8_t* mat_base = nullptr;
+    if (ptab)
     {
-        k = static_cast<int>((km >> (4 * bm)) & 15);
-        off = 0;
-        for (int i = 0; i < bm; ++i) off += static_cast<size_t>((km >> (4 * i)) & 15) * (TR3W_MAT / 3);
+        const int b = bm >> 1, mat = bm & 1;
+        const int kg = km ? static_cast<int>((km >> (8 * b)) & 15) : k;
+        if (km) k = static_cast<int>((km >> (4 * bm)) & 15);
+        const size_t in_slab = mat ? static_cast<size_t>(kg) * (TR3W_MAT / 3) : 0;
+        mat_base = const_cast<uint8_t*>(ptab[(e * nb + b) * 2]) + in_slab;
     }
-    if (k == 3) trw_widen_group<3>(fc1 + tr[0] + off + static_cast<size_t>(g) * TR3W_GROUP, j, lane);
-    else if (k == 2) trw_widen_group<2>(fc1 + tr[0] + off + static_cast<size_t>(g) * 4096, j, lane);
+    else
+    {
+        size_t off = static_cast<size_t>(bm) * k * (TR3W_MAT / 3);
+        if (km)
+        {
+            k = static_cast<int>((km >> (4 * bm)) & 15);
+            off = 0;
+            for (int i = 0; i < bm; ++i) off += static_cast<size_t>((km >> (4 * i)) & 15) * (TR3W_MAT / 3);
+        }
+        mat_base = fc1 + tr[0] + off;
+    }
+    if (k == 3) trw_widen_group<3>(mat_base + static_cast<size_t>(g) * TR3W_GROUP, j, lane);
+    else if (k == 2) trw_widen_group<2>(mat_base + static_cast<size_t>(g) * 4096, j, lane);
 }
 
-inline void launch_tr3_widen(void* fc1, const long long* tab, const long long* kmix, int n_experts, int nb, cudaStream_t st)
+inline void launch_tr3_widen(void* fc1, const long long* tab, const long long* kmix, int n_experts, int nb, cudaStream_t st,
+                             const uint8_t* const* ptab = nullptr)
 {
-    k_tr3_widen<<<n_experts * nb * 2 * (KSH / 8), 256, 0, st>>>(static_cast<uint8_t*>(fc1), tab, kmix, nb);
+    k_tr3_widen<<<n_experts * nb * 2 * (KSH / 8), 256, 0, st>>>(static_cast<uint8_t*>(fc1), tab, kmix, nb, ptab);
 }
 
 // fc2 (down) of a K3 (or K2) expert, same idea. Pack order of one block: [KSH n-tiles][8 k-tiles p][96 B]; a warp of the
@@ -143,22 +158,27 @@ inline void launch_tr3_widen(void* fc1, const long long* tab, const long long* k
 // k-tile p sits at bits 24p .. 24p+23 of its three u64. grid = E * nb * (KSH / 8), block = 256 (warp j = n-tile
 // 8 * group + j). tab [E][6]: fc2 byte offset at [1]. Run k_tr3_widen2 exactly once per tensor.
 constexpr int TR3W_NT = 8 * 96;                 // bytes of one n-tile of a K3 fc2 block
-__global__ void __launch_bounds__(256) k_tr3_widen2(uint8_t* fc2, const long long* tab, int nb)
+__global__ void __launch_bounds__(256) k_tr3_widen2(uint8_t* fc2, const long long* tab, int nb,
+                                                    const uint8_t* const* ptab = nullptr)
 {
     const int lane = threadIdx.x & 31, j = threadIdx.x >> 5;
     const int g = blockIdx.x % (KSH / 8);
     const int b = (blockIdx.x / (KSH / 8)) % nb;
-    const long long* tr = tab + 6 * (blockIdx.x / (KSH / 8 * nb));
+    const int e = blockIdx.x / (KSH / 8 * nb);
+    const long long* tr = tab + 6 * e;
     const int k = static_cast<int>(tr[4]);
     if ((k != 3 && k != 2) || b >= static_cast<int>(tr[3])) return;
-    uint8_t* grp = fc2 + tr[1] + static_cast<size_t>(b) * k * (TR3W_MAT / 3) + static_cast<size_t>(g * 8 + j) * 8 * 32 * k;
+    uint8_t* base = ptab ? const_cast<uint8_t*>(ptab[(e * nb + b) * 2 + 1])
+                         : (fc2 + tr[1] + static_cast<size_t>(b) * k * (TR3W_MAT / 3));
+    uint8_t* grp = base + static_cast<size_t>(g * 8 + j) * 8 * 32 * k;
     if (k == 3) trw_widen_ntile<3>(grp, lane);
     else trw_widen_ntile<2>(grp, lane);
 }
 
-inline void launch_tr3_widen2(void* fc2, const long long* tab, int n_experts, int nb, cudaStream_t st)
+inline void launch_tr3_widen2(void* fc2, const long long* tab, int n_experts, int nb, cudaStream_t st,
+                              const uint8_t* const* ptab = nullptr)
 {
-    k_tr3_widen2<<<n_experts * nb * (KSH / 8), 256, 0, st>>>(static_cast<uint8_t*>(fc2), tab, nb);
+    k_tr3_widen2<<<n_experts * nb * (KSH / 8), 256, 0, st>>>(static_cast<uint8_t*>(fc2), tab, nb, ptab);
 }
 
 // host reference of the fc2 reorder, one K3 block (TR3W_MAT bytes), in place
@@ -275,7 +295,8 @@ __device__ __forceinline__ void tr4w_st32_ef(void* p, u32 v)
         :: "l"(p), "r"(v) : "memory");
 }
 
-__global__ void __launch_bounds__(256) k_tr4_widen(uint8_t* fc1, const long long* tab, const long long* kmix, int nb)
+__global__ void __launch_bounds__(256) k_tr4_widen(uint8_t* fc1, const long long* tab, const long long* kmix, int nb,
+                                                   const uint8_t* const* ptab = nullptr)
 {
     const int lane = threadIdx.x & 31, j = threadIdx.x >> 5;
     const int g = blockIdx.x % (KSH / 8);
@@ -285,15 +306,28 @@ __global__ void __launch_bounds__(256) k_tr4_widen(uint8_t* fc1, const long long
     if (bm >= 2 * static_cast<int>(tr[3])) return;
     const long long km = kmix ? kmix[e] : 0;
     int k = static_cast<int>(tr[4]);
-    size_t off = static_cast<size_t>(bm) * k * (TR3W_MAT / 3);
-    if (km)
+    uint8_t* mat_base = nullptr;
+    if (ptab)
     {
-        k = static_cast<int>((km >> (4 * bm)) & 15);
-        off = 0;
-        for (int i = 0; i < bm; ++i) off += static_cast<size_t>((km >> (4 * i)) & 15) * (TR3W_MAT / 3);
+        const int b = bm >> 1, mat = bm & 1;
+        const int kg = km ? static_cast<int>((km >> (8 * b)) & 15) : k;
+        if (km) k = static_cast<int>((km >> (4 * bm)) & 15);
+        const size_t in_slab = mat ? static_cast<size_t>(kg) * (TR3W_MAT / 3) : 0;
+        mat_base = const_cast<uint8_t*>(ptab[(e * nb + b) * 2]) + in_slab;
+    }
+    else
+    {
+        size_t off = static_cast<size_t>(bm) * k * (TR3W_MAT / 3);
+        if (km)
+        {
+            k = static_cast<int>((km >> (4 * bm)) & 15);
+            off = 0;
+            for (int i = 0; i < bm; ++i) off += static_cast<size_t>((km >> (4 * i)) & 15) * (TR3W_MAT / 3);
+        }
+        mat_base = fc1 + tr[0] + off;
     }
     if (k != 4) return;
-    uint8_t* grp = fc1 + tr[0] + off + static_cast<size_t>(g) * TR4W_GROUP;
+    uint8_t* grp = mat_base + static_cast<size_t>(g) * TR4W_GROUP;
     u32 w[8];
     #pragma unroll
     for (int p = 0; p < 8; ++p)
@@ -303,19 +337,24 @@ __global__ void __launch_bounds__(256) k_tr4_widen(uint8_t* fc1, const long long
     *reinterpret_cast<uint4*>(grp + (j * 2 + 1) * 512 + lane * 16) = make_uint4(w[4], w[5], w[6], w[7]);
 }
 
-inline void launch_tr4_widen(void* fc1, const long long* tab, const long long* kmix, int n_experts, int nb, cudaStream_t st)
+inline void launch_tr4_widen(void* fc1, const long long* tab, const long long* kmix, int n_experts, int nb, cudaStream_t st,
+                             const uint8_t* const* ptab = nullptr)
 {
-    k_tr4_widen<<<n_experts * nb * 2 * (KSH / 8), 256, 0, st>>>(static_cast<uint8_t*>(fc1), tab, kmix, nb);
+    k_tr4_widen<<<n_experts * nb * 2 * (KSH / 8), 256, 0, st>>>(static_cast<uint8_t*>(fc1), tab, kmix, nb, ptab);
 }
 
-__global__ void __launch_bounds__(256) k_tr4_widen2(uint8_t* fc2, const long long* tab, int nb)
+__global__ void __launch_bounds__(256) k_tr4_widen2(uint8_t* fc2, const long long* tab, int nb,
+                                                    const uint8_t* const* ptab = nullptr)
 {
     const int lane = threadIdx.x & 31, j = threadIdx.x >> 5;
     const int g = blockIdx.x % (KSH / 8);
     const int b = (blockIdx.x / (KSH / 8)) % nb;
-    const long long* tr = tab + 6 * (blockIdx.x / ((KSH / 8) * nb));
+    const int e = blockIdx.x / ((KSH / 8) * nb);
+    const long long* tr = tab + 6 * e;
     if (static_cast<int>(tr[4]) != 4 || b >= static_cast<int>(tr[3])) return;
-    uint8_t* nt = fc2 + tr[1] + static_cast<size_t>(b) * TR4W_MAT + static_cast<size_t>(g * 8 + j) * TR4W_NT;
+    uint8_t* base = ptab ? const_cast<uint8_t*>(ptab[(e * nb + b) * 2 + 1])
+                         : (fc2 + tr[1] + static_cast<size_t>(b) * TR4W_MAT);
+    uint8_t* nt = base + static_cast<size_t>(g * 8 + j) * TR4W_NT;
     u32 w[8];
     #pragma unroll
     for (int p = 0; p < 8; ++p)
@@ -325,7 +364,8 @@ __global__ void __launch_bounds__(256) k_tr4_widen2(uint8_t* fc2, const long lon
     *reinterpret_cast<uint4*>(nt + 512 + lane * 16) = make_uint4(w[4], w[5], w[6], w[7]);
 }
 
-inline void launch_tr4_widen2(void* fc2, const long long* tab, int n_experts, int nb, cudaStream_t st)
+inline void launch_tr4_widen2(void* fc2, const long long* tab, int n_experts, int nb, cudaStream_t st,
+                              const uint8_t* const* ptab = nullptr)
 {
-    k_tr4_widen2<<<n_experts * nb * (KSH / 8), 256, 0, st>>>(static_cast<uint8_t*>(fc2), tab, nb);
+    k_tr4_widen2<<<n_experts * nb * (KSH / 8), 256, 0, st>>>(static_cast<uint8_t*>(fc2), tab, nb, ptab);
 }

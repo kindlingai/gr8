@@ -607,19 +607,33 @@ int main(int argc, char** argv)
     cudaGraphExec_t exec_ds[9] = {};    // its captured draft steps: [S] = S sessions of 5 rows (S = 1: the one-session block)
 #endif
     g6::DevImage img;
+    DirectPtab direct_ptab;
     boot("fabric up");
     host_mem_log(R, "before the weights");     // #4: MemAvailable, page cache and RSS around the load
     if (!v2src.dir.empty() && (!image || v2src.slices.empty() || v2src.widths.empty()))
         die("--v2 needs --image, --v2-slices and --v2-widths");
-    if (image) load_image(pack, img, manifest, packfile, R, hash, v2src);
+    if (image) load_image(pack, img, manifest, packfile, R, hash, v2src, &direct_ptab);
     else load_pack(pack, manifest, packfile, R);
+    if (direct_ptab.active())
+    {
+        m.ppool = direct_ptab.pool;
+        m.direct_ptab = direct_ptab.tables;
+    }
+    // GR8_PTAB=3 is the direct slab load: building its slabs from the image instead keeps the image's expert bytes too,
+    // every routed expert held twice (a TP=1 Flash rank cannot fit that)
+    else if (ptab::mode_env() == ptab::CONTIG)
+        die(wcheck::enabled() ? "GR8_PTAB=3 loads the routed experts straight into slabs, which the weight check cannot "
+                                "follow (it sums the whole image): set GR8_WEIGHT_CHECK=0 with it"
+                              : "GR8_PTAB=3 needs the direct slab load: an --image boot through the Rust loader");
     u64* stepp = dmalloc<u64>(1);
     StepIn* in;
     StepOut* out;
     G6RT_CK(cudaHostAlloc((void**)&in, sizeof(StepIn), cudaHostAllocMapped));
     G6RT_CK(cudaHostAlloc((void**)&out, sizeof(StepOut), cudaHostAllocMapped));
     // dense trellis matrices: their FP8 copies for prefill under the MXFP8 names (dtr_find.h)
-    const Find find = dtr_overlay(image ? image_find(pack, img) : pack_find(pack, store), MP > 0, st, R);
+    const Find raw_find = direct_ptab.active() ? direct_image_find(pack, img, direct_ptab)
+                                               : (image ? image_find(pack, img) : pack_find(pack, store));
+    const Find find = dtr_overlay(raw_find, MP > 0, st, R);
     g6::Pack qo_pack;
     g6::DevImage qo_img;                // --image: the qo pack streamed into one device allocation (no host copy)
     std::vector<QoW> qow;               // pf_qo: full-head weights per model layer

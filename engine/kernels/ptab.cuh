@@ -29,6 +29,7 @@
 #include <utility>
 #include <vector>
 #include <cuda_runtime.h>
+#include "ptab_pool.h"
 #include "tr3.cuh"
 #include "../vmm.h"
 #include "../knobs-rs/gr8_knobs.h"
@@ -36,101 +37,50 @@
 namespace ptab
 {
 
-constexpr size_t SLAB_ALIGN = 256;         // every slab starts on a 256 B boundary (the widest load is 16 B cp.async)
-
-// Device memory in chunks (cudaMalloc, or cuMemCreate ranges under vmm, engine/vmm.h); slabs are carved from the
-// current chunk, and a freed slab of a size goes to that size's free list, where the next take of that size finds it.
-// A slab never spans two chunks. A slab larger than chunk_bytes gets a chunk of its own size, which never becomes the
-// current chunk (the current one keeps its free tail). Stage 1 keeps whole chunks until release(); a later stage hands
-// empty chunks to the KV pool (#153).
-struct Pool
+// CUDA chunk backend for SlabPool (ptab_pool.h): allocates chunks via g6vmm::alloc (when vmm=true) or cudaMalloc,
+// and releases empty chunks back to unified RAM / the EL5 KV pool via g6vmm::release or cudaFree.
+struct CudaBackend
 {
-    size_t chunk_bytes = size_t(256) << 20;   // default chunk; a slab larger than it gets a chunk of its own size
-    bool vmm = false;                         // chunks from g6vmm::alloc (as GR8_IMG_VMM does for the image) instead of cudaMalloc
-    struct Chunk { uint8_t* p; size_t bytes, used; bool vmm; };
-    std::vector<Chunk> chunks;
-    std::map<size_t, std::vector<uint8_t*>> free_by_size;
-    size_t held = 0, used = 0, freed = 0;     // bytes: of chunks (a VMM chunk at its rounded size), in live slabs, in the free lists
-    int cur = -1;                             // the chunk new slabs are carved from
-    int vmm_fallbacks = 0;                    // chunks that asked for VMM and got cudaMalloc (each printed once)
-
-    Pool() = default;
-    Pool(const Pool&) = delete;              // owns device memory: never copied
-    Pool& operator=(const Pool&) = delete;
-    ~Pool() { release(); }
-    static size_t round(size_t n) { return (n + SLAB_ALIGN - 1) / SLAB_ALIGN * SLAB_ALIGN; }
-
-    // a chunk of at least `at_least` bytes; its index in chunks, or -1 + err. An exact-size chunk for an oversize slab
-    // (at_least > chunk_bytes) is not made the current chunk.
-    int grow(size_t at_least, const char*& err)
+    static bool alloc_chunk(size_t want_bytes, bool want_vmm, uint8_t*& out_p, size_t& out_bytes, bool& out_vmm,
+                            int& vmm_fallbacks, const char*& err)
     {
-        err = nullptr;
-        const bool oversize = at_least > chunk_bytes;
-        Chunk c{nullptr, oversize ? at_least : chunk_bytes, 0, false};
-        if (vmm)
+        out_p = nullptr;
+        out_bytes = want_bytes;
+        out_vmm = false;
+        if (want_vmm)
         {
             std::string why;
             size_t gmin = 0, grec = 0;
             int dev = 0;
             cudaGetDevice(&dev);
             g6vmm::granularity(dev, gmin, grec);
-            c.p = static_cast<uint8_t*>(g6vmm::alloc(c.bytes, 0, why));
-            c.vmm = c.p != nullptr;
-            if (c.vmm && grec) c.bytes = (c.bytes + grec - 1) / grec * grec;   // the range is rounded up to the granularity: held counts it
-            else if (!c.vmm) { fprintf(stderr, "# ptab::Pool: VMM chunk of %zu MB failed (%s); cudaMalloc instead\n", c.bytes >> 20, why.c_str()); ++vmm_fallbacks; }
+            out_p = static_cast<uint8_t*>(g6vmm::alloc(out_bytes, 0, why));
+            out_vmm = out_p != nullptr;
+            if (out_vmm && grec) out_bytes = (out_bytes + grec - 1) / grec * grec;
+            else if (!out_vmm)
+            {
+                fprintf(stderr, "# ptab::Pool: VMM chunk of %zu MB failed (%s); cudaMalloc instead\n", out_bytes >> 20, why.c_str());
+                ++vmm_fallbacks;
+            }
         }
-        if (!c.p && cudaMalloc(&c.p, c.bytes) != cudaSuccess) { err = "ptab::Pool: cudaMalloc of a chunk failed"; return -1; }
-        chunks.push_back(c);
-        held += c.bytes;
-        const int i = static_cast<int>(chunks.size()) - 1;
-        if (!oversize) cur = i;
-        return i;
-    }
-    // a slab of n bytes (rounded up to SLAB_ALIGN); nullptr + err on failure. fresh: never a free-list slab (one carved
-    // at the bump pointer)
-    uint8_t* take(size_t n, const char*& err, bool fresh = false)
-    {
-        err = nullptr;
-        n = round(n);
-        auto it = free_by_size.find(n);
-        if (!fresh && it != free_by_size.end() && !it->second.empty())
+        if (!out_p && cudaMalloc(&out_p, out_bytes) != cudaSuccess)
         {
-            uint8_t* p = it->second.back();
-            it->second.pop_back();
-            freed -= n; used += n;
-            return p;
+            err = "ptab::Pool: cudaMalloc of a chunk failed";
+            return false;
         }
-        int i = cur;
-        if (i < 0 || chunks[i].used + n > chunks[i].bytes)
-            if ((i = grow(n, err)) < 0) return nullptr;
-        Chunk& c = chunks[i];
-        uint8_t* p = c.p + c.used;
-        c.used += n; used += n;
-        return p;
+        return true;
     }
-    // returns a slab take() gave, with the byte count it was taken with (rounded the same way)
-    void give(uint8_t* p, size_t n)
+    static void free_chunk(uint8_t* p, bool is_vmm)
     {
         if (!p) return;
-        n = round(n);
-        free_by_size[n].push_back(p);
-        used -= n; freed += n;
-    }
-    void release()
-    {
-        for (Chunk& c : chunks)
-        {
-            if (c.vmm) g6vmm::release(c.p);
-            else cudaFree(c.p);
-        }
-        chunks.clear();
-        free_by_size.clear();
-        held = used = freed = 0;
-        cur = -1;
+        if (is_vmm) g6vmm::release(p);
+        else cudaFree(p);
     }
 };
 
-enum Mode { OFF = 0, IMAGE = 1, SCATTER = 2 };
+using Pool = SlabPool<CudaBackend>;
+
+enum Mode { OFF = 0, IMAGE = 1, SCATTER = 2, CONTIG = 3 };
 
 // One layer's piece table: the device array at a fixed address (dev), and its host twin with each entry's bytes.
 // Movable (a runtime Layer that holds one can live in a std::vector), never copied: the device array has one owner.
@@ -193,7 +143,7 @@ inline const char* image_entries(Table& t, const uint8_t* fc1, const uint8_t* fc
     {
         const long long* tr = &h[static_cast<size_t>(e) * 6];
         if (tr[3] > t.eb) return "ptab: a row has more blocks than EB";
-        if (tr[3] > 8) return "ptab: a row has more than 8 blocks (the tr3.kmix format's ceiling)";
+        if (k[e] && tr[3] > 8) return "ptab: a row with mixed widths has more than 8 blocks (the tr3.kmix format's ceiling)";
         for (int b = 0; b < tr[3]; ++b)
         {
             const size_t f1 = tr3_piece_fc1_bytes(k[e], tr, b), f2 = tr3_piece_fc2_bytes(tr);
@@ -314,6 +264,87 @@ inline const char* build(Table& t, const void* tab, const void* kmix, const uint
             ++t.relocated;
         }
         if (adjacent_pairs(t, t.host)) return "ptab: an image-adjacent pair of pieces is adjacent in memory after the relocations";
+    }
+    else if (mode == CONTIG)
+    {
+        // EL3 (#151) serving layout: all fc1 blocks of each expert contiguous in one take_run, and all fc2 blocks
+        // contiguous in one take_run (matching mode-1 DRAM/L2 locality while keeping every block individually freeable).
+        std::vector<const uint8_t*> src = t.host;
+        std::vector<size_t> f1_sz(eb), f2_sz(eb);
+        std::vector<uint8_t*> f1_p(eb), f2_p(eb);
+        for (int e = 0; e < t.rows; ++e)
+        {
+            const int nb = static_cast<int>(h[static_cast<size_t>(e) * 6 + 3]);
+            if (nb <= 0) continue;
+            for (int b = 0; b < nb; ++b)
+            {
+                const int s = t.slot(e, b);
+                f1_sz[b] = t.bytes[s];
+                f2_sz[b] = t.bytes[s + 1];
+            }
+            const char* err = nullptr;
+            if (!pool.take_run(f1_sz.data(), nb, f1_p.data(), err)) return err;
+            if (!pool.take_run(f2_sz.data(), nb, f2_p.data(), err)) return err;
+            for (int b = 0; b < nb; ++b)
+            {
+                const int s = t.slot(e, b);
+                if (cudaMemcpyAsync(f1_p[b], src[s], t.bytes[s], cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+                    return "ptab: contig fc1 piece copy failed";
+                if (cudaMemcpyAsync(f2_p[b], src[s + 1], t.bytes[s + 1], cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+                    return "ptab: contig fc2 piece copy failed";
+                t.host[s] = f1_p[b];
+                t.host[s + 1] = f2_p[b];
+                t.slab_bytes += Pool::round(t.bytes[s]) + Pool::round(t.bytes[s + 1]);
+            }
+        }
+    }
+    return upload(t, st);
+}
+
+// EL3 (#151) direct slab allocation: given host copies of tr3.table (`h`) and tr3.kmix (`k`), allocates every
+// routed-expert piece contiguously per expert in `pool` (Mode::CONTIG), populates `t.dev`, and records every
+// piece's logical pack byte range [pack_lo, pack_hi) -> slab pointer into `route` so the Rust loader can stream
+// directly into slabs without allocating tr3.fc1 / tr3.fc2 in DevImage.
+inline const char* alloc_direct(Table& t, const std::vector<long long>& h, const std::vector<long long>& k, int rows,
+                                int eb, Pool& pool, uint64_t fc1_pack_off, uint64_t fc2_pack_off, RouteMap& route,
+                                cudaStream_t st)
+{
+    if (rows <= 0 || eb <= 0 || h.size() < static_cast<size_t>(rows) * 6 || (!k.empty() && k.size() < static_cast<size_t>(rows)))
+        return "ptab::alloc_direct: invalid tr3.table / tr3.kmix";
+    t.rows = rows; t.eb = eb; t.mode = CONTIG;
+    t.host.assign(t.n(), nullptr);
+    t.bytes.assign(t.n(), 0);
+    t.slab_bytes = 0;
+    if (!t.dev && cudaMalloc(&t.dev, t.n() * sizeof(void*)) != cudaSuccess) return "ptab::alloc_direct: cudaMalloc of table failed";
+    std::vector<size_t> f1_sz(eb), f2_sz(eb);
+    std::vector<uint8_t*> f1_p(eb), f2_p(eb);
+    for (int e = 0; e < rows; ++e)
+    {
+        const long long* tr = &h[static_cast<size_t>(e) * 6];
+        const long long km = k.empty() ? 0 : k[e];
+        const int nb = static_cast<int>(tr[3]);
+        if (nb > eb) return "ptab::alloc_direct: a row has more blocks than EB";
+        if (km && nb > 8) return "ptab::alloc_direct: a row with mixed widths has more than 8 blocks (tr3.kmix ceiling)";
+        if (nb <= 0) continue;
+        for (int b = 0; b < nb; ++b)
+        {
+            f1_sz[b] = tr3_piece_fc1_bytes(km, tr, b);
+            f2_sz[b] = tr3_piece_fc2_bytes(tr);
+        }
+        const char* err = nullptr;
+        if (!pool.take_run(f1_sz.data(), nb, f1_p.data(), err)) return err;
+        if (!pool.take_run(f2_sz.data(), nb, f2_p.data(), err)) return err;
+        for (int b = 0; b < nb; ++b)
+        {
+            const int s = t.slot(e, b);
+            t.host[s] = f1_p[b];
+            t.host[s + 1] = f2_p[b];
+            t.bytes[s] = f1_sz[b];
+            t.bytes[s + 1] = f2_sz[b];
+            t.slab_bytes += Pool::round(f1_sz[b]) + Pool::round(f2_sz[b]);
+            route.add(fc1_pack_off + unit_off(km, tr, 2 * b), f1_sz[b], f1_p[b]);
+            route.add(fc2_pack_off + static_cast<uint64_t>(tr[1]) + static_cast<uint64_t>(b) * f2_sz[b], f2_sz[b], f2_p[b]);
+        }
     }
     return upload(t, st);
 }

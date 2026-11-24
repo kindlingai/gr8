@@ -465,7 +465,8 @@ struct Model
 #endif
     bool graph = false;               // attention through the replay entry (set before prepare)
     bool wide = false;                // set before build: tr3.fc1 K3 records into the wide order, in place (bind::widen_fc1)
-    std::shared_ptr<ptab::Pool> ppool;   // EL3 (#151): the slab pool of the piece tables (GR8_PTAB=2 copies pieces into it); shared like ptab
+    std::shared_ptr<ptab::Pool> ppool;   // EL3 (#151): the slab pool of the piece tables (GR8_PTAB=2/3); shared like ptab
+    std::map<int, std::shared_ptr<ptab::Table>> direct_ptab;   // GR8_PTAB=3 direct slab load: pre-populated per-layer tables
     // graph form: captured attention capacities, ascending, the last = the binding's capacity. GR8_DEC_BK=B (read at
     // build, default 2048): B, 2B, 4B, ... (7 at most) below the capacity, then the capacity, and CP's R when it is not one
     // of them; 0 = one bucket (the capacity). A step runs the graph of the smallest bucket >= its context (bucket_of);
@@ -816,8 +817,23 @@ inline void build_ptab(Model& m, Layer& y, int rank, bool say, cudaStream_t st)
 {
     const ptab::Mode pm = ptab::mode_env();
     if (pm == ptab::OFF || !y.T.t[bind::T_TR3_TAB].p) return;
+    if (y.ptab)
+    {
+        y.T.ptab = y.ptab->dev;
+#if G6_MODEL_FLASH
+        y.flash_mlp_w.experts.ptab = y.ptab->dev;
+#endif
+        if (say)
+            fprintf(stderr, "# rank %d: GR8_PTAB=%d (direct): layer %d routed experts through a piece table (%d x %d x 2 entries, %zu MB of slabs)\n",
+                    rank, (int)pm, y.l, y.ptab->rows, y.ptab->eb, y.ptab->slab_bytes >> 20);
+        return;
+    }
     const bind::Tensor& tab = y.T.t[bind::T_TR3_TAB];
-    if (!m.ppool) m.ppool = std::make_shared<ptab::Pool>();
+    if (!m.ppool)
+    {
+        m.ppool = std::make_shared<ptab::Pool>();
+        m.ppool->vmm = knob::img_vmm() > 0;
+    }
     auto t = std::make_shared<ptab::Table>();
     if (const char* e = ptab::build(*t, tab.p, y.T.t[bind::T_TR3_KMIX].p, static_cast<const uint8_t*>(y.T.t[bind::T_TR3_FC1].p),
                                     static_cast<const uint8_t*>(y.T.t[bind::T_TR3_FC2].p), static_cast<int>(tab.shape[0]), g6nr::EB, pm, *m.ppool, st))
@@ -829,7 +845,7 @@ inline void build_ptab(Model& m, Layer& y, int rank, bool say, cudaStream_t st)
 #endif
     if (say)
         fprintf(stderr, "# rank %d: GR8_PTAB=%d: layer %d routed experts through a piece table (%d x %d x 2 entries%s%s)\n", rank, (int)pm, y.l,
-                t->rows, t->eb, pm == ptab::SCATTER ? (", " + std::to_string(t->slab_bytes >> 20) + " MB of slabs").c_str() : "",
+                t->rows, t->eb, (pm == ptab::SCATTER || pm == ptab::CONTIG) ? (", " + std::to_string(t->slab_bytes >> 20) + " MB of slabs").c_str() : "",
                 t->reshuffles ? (", " + std::to_string(t->reshuffles) + " reshuffles").c_str() : "");
 }
 
@@ -945,6 +961,11 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         Layer& y = m.layers[i];
         y.l = ids[i];
         y.T = bind::layer_tensors(y.l, [&](const char* n) { return as_bind(find(n)); });
+        if (auto it = m.direct_ptab.find(y.l); it != m.direct_ptab.end())
+        {
+            y.ptab = it->second;
+            y.T.ptab = y.ptab->dev;
+        }
         if (const char* e = bind::scan_widths(y.T)) die("layer " + std::to_string(y.l) + ": " + e);
         // GR8_V2_SHARED=trellis: prefill runs an exlr8 v2 layer's shared expert as a trellis pass (no FP8 copy)
         if (y.T.sh_trellis && knob::v2_shared() != "trellis")
@@ -2610,6 +2631,8 @@ inline void build_draft(Draft& D, const Model& main, const Find& find, int capac
     #endif
     D.d.wide = main.wide;
     D.d.headroom = false;
+    D.d.ppool = main.ppool;
+    D.d.direct_ptab = main.direct_ptab;
     D.d.eh_in = dmalloc<__half>((size_t)MX * 2 * HID);
     D.d.eh_out = dmalloc<__half>((size_t)MX * HID);
     if (main.dscratch)   // GR8_DEC_SHARED_SCRATCH: the draft's calls run after the main step's on its stream (build)

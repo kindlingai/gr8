@@ -100,6 +100,11 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
         if(y.flash_mlp_w.moe!=y.moe) die("Flash MLP format disagrees with layer schedule");
         if(y.moe && !find(lname(y.l,"router.bias")).fp32) die("Flash router.bias must be FP32");
         y.T=y.flash_mlp_w.experts;
+        if(auto it=m.direct_ptab.find(y.l); it!=m.direct_ptab.end()) {
+            y.ptab=it->second;
+            y.T.ptab=y.ptab->dev;
+            y.flash_mlp_w.experts.ptab=y.ptab->dev;
+        }
         // GR8_PTAB (EL3, #151): the piece table is built here, once, for both binders. Flash widens tr3.fc1 / fc2 lazily
         // in the prefill binder (flash_mlp_pf::bind_layer_tensors), and a SCATTER slab must hold the order the kernels
         // read, so with the knob on that sequence runs now (the shared expert's FP8 copy first, as there: it reads the

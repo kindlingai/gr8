@@ -669,6 +669,11 @@ run_job kv_chunks_plan_test '
     "$REPO/engine/runtime/s2/tests/kv_chunks_plan_test.cpp" -o "$D/kv_chunks_plan_test" "${KVLIB[@]}"
   "$D/kv_chunks_plan_test"
 '
+# EL3 (#151) piece-table slab pool (chunk release, contiguous take_run, direct-load RouteMap)
+run_job ptab_pool_test '
+  g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined "$REPO/engine/kernels/tests/ptab_pool_test.cpp" -o "$D/ptab_pool_test"
+  "$D/ptab_pool_test"
+'
 
 wait
 for name in "${ORDER[@]}"; do
