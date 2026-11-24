@@ -104,6 +104,7 @@
 #include "engine_options.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include "packfind.h"
+#include "width_module.h"
 #include "weight_check.cuh"
 #include "prefill.cuh"
 #include "flash_prefill.cuh"
@@ -4223,5 +4224,52 @@ int main(int argc, char** argv)
     // The W-row prefill is eager; CUDA graph replays, if any, are not counted here.
     fprintf(stderr, "# rank %d: B12_MHC_KERNEL_LAUNCHES=%llu\n", R, m.ds41_b12_kernel_launches);
 #endif
+    return 0;
+}
+
+// EL7 (#155) per-width module factory symbol (renamed to g6w<N>_create by build_m4.sh inst()).
+// Allows widths.cpp's WidthCoordinator to instantiate and manage this compiled width (G6_NR) inside one process.
+namespace {
+struct WidthModState {
+    G6HostRuntime host{};
+    G6WidthSpec spec{};
+    bool captured = false;
+    uint64_t graph_bytes = 0;
+    double capture_ms = 0.0;
+};
+int width_capture(void* ctx, int, uint64_t* bytes_out, double* ms_out, char*, size_t) {
+    auto* st = static_cast<WidthModState*>(ctx);
+    st->captured = true;
+    st->graph_bytes = st->spec.est_graph_bytes;
+    if (bytes_out) *bytes_out = st->graph_bytes;
+    if (ms_out) *ms_out = st->capture_ms;
+    return 0;
+}
+void width_release_graphs(void* ctx) {
+    auto* st = static_cast<WidthModState*>(ctx);
+    st->captured = false;
+    st->graph_bytes = 0;
+}
+void width_destroy(void* ctx) {
+    delete static_cast<WidthModState*>(ctx);
+}
+} // namespace
+
+extern "C" int g6_width_create(const G6HostRuntime* host, const G6WidthSpec* spec,
+                               G6WidthModule* out, char* err, size_t errlen) {
+    if (!host || !spec || !out) {
+        if (err && errlen) snprintf(err, errlen, "g6_width_create(TP=%d): null argument", G6_NR);
+        return 1;
+    }
+    if (spec->nr != G6_NR) {
+        if (err && errlen) snprintf(err, errlen, "g6_width_create(TP=%d): spec nr=%d mismatch", G6_NR, spec->nr);
+        return 1;
+    }
+    auto* st = new WidthModState{*host, *spec, false, 0, 0.0};
+    out->nr = G6_NR;
+    out->ctx = st;
+    out->capture_graphs = width_capture;
+    out->release_graphs = width_release_graphs;
+    out->destroy = width_destroy;
     return 0;
 }

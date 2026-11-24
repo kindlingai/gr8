@@ -185,6 +185,8 @@ class NativeDispatch {
     int dlp_rows_ = 0;
     struct Graphs { cudaGraphExec_t a = nullptr, b = nullptr; };
     std::map<std::string, Graphs> graphs_;
+    uint64_t last_capture_bytes_ = 0;
+    double last_capture_ms_ = 0.0;
     static void destroy(Graphs& g) {
         if (g.a) G6RT_CK(cudaGraphExecDestroy(g.a));
         if (g.b) G6RT_CK(cudaGraphExecDestroy(g.b));
@@ -392,6 +394,14 @@ public:
         cudaFreeHost(layout_); cudaFreeHost(draft_layout_);
     }
     NativeDispatch(const NativeDispatch&) = delete; NativeDispatch& operator=(const NativeDispatch&) = delete;
+    // EL7 (#155): releases every captured CUDA graph immediately (freeing graph memory Y at cutover or rollback).
+    void release_graphs() {
+        for (auto& item : graphs_) destroy(item.second);
+        graphs_.clear();
+    }
+    size_t graph_count() const { return graphs_.size(); }
+    uint64_t last_capture_bytes() const { return last_capture_bytes_; }
+    double last_capture_ms() const { return last_capture_ms_; }
     // graphs are keyed by (kind, M, bucket), not by session: a retired session leaves them valid
     void retire(const Slot&) {}
     // Boot capture of every graph key a decode step can reach, before serving (a launch of any other key fails):
@@ -475,10 +485,12 @@ public:
         }
         c_.main.s2on = on_main; c_.draft.d.s2on = on_draft; fence();
         G6RT_CK(cudaMemGetInfo(&free1,&total));
+        last_capture_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        last_capture_bytes_ = free0 > free1 ? uint64_t(free0 - free1) : 0ull;
         if (c_.main.rank == 0)
             fprintf(stderr,"# s2 boot capture: %zu keys, %zu graphs (%d buckets; main %zu draft %zu chain %zu shapes; N %d K %d chunk %d) in %.2f s, graph memory %.1f MiB\n",
                 keys,graphs,nbk,mains.size(),drafts.size(),chains.size(),N,K,chunk,
-                std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count(),
+                last_capture_ms_ / 1000.0,
                 (double(free0)-double(free1))/(1024.0*1024.0));
         if (c_.main.rank == 0 && cp_rows)
             fprintf(stderr,"# s2 boot capture: GR8_CP_STEP_ROWS=%d: %zu main keys wider than that at the buckets past R not captured\n",

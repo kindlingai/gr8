@@ -442,6 +442,11 @@ run_job host_reclaim_test '
   g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/host_reclaim_test.cpp" -o "$D/host_reclaim_test" "${KNOBS[@]}"
   "$D/host_reclaim_test"
 '
+# EL7 (#155) in-process width-module lifecycle & CaptureAhead vs CaptureAfter graph capture policy
+run_job width_module_test '
+  g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined "$REPO/engine/runtime/tests/width_module_test.cpp" -o "$D/width_module_test"
+  "$D/width_module_test"
+'
 run_job test_flash_ring '
   g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_ring.cpp" -o "$D/test_flash_ring" "${KNOBS[@]}"
   "$D/test_flash_ring"
