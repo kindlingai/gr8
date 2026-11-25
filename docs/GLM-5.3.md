@@ -39,8 +39,8 @@ before it landed, and TP=6 on 8da82ff. Six boxes on one 200G switch.
 column would be a little higher on six uncapped boxes.
 § The TP=3 and TP=6 int4 figures are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [KV4.md](KV4.md)
 
-The recipe [glm-5.3-exlr8-4x-spark](https://github.com/kindlingai/glm-5.3-exlr8-4x-spark) has these results in a form a program can read
-([kindling.json](https://github.com/kindlingai/glm-5.3-exlr8-4x-spark/blob/main/kindling.json)).
+The recipe [glm-5.3-exlr8-4x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/4x/exlr8-gr8) has these results in a form a program can read
+([kindling.json](https://github.com/kindlingai/recipes/blob/main/glm-5.3/dgx-spark/4x/exlr8-gr8/kindling.json)).
 
 ## How it works
 

@@ -20,7 +20,7 @@ each image's defaults:
 | prefill, 8K / 32K / 128K prompt | 995 / 1,024 / 916 tok/s | 1,670 / 1,729 / 1,595 tok/s |
 | aggregate decode, 1 / 2 / 4 / 8 streams | 43.5 / 41.3 / 53.4 / 57.5 tok/s | 55.1 / 70.3 / 82.9 tok/s (1 / 2 / 4 streams; 97.4 at 8 with `TUNE=context`) |
 | KV pool | 700,032 tokens, up to 4 requests at once | 2,097,152 tokens, up to 4 requests at once (`SESS=4`; max tokens per active chat: 262,144 at 1 measured, 262,144 at 2 and 4 computed; 8 chats at 233,458 each, computed, with `TUNE=context`) |
-| from | [glm-5.3-flash-exlr8-1x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark/blob/3e9754c5/kindling.json) | [glm-5.3-flash-exlr8-2x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark/blob/main/kindling.json) |
+| from | [glm-5.3-flash-exlr8-1x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark/blob/3e9754c5/kindling.json) | [glm-5.3-flash-exlr8-2x-spark `kindling.json`](https://github.com/kindlingai/recipes/blob/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8/kindling.json) |
 
 The recipes use two other manifests of the same release. `bit201` (one box) is K2, with the 124 routed experts that
 carry the most routing weight at tool-call positions at K3. `bit349` (two boxes) is K3, with K4 where it lowers KL most,

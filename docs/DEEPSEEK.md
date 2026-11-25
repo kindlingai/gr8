@@ -11,7 +11,7 @@ the DeepSeek dialect (DSML tool calls, numeric reasoning effort). It serves text
 ## Results
 
 Fast mode, the default of the Docker recipe
-[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark) (`TUNE=speed`):
+[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/recipes/tree/main/deepseek-v4.1-flash/dgx-spark/4x/exlr8-gr8) (`TUNE=speed`):
 the recipe's published image `sha-7c2088a` (gr8 `main` at
 [`43cad38`](https://github.com/kindlingai/gr8/commit/43cad388ec8b7026b4feed2190fc5ce5a90c0c6d), engine built with
 `DS41_MX=48`), Engram on, 32 chat slots, `CAP` 327,680, the recipe's release settings (its `knobs.sh`), on four GB10
@@ -103,7 +103,7 @@ makes.
 ## Start it
 
 The quickest way is the recipe
-[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): the same Docker
+[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/recipes/tree/main/deepseek-v4.1-flash/dgx-spark/4x/exlr8-gr8): the same Docker
 image on all four boxes, in fast mode. On every box, fetch the release (510.6 GB) with the image, then start the image.
 Its README has the commands (`docker run` or Docker Compose), the cabling and the settings, and shows how to get the
 exact model instead. We booted the recipe's image `sha-ad3efdf` on four boxes on 2026-11-09 (first boot, cold disk,
@@ -133,7 +133,7 @@ check 6 rows for each of 8 chats. Its settings come in three groups, each set in
 - The release stack: the v2 prefill path (`GR8_DS_PF_V2=1`) with 12,288-row chunks, its wire settings, the two-rail
   split, and Engram reads with io_uring. One of them, `GR8_DS_SH_TC=1`, changes the output. gr8's launcher sets the
   same stack by default ([The prefill path](#the-prefill-path)). The recipe README's
-  [What `TUNE=speed` sets](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark#what-tunespeed-sets) has
+  [What `TUNE=speed` sets](https://github.com/kindlingai/recipes/blob/main/deepseek-v4.1-flash/dgx-spark/4x/exlr8-gr8/README.md#what-tunespeed-sets) has
   one line for each. Engram's io_uring reads need the recipe's seccomp profile; without it, Engram reads with threads
   and gives the same output.
 
