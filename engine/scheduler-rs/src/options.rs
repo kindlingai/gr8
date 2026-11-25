@@ -999,6 +999,9 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result
         if !o.spec.set_levels(&lv) {
             return Err("--spec-levels: no level".into());
         }
+        if dfl && k.flag(kid::SPEC_K0) {
+            o.spec.allow_k0();
+        }
         o.spec.draft_round = if dfl { 5.6 } else { 2.5 };
         o.spec.draft_each = if dfl { 0.0 } else { 2.1 };
         if flash {
@@ -1007,6 +1010,9 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result
                 o.spec.draft_round = 5.3;
                 o.spec.draft_each = 0.0;
             }
+        } else if !ds41 && nr == 2 {
+            // GLM-5.3 TP=2 bit225 verify cost estimates (ms for M=1..8 rows; overridable via GR8_SPEC_TABLE)
+            o.spec.table = [0.0, 62.0, 72.0, 81.0, 89.5, 97.5, 105.0, 112.0, 118.5];
         }
     }
     let (s2port, s2sess, s2epoch) = (o.s2port, o.s2sess, o.s2epoch);
@@ -1414,6 +1420,12 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result
     }
     for &l in o.spec.levels() {
         add(&mut row_counts, l + 1);
+    }
+    // GR8_DFL_VERIFY_CAP: solo DFlash2 rounds may truncate to any k* in 0..=dfl_k (M = 1..=dfl_k + 1)
+    if dfl && s2mode && k.float(kid::DFL_VERIFY_CAP) > 0.0 {
+        for r in 1..=dfl_k + 1 {
+            add(&mut row_counts, r);
+        }
     }
     if flash && s2mode {
         for r in 1..=mtp + 1 {

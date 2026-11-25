@@ -127,3 +127,48 @@ fn refusals_name_the_cause() {
     assert!(edit("dflash_config", d).contains("target_layer_ids"));
     assert!(dflash2::check_config(&config(), &dflash2::GLM53).err().unwrap().contains("hidden_size = 64"));
 }
+
+#[test]
+fn int4_body_and_codebooks_tp2() {
+    let out = std::env::temp_dir().join(format!("g6load-dflash2-int4-tp2-{}", std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    let cfg = config();
+    let st = St::open(&format!("{D}/src/model.safetensors")).unwrap();
+    let i4: Vec<String> = ["fc", "attn", "mlp", "conv"].into_iter().map(String::from).collect();
+    for r in 0..2 {
+        let m = dflash2::convert_rank_ex(&st, &cfg, &SMALL, 2, r, out.to_str().unwrap(), &[], &i4, false).unwrap();
+        assert_eq!(m.get("nr").and_then(|v| v.int()), Some(2));
+        let tensors = m.get("tensors").and_then(|t| t.arr()).unwrap();
+        let find = |n: &str| tensors.iter().find(|t| t.get("name").and_then(|s| s.str()) == Some(n));
+        let fc = find("D.fc.gv").unwrap();
+        assert_eq!(fc.get("shape").and_then(|s| s.arr()).unwrap()[2].int(), Some(288));
+        assert_eq!(fc.get("layout").and_then(|s| s.str()), Some("int4_gv_record[O/16][K/32][288]"));
+        let hproj = find("D.sel.hproj.gv").unwrap();
+        assert_eq!(hproj.get("shape").and_then(|s| s.arr()).unwrap()[2].int(), Some(528));
+    }
+    // Real GLM-5.3 selector codebooks have SELR = 256 (8 x g32): verify INT4 codebook shapes & dequant accuracy
+    let (v, c) = (16usize, 256usize);
+    let src: Vec<u16> = (0..v * c).map(|i| {
+        let f = (((i * 37) % 101) as f32 - 50.0) * 0.02;
+        (f.to_bits() >> 16) as u16
+    }).collect();
+    let (q4, s4, qs, ss) = dflash2::int4_codebook(&src, &[v, c]).unwrap();
+    assert_eq!(qs, vec![v, c / 2]);
+    assert_eq!(ss, vec![v, c / 32]);
+    assert_eq!(q4.len(), v * c / 2);
+    assert_eq!(s4.len(), v * (c / 32) * 2);
+    // Verify round-trip max error matches INT4 g32 quantization bound (<= scale / 2 + f16 eps)
+    for row in 0..v {
+        for i in 0..c {
+            let orig = f32::from_bits((src[row * c + i] as u32) << 16);
+            let b = q4[row * (c / 2) + (i >> 1)];
+            let nib = if (i & 1) != 0 { b >> 4 } else { b & 15 } as i32 - 8;
+            let g = i >> 5;
+            let sb = u16::from_le_bytes([s4[(row * (c / 32) + g) * 2], s4[(row * (c / 32) + g) * 2 + 1]]);
+            let sc = g6load::exlr8::f16_to_f32(sb);
+            let recon = nib as f32 * sc;
+            assert!((orig - recon).abs() <= sc * 0.55 + 1e-3, "row {row} col {i}: orig {orig} recon {recon} sc {sc}");
+        }
+    }
+    std::fs::remove_dir_all(&out).unwrap();
+}

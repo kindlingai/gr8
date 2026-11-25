@@ -614,6 +614,8 @@ struct Model
     bind::Scratch sc;
     std::vector<Layer> layers;
     const __nv_bfloat16 *emb = nullptr, *final_norm = nullptr;
+    const int8_t* emb_i8 = nullptr;
+    const float* emb_scale = nullptr;
     bind::HeadTensors head_t;
     bind::Head head[MX + 1];
     __half *eh_in = nullptr, *eh_out = nullptr;   // MTP draft model only: eh_proj input [MX][12288] and output [MX][6144]
@@ -1230,7 +1232,11 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         fprintf(stderr, "# rank %d: dense decode weights (trellis / int4 g32 / MXFP8): q_b %d / %d / %d, o_proj %d / %d / %d, dense MLP %d / %d / %d\n",
                 rank, q[0], q[1], q[2], o[0], o[1], o[2], d[0], d[1], d[2]);
     }
-    m.emb = (const __nv_bfloat16*)need(find, "G.embed");
+    {
+        const TensorRef er = find("G.embed");
+        if (er.p) { m.emb = (const __nv_bfloat16*)er.p; m.emb_i8 = nullptr; m.emb_scale = nullptr; }
+        else { m.emb = nullptr; m.emb_i8 = (const int8_t*)need(find, "G.embed.i8"); m.emb_scale = (const float*)need(find, "G.embed.scale"); }
+    }
     m.final_norm = (const __nv_bfloat16*)need(find, "G.final_norm");
     m.head_t = bind::head_tensors([&](const char* n) { return as_bind(find(n)); });
     if (!m.head_t.lm_head.p) die("pack has no G.lm_head.mx.gv");
@@ -1378,7 +1384,7 @@ inline void launch_embed(Model& m, int M, cudaStream_t st)
 #if G6_MODEL_DS41
     if(m.ds41) { ds41_unit(m,ds41::U_EMBED,0,M,st); return; }
 #endif
-    glue::EmbedArgs a{m.tok, m.emb, m.layers[0].attn_norm, m.resid, m.x, glue::RMS_EPS};
+    glue::EmbedArgs a{m.tok, m.emb, m.layers[0].attn_norm, m.resid, m.x, glue::RMS_EPS, m.emb_i8, m.emb_scale};
     glue::k_embed_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
 }
 
@@ -2569,13 +2575,18 @@ struct MtpInArgs
     const __half* hid;                // [M][6144]
     float eps;
     __half* out;                      // [M][12288]
+    const int8_t* emb_i8 = nullptr;
+    const float* emb_scale = nullptr;
 };
 // grid (2, M), block 256: half 0 = enorm(emb[tok]) (zeros at position 0), half 1 = hnorm(hid). fp32 math, fixed order.
 __global__ void __launch_bounds__(256) k_mtp_in(MtpInArgs a)
 {
     __shared__ float wsum[8];
     const int m = blockIdx.y, half = blockIdx.x;
-    const __nv_bfloat16* e = a.emb + (size_t)a.tok[m] * HID;
+    const int tid = a.tok[m];
+    const __nv_bfloat16* e = a.emb ? (a.emb + (size_t)tid * HID) : nullptr;
+    const int8_t* ei8 = a.emb_i8 ? (a.emb_i8 + (size_t)tid * HID) : nullptr;
+    const float esc = a.emb_i8 ? a.emb_scale[tid] : 0.f;
     const __half* h = a.hid + (size_t)m * HID;
     const __nv_bfloat16* w = half ? a.hnorm : a.enorm;
     __half* out = a.out + (size_t)m * 2 * HID + (size_t)half * HID;
@@ -2583,7 +2594,7 @@ __global__ void __launch_bounds__(256) k_mtp_in(MtpInArgs a)
     float ss = 0.f;
     for (int i = threadIdx.x; i < HID; i += 256)
     {
-        const float v = half ? __half2float(h[i]) : __bfloat162float(e[i]);
+        const float v = half ? __half2float(h[i]) : (ei8 ? static_cast<float>(ei8[i]) * esc : __bfloat162float(e[i]));
         ss = fmaf(v, v, ss);
     }
     #pragma unroll
@@ -2596,7 +2607,7 @@ __global__ void __launch_bounds__(256) k_mtp_in(MtpInArgs a)
     const float inv = rsqrtf(tot * (1.f / HID) + a.eps);
     for (int i = threadIdx.x; i < HID; i += 256)
     {
-        const float v = half ? __half2float(h[i]) : __bfloat162float(e[i]);
+        const float v = half ? __half2float(h[i]) : (ei8 ? static_cast<float>(ei8[i]) * esc : __bfloat162float(e[i]));
         out[i] = zero ? __float2half_rn(0.f) : __float2half_rn(v * inv * __bfloat162float(w[i]));
     }
 }
@@ -2792,9 +2803,9 @@ inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st, int
     {
 #ifdef DEC_S2
         const __half* hid = d.s2on ? s2_draft_hid(D, chain, st) : chain ? D.hprev : D.main_x;
-        k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{d.tok, d.pos, d.emb, D.enorm, D.hnorm, hid, glue::RMS_EPS, d.eh_in});
+        k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{d.tok, d.pos, d.emb, D.enorm, D.hnorm, hid, glue::RMS_EPS, d.eh_in, d.emb_i8, d.emb_scale});
 #else
-        k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{d.tok, d.pos, d.emb, D.enorm, D.hnorm, chain ? D.hprev : D.main_x, glue::RMS_EPS, d.eh_in});
+        k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{d.tok, d.pos, d.emb, D.enorm, D.hnorm, chain ? D.hprev : D.main_x, glue::RMS_EPS, d.eh_in, d.emb_i8, d.emb_scale});
 #endif
         bind::launch(H.xf_eh, st);
         bind::launch(H.eh, st);

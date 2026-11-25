@@ -1598,6 +1598,7 @@ int main(int argc, char** argv)
         cudaStream_t dfl_ds = st;        // GR8_DRAFT_PAR: the stream of the drafter step in flight
         auto dfl_install = [&](g6s2::NativeHooks& h, g6s2::FlashExtras& ext) {
             h.dfl_kv = dfl_k; h.dfl_spec = spec;
+            h.dfl_verify_cap = knob::dfl_verify_cap();
             h.dsel.on = s2::dsel_env();
             h.dsel.margin = knob::s2_dsel_margin();
             h.dsel.dwell = (int)std::max<int64_t>(1, knob::s2_dsel_dwell());
@@ -3418,6 +3419,7 @@ int main(int argc, char** argv)
             if (dfl)
             {
                 h.dfl_kv = dfl_k; h.dfl_spec = spec;
+                h.dfl_verify_cap = knob::dfl_verify_cap();
                 // drafter choice: drafting ms per round at 2200 MHz. DFlash2: the drafter step and the MTP first form;
                 // MTP: the first form, the drafter's context-only step, a chain step per draft after the first
                 h.dsel.on = s2::dsel_env();

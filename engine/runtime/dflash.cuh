@@ -116,6 +116,10 @@ struct Dfl
     bind::Gv fc, hproj;
     DLayer ly[dfl::L];
     const __nv_bfloat16 *hnorm = nullptr, *norm = nullptr, *pred = nullptr, *succ = nullptr, *emb = nullptr;
+    const int8_t* emb_i8 = nullptr;
+    const float* emb_scale = nullptr;
+    const uint8_t *pred_q4 = nullptr, *succ_q4 = nullptr;
+    const __half *pred_s4 = nullptr, *succ_s4 = nullptr;
     const int* emb_rows = nullptr;    // dfltest: block row r reads row r of its small embedding table
     // buffers (device)
     __half* feat = nullptr;           // [B][NT][HID] fp16, FEAT_SCALE x the target residual
@@ -503,13 +507,22 @@ struct WalkArgs
 {
     g6::FabricDev f; const u64* stepp; int c;
     const float* hp;                  // [B][SELR]
-    const __nv_bfloat16 *pred, *succ; // [vocab][SELR]
+    const __nv_bfloat16 *pred, *succ; // [vocab][SELR] (BF16; null when INT4 g32 codebooks are loaded)
+    const uint8_t *pred_q4, *succ_q4; // [vocab][SELR/2] u8 nibbles (null when BF16)
+    const __half *pred_s4, *succ_s4;  // [vocab][SELR/32] f16 scales (null when BF16)
     const int* tok;                   // tok[0] = bonus
     const glue::SampleRow* srow;
     int* tok_out;
     float* lp_out;
     float alpha;                      // the correction's coefficient (1: the trained selector, exactly)
 };
+__device__ __forceinline__ float cb_val(const __nv_bfloat16* bf, const uint8_t* q4, const __half* s4, int row, int i)
+{
+    if (bf) return __bfloat162float(bf[(size_t)row * SELR + i]);
+    const uint8_t b = q4[(size_t)row * (SELR / 2) + (i >> 1)];
+    const int nib = (i & 1) ? (b >> 4) : (b & 15);
+    return (float)(nib - 8) * __half2float(s4[(size_t)row * (SELR / 32) + (i >> 5)]);
+}
 __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
 {
     __shared__ float s_l[K][TOPK];
@@ -551,7 +564,7 @@ __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
             const int id = s_i[s][cc];
             float acc = 0.f;
             for (int i = l; i < SELR; i += 32)
-                acc += __bfloat162float(a.pred[(size_t)prev * SELR + i]) * hp[i] * __bfloat162float(a.succ[(size_t)id * SELR + i]);
+                acc += cb_val(a.pred, a.pred_q4, a.pred_s4, prev, i) * hp[i] * cb_val(a.succ, a.succ_q4, a.succ_s4, id, i);
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
             if (l == 0) s_sc[cc] = s_l[s][cc] + a.alpha * acc;
@@ -620,7 +633,7 @@ __global__ void __launch_bounds__(256) k_walk_dedup(WalkArgs a)
             const int id = s_i[s][cc];
             float acc = 0.f;
             for (int i = l; i < SELR; i += 32)
-                acc += __bfloat162float(a.pred[(size_t)prev * SELR + i]) * hp[i] * __bfloat162float(a.succ[(size_t)id * SELR + i]);
+                acc += cb_val(a.pred, a.pred_q4, a.pred_s4, prev, i) * hp[i] * cb_val(a.succ, a.succ_q4, a.succ_s4, id, i);
             #pragma unroll
             for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
             if (l == 0) s_sc[cc] = s_l[s][cc] + a.alpha * acc;
@@ -758,6 +771,8 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
     D.mask_id = meta.mask_id; D.theta = meta.theta; D.eps = meta.eps;
     for (int i = 0; i < NT; ++i) D.tlayer[i] = meta.tl[i];
     D.emb = main.emb;
+    D.emb_i8 = main.emb_i8;
+    D.emb_scale = main.emb_scale;
     D.tickets = dmalloc<unsigned>(NC);
     D.cell = dmalloc<int>(C_N);
     D.tok = dmalloc<int>(B);
@@ -821,15 +836,35 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
     D.tok_out = dmalloc<int>(B);
     D.lp = dmalloc<float>(B);
     D.topp_miss = dmalloc<unsigned>(1);
-    // GEMV bindings: the codec follows the record (528 B groups = MXFP8 with fp16 fragments, 512 B = BF16 with BF16 fragments)
+    // GEMV bindings: the codec follows the record (288 B = INT4 g32, 528 B = MXFP8, 512 B = BF16)
     auto gv = [&](const std::string& name, int tpc, int ks, const u32* xf, const u32* xb, void* y, int odt, int K_, int O_, bind::Gv& g) {
         const TensorRef t = find(name);
         if (!t.p) die("dflash pack has no " + name);
-        if (t.nd != 3 || (t.shape[2] != 528 && t.shape[2] != 512)) die("dflash pack: " + name + " is not a GEMV record");
-        const int codec = t.shape[2] == 528 ? bind::MXFP8 : bind::BF16W;
+        if (t.nd != 3 || (t.shape[2] != 288 && t.shape[2] != 528 && t.shape[2] != 512)) die("dflash pack: " + name + " is not a GEMV record");
+        const int codec = t.shape[2] == 288 ? bind::INT4 : t.shape[2] == 528 ? bind::MXFP8 : bind::BF16W;
         if (const char* e = bind::make_gv(as_bind(t), codec, tpc, ks, B, codec == bind::BF16W ? xb : xf, y, odt, g)) die(name + ": " + e);
         if (g.K != K_ || g.O != O_) die("dflash pack: " + name + " is [" + std::to_string(g.O) + "][" + std::to_string(g.K) + "], want [" +
                                         std::to_string(O_) + "][" + std::to_string(K_) + "]");
+#if DEC_I4PAIR
+        if (codec == bind::INT4)
+        {
+            static std::mutex i4_mu;
+            static std::unordered_map<const void*, int> i4_packed;
+            const int tiles = g.O / 16, ng = g.K / 32;
+            if ((size_t)(ng / g.ks) * head_i4::I4GR > 48 * 1024)
+                die("dflash pack: " + name + " k-part exceeds k_i4pair shared memory");
+            std::lock_guard<std::mutex> lk(i4_mu);
+            const auto it = i4_packed.find(t.p);
+            if (it == i4_packed.end())
+            {
+                launch_i4pair(const_cast<void*>(t.p), tiles, ng, g.ks, st);
+                G6RT_CK(cudaGetLastError());
+                i4_packed[t.p] = g.ks;
+            }
+            else if (it->second != g.ks)
+                die("dflash pack: " + name + " shared INT4 tensor bound with conflicting ks");
+        }
+#endif
     };
     auto vec = [&](const std::string& name, long long n) {
         const TensorRef t = find(name);
@@ -880,8 +915,25 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
     if (sel)
     {
         gv("D.sel.hproj.gv", 1, 32, D.xf_x, D.xb_x, D.hp, gv::O_F32, HID, SELR, D.hproj);
-        D.pred = vec("D.sel.pred", (long long)glue::VOCAB * SELR);
-        D.succ = vec("D.sel.succ", (long long)glue::VOCAB * SELR);
+        if (find("D.sel.pred").p)
+        {
+            D.pred = vec("D.sel.pred", (long long)glue::VOCAB * SELR);
+            D.succ = vec("D.sel.succ", (long long)glue::VOCAB * SELR);
+        }
+        else
+        {
+            auto cb = [&](const std::string& base, const uint8_t*& q4, const __half*& s4) {
+                const TensorRef qt = find(base + ".q4"), stt = find(base + ".s4");
+                if (!qt.p || qt.nd != 2 || qt.shape[0] != glue::VOCAB || qt.shape[1] != SELR / 2)
+                    die("dflash pack has no valid " + base + ".q4");
+                if (!stt.p || stt.nd != 2 || stt.shape[0] != glue::VOCAB || stt.shape[1] != SELR / 32)
+                    die("dflash pack has no valid " + base + ".s4");
+                q4 = static_cast<const uint8_t*>(qt.p);
+                s4 = static_cast<const __half*>(stt.p);
+            };
+            cb("D.sel.pred", D.pred_q4, D.pred_s4);
+            cb("D.sel.succ", D.succ_q4, D.succ_s4);
+        }
     }
     // the target's lm_head on the drafter's final-norm rows (no MTP eh_proj)
     bind::HeadTensors ht = main.head_t;
@@ -915,9 +967,10 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
         gvb(y.kvc); gvb(y.ac); gvb(y.q); gvb(y.o); gvb(y.mc); gvb(y.gu); gvb(y.down);
         if constexpr (REP) for (int v = 0; v < KS; ++v) { gvb(y.ok[v]); gvb(y.dk[v]); }
     }
-    fprintf(stderr, "# rank %d: dflash drafter %s%s, records %.3f GB, ring %.1f MB, prompt taps %.1f MB, %s\n", D.rank,
+    fprintf(stderr, "# rank %d: dflash drafter %s%s, records %.3f GB, ring %.1f MB, prompt taps %.1f MB, %s%s\n", D.rank,
             sel ? "DFlash2 selector" : "argmax", REP ? " (replicated body)" : "", wb / 1e9, 2.0 * L * NKR * RING * HD * 2 / 1e6, pf ? (double)WIN * NT * HID * 2 / 1e6 : 0.0,
-            D.fc.codec == bind::MXFP8 ? "MXFP8" : "BF16");
+            D.fc.codec == bind::INT4 ? "INT4" : D.fc.codec == bind::MXFP8 ? "MXFP8" : "BF16",
+            D.pred_q4 ? " + INT4 codebooks" : "");
     if (D.dedup)
         fprintf(stderr, "# rank %d: GR8_DFL_DEDUP: fused kv2 (M=%d), conv/silu xfrag, in-place k_walk\n", D.rank, 2 * B);
 }
@@ -1147,7 +1200,7 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
     {
         dfl_ctx_store(D, 0, st, D.dedup && query);
         if (!query) return;
-        glue::k_embed_norm<<<dim3(glue::RN_CL, B), glue::RN_T, 0, st>>>(glue::EmbedArgs{D.emb_rows ? D.emb_rows : D.tok, D.emb, D.ly[0].in_norm, D.resid, D.x, D.eps});
+        glue::k_embed_norm<<<dim3(glue::RN_CL, B), glue::RN_T, 0, st>>>(glue::EmbedArgs{D.emb_rows ? D.emb_rows : D.tok, D.emb, D.ly[0].in_norm, D.resid, D.x, D.eps, D.emb_i8, D.emb_scale});
         dfl_attn(D, 0, st);
         return;
     }
@@ -1183,7 +1236,8 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
     // p == NC: the merge (gr8's head merge in argmax mode, the walk in selector mode), StepOut
     if (D.sel)
     {
-        const dflk::WalkArgs wa{D.f, D.stepp, NC - 1, D.hp, D.pred, D.succ, D.tok, D.srow, D.tok_out, D.lp, D.sel_alpha};
+        const dflk::WalkArgs wa{D.f, D.stepp, NC - 1, D.hp, D.pred, D.succ, D.pred_q4, D.succ_q4, D.pred_s4, D.succ_s4,
+                                D.tok, D.srow, D.tok_out, D.lp, D.sel_alpha};
         if (D.dedup) dflk::k_walk_dedup<<<1, 256, 0, st>>>(wa);
         else dflk::k_walk<<<1, 256, 0, st>>>(wa);
     }

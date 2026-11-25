@@ -409,6 +409,7 @@ void g6s2_batch_fresh_spec(g6s2_batch* b, bool on);
 int32_t g6s2_batch_waterfill(g6s2_batch* b, bool on, double margin, bool shared_only);
 void g6s2_batch_waterfill_lp(const g6s2_batch* b, float* out); // 32 x 8 log-probabilities
 void g6s2_batch_dflash(g6s2_batch* b, int32_t kv, const g6s2_spec_len* sl);
+void g6s2_batch_dfl_verify_cap(g6s2_batch* b, double cap);
 void g6s2_batch_dsel(g6s2_batch* b, const g6s2_dsel* d);
 void g6s2_batch_kstop(g6s2_batch* b, const g6s2_kstop* k);
 void g6s2_batch_dfl_reuse(g6s2_batch* b, int32_t mode, int32_t min);

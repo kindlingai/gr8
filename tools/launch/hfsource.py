@@ -403,19 +403,20 @@ class Release:
 
 
 class Drafter:
-    """The DFlash2 drafter at one commit, and this box's converted rank at TP=4 or TP=6 (the replicated layout: every
-    rank's pack holds the whole drafter, tools/convert/dflash2.py):
+    """The DFlash2 drafter at one commit, and this box's converted rank at TP=4, TP=2, TP=1 or TP=6 (the replicated
+    layout: every rank's pack holds the whole drafter, tools/convert/dflash2.py):
 
         <cache>/hf/<org>--<repo>/<commit>/config.json, model.safetensors
-        <cache>/hf/<org>--<repo>/<commit>/tp<TP>/dflash.r<r>.{manifest.json,pack}, rank<r>.COMPLETE (written last)
+        <cache>/hf/<org>--<repo>/<commit>/tp<TP>[-int4]/dflash.r<r>.{manifest.json,pack}, rank<r>.COMPLETE (written last)
     """
 
-    def __init__(self, cache, repo, rev, refresh=False, log=print, tp=4):
+    def __init__(self, cache, repo, rev, refresh=False, log=print, tp=4, int4=False):
         self.repo = Repo(cache, repo, rev, refresh, log)
         self.log = log
         self.tp = tp
+        self.int4 = bool(int4)
         self.dir = os.path.join(self.repo.root, self.repo.commit)
-        self.out = os.path.join(self.dir, f'tp{tp}')
+        self.out = os.path.join(self.dir, f'tp{tp}-int4' if self.int4 else f'tp{tp}')
 
     @property
     def commit(self):
@@ -439,6 +440,8 @@ class Drafter:
                 c = json.load(f)
         except (OSError, ValueError):
             return [f'the drafter {self} is not converted for rank {rank} yet']
+        if bool(c.get('int4', False)) != self.int4:
+            return [f'the drafter {self} for rank {rank} was converted with a different quantization mode']
         return [f'{p}: missing or not {n} bytes' for p, n in sorted(c['files'].items())
                 if not os.path.isfile(os.path.join(self.out, p)) or os.path.getsize(os.path.join(self.out, p)) != n]
 
@@ -452,18 +455,21 @@ class Drafter:
             if n not in t:
                 raise modelset.ModelError(f'the drafter {self} has no {n}')
             self.repo.fetch(n, os.path.join(self.dir, n), meter)
-        convert_drafter(convert, self.dir, self.out, self.tp, rank, self.id, self.log, str(self), scratch=self.dir)
+        convert_drafter(convert, self.dir, self.out, self.tp, rank, self.id, self.log, str(self), scratch=self.dir,
+                        int4=self.int4)
 
 
-def convert_drafter(convert, src, out, tp, rank, ident, log, label, scratch):
+def convert_drafter(convert, src, out, tp, rank, ident, log, label, scratch, int4=False):
     """Convert one rank of the drafter in src (config.json, model.safetensors) into out, through a temporary directory
     in scratch (on out's filesystem), check the pack's size, then write rank<r>.COMPLETE. src is only read (it may be
     read-only), and out is made only once the conversion succeeded."""
     tmp = os.path.join(scratch, f'tmp.rank{rank}.{os.getpid()}')
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp)
-    log(f'converting the drafter {label} for rank {rank} of TP={tp}')
-    r = subprocess.run(convert + ['--src', src, '--out', tmp, '--nr', str(tp), '--ranks', str(rank)], cwd=REPO,
+    extra = ['--int4', 'body', '--int4-codebooks', '1'] if int4 else []
+    mode = ' (native INT4)' if int4 else ''
+    log(f'converting the drafter {label} for rank {rank} of TP={tp}{mode}')
+    r = subprocess.run(convert + ['--src', src, '--out', tmp, '--nr', str(tp), '--ranks', str(rank), *extra], cwd=REPO,
                        capture_output=True, text=True)
     names = [f'dflash.r{rank}.manifest.json', f'dflash.r{rank}.pack']
     if r.returncode or not all(os.path.isfile(os.path.join(tmp, n)) for n in names):
@@ -482,7 +488,10 @@ def convert_drafter(convert, src, out, tp, rank, ident, log, label, scratch):
         os.replace(os.path.join(tmp, n), os.path.join(out, n))
     shutil.rmtree(tmp, ignore_errors=True)
     m = os.path.join(out, f'rank{rank}.COMPLETE')
+    meta = {'drafter': ident, 'rank': rank, 'files': files}
+    if int4:
+        meta['int4'] = True
     with open(m + '.tmp', 'w') as f:
-        json.dump({'drafter': ident, 'rank': rank, 'files': files}, f, indent=1, sort_keys=True)
+        json.dump(meta, f, indent=1, sort_keys=True)
     os.replace(m + '.tmp', m)
     log(f'the drafter {label} is converted for rank {rank} in {out}')

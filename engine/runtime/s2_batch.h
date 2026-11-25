@@ -666,6 +666,10 @@ public:
         const g6s2_spec_len c = to_c(sl);
         g6s2_batch_dflash(b(), kv, &c);
     }
+    void dfl_verify_cap(double cap)
+    {
+        g6s2_batch_dfl_verify_cap(b(), cap);
+    }
     void dsel(const DSel& d)
     {
         const Api api_(this, "dsel", d);

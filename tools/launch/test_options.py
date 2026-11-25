@@ -173,7 +173,7 @@ class ValidateTests(unittest.TestCase):
         o_qw = opt.parse(['--no-config', '--peers', '10.0.0.1', '--kv-store', 'mem:,size=2G'], {'GR8_MODEL': 'qw38'})
         opt.validate(o_qw)
         self.check(['--peers', '10.0.0.1', '--flash-cache', 'aligned'], 'glm53f only', {'GR8_MODEL': 'qw38'})
-        self.check(['--peers', PEERS, '--tp', '7'], 'want 4, 6, 3 or 5')
+        self.check(['--peers', PEERS, '--tp', '7'], 'want 4, 6, 3, 5 or 2')
         self.check(['--peers', PEERS, '--tp', '6'], 'names 4 boxes for --tp 6')
         self.check(['--mentat', 'localhost'], '--tp is needed')
         self.check(['--peers', PEERS], 'PLAIN=1', {'PLAIN': '1'})
@@ -805,6 +805,55 @@ class CanonicalTests(unittest.TestCase):
             self.assertFalse(any(a.startswith('GR8_DFL_DEDUP=') for a in e_wide))
             self.assertIn('GR8_MOE_UNION_CAP=32', env(peers, '--moe-union-cap', '32'))
             self.assertFalse(any(a.startswith('GR8_MOE_UNION_CAP=') for a in env(peers, '--moe-union-cap', '0')))
+
+    def test_tp2_defaults_and_int4_kv(self):
+        peers2 = '10.0.0.1,10.0.0.2'
+        o = opt.parse(['--no-config', '--peers', peers2], GLM)
+        opt.validate(o)
+        plan = opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')
+        self.assertEqual(o.get('KV_FORMAT'), 'int4')
+        self.assertEqual(plan['knobs']['KV_FORMAT'], 'int4')
+        self.assertIn('--kv-format', plan['args'])
+        self.assertIn('--cap', plan['args'])
+        self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '98304')
+        self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '4')
+        self.assertEqual(plan['args'][plan['args'].index('--mtp') + 1], '1')
+        self.assertEqual(plan['args'][plan['args'].index('--prefill') + 1], '1024')
+        self.assertEqual(plan['args'][plan['args'].index('--pf-lanes') + 1], '1')
+        self.assertIn('--spec-adaptive', plan['args'])
+        self.assertIn('--reuse-prefix', plan['args'])
+        for v in ('GR8_PF_OWN=1', 'GR8_PF_STREAMS=1', 'GR8_PF_DENSE=1024', 'GR8_PF_ATTN_ROWS=256',
+                  'GR8_PF_BLAS_ROWS=512', 'GR8_S2_DECODE_PF=1024', 'GR8_CP_R=4096',
+                  'GR8_MEM_MIN=2', 'GR8_V2_SHARED=trellis', 'GR8_KV_SHARE_PAGES=1', 'GR8_DFL_DEDUP=1',
+                  'GR8_SPEC_K0=1', 'GR8_DFL_VERIFY_CAP=0.35', 'GR8_MOE_UNION_CAP=48', 'GR8_REUSE_GRID=64'):
+            self.assertIn(v, plan['env'])
+        # Explicit GR8_MEM_MIN (or legacy G6_MEM_MIN) in EXTRA_ENV overrides the TP=2 2 GiB default
+        for override in ('GR8_MEM_MIN=1.5', 'G6_MEM_MIN=1.5'):
+            o_mem = opt.parse(['--no-config', '--peers', peers2, '--extra-env', override], GLM)
+            opt.validate(o_mem)
+            e_mem = opt.engine_plan(o_mem, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env']
+            self.assertEqual([a for a in e_mem if a.startswith('GR8_MEM_MIN=')], ['GR8_MEM_MIN=1.5'])
+        # Explicit --cap 131072 override still works for tight 128K
+        o_128k = opt.parse(['--no-config', '--peers', peers2, '--cap', '131072'], GLM)
+        opt.validate(o_128k)
+        plan_128k = opt.engine_plan(o_128k, rank=0, rank_dir='/r', aux_dir='/a', home='/h')
+        self.assertEqual(plan_128k['args'][plan_128k['args'].index('--cap') + 1], '131072')
+        # Duplicate INT4 head copies stay off at TP=2 to save ~0.68 GB/rank
+        for k in ('GR8_DRAFT_HEAD_I4=', 'GR8_DRAFT_HEAD2=', 'GR8_DFL_HEAD_I4='):
+            self.assertFalse(any(a.startswith(k) for a in plan['env']))
+        # DFLASH=0 turns off DFL_DEDUP, SPEC_K0 and DFL_VERIFY_CAP
+        o_nodfl = opt.parse(['--no-config', '--peers', peers2, '--dflash', '0'], GLM)
+        opt.validate(o_nodfl)
+        e_nodfl = opt.engine_plan(o_nodfl, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env']
+        for k in ('GR8_DFL_DEDUP=', 'GR8_SPEC_K0=', 'GR8_DFL_VERIFY_CAP='):
+            self.assertFalse(any(a.startswith(k) for a in e_nodfl))
+        # FP8 KV fallback sizes CAP to 94,208 (768 fp8 pages/rank at SHARE_LIMIT=4096)
+        o_fp8 = opt.parse(['--no-config', '--peers', peers2, '--kv-format', 'fp8'], GLM)
+        opt.validate(o_fp8)
+        plan_fp8 = opt.engine_plan(o_fp8, rank=0, rank_dir='/r', aux_dir='/a', home='/h')
+        self.assertEqual(plan_fp8['knobs']['KV_FORMAT'], 'fp8')
+        self.assertNotIn('--kv-format', plan_fp8['args'])
+        self.assertEqual(plan_fp8['args'][plan_fp8['args'].index('--cap') + 1], '94208')
 
     def test_ptab_off_unless_set(self):
         # PTAB (EL3 #151): unset = no GR8_PTAB in the engine environment (the pack layout); set = passed through, as a

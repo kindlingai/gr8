@@ -281,25 +281,33 @@ def resolve_model(o, refresh=False, log=log):
 
 
 def drafter_of(o, ms, refresh, log):
-    """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At TP=4, TP=2 and TP=1 with no drafter
-    (no --drafter, no DFLASH_DIR), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused. TP=6 (the
-    drafter's body replicated on every rank) the same, except that DFLASH defaults to 0 there: --dflash 1 turns it on."""
+    """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At GLM-5.3 TP=2 with a local
+    MODEL_CACHE (and FETCH != model-loader), the public DFlash2 repo is fetched and converted locally into native INT4
+    (--int4 body --int4-codebooks 1) automatically unless --dflash 0 or --dflash-dir is given. Elsewhere at TP=4, TP=2
+    and TP=1 with no drafter (no --drafter, no DFLASH_DIR), DFLASH defaults to 0 with a notice, and an explicit
+    --dflash 1 is refused. TP=6 (the drafter's body replicated on every rank) the same, except that DFLASH defaults to
+    0 there: --dflash 1 turns it on."""
     if o.get('TP') not in ('4', '6', '2', '1') or not models.of(o).drafter:
         return None
     if o.get('TP') == '6' and o.get('DFLASH') != '1':
         if o.get('DRAFTER'):
             log('--drafter at TP=6 is used with --dflash 1 only: MTP only')
         return None
-    if o.get('DRAFTER'):
+    int4 = models.of(o) is models.GLM53 and o.get('TP') == '2'
+    drafter_url = o.get('DRAFTER')
+    if (not drafter_url and int4 and o.get('DFLASH') != '0' and not o.get('DFLASH_DIR')
+            and o.get('MODEL_CACHE') and o.get('FETCH') != 'model-loader'):
+        drafter_url = models.of(o).drafter_url
+    if drafter_url:
         if not o.get('MODEL_CACHE'):
             raise modelset.ModelError('--drafter needs --model-cache <local dir>: each box converts its rank there')
         if o.get('DFLASH') == '0':
             return None
         if o.get('FETCH') == 'model-loader':
-            d = mlsource.drafter_of(o, *hfsource.parse_url(o.get('DRAFTER')), log=log)
+            d = mlsource.drafter_of(o, *hfsource.parse_url(drafter_url), log=log, int4=int4, url=drafter_url)
         else:
-            d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh,
-                                 log=log, tp=int(o.get('TP')))
+            d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(drafter_url), refresh=refresh,
+                                 log=log, tp=int(o.get('TP')), int4=int4)
         o.values['DFLASH_DIR'] = d.out
         return d
     if o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):

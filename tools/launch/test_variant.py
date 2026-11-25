@@ -50,8 +50,8 @@ class ResolveTests(unittest.TestCase):
     def test_the_defaults_by_tp(self):
         for name in ('bit225', 'bit325'):
             manifest(os.path.join(self.v2, 'manifests', f'exlr8-manifest-{name}.json'), name, 3)
-        self.assertEqual([M.resolve_variant(None, self.v2, [], tp).name for tp in (3, 4, 5, 6)],
-                         ['bit225', 'bit325', 'bit325', 'bit325'])          # a release without bit260 boots bit225
+        self.assertEqual([M.resolve_variant(None, self.v2, [], tp).name for tp in (2, 3, 4, 5, 6)],
+                         ['bit225', 'bit225', 'bit325', 'bit325', 'bit325'])          # TP=2 defaults to bit225; TP=3 falls back when bit260 absent
         manifest(os.path.join(self.v2, 'manifests', 'exlr8-manifest-bit260.json'), 'bit260', 3)
         self.assertEqual(M.resolve_variant(None, self.v2, [], 3).name, 'bit260')
         self.assertEqual(M.resolve_variant('bit400', self.v2, [], 4).name, 'bit400')  # a name given wins

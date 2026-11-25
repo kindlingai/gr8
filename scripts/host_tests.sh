@@ -222,7 +222,7 @@ run_job batch_k0_test '
   g++ -std=c++17 -O1 -g -fsanitize=address,undefined -D_GLIBCXX_ASSERTIONS -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_k0_test.cpp" -o "$D/batch_k0_test" "${KNOBS[@]}"
   "$D/batch_k0_test" > /dev/null
 '
-for t in batch_dflash_test batch_dsel_test batch_dflreuse_test batch_insert_test batch_kstop_test batch_draftpar_test batch_dselmodel_test batch_kstop_mtp_test scheduler_fair_test scheduler_r_test scheduler_horizon_test; do
+for t in batch_dflash_test batch_dfl_verify_cap_test batch_dsel_test batch_dflreuse_test batch_insert_test batch_kstop_test batch_draftpar_test batch_dselmodel_test batch_kstop_mtp_test scheduler_fair_test scheduler_r_test scheduler_horizon_test; do
   run_job "$t" "
     g++ -std=c++17 -O2 -Wall -I \"\$REPO/engine/runtime\" \"\$REPO/engine/runtime/s2/tests/$t.cpp\" -o \"\$D/$t\" \"\${KNOBS[@]}\"
     \"\$D/$t\"

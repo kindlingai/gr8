@@ -4,7 +4,7 @@
 # GR8_MODEL picks the model: glm53 (unset), glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2), ds41, DeepSeek-V4.1-Flash-1017
 # (bin/g6m4_ds41, TP 4; docs/DEEPSEEK.md), ink2, Inkling-2-Small (bin/g6m4_ink2, TP 6 or 4), or pseudo, the pseudo engine (bin/g6pseudo, frontend/pseudo-engine).
 #
-#   engine_defaults          needs TP (4, 6, 3 or 5); sets every knob that is unset to its default for this TP. An unset CAP
+#   engine_defaults          needs TP (4, 6, 3, 5 or 2); sets every knob that is unset to its default for this TP. An unset CAP
 #                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
 #   engine_env               sets ENGINE_ENV, the engine environment for every rank (K=V words), and ENGINE_BIN, the
 #                            engine under bin/ for KV_FORMAT (g6m4, or g6m4-int4 for int4)
@@ -36,6 +36,7 @@ share_cap() {
 # the model's estimates.
 int4_pages() {
   case $TP:$1 in
+    2:768) echo 800 ;;     # 800 int4 pages/rank = 98,304 CAP (96K) at SHARE_LIMIT=4096 (~1.85 GiB KV/rank, ~1.1 GiB live headroom; --cap 131072 fits tightly)
     4:2280) echo 2390 ;;   # measured against fp8 at 1,920 pages, and not re-measured since the drafter's prefill shares
                            # the target's scratch: int4 keeps the memory of 1,981 fp8 pages
     3:1941) echo 2480 ;;
@@ -429,7 +430,41 @@ engine_defaults() {
        tp4_default DEC_DENSE_OPT 1; tp4_default DTR_EXACT_OPT 1; tp4_default MOE_RTR_FIN_OPT 1
        tp4_default TR3_WIDE4 1; tp4_default PF_ATTN_OPT 1; tp4_default PF_DENSE_OPT 1; tp4_default PF_ISGRT_CLEAN 1
        tp4_default MOE_UNION_CAP 48 ;;
-    *) echo "engine_defaults: TP=$TP; want 4, 6, 3 or 5" >&2; return 2 ;;
+    2) SHARE_LIMIT=${SHARE_LIMIT:-4096}; _base_p=768; CAP=${CAP:-$(pool_cap 768)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=${SESS:-4}; S2PORT=${S2PORT:-7341}
+       DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1}
+       [ -z "${V2_DENSE:-}" ] || KVB=${KVB:-fp8}
+       case " ${EXTRA_ENV:-} " in *" GR8_TR3_W2ALL="*) ;; *) TR3_W2ALL=${TR3_W2ALL:-1} ;; esac
+       # TP=2 omits duplicate INT4 head copies (DRAFT_HEAD_I4, DRAFT_HEAD2, DFL_HEAD_I4) to save ~0.68 GB/rank;
+       # native INT4 DFlash2 packs (--int4 body --int4-codebooks 1) keep the drafter in INT4 (~714 MiB/rank).
+       tp4_default ROUTE_OVL 1
+       tp4_default ATTN_SC2 4; tp4_default ATTN_SC2_TR 2; tp4_default ATTN_CTX2 4; tp4_default ATTN_CTX3 2
+       tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
+       tp4_default IDX_VEC 1; tp4_default DEC_BK 2048; tp4_default DEC_BK_MAX 2048; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
+       tp4_default S2_DECODE_PF 1024; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248
+       tp4_default DEC_DENSE_OPT 1; tp4_default DTR_EXACT_OPT 1; tp4_default MOE_RTR_FIN_OPT 1
+       tp4_default TR3_WIDE4 1; tp4_default PF_ATTN_OPT 1; tp4_default PF_DENSE_OPT 1
+       tp4_default PF_ISGRT_CLEAN 1
+       if [ "${DFLASH:-0}" != 0 ]; then
+         tp4_default DFL_DEDUP 1; tp4_default DFL_REUSE_MIN 0
+         [ "${SPEC_ADAPT:-0}" = 0 ] || tp4_default SPEC_K0 1
+       fi
+       tp4_default L2PF 31; tp4_default PF_GEMMF32 1
+       [ "$MTP" = 0 ] || { tp4_default MTP_L2PF 3; tp4_default MTP_LASTROW 1; }
+       tp4_default MOE_UNION_CAP 48
+       if [ "${KV_FORMAT:-fp8}" = int4 ]; then
+         tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
+         case " ${EXTRA_ENV:-} " in *" GR8_ATTN_FLIP=1 "*) ;; *) tp4_default CP_ONECHAIN 1 ;; esac
+         if [ "${KVB:-bf16}" != fp8 ]; then
+           case " ${EXTRA_ENV:-} " in *" GR8_KVB=fp8 "*) ;; *) tp4_default KV4_FOLD 1 ;; esac
+         fi
+         local _fold_eff=${KV4_FOLD:-0}
+         case " ${EXTRA_ENV:-} " in *" GR8_KV4_FOLD=1 "*) _fold_eff=1 ;; *" GR8_KV4_FOLD=0 "*) _fold_eff=0 ;; esac
+         if [ "$_fold_eff" = 1 ]; then tp4_default KV4_TC 1; fi
+         if [ "$REUSE" = 1 ]; then
+           case " ${EXTRA_ENV:-} " in *" GR8_REUSE_ALIGN=0 "*|*" G6_REUSE_ALIGN=0 "*) ;; *) tp4_default REUSE_GRID 64 ;; esac
+         fi
+       fi ;;
+    *) echo "engine_defaults: TP=$TP; want 4, 6, 3, 5 or 2" >&2; return 2 ;;
   esac
   if [ -z "$_cap_set" ] && [ "$_base_p" -gt 0 ] && [ "${DISPRAM:-0}" = 1 ] && [[ ${DISPRAM_BYTES:-0} =~ ^[0-9]+$ ]] && [ "${DISPRAM_BYTES:-0}" -gt 0 ]; then
     local _p=$_base_p _base_cap _added _row=656 _analytical
@@ -535,10 +570,22 @@ engine_env() {
   [ "$_engine_profile" = qw38 ] && { qw38_env; return 0; }
   [ "$_engine_profile" = pseudo ] && { ENGINE_BIN=$_engine_binary; ENGINE_ENV=""; return 0; }
   ENGINE_BIN=$_engine_binary; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=$_engine_binary-int4
-  ENGINE_ENV="GR8_PF_TILE=64 GR8_PF_DENSE=8192 GR8_PF_RS=1 GR8_PF_STREAMS=2 GR8_PF_ATTN_ROWS=${PF_ATTN_ROWS:-1024} GR8_PF_OWN=$PF_OWN \
-GR8_PF_BLAS_ROWS=1024 GR8_PF_HASH_GPU=1 GR8_PF_RSDIRECT=1 GR8_DEC_SPLIT=3 GR8_DEC_SHARED_SCRATCH=1 \
+  local _pf_dense=8192 _pf_streams=2 _pf_attn=1024 _pf_blas=1024
+  if [ "$TP" = 2 ]; then _pf_dense=1024; _pf_streams=1; _pf_attn=256; _pf_blas=512; fi
+  ENGINE_ENV="GR8_PF_TILE=64 GR8_PF_DENSE=$_pf_dense GR8_PF_RS=1 GR8_PF_STREAMS=$_pf_streams GR8_PF_ATTN_ROWS=${PF_ATTN_ROWS:-$_pf_attn} GR8_PF_OWN=$PF_OWN \
+GR8_PF_BLAS_ROWS=$_pf_blas GR8_PF_HASH_GPU=1 GR8_PF_RSDIRECT=1 GR8_DEC_SPLIT=3 GR8_DEC_SHARED_SCRATCH=1 \
 GR8_CP=1 GR8_CP_R=$SHARE_LIMIT${SHARE_LIMIT_BUSY:+ GR8_CP_R2=$SHARE_LIMIT_BUSY}${SHARE_BIG:+ GR8_CP_R2_BIG=$SHARE_BIG} \
 GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
+  if [ "$TP" = 2 ]; then
+    case " ${EXTRA_ENV:-} " in *" GR8_MEM_MIN="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_MEM_MIN=2" ;; esac
+    case " ${EXTRA_ENV:-} " in *" GR8_V2_SHARED="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_V2_SHARED=trellis" ;; esac
+    if [ "${REUSE:-0}" = 1 ]; then
+      case " ${EXTRA_ENV:-} " in *" GR8_KV_SHARE_PAGES="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_KV_SHARE_PAGES=1" ;; esac
+    fi
+    if [ "${DFLASH:-0}" = 1 ] && [ "${SPEC_ADAPT:-0}" = 1 ]; then
+      case " ${EXTRA_ENV:-} " in *" GR8_DFL_VERIFY_CAP="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_DFL_VERIFY_CAP=0.35" ;; esac
+    fi
+  fi
   if [ "$TP" = 4 ] && [ "$PF_OWN" = 4 ]; then
     ENGINE_ENV="$ENGINE_ENV GR8_PF_QP_ROLL=${QP_ROLL:-2} GR8_PF_QP_CTX=${QP_CTX:-$CAP} GR8_PF_QP_EARLY=${QP_EARLY:-1}"
   fi
@@ -666,6 +713,7 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   ENGINE_ENV="$ENGINE_ENV${PF_DENSE_OPT:+ GR8_PF_DENSE_OPT=$PF_DENSE_OPT}"
   ENGINE_ENV="$ENGINE_ENV${PF_ISGRT_CLEAN:+ GR8_PF_ISGRT_CLEAN=$PF_ISGRT_CLEAN}"
   ENGINE_ENV="$ENGINE_ENV${DFL_DEDUP:+ GR8_DFL_DEDUP=$DFL_DEDUP}"
+  ENGINE_ENV="$ENGINE_ENV${SPEC_K0:+ GR8_SPEC_K0=$SPEC_K0}"
   # batch-budgeted MoE union cap (#548; docs/ENV.md): 0 leaves the engine uncapped; TP=4 defaults to 48
   [ "${MOE_UNION_CAP:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_MOE_UNION_CAP=$MOE_UNION_CAP"
   ENGINE_ENV="$ENGINE_ENV${MOE_UNION_MODE:+ GR8_MOE_UNION_MODE=$MOE_UNION_MODE}"
@@ -783,7 +831,9 @@ engine_args() {
     (set -f; echo $a)
     return
   fi
-  a="$a $src --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill 4096 --pf-lanes 2 --pfv2 \
+  local _pf_w=4096 _pf_lanes=2
+  [ "$TP" = 2 ] && { _pf_w=1024; _pf_lanes=1; }
+  a="$a $src --top-p-cands 256 --chunk 8 --temp 0.7 --cap $CAP --graph --wide --prefill $_pf_w --pf-lanes $_pf_lanes --pfv2 \
 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
   [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
   [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"

@@ -152,7 +152,7 @@ impl SpecLen {
 
     /// the allowed level <= n with the most expected tokens per ms (ties: fewer drafts); aborts with none, as the C++
     pub fn choose(&self, lp: Option<&[f32]>, n: i32, drafted: i32, e_out: Option<&mut f64>) -> i32 {
-        let (mut best, mut br, mut be) = (0, -1.0, 1.0);
+        let (mut best, mut br, mut be) = (-1, -1.0, 1.0);
         for &k in self.levels() {
             if k > n {
                 break;
@@ -165,7 +165,7 @@ impl SpecLen {
                 be = e;
             }
         }
-        if best == 0 {
+        if best < 0 {
             eprintln!("g6: spec_len: {n} drafts, below every level");
             std::process::abort();
         }
@@ -249,6 +249,17 @@ impl SpecLen {
         self.levels = [0; LEVELS_MAX];
         self.levels[..l.len()].copy_from_slice(&l);
         !l.is_empty()
+    }
+
+    /// prepends k = 0 (plain 1-row decode) to the allowed levels when not already present (GR8_SPEC_K0=1)
+    pub fn allow_k0(&mut self) {
+        if self.n_levels < LEVELS_MAX && (self.n_levels == 0 || self.levels[0] != 0) {
+            for i in (0..self.n_levels).rev() {
+                self.levels[i + 1] = self.levels[i];
+            }
+            self.levels[0] = 0;
+            self.n_levels += 1;
+        }
     }
 
     /// a new estimate with this one's settings (policy, costs, seeds, decays, prior) and no rounds

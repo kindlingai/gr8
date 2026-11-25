@@ -5944,11 +5944,18 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if ((e = make_gemm(T.t[T_Q_B],      T.s[T_Q_B],      M, sc.x8_small, io.q_b,                             0, L.q_b))) return e;
     if ((e = make_gemm(T.t[T_IDX_WQ_B], T.s[T_IDX_WQ_B], M, sc.x8_small, io.idx_q,                           0, L.idx_q))) return e;
     if ((e = make_gemm(T.t[T_O_PROJ],   T.s[T_O_PROJ],   M, sc.x8_small, io.attn_part,                       1, L.o_proj))) return e;
-    // a dense trellis o_proj without an FP8 copy (dtr_find.h): the GEMM decodes its tiles (bit-equal to the copy)
+    // a dense trellis matrix without an FP8 copy (dtr_find.h): the GEMM decodes its tiles (bit-equal to the copy)
     if (!L.o_proj.on && T.tm.o_proj.w && (e = make_gemm_tr(T.tm.o_proj, M, sc.x8_small, io.attn_part, 1, L.o_proj))) return e;
+    if (!L.q_b.on && T.tm.q_b.w && (e = make_gemm_tr(T.tm.q_b, M, sc.x8_small, io.q_b, 0, L.q_b))) return e;
     if ((e = make_gemm(T.t[GT],         T.s[GT],         M, sc.x8_big,   sc.g,                               0, L.gate))) return e;
     if ((e = make_gemm(T.t[UT],         T.s[UT],         M, sc.x8_big,   sc.u,                               0, L.up))) return e;
     if ((e = make_gemm(T.t[DT],         T.s[DT],         M, sc.x8_small, L.moe ? static_cast<void*>(sc.ysh) : static_cast<void*>(io.mlp_part), !L.moe, L.down))) return e;
+    if (!L.moe)
+    {
+        if (!L.gate.on && T.tm.gate.w && (e = make_gemm_tr(T.tm.gate, M, sc.x8_big, sc.g, 0, L.gate))) return e;
+        if (!L.up.on && T.tm.up.w && (e = make_gemm_tr(T.tm.up, M, sc.x8_big, sc.u, 0, L.up))) return e;
+        if (!L.down.on && T.tm.down.w && (e = make_gemm_tr(T.tm.down, M, sc.x8_small, io.mlp_part, 1, L.down))) return e;
+    }
 #if G6_MODEL_FLASH
     const bool dtr8 = knob::pf_dtr8();
     if ((!L.o_proj.on || !dtr8) && T.tm.o_proj.w && (e = make_gemm_tr(T.tm.o_proj, M, sc.x8_small, io.attn_part, 1, L.o_proj))) return e;

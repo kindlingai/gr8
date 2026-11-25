@@ -695,6 +695,11 @@ pub unsafe extern "C" fn g6s2_batch_dflash(b: *mut Planner, kv: i32, sl: *const 
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn g6s2_batch_dfl_verify_cap(b: *mut Planner, cap: f64) {
+    (*b).b.set_dfl_verify_cap(cap)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn g6s2_batch_dsel(b: *mut Planner, d: *const CDSel) {
     (*b).b.dsel((&*d).into())
 }

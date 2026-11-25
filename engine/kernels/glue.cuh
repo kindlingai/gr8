@@ -339,11 +339,13 @@ __device__ __forceinline__ void cluster_project_add_rms_store(
 struct EmbedArgs
 {
     const int* tok;               // [M] token ids, device memory (written by the previous step's sampler)
-    const __nv_bfloat16* emb;     // [VOCAB][6144]
+    const __nv_bfloat16* emb;     // [VOCAB][6144] (BF16, or nullptr when emb_i8 is used)
     const __nv_bfloat16* w;       // [6144] layer-0 input_layernorm weight
     float* resid;                 // [M][6144]
     __half* out;                  // [M][6144]
     float eps;
+    const int8_t* emb_i8 = nullptr;   // [VOCAB][6144] symmetric per-row INT8 embedding (TP=2)
+    const float* emb_scale = nullptr; // [VOCAB] per-row scale
 };
 
 // grid (RN_CL, M), block RN_T
@@ -351,9 +353,20 @@ __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_embed_no
 {
     const int m = blockIdx.y;
     const int col0 = blockIdx.x * RN_COLS + threadIdx.x * 8;
-    const uint4 v = *reinterpret_cast<const uint4*>(a.emb + (size_t)a.tok[m] * HID + col0);
     float x[8];
-    bf16x8_to_f(v, x);
+    if (a.emb_i8)
+    {
+        const int tid = a.tok[m];
+        const float sc = a.emb_scale[tid];
+        const int8_t* p = a.emb_i8 + (size_t)tid * HID + col0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) x[i] = static_cast<float>(p[i]) * sc;
+    }
+    else
+    {
+        const uint4 v = *reinterpret_cast<const uint4*>(a.emb + (size_t)a.tok[m] * HID + col0);
+        bf16x8_to_f(v, x);
+    }
     float4* r = reinterpret_cast<float4*>(a.resid + (size_t)m * HID + col0);
     r[0] = make_float4(x[0], x[1], x[2], x[3]);
     r[1] = make_float4(x[4], x[5], x[6], x[7]);
