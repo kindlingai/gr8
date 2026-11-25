@@ -11,6 +11,7 @@
 //! (src/records.rs), in stripes of EXP_GROUP experts. Every dimension comes from config.json and the tensor shapes,
 //! so a miniature checkpoint plans through the same code.
 
+use crate::codebook::Codebook;
 use crate::ds41::{inter_slice, Reads};
 use crate::exlr8::StFile;
 use crate::json::{self, Json};
@@ -58,6 +59,24 @@ pub fn vocab_split(vocab: usize, nr: usize) -> (usize, usize) {
     (padded, padded / nr)
 }
 
+/// Looped core parameters from `text_config.loop_config` (Inkling-2-Mini).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoopConfig {
+    pub core_start: usize,
+    pub core_end: usize,
+    pub num_passes: usize,
+    pub gate_rank: usize,
+}
+
+impl LoopConfig {
+    pub fn is_looped(&self) -> bool {
+        self.num_passes > 1 && self.core_end > self.core_start
+    }
+    pub fn n_loop_layers(&self) -> usize {
+        if self.is_looped() { self.core_end - self.core_start } else { 0 }
+    }
+}
+
 /// The dimensions the planner takes from config.json (`text_config`, or the top level without one).
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -72,6 +91,8 @@ pub struct Config {
     pub vocab: usize,
     /// per layer: full (global) attention; false = sliding-window (local) attention
     pub global: Vec<bool>,
+    /// looped core config (Inkling-2-Mini), None for unlooped Inkling-2-Small
+    pub loop_cfg: Option<LoopConfig>,
 }
 
 impl Config {
@@ -92,6 +113,24 @@ impl Config {
         if global.len() != layers {
             return Err(format!("config.json: {} layer types for {layers} layers", global.len()));
         }
+        let loop_cfg = if let Some(lc) = t.get("loop_config").and_then(Json::obj) {
+            let get = |k: &str| lc.get(k).and_then(Json::int).filter(|&v| v >= 0).map(|v| v as usize)
+                .ok_or_else(|| format!("config.json: loop_config missing {k}"));
+            let core_start = get("core_start")?;
+            let core_end = get("core_end")?;
+            let num_passes = get("num_passes")?;
+            let gate_rank = get("gate_rank")?;
+            if num_passes > 1 {
+                if core_start >= core_end || core_end > layers || gate_rank == 0 {
+                    return Err(format!("config.json: invalid loop_config {core_start}..{core_end} x {num_passes}, rank {gate_rank}"));
+                }
+                Some(LoopConfig { core_start, core_end, num_passes, gate_rank })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Ok(Config {
             hidden: need("hidden_size")?,
             layers,
@@ -103,6 +142,7 @@ impl Config {
             top_k: need("num_experts_per_tok")?,
             vocab: need("vocab_size")?,
             global,
+            loop_cfg,
         })
     }
 }
@@ -114,6 +154,8 @@ pub enum ExpertFormat {
     Nvfp4(Nvfp4ScaleRule),
     /// E4M3 codes + E8M0 block-32 scales
     Mxfp8,
+    /// exlr8 v2 trellis experts (tr3.fc1 / tr3.fc2 / tr3.v1 / tr3.v2 / tr3.v3 / tr3.table / tr3.kmix)
+    Exlr8(Codebook),
 }
 
 /// Options of a plan. The default plans everything the checkpoint holds.
@@ -125,11 +167,13 @@ pub struct Opts {
     pub with_mtp: bool,
     /// plan `model.visual.*` (when present) as `V.*`
     pub with_vision: bool,
+    /// exlr8 width-manifest variant name (None = auto-detect if experts/ + manifests/ exist and native experts absent)
+    pub variant: Option<String>,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { bf16_gv: true, with_mtp: true, with_vision: true }
+        Opts { bf16_gv: true, with_mtp: true, with_vision: true, variant: None }
     }
 }
 
@@ -263,6 +307,40 @@ fn rows_cols(s: &Src, k: usize, r0: usize, m: usize, cols: &Range<usize>) -> Res
     Ok(out)
 }
 
+struct Exlr8Ctx {
+    man: Json,
+    slices: v2plan::Slices,
+    dir: String,
+}
+
+/// Resolves an exlr8 width-manifest file path in `dir/manifests/` (or `dir/`).
+fn find_exlr8_manifest(dir: &str, variant: Option<&str>) -> Result<Option<String>, String> {
+    if let Some(v) = variant.filter(|s| !s.is_empty()) {
+        for p in [format!("{dir}/manifests/exlr8-manifest-{v}.json"), format!("{dir}/exlr8-manifest-{v}.json"), v.to_string()] {
+            if std::path::Path::new(&p).is_file() {
+                return Ok(Some(p));
+            }
+        }
+        return Err(format!("{dir}: no exlr8 manifest for variant {v:?}"));
+    }
+    for v in ["bit300", "bit325", "k3", "k4", "k2", "bit250"] {
+        let p = format!("{dir}/manifests/exlr8-manifest-{v}.json");
+        if std::path::Path::new(&p).is_file() {
+            return Ok(Some(p));
+        }
+    }
+    let mdir = format!("{dir}/manifests");
+    if let Ok(rd) = std::fs::read_dir(&mdir) {
+        let mut names: Vec<String> = rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("exlr8-manifest-") && n.ends_with(".json")).collect();
+        names.sort();
+        if let Some(first) = names.first() {
+            return Ok(Some(format!("{mdir}/{first}")));
+        }
+    }
+    Ok(None)
+}
+
 struct Planner<'a> {
     ck: &'a Ckpt,
     cfg: &'a Config,
@@ -277,6 +355,7 @@ struct Planner<'a> {
     /// rows of the padded vocabulary this rank owns
     v: Range<usize>,
     experts: Vec<ExpertFormat>,
+    exlr8: Option<Exlr8Ctx>,
 }
 
 impl Planner<'_> {
@@ -418,6 +497,35 @@ impl Planner<'_> {
         self.whole("G.embed_norm".into(), "model.llm.embed_norm.weight", Some("bf16"), Some(&h))?;
         self.whole("G.final_norm".into(), "model.llm.norm.weight", Some("bf16"), Some(&h))?;
         self.whole("G.attn_res.output_query".into(), "model.llm.attn_res.output_query", Some("f32"), Some(&h))?;
+        if let Some(lc) = c.loop_cfg.filter(|lc| lc.is_looped()) {
+            let nl = lc.n_loop_layers();
+            let qm = self.take("model.llm.middle_cycle_cross_pass_queries")?;
+            let qkv = self.take("model.llm.middle_cycle_cross_pass_kv_queries")?;
+            let want = vec![2 * nl, c.hidden];
+            if qm.dtype != "F32" || qm.shape != want {
+                return Err(format!("model.llm.middle_cycle_cross_pass_queries: stored as {} {:?}, expected F32 {want:?}", qm.dtype, qm.shape));
+            }
+            if qkv.dtype != "F32" || qkv.shape != want {
+                return Err(format!("model.llm.middle_cycle_cross_pass_kv_queries: stored as {} {:?}, expected F32 {want:?}", qkv.dtype, qkv.shape));
+            }
+            self.note(&qm, [(0, qm.len)]);
+            self.note(&qkv, [(0, qkv.len)]);
+            // Merge into [n_loop, 4, H] in (q, k, v, mlp) order (Inkling2LoopMergeMessageQueries):
+            // qm holds [q, mlp] per loop layer; qkv holds [k, v] per loop layer.
+            let row_b = c.hidden * 4;
+            let raw_m = qm.read(0, qm.len)?;
+            let raw_kv = qkv.read(0, qkv.len)?;
+            let mut merged = Vec::with_capacity(nl * 4 * row_b);
+            for j in 0..nl {
+                merged.extend_from_slice(&raw_m[(2 * j) * row_b..(2 * j + 1) * row_b]);       // q
+                merged.extend_from_slice(&raw_kv[(2 * j) * row_b..(2 * j + 1) * row_b]);      // k
+                merged.extend_from_slice(&raw_kv[(2 * j + 1) * row_b..(2 * j + 2) * row_b]);  // v
+                merged.extend_from_slice(&raw_m[(2 * j + 1) * row_b..(2 * j + 2) * row_b]);   // mlp
+            }
+            let total = merged.len() as u64;
+            let base = self.b.begin("G.loop.msg_queries".into(), "f32", vec![nl as i64, 4, c.hidden as i64], total, None);
+            self.mem_seg(base, merged);
+        }
         let valid = self.v.start.min(c.vocab)..self.v.end.min(c.vocab);
         self.mat("G.lm_head", "model.llm.unembed.weight", c.vocab, Some(valid), None, Some(self.v.len()), gv)
     }
@@ -614,7 +722,40 @@ impl Planner<'_> {
         self.whole(o("mlp_norm"), &t("mlp_norm.weight"), Some("bf16"), Some(&[h]))?;
         self.mat(&o("router.w"), &t("mlp.gate.weight"), c.n_exp, None, None, None, gv)?;
         self.whole(o("router.bias"), &t("mlp.gate.bias"), Some("f32"), Some(&[c.n_exp]))?;
-        self.routed(&p, &t("mlp.experts."))
+        if let Some(lc) = c.loop_cfg.filter(|lc| lc.is_looped() && l >= lc.core_start && l < lc.core_end) {
+            for (src, dst) in [("attn", "q"), ("k", "k"), ("v", "v"), ("mlp", "mlp")] {
+                self.mat(&o(&format!("ctrl.{dst}.down")), &t(&format!("controllers.{src}.down_weight")), lc.gate_rank, None, None, None, false)?;
+                self.mat(&o(&format!("ctrl.{dst}.forget")), &t(&format!("controllers.{src}.forget_weight")), h, None, None, None, false)?;
+                self.mat(&o(&format!("ctrl.{dst}.gain")), &t(&format!("controllers.{src}.gain_weight")), h, None, None, None, false)?;
+            }
+        }
+        let ex_pre = t("mlp.experts.");
+        if let Some(ref ex) = self.exlr8 {
+            let nh_cfg = c.inter / 128;
+            if let Some(w) = v2plan::widths_nh(&ex.man, l, nh_cfg)? {
+                let nh = w.nh;
+                let (nr, rank) = (self.nr, self.rank);
+                let dir = ex.dir.clone();
+                let wfile = move |ll: usize, k: u8| v2plan::width_file(&dir, ll, k);
+                let own = move |e: usize| Ok(v2plan::formula_halves_nh(e, l, nr, rank, nh));
+                v2plan::v2_layer(&mut self.b, l, &w, &ex.slices, &wfile, &own)?;
+                let xf = self.b.tensors.last().and_then(|t| t.expert_format.as_deref()).unwrap_or("");
+                let cb = match xf {
+                    "exlr8-e4m3-pmcgx" => Codebook::Pmcgx,
+                    "exlr8-e4m3-mul1" => Codebook::Mul1,
+                    "exlr8-e4m3" => Codebook::Mcg,
+                    other => return Err(format!("layer {l}: unsupported exlr8 expert_format {other:?}")),
+                };
+                self.experts.push(ExpertFormat::Exlr8(cb));
+                // If native expert tensors also live in the same dir, mark them consumed so missing-tensor check passes.
+                let native_keys: Vec<String> = self.ck.t.keys().filter(|k| k.starts_with(&ex_pre)).cloned().collect();
+                for k in native_keys {
+                    self.used.insert(k);
+                }
+                return Ok(());
+            }
+        }
+        self.routed(&p, &ex_pre)
     }
 
     /// Every `model.visual.*` tensor, replicated as stored under `V.`; left out (and accounted for) without vision.
@@ -728,12 +869,26 @@ pub fn plan(dir: &str, nr: usize, rank: usize, opts: &Opts) -> Result<Ink2Plan, 
     let cpath = format!("{dir}/config.json");
     let cfg = Config::parse(&std::fs::read_to_string(&cpath).map_err(|e| format!("{cpath}: {e}"))?)?;
     let (q, kv) = head_ranges(cfg.heads, cfg.kv_heads, nr, rank)?;
-    inter_slice(cfg.inter, nr, rank)?;
     let (vocab_padded, per) = vocab_split(cfg.vocab, nr);
     let v = rank * per..(rank + 1) * per;
     let ck = Ckpt::open(dir, opts.with_mtp)?;
+    let has_native_experts = ck.t.contains_key("model.llm.layers.0.mlp.experts.w13_weight");
+    let exlr8 = if opts.variant.is_some() || !has_native_experts {
+        if let Some(mpath) = find_exlr8_manifest(dir, opts.variant.as_deref())? {
+            let man = v2plan::width_manifest(&mpath)?;
+            let slices = v2plan::Slices::open(dir, nr, &[rank])?;
+            Some(Exlr8Ctx { man, slices, dir: dir.to_string() })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if exlr8.is_none() {
+        inter_slice(cfg.inter, nr, rank)?;
+    }
     let mut p = Planner { ck: &ck, cfg: &cfg, b: v2plan::Builder::new(), used: BTreeSet::new(), reads: Reads::new(), nr, rank,
-                          opts: opts.clone(), q: q.clone(), kv: kv.clone(), v: v.clone(), experts: Vec::new() };
+                          opts: opts.clone(), q: q.clone(), kv: kv.clone(), v: v.clone(), experts: Vec::new(), exlr8 };
     p.globals()?;
     for l in 0..cfg.layers {
         p.layer(l)?;
@@ -775,22 +930,24 @@ pub fn plan(dir: &str, nr: usize, rank: usize, opts: &Opts) -> Result<Ink2Plan, 
 
 // ---------------------------------------------------------------------------------------------------- C interface
 
-/// Plans rank `rank`'s image at TP `nr` from the checkpoint directory `model_dir` and writes the image's manifest
-/// (sha256 fields zero) to `out_manifest`. Returns a handle for g6l_plan_load, g6l_plan_read and g6l_plan_free, or NULL
-/// with a message in `err`.
+/// Plans rank `rank`'s image at TP `nr` from the checkpoint directory `model_dir` with optional exlr8 `variant`
+/// (NULL or empty = auto-detect / `GR8_INK2_VARIANT` knob) and writes the image's manifest (sha256 fields zero) to
+/// `out_manifest`. Returns a handle for g6l_plan_load, g6l_plan_read and g6l_plan_free, or NULL with a message in `err`.
 ///
 /// # Safety
 /// The strings must be NUL-terminated, `err` must hold `errlen` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn g6l_ink2_plan(model_dir: *const c_char, nr: u32, rank: u32, out_manifest: *const c_char,
-                                       err: *mut c_char, errlen: usize) -> *mut c_void {
+pub unsafe extern "C" fn g6l_ink2_plan_ex(model_dir: *const c_char, nr: u32, rank: u32, variant: *const c_char,
+                                          out_manifest: *const c_char, err: *mut c_char, errlen: usize) -> *mut c_void {
     let t0 = Instant::now();
     let arg = |p, what| crate::cstr(p).ok_or(format!("g6l_ink2_plan: no {what}"));
     let r = (|| {
         let dir = arg(model_dir, "model dir")?;
         let d = dir.trim_end_matches('/');
+        let var = crate::cstr(variant).filter(|s| !s.is_empty())
+            .or_else(|| gr8knobs::INK2_VARIANT.get().filter(|s| !s.is_empty()).map(str::to_string));
         let (mpath, ppath) = (format!("{d}/tp{nr}.rank{rank}.manifest.json"), format!("{d}/tp{nr}.rank{rank}.pack"));
-        if std::path::Path::new(&mpath).is_file() && std::path::Path::new(&ppath).is_file() {
+        if var.is_none() && std::path::Path::new(&mpath).is_file() && std::path::Path::new(&ppath).is_file() {
             let manifest = std::fs::read_to_string(&mpath).map_err(|e| format!("{mpath}: {e}"))?;
             let j = json::parse(&manifest).map_err(|e| format!("{mpath}: {e}"))?;
             let bytes = j.get("pack_bytes").and_then(Json::int).filter(|&v| v > 0)
@@ -805,14 +962,16 @@ pub unsafe extern "C" fn g6l_ink2_plan(model_dir: *const c_char, nr: u32, rank: 
             let plan = Plan::from_segs(vec![ppath], segs, Vec::new(), Vec::new(), bytes)?;
             return Ok::<_, String>(V2Image { rank: rank as usize, tensors: Vec::new(), bytes, plan, cache: None });
         }
-        let p = plan(&dir, nr as usize, rank as usize, &Opts::default())?;
+        let opts = Opts { variant: var.clone(), ..Opts::default() };
+        let p = plan(&dir, nr as usize, rank as usize, &opts)?;
         let out = arg(out_manifest, "output manifest")?;
         let zeros = vec!["0".repeat(64); p.img.tensors.len()];
         let manifest = manifest_json(&p.img, &zeros, nr as usize);
         std::fs::write(&out, &manifest).map_err(|e| format!("{out}: {e}"))?;
         // GR8_GEN_CACHE (gencache.rs): the key binds the engine binary, the planned manifest and the checkpoint directory.
         let mut img = p.img;
-        let key_text = format!("ink2 dir={dir} nr={nr} rank={rank}\n{manifest}\n{}", crate::gencache::source_identity(&[&dir]));
+        let vtag = var.as_deref().unwrap_or("");
+        let key_text = format!("ink2 dir={dir} nr={nr} rank={rank} var={vtag}\n{manifest}\n{}", crate::gencache::source_identity(&[&dir]));
         img.cache = crate::gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)
     })();
@@ -823,4 +982,16 @@ pub unsafe extern "C" fn g6l_ink2_plan(model_dir: *const c_char, nr: u32, rank: 
             std::ptr::null_mut()
         }
     }
+}
+
+/// Plans rank `rank`'s image at TP `nr` from the checkpoint directory `model_dir` and writes the image's manifest
+/// (sha256 fields zero) to `out_manifest`. Returns a handle for g6l_plan_load, g6l_plan_read and g6l_plan_free, or NULL
+/// with a message in `err`.
+///
+/// # Safety
+/// The strings must be NUL-terminated, `err` must hold `errlen` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_ink2_plan(model_dir: *const c_char, nr: u32, rank: u32, out_manifest: *const c_char,
+                                       err: *mut c_char, errlen: usize) -> *mut c_void {
+    g6l_ink2_plan_ex(model_dir, nr, rank, std::ptr::null(), out_manifest, err, errlen)
 }

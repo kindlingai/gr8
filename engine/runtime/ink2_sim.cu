@@ -19,7 +19,7 @@
 int main(int argc, char** argv)
 {
     using namespace ink2rt;
-    std::string dir, layers = "all", tokens;
+    std::string dir, layers = "all", variant, tokens;
     int gen = 16, sessions = 1, chunk = 8, nc = 256, cap = 4096, mtp = 0;
     float temp = 0.f, top_p = 1.f;
     uint32_t seed = 1234;
@@ -32,6 +32,7 @@ int main(int argc, char** argv)
         };
         if (a == "--v2-dense" || a == "--model" || a == "--packs") dir = val();
         else if (a == "--layers") layers = val();
+        else if (a == "--variant") variant = val();
         else if (a == "--tokens") tokens = val();
         else if (a == "--gen") gen = atoi(val().c_str());
         else if (a == "--sessions" || a == "--s2-sessions") sessions = atoi(val().c_str());
@@ -61,6 +62,7 @@ int main(int argc, char** argv)
     o.cap = cap;
     o.nc = std::max(nc, 1);
     o.layers = layers;
+    o.variant = variant;
     Engine e;
     e.init(dir, o);
 

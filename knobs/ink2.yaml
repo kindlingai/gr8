@@ -54,3 +54,175 @@ knobs:
       tensor cores, each key tile read once for all rows. 0 (the default) = the per-row kernels at every size. The
       scores are sums in another order and the probabilities are rounded for the product with V, so the rows agree
       within rounding, not bit for bit; decode and verify steps never take this path. Every rank must agree.
+  GR8_INK2_VARIANT:
+    scope: agree
+    kind: text
+    unset: "auto-detect an exlr8 manifest when native experts are absent, else native"
+    legacy: []
+    doc: >-
+      Optional exlr8 width-manifest variant name or path (manifests/exlr8-manifest-NAME.json) used when --variant is
+      not passed on the command line. Every rank must agree.
+  GR8_INK2_MMA_NARROW_CTA:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = for BF16 engine projections with at most 56 rows and output width 17 through 4096, schedule one
+      independent MMA output warp per CTA. The operands and accumulation order within each warp do not
+      change. 0 (the default) uses the original multi-warp CTA.
+  GR8_INK2_GRAPH:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = on TP=1, capture and replay CUDA graphs for decode, verify, and MTP draft steps.
+      0 = launch kernels directly on the stream without CUDA graph capture.
+  GR8_INK2_PROFILE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = record per-stage CUDA event timings across Inkling-2 forward, commit, and MTP draft buckets and
+      print periodic summaries to stderr. 0 (the default) disables profiling with zero overhead.
+  GR8_INK2_PROFILE_EVERY:
+    scope: local
+    kind: int
+    default: "20"
+    values: "1.."
+    legacy: []
+    doc: >-
+      Number of profiled step flushes between periodic stderr reports when GR8_INK2_PROFILE=1.
+  GR8_INK2_LOCAL_GRP:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = use the grouped GQA local-attention kernel that shares each KV read across the query heads in a
+      group. 0 (the default) uses the per-query-head local-attention kernel.
+  GR8_INK2_STOCK_MSG_GATE:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = replay the stock serial-rank loop message-gate kernel instead of the batched rank-64 fast path.
+      0 (the default) uses the batched rank-64 message-gate kernels. Every rank must agree.
+  GR8_INK2_MSG_PREFILL_FUSE:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = on looped checkpoints with rank-64 message gates and M > 64 rows, run the fused apply+norm kernel
+      instead of separate BF16 projections and finish pass. 0 (the default) uses the split path for M > 64.
+      Every rank must agree.
+  GR8_INK2_MTP_ATTN_GRP:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = use the grouped block-attention kernel during MTP draft steps when group and block
+      sizes fit. 0 = fall back to the per-query-head MTP attention kernel.
+  GR8_INK2_FAST_GEMV:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = use the 1-warp multi-row BF16 GEMV kernel for aligned small-M projections (M <= 64). 0 (the
+      default) uses the standard MMA projection path.
+  GR8_INK2_GEMM_C128:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = use the 128B-coalesced shared-memory BF16 MMA GEMM kernel (k_ink2_gemm_c128) for
+      aligned projections. 0 = use the original BF16 MMA kernel.
+  GR8_INK2_FUSED_QKV:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = fuse Q/K/V and related multi-target BF16 projections into a single kernel launch
+      reading input rows once. 0 = launch each projection separately.
+  GR8_INK2_SPLITK:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = enable deterministic Split-K reduction on small-N BF16 projections and MoE routing
+      scores. 0 = disable Split-K.
+  GR8_INK2_FAST_ROUTER:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = use the fast coalesced router score and expert-plan kernels. 0 = use the baseline
+      router and plan kernels.
+  GR8_INK2_TR3_WIDE:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = enable the wide exlr8 tr3 pmcgx MoE fc1/fc2 path with pre-rotated activations.
+      0 = fall back to the baseline tr3 MoE kernels.
+  GR8_INK2_FAST_GREEDY_HEAD:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = on TP=1 greedy steps with GPU head packing enabled, compute exact argmax directly on
+      the device without packing candidate lists. 0 = use the standard GPU head-pack path.
+  GR8_INK2_BATCH_COMMIT:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = commit KV cache and short-conv history across all layers in a single batched kernel
+      launch. 0 = launch per-layer commit kernels.
+  GR8_INK2_MTP_FAST_ARGMAX:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = use the half-warp monotonic-argmax fold kernel for greedy MTP draft selection.
+      0 = use the standard MTP head reduction.
+  GR8_INK2_MTP_INT8_LM:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = quantize MTP drafter body and LM head weights to per-row INT8 at load time for
+      faster speculative drafting (drafter-only; trunk verification remains exact). 0 = keep MTP weights in
+      BF16. Every rank must agree.

@@ -31,6 +31,7 @@
 #pragma once
 #include "ink2_attn.h"
 #include "../kernels/ink2_sconv.cuh"
+#include "../runtime/ink2_prof.cuh"
 
 namespace ink2
 {
@@ -223,7 +224,7 @@ constexpr int GRP_KT = 32;   // keys loaded per shared-memory tile (4 tiles = AC
 __global__ void __launch_bounds__(ACT) k_ink2_attn_global_grp(AttnCoreArgs a)
 {
     __shared__ float qs[GRP_Q][ATTN_MAX_HD], rs[GRP_Q][ATTN_MAX_REL], zs[GRP_Q][ACT];
-    __shared__ alignas(8) uint16_t ks[GRP_KT][ATTN_MAX_HD + 2];
+    __shared__ alignas(16) uint16_t ks[GRP_KT][ATTN_MAX_HD + 8];
     __shared__ int q_row[GRP_Q], q_lq[GRP_Q], q_pos[GRP_Q], q_ns[GRP_Q], q_sidx[GRP_Q];
     __shared__ int uniq_slots[GRP_Q], uniq_max_p[GRP_Q], nq_s[GRP_Q];
     __shared__ float mx_s[GRP_Q], den_s[GRP_Q], sc_s[GRP_Q];
@@ -348,9 +349,18 @@ __global__ void __launch_bounds__(ACT) k_ink2_attn_global_grp(AttnCoreArgs a)
                 const uint16_t* kbase = a.pages + (pg * 2 * KV_PAGE_TOKENS + (kb + kt) % KV_PAGE_TOKENS) * nk + lkv * hd;
                 for (int key = grp8; key < nt; key += 16)
                 {
-                    const uint32_t* kr32 = reinterpret_cast<const uint32_t*>(kbase + static_cast<size_t>(key) * nk);
-                    uint32_t* ks32 = reinterpret_cast<uint32_t*>(&ks[key][0]);
-                    for (int c2 = sub8; c2 < (hd >> 1); c2 += 8) ks32[c2] = kr32[c2];
+                    if ((hd & 7) == 0 && (reinterpret_cast<uintptr_t>(kbase + static_cast<size_t>(key) * nk) & 15u) == 0)
+                    {
+                        const uint4* kr128 = reinterpret_cast<const uint4*>(kbase + static_cast<size_t>(key) * nk);
+                        uint4* ks128 = reinterpret_cast<uint4*>(&ks[key][0]);
+                        for (int c8 = sub8; c8 < (hd >> 3); c8 += 8) ks128[c8] = __ldg(kr128 + c8);
+                    }
+                    else
+                    {
+                        const uint32_t* kr32 = reinterpret_cast<const uint32_t*>(kbase + static_cast<size_t>(key) * nk);
+                        uint32_t* ks32 = reinterpret_cast<uint32_t*>(&ks[key][0]);
+                        for (int c2 = sub8; c2 < (hd >> 1); c2 += 8) ks32[c2] = kr32[c2];
+                    }
                 }
                 __syncthreads();
 
@@ -486,6 +496,288 @@ __global__ void __launch_bounds__(ACT) k_ink2_attn_global_grp(AttnCoreArgs a)
     }
 }
 
+// Grouped local sliding-window attention core: up to GRP_Q (row, query head) queries sharing K / V head lkv = blockIdx.z
+// read each K and V row ONCE with coalesced 128-bit loads and fold keys in the exact arithmetic order of k_ink2_attn_core.
+// grid (max_ngrp, smax, nh_kv)
+__global__ void __launch_bounds__(ACT) k_ink2_attn_local_grp(AttnCoreArgs a)
+{
+    __shared__ float qs[GRP_Q][ATTN_MAX_HD], rs[GRP_Q][ATTN_MAX_REL], zs[GRP_Q][ACT];
+    __shared__ alignas(16) uint16_t ks[GRP_KT][ATTN_MAX_HD + 8];
+    __shared__ int q_row[GRP_Q], q_lq[GRP_Q], q_pos[GRP_Q], q_k0[GRP_Q], q_k1[GRP_Q], q_ns[GRP_Q], q_sidx[GRP_Q];
+    __shared__ int uniq_slots[GRP_Q], uniq_r0[GRP_Q], uniq_p0[GRP_Q], uniq_k0[GRP_Q], uniq_k1[GRP_Q], q_act[GRP_Q];
+    __shared__ float mx_s[GRP_Q], den_s[GRP_Q], sc_s[GRP_Q];
+    __shared__ int num_slots_s;
+
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int hd = a.hd, rd = a.rel_dim, sp = static_cast<int>(blockIdx.y), lkv = static_cast<int>(blockIdx.z);
+    const int lq0 = max(0, (a.kv0 + lkv) * a.gqa - a.q0);
+    const int lq1 = min(a.nh_q, (a.kv0 + lkv + 1) * a.gqa - a.q0);
+    const int gq = lq1 - lq0;
+    if (gq <= 0) return;
+    const int qbase = static_cast<int>(blockIdx.x) * GRP_Q;
+    const int total_q = a.rows * gq;
+    if (qbase >= total_q) return;
+    const int qcnt = min(GRP_Q, total_q - qbase);
+
+    if (t < GRP_Q)
+    {
+        q_act[t] = 0;
+        if (t < qcnt)
+        {
+            const int qi = qbase + t;
+            const int r_loc = qi / gq, lq = lq0 + (qi % gq);
+            const int row = a.m0 + r_loc, p = a.rw.pos[row];
+            const int lo = attn_lo(false, a.window, p);
+            const int ns = attn_splits(false, a.window, p);
+            const int k0 = lo + sp * ATTN_SPAN;
+            const int k1 = min(k0 + ATTN_SPAN, p + 1);
+            q_row[t] = row;
+            q_lq[t] = lq;
+            q_pos[t] = p;
+            q_k0[t] = k0;
+            q_k1[t] = k1;
+            q_ns[t] = ns;
+            mx_s[t] = -INFINITY;
+            den_s[t] = 0.0f;
+            sc_s[t] = 1.0f;
+        }
+    }
+    __syncthreads();
+
+    if (t == 0)
+    {
+        int ns_u = 0;
+        for (int q = 0; q < qcnt; ++q)
+        {
+            if (sp >= q_ns[q])
+            {
+                q_sidx[q] = -1;
+                continue;
+            }
+            const int row = q_row[q], sl = a.rw.slot[row], r0 = a.rw.run0[row];
+            const int k0 = q_k0[q], k1 = q_k1[q];
+            int idx = -1;
+            for (int u = 0; u < ns_u; ++u)
+                if (uniq_slots[u] == sl && uniq_r0[u] == r0) { idx = u; break; }
+            if (idx < 0)
+            {
+                idx = ns_u++;
+                uniq_slots[idx] = sl;
+                uniq_r0[idx] = r0;
+                uniq_p0[idx] = a.rw.pos[r0];
+                uniq_k0[idx] = k0;
+                uniq_k1[idx] = k1;
+            }
+            else
+            {
+                if (k0 < uniq_k0[idx]) uniq_k0[idx] = k0;
+                if (k1 > uniq_k1[idx]) uniq_k1[idx] = k1;
+            }
+            q_sidx[q] = idx;
+        }
+        num_slots_s = ns_u;
+    }
+    __syncthreads();
+    const int num_slots = num_slots_s;
+    if (num_slots == 0) return;
+
+    for (int i = t; i < GRP_Q * ATTN_MAX_HD; i += ACT) (&qs[0][0])[i] = 0.0f;
+    __syncthreads();
+
+    for (int q = warp; q < qcnt; q += 4)
+    {
+        if (q_sidx[q] < 0) continue;
+        const int row = q_row[q], lq = q_lq[q];
+        const size_t qo = (static_cast<size_t>(row) * a.nh_q + lq) * hd;
+        const int d0 = lane, d1 = lane + 32, d2 = lane + 64, d3 = lane + 96;
+        const float tmp0 = d0 < hd ? mul_rn(bf(a.q_raw[qo + d0]), bf(a.q_clip[lq * hd + d0])) : 0.0f;
+        const float tmp1 = d1 < hd ? mul_rn(bf(a.q_raw[qo + d1]), bf(a.q_clip[lq * hd + d1])) : 0.0f;
+        const float tmp2 = d2 < hd ? mul_rn(bf(a.q_raw[qo + d2]), bf(a.q_clip[lq * hd + d2])) : 0.0f;
+        const float tmp3 = d3 < hd ? mul_rn(bf(a.q_raw[qo + d3]), bf(a.q_clip[lq * hd + d3])) : 0.0f;
+        const float s02 = add_rn(mul_rn(tmp0, tmp0), mul_rn(tmp2, tmp2));
+        const float s13 = add_rn(mul_rn(tmp1, tmp1), mul_rn(tmp3, tmp3));
+        float ss = add_rn(s02, s13);
+        for (int off = 16; off > 0; off >>= 1) ss = add_rn(ss, __shfl_down_sync(0xffffffffu, ss, off));
+        ss = __shfl_sync(0xffffffffu, ss, 0);
+        const float qf = l2_clip(ss, hd);
+        if (d0 < hd) qs[q][d0] = rbf(mul_rn(tmp0, qf));
+        if (d1 < hd) qs[q][d1] = rbf(mul_rn(tmp1, qf));
+        if (d2 < hd) qs[q][d2] = rbf(mul_rn(tmp2, qf));
+        if (d3 < hd) qs[q][d3] = rbf(mul_rn(tmp3, qf));
+        if (lane == 0)
+        {
+            const uint16_t* rr = a.r_raw + (static_cast<size_t>(row) * a.nh_q + lq) * rd;
+            float rss = 0.0f;
+            for (int d = 0; d < rd; ++d)
+            {
+                rs[q][d] = mul_rn(bf(rr[d]), bf(a.rel_clip[lq * rd + d]));
+                rss = add_rn(rss, mul_rn(rs[q][d], rs[q][d]));
+            }
+            const float rf = l2_clip(rss, rd);
+            for (int d = 0; d < rd; ++d) rs[q][d] = rbf(mul_rn(rs[q][d], rf));
+        }
+    }
+    __syncthreads();
+
+    float acc[GRP_Q];
+    #pragma unroll
+    for (int q = 0; q < GRP_Q; ++q) acc[q] = 0.0f;
+    const float root_hd = sqrtf(static_cast<float>(hd));
+    const size_t nk = static_cast<size_t>(a.nk);
+    const int grp8 = t >> 3, sub8 = t & 7, q0w = warp * 8, qnw = min(8, max(0, qcnt - q0w));
+
+    for (int si = 0; si < num_slots; ++si)
+    {
+        const size_t slot = static_cast<size_t>(uniq_slots[si]);
+        const int r0 = uniq_r0[si], p0 = uniq_p0[si];
+        const int k0_slot = uniq_k0[si], k1_slot = uniq_k1[si];
+        for (int kb = k0_slot; kb < k1_slot; kb += ACT)
+        {
+            const int n_slot = min(ACT, k1_slot - kb);
+            for (int kt = 0; kt < n_slot; kt += GRP_KT)
+            {
+                const int nt = min(GRP_KT, n_slot - kt);
+                for (int key = grp8; key < nt; key += 16)
+                {
+                    const int kpos = kb + kt + key;
+                    const uint16_t* krow = (kpos >= p0)
+                        ? (a.kv_new + static_cast<size_t>(r0 + kpos - p0) * 2 * nk + lkv * hd)
+                        : (a.ring + (slot * 2 * a.window + kpos % a.window) * nk + lkv * hd);
+                    if ((hd & 7) == 0 && (reinterpret_cast<uintptr_t>(krow) & 15u) == 0)
+                    {
+                        const uint4* kr128 = reinterpret_cast<const uint4*>(krow);
+                        uint4* ks128 = reinterpret_cast<uint4*>(&ks[key][0]);
+                        for (int c8 = sub8; c8 < (hd >> 3); c8 += 8) ks128[c8] = __ldg(kr128 + c8);
+                    }
+                    else
+                    {
+                        const uint32_t* kr32 = reinterpret_cast<const uint32_t*>(krow);
+                        uint32_t* ks32 = reinterpret_cast<uint32_t*>(&ks[key][0]);
+                        for (int c2 = sub8; c2 < (hd >> 1); c2 += 8) ks32[c2] = kr32[c2];
+                    }
+                }
+                __syncthreads();
+
+                if (lane < nt && qnw > 0)
+                {
+                    float s[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                    const uint32_t* ks32 = reinterpret_cast<const uint32_t*>(&ks[lane][0]);
+                    for (int d = 0; d < hd; d += 2)
+                    {
+                        const uint32_t pair = ks32[d >> 1];
+                        const float k0f = bf(static_cast<uint16_t>(pair));
+                        const float k1f = bf(static_cast<uint16_t>(pair >> 16));
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i)
+                        {
+                            s[i] = add_rn(s[i], mul_rn(qs[q0w + i][d], k0f));
+                            s[i] = add_rn(s[i], mul_rn(qs[q0w + i][d + 1], k1f));
+                        }
+                    }
+                    const int kpos = kb + kt + lane;
+                    for (int i = 0; i < qnw; ++i)
+                    {
+                        const int q = q0w + i;
+                        if (q_sidx[q] != si) continue;
+                        if (kpos < q_k0[q] || kpos >= q_k1[q])
+                        {
+                            zs[q][kt + lane] = -INFINITY;
+                            continue;
+                        }
+                        const int p = q_pos[q];
+                        float z = div_rn(s[i], root_hd);
+                        const int dist = p - kpos;
+                        if (dist < a.rel_win)
+                        {
+                            float b = 0.0f;
+                            for (int d = 0; d < rd; ++d)
+                                b = add_rn(b, mul_rn(rs[q][d], bf(a.rel_proj[static_cast<size_t>(d) * a.rel_win + dist])));
+                            z = add_rn(z, b);
+                        }
+                        zs[q][kt + lane] = z;
+                    }
+                }
+                __syncthreads();
+            }
+
+            for (int q = warp; q < qcnt; q += 4)
+            {
+                const bool active = (q_sidx[q] == si && kb < q_k1[q] && kb + n_slot > q_k0[q]);
+                if (lane == 0) q_act[q] = active ? 1 : 0;
+                if (!active) continue;
+                const int j0 = lane, j1 = lane + 32, j2 = lane + 64, j3 = lane + 96;
+                const float z0 = j0 < n_slot ? zs[q][j0] : -INFINITY;
+                const float z1 = j1 < n_slot ? zs[q][j1] : -INFINITY;
+                const float z2 = j2 < n_slot ? zs[q][j2] : -INFINITY;
+                const float z3 = j3 < n_slot ? zs[q][j3] : -INFINITY;
+                float m = fmaxf(fmaxf(z0, z2), fmaxf(z1, z3));
+                for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
+                m = __shfl_sync(0xffffffffu, m, 0);
+                const float mx_old = mx_s[q];
+                const float mn = fmaxf(mx_old, m), sc = expf(mx_old - mn);
+                zs[q][j0] = (j0 < n_slot && isfinite(z0)) ? expf(z0 - mn) : 0.0f;
+                zs[q][j1] = (j1 < n_slot && isfinite(z1)) ? expf(z1 - mn) : 0.0f;
+                zs[q][j2] = (j2 < n_slot && isfinite(z2)) ? expf(z2 - mn) : 0.0f;
+                zs[q][j3] = (j3 < n_slot && isfinite(z3)) ? expf(z3 - mn) : 0.0f;
+                __syncwarp();
+                if (lane == 0)
+                {
+                    float den = mul_rn(den_s[q], sc);
+                    const int jlo = max(0, q_k0[q] - kb);
+                    const int jhi = min(n_slot, q_k1[q] - kb);
+                    for (int j = jlo; j < jhi; ++j) den = add_rn(den, zs[q][j]);
+                    den_s[q] = den;
+                    mx_s[q] = mn;
+                    sc_s[q] = sc;
+                }
+            }
+            __syncthreads();
+
+            if (t < hd)
+            {
+                for (int q = 0; q < qcnt; ++q)
+                    if (q_act[q]) acc[q] = mul_rn(acc[q], sc_s[q]);
+                for (int j = 0; j < n_slot; ++j)
+                {
+                    const int kpos = kb + j;
+                    const uint16_t* vrow = (kpos >= p0)
+                        ? (a.kv_new + static_cast<size_t>(r0 + kpos - p0) * 2 * nk + nk + lkv * hd)
+                        : (a.ring + (slot * 2 * a.window + a.window + kpos % a.window) * nk + lkv * hd);
+                    const float vv = bf(__ldg(vrow + t));
+                    for (int q = 0; q < qcnt; ++q)
+                        if (q_act[q] && kpos >= q_k0[q] && kpos < q_k1[q])
+                            acc[q] = add_rn(acc[q], mul_rn(zs[q][j], vv));
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int q = 0; q < qcnt; ++q)
+    {
+        if (q_sidx[q] < 0) continue;
+        const int row = q_row[q], lq = q_lq[q], ns = q_ns[q];
+        const size_t b = static_cast<size_t>(row - a.m0) * a.nh_q + lq;
+        if (ns > 1)
+        {
+            float* pt = a.part + (b * a.smax + sp) * (hd + 2);
+            if (t == 0)
+            {
+                pt[0] = mx_s[q];
+                pt[1] = den_s[q];
+            }
+            if (t < hd) pt[2 + t] = acc[q];
+        }
+        else if (t < hd)
+        {
+            const size_t qo = (static_cast<size_t>(row) * a.nh_q + lq) * hd;
+            float m2 = bf(a.sink[static_cast<size_t>(row) * a.nh_q + lq]), d2 = 1.0f, a2 = 0.0f;
+            attn_merge(m2, d2, a2, mx_s[q], den_s[q], acc[q]);
+            a.og[qo + t] = attn_out(a2, d2, a.gate[qo + t]);
+        }
+    }
+}
+
 // The rows with more than one span: the sink, then the partials in span order. grid rows * nh_q.
 __global__ void __launch_bounds__(ACT) k_ink2_attn_merge(AttnCoreArgs a)
 {
@@ -572,34 +864,79 @@ inline void attn_check(const AttnGeom& g)
 // out_f32 [M][H] = the rank's partial of the wo sum.
 #include "ink2_attn_tc.cuh"   // in this namespace: the tensor-core kernel of a prefill chunk
 
+// Set once at runtime startup; standalone kernel users retain the default dispatch.
+inline bool& local_grp_enabled()
+{
+    static bool on = false;
+    return on;
+}
+
 // tc: the rows are one run of one slot at consecutive positions (a prefill chunk), and the caller wants the
 // tensor-core kernel for them (ink2_attn_tc.cuh). Geometries it does not cover take the stock kernels.
 inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnState& s, AttnWork& wk, const Rows& rw, int max_pos, const uint16_t* qi,
-                         const uint16_t* ki, const uint16_t* vi, int M, uint16_t* out, float* out_f32, cudaStream_t st, bool tc = false)
+                         const uint16_t* ki, const uint16_t* vi, int M, uint16_t* out, float* out_f32, cudaStream_t st, bool tc = false, Prof* prof = nullptr)
 {
     attn_check(g);
     if (M < 1 || M > wk.M) throw std::runtime_error("ink2::attn_forward: rows");
     if (g.global && max_pos / KV_PAGE_TOKENS >= s.max_pps) throw std::runtime_error("ink2::attn_forward: position past the slot's page table");
     const int H = g.H, hd = g.hd, nk = g.nh_kv * hd, nq = g.nh_q * hd;
-    gemm_bf16(ki, w.wk, M, H, nk, wk.kp, st);
-    gemm_bf16(vi, w.wv, M, H, nk, wk.vp, st);
-    gemm_bf16(qi, w.wq, M, H, nq, wk.q_raw, st);
-    gemm_bf16(qi, w.wr, M, H, g.nh_q * g.rel_dim, wk.r_raw, st);
-    gemm_bf16(qi, w.gate, M, H, nq, wk.gate, st);
-    gemm_bf16(qi, w.sink, M, H, g.nh_q, wk.sink, st);
-    if (g.global)
     {
-        gemm_f32(ki, w.k_wproj, M, H, g.nh_kv * SCONV_TAPS, wk.dynk, st);
-        gemm_f32(vi, w.v_wproj, M, H, g.nh_kv * SCONV_TAPS, wk.dynv, st);
-        sconv_dynamic(wk.kp, s.hist_k, rw, w.k_static, wk.dynk, M, nk, hd, wk.kc, st);
-        sconv_dynamic(wk.vp, s.hist_v, rw, w.v_static, wk.dynv, M, nk, hd, wk.vc, st);
+        ProfScope _ps(prof, PS_ATTN_QKV_PROJ, st);
+        if (qi == ki && qi == vi && !g.global)
+        {
+            const GemmTarget tg[6] = {
+                {w.wk, wk.kp, nk, GEMM_BF16, 0},
+                {w.wv, wk.vp, nk, GEMM_BF16, 0},
+                {w.wq, wk.q_raw, nq, GEMM_BF16, 0},
+                {w.wr, wk.r_raw, g.nh_q * g.rel_dim, GEMM_BF16, 0},
+                {w.gate, wk.gate, nq, GEMM_BF16, 0},
+                {w.sink, wk.sink, g.nh_q, GEMM_BF16, 0},
+            };
+            gemm_multi(qi, tg, 6, M, H, st);
+        }
+        else
+        {
+            if (g.global)
+            {
+                const GemmTarget tk[2] = {
+                    {w.wk, wk.kp, nk, GEMM_BF16, 0},
+                    {w.k_wproj, wk.dynk, g.nh_kv * SCONV_TAPS, GEMM_F32, 0},
+                };
+                const GemmTarget tv[2] = {
+                    {w.wv, wk.vp, nk, GEMM_BF16, 0},
+                    {w.v_wproj, wk.dynv, g.nh_kv * SCONV_TAPS, GEMM_F32, 0},
+                };
+                gemm_multi(ki, tk, 2, M, H, st);
+                gemm_multi(vi, tv, 2, M, H, st);
+            }
+            else
+            {
+                gemm_bf16(ki, w.wk, M, H, nk, wk.kp, st);
+                gemm_bf16(vi, w.wv, M, H, nk, wk.vp, st);
+            }
+            const GemmTarget tq[4] = {
+                {w.wq, wk.q_raw, nq, GEMM_BF16, 0},
+                {w.wr, wk.r_raw, g.nh_q * g.rel_dim, GEMM_BF16, 0},
+                {w.gate, wk.gate, nq, GEMM_BF16, 0},
+                {w.sink, wk.sink, g.nh_q, GEMM_BF16, 0},
+            };
+            gemm_multi(qi, tq, 4, M, H, st);
+        }
     }
-    else
     {
-        sconv_static(wk.kp, s.hist_k, rw, w.k_sconv, M, nk, wk.kc, st);
-        sconv_static(wk.vp, s.hist_v, rw, w.v_sconv, M, nk, wk.vc, st);
+        ProfScope _ps(prof, PS_ATTN_SCONV_KVPREP, st);
+        if (g.global)
+        {
+            sconv_dynamic(wk.kp, s.hist_k, rw, w.k_static, wk.dynk, M, nk, hd, wk.kc, st);
+            sconv_dynamic(wk.vp, s.hist_v, rw, w.v_static, wk.dynv, M, nk, hd, wk.vc, st);
+        }
+        else
+        {
+            sconv_static(wk.kp, s.hist_k, rw, w.k_sconv, M, nk, wk.kc, st);
+            sconv_static(wk.vp, s.hist_v, rw, w.v_sconv, M, nk, wk.vc, st);
+        }
+        k_ink2_kv_prep<<<M * g.nh_kv, ACT, 0, st>>>(wk.kc, wk.vc, wk.kv_new, g.global ? s.pages : nullptr, s.page_table, s.max_pps, rw, g.nh_kv, hd);
     }
-    k_ink2_kv_prep<<<M * g.nh_kv, ACT, 0, st>>>(wk.kc, wk.vc, wk.kv_new, g.global ? s.pages : nullptr, s.page_table, s.max_pps, rw, g.nh_kv, hd);
 
     const int smax = attn_splits(g.global, g.window, max_pos);
     const size_t per_row = static_cast<size_t>(g.nh_q) * smax * (hd + 2);
@@ -607,42 +944,51 @@ inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnStat
     if (mb < 1) throw std::runtime_error("ink2::attn_forward: AttnWork::part_floats is too small for one row at this position");
     if (g.global && mb > 16 && mb < M) mb = mb / 16 * 16;
     int max_gq = 1;
-    if (g.global)
+    for (int lkv = 0; lkv < g.nh_kv; ++lkv)
     {
-        for (int lkv = 0; lkv < g.nh_kv; ++lkv)
-        {
-            const int lq0 = std::max(0, (g.kv0 + lkv) * g.gqa - g.q0);
-            const int lq1 = std::min(g.nh_q, (g.kv0 + lkv + 1) * g.gqa - g.q0);
-            if (lq1 - lq0 > max_gq) max_gq = lq1 - lq0;
-        }
+        const int lq0 = std::max(0, (g.kv0 + lkv) * g.gqa - g.q0);
+        const int lq1 = std::min(g.nh_q, (g.kv0 + lkv + 1) * g.gqa - g.q0);
+        if (lq1 - lq0 > max_gq) max_gq = lq1 - lq0;
     }
+    const bool local_grp_on = local_grp_enabled();
     AttnCoreArgs a{wk.q_raw, wk.r_raw, wk.gate, wk.sink, w.q_clip, w.rel_clip, w.rel_proj, wk.kv_new, s.ring, s.pages, s.page_table, rw, wk.og, wk.part,
                    0, 0, g.nh_q, g.q0, g.gqa, g.kv0, nk, hd, g.rel_dim, g.rel_win, g.window, g.log_scale_base, g.global ? 1 : 0, s.max_pps, smax};
     const bool use_tc = tc && hd == TC_HD && g.rel_dim == TC_RD && g.gqa <= TC_MAX_GQ;
-    if (use_tc)
     {
-        static const cudaError_t attr = cudaFuncSetAttribute(k_ink2_attn_prefill_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(attn_tc_smem(TC_MAX_GQ)));
-        if (attr != cudaSuccess) throw std::runtime_error("ink2::attn_forward: shared memory of the tensor-core kernel");
-        k_ink2_attn_qr_prep<<<M * g.nh_q, ACT, 0, st>>>(wk.q_raw, wk.r_raw, w.q_clip, w.rel_clip, rw, g.nh_q, hd, g.rel_dim, g.log_scale_base, g.global ? 1 : 0);
-        a.m0 = 0;
-        a.rows = M;
-        k_ink2_attn_prefill_tc<<<dim3((M + 15) / 16, g.nh_kv), g.gqa * 32, attn_tc_smem(g.gqa), st>>>(a, g.gqa);
-    }
-    for (int m0 = 0; m0 < M && !use_tc; m0 += mb)
-    {
-        const int rows = M - m0 < mb ? M - m0 : mb;
-        a.m0 = m0;
-        a.rows = rows;
-        if (g.global)
+        ProfScope _ps(prof, g.global ? PS_ATTN_CORE_GLOBAL : PS_ATTN_CORE_LOCAL, st);
+        if (use_tc)
         {
-            const int max_ngrp = (rows * max_gq + GRP_Q - 1) / GRP_Q;
-            k_ink2_attn_global_grp<<<dim3(max_ngrp, smax, g.nh_kv), ACT, 0, st>>>(a);
+            static const cudaError_t attr = cudaFuncSetAttribute(k_ink2_attn_prefill_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(attn_tc_smem(TC_MAX_GQ)));
+            if (attr != cudaSuccess) throw std::runtime_error("ink2::attn_forward: shared memory of the tensor-core kernel");
+            k_ink2_attn_qr_prep<<<M * g.nh_q, ACT, 0, st>>>(wk.q_raw, wk.r_raw, w.q_clip, w.rel_clip, rw, g.nh_q, hd, g.rel_dim, g.log_scale_base, g.global ? 1 : 0);
+            a.m0 = 0;
+            a.rows = M;
+            k_ink2_attn_prefill_tc<<<dim3((M + 15) / 16, g.nh_kv), g.gqa * 32, attn_tc_smem(g.gqa), st>>>(a, g.gqa);
         }
-        else k_ink2_attn_core<<<dim3(rows * g.nh_q, smax), ACT, 0, st>>>(a);
-        if (smax > 1) k_ink2_attn_merge<<<rows * g.nh_q, ACT, 0, st>>>(a);
+        for (int m0 = 0; m0 < M && !use_tc; m0 += mb)
+        {
+            const int rows = M - m0 < mb ? M - m0 : mb;
+            a.m0 = m0;
+            a.rows = rows;
+            if (g.global)
+            {
+                const int max_ngrp = (rows * max_gq + GRP_Q - 1) / GRP_Q;
+                k_ink2_attn_global_grp<<<dim3(max_ngrp, smax, g.nh_kv), ACT, 0, st>>>(a);
+            }
+            else if (local_grp_on && max_pos < g.window)
+            {
+                const int max_ngrp = (rows * max_gq + GRP_Q - 1) / GRP_Q;
+                k_ink2_attn_local_grp<<<dim3(max_ngrp, smax, g.nh_kv), ACT, 0, st>>>(a);
+            }
+            else k_ink2_attn_core<<<dim3(rows * g.nh_q, smax), ACT, 0, st>>>(a);
+            if (smax > 1) k_ink2_attn_merge<<<rows * g.nh_q, ACT, 0, st>>>(a);
+        }
     }
-    if (out != nullptr) gemm_bf16(wk.og, w.wo, M, nq, H, out, st);
-    else gemm_f32(wk.og, w.wo, M, nq, H, out_f32, st);
+    {
+        ProfScope _ps(prof, PS_ATTN_WO, st);
+        if (out != nullptr) gemm_bf16(wk.og, w.wo, M, nq, H, out, st);
+        else gemm_f32(wk.og, w.wo, M, nq, H, out_f32, st);
+    }
 }
 
 // The rows a forward of this layer ran on, and the accepted ones (acc [M] bytes on the device; nullptr = all).

@@ -87,6 +87,7 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
     std::array<Run, MAX_SESSIONS> bound{};
     std::array<bool, MAX_SESSIONS> bound_live{};
     std::array<int64_t, MAX_SESSIONS> incoming_sys{};
+    std::array<bool, MAX_SESSIONS> slot_want_lp{};
 
     // MTP > 0: a session's rows of the engine's last forward that are not committed yet, its cached drafts (drafts[i]
     // is the token at position q + 2 + i) and the end of its committed rows
@@ -289,14 +290,17 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
             did_drain = false;
             return d;
         };
-        h.bind_request = [&](unsigned slot, const g6rt::ServeReq& r) {
-            require(slot < MAX_SESSIONS, "Inkling-2-Small bind_request: slot outside the sessions");
-            incoming_sys[slot] = r.sys;
+    }
+    h.bind_request = [&](unsigned slot, const g6rt::ServeReq& r) {
+        require(slot < MAX_SESSIONS, "Inkling-2-Small bind_request: slot outside the sessions");
+        incoming_sys[slot] = r.sys;
+        slot_want_lp[slot] = (r.lp >= 0 || r.plp >= 0);
+        if (stash) {
             std::lock_guard<std::mutex> lk(ck_mu);
             stash->count(r.prompt, r.sys, g6rt::steering::cache_namespace(r.steering), !claimed.empty());
             stash->io_done();
-        };
-    }
+        }
+    };
 
     h.bind = [&](const Grant& g) {
         const int q = int(g.key.slot);
@@ -422,11 +426,19 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
                 sm[size_t(r)] = ink2rt::RowSample{s.inv_temp, s.top_p, s.seed, uint32_t(x.spos)};
             }
         }
+        bool want_lp = false;
+        for (size_t j = 0; j < sp.sess.size(); ++j)
+            if (slot_want_lp[size_t(sp.sess[j])]) want_lp = true;
         if (K == 0) {
-            c.step(rh, toks.data(), sm.data(), out, nullptr);
+            if (!want_lp) {
+                c.step(rh, toks.data(), sm.data(), out, nullptr);
+            } else {
+                c.engine.forward(rh, toks.data(), sm.data(), out, nullptr, true);
+                c.engine.commit();
+            }
         } else {
             settle(&sp);
-            c.engine.forward(rh, toks.data(), sm.data(), out);
+            c.engine.forward(rh, toks.data(), sm.data(), out, nullptr, want_lp);
             fwd_rows = M;
             // kept rows are committed now; a session's verify rows (a round, more than one row) wait for its DRAFT step
             bool wait = false, any = false;
@@ -460,7 +472,7 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
         for (int i = 0; i < e.n; ++i) { e.id[i] = o.top[size_t(i)].id; e.tlp[i] = o.top[size_t(i)].logit - o.lse; }
         e.lp = o.top.empty() ? 0.f : o.top.back().logit - o.lse;
         for (size_t i = 0; i < o.top.size(); ++i)
-            if (o.top[i].id == id) { e.lp = o.top[i].logit - o.lse; e.rank = i < size_t(g6rt::LP_MAX) ? int(i) : -1; break; }
+            if (o.top[i].id == id) { e.lp = o.top[i].logit - o.lse; e.rank = i < size_t(g6rt::LP_MAX) ? int(i) + 1 : -1; break; }
         return e;
     };
     h.dispatch.prefill = [&](const Slot& s, const Payload& p, uint32_t first, uint32_t rows) {

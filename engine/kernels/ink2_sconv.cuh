@@ -104,5 +104,52 @@ inline void sconv_advance(const uint16_t* x, uint16_t* hist, const Rows& rw, con
 {
     k_ink2_sconv_advance<<<cells_grid(static_cast<size_t>(M) * C), 256, 0, st>>>(x, hist, rw, acc, M, C);
 }
+
+// Batched multi-layer trunk commit: collapses ~232 per-layer sconv_advance + attn_commit launches into 1 launch!
+struct CommitLayerDesc
+{
+    const uint16_t *att, *mo, *kp, *vp, *kv_new;
+    uint16_t *hist_a, *hist_m, *hist_k, *hist_v, *ring;
+    int nk, window, is_local;
+};
+
+__global__ void __launch_bounds__(256) k_ink2_commit_all(
+    const CommitLayerDesc* __restrict__ descs, Rows rw, const uint8_t* __restrict__ acc, int M, int H)
+{
+    const size_t i = static_cast<size_t>(blockIdx.x) * 256 + threadIdx.x;
+    if (i >= static_cast<size_t>(M) * H) return;
+    const int m = static_cast<int>(i / H), c = static_cast<int>(i % H);
+    const CommitLayerDesc d = descs[blockIdx.y];
+    const size_t slot = static_cast<size_t>(rw.slot[m]);
+    const int pos = rw.pos[m];
+    if (ring_writer(rw, acc, m, M, SCONV_HIST))
+    {
+        const size_t h3H = (slot * SCONV_HIST + pos % SCONV_HIST) * H + c;
+        d.hist_a[h3H] = d.att[i];
+        d.hist_m[h3H] = d.mo[i];
+        if (c < d.nk)
+        {
+            const size_t nk = static_cast<size_t>(d.nk);
+            const size_t ik = static_cast<size_t>(m) * nk + c;
+            const size_t h3k = (slot * SCONV_HIST + pos % SCONV_HIST) * nk + c;
+            d.hist_k[h3k] = d.kp[ik];
+            d.hist_v[h3k] = d.vp[ik];
+        }
+    }
+    if (d.is_local && c < d.nk && ring_writer(rw, acc, m, M, d.window))
+    {
+        const size_t nk = static_cast<size_t>(d.nk);
+        const uint16_t* src = d.kv_new + static_cast<size_t>(m) * 2 * nk + c;
+        uint16_t* dst = d.ring + (slot * 2 * d.window + pos % d.window) * nk + c;
+        dst[0] = src[0];
+        dst[static_cast<size_t>(d.window) * nk] = src[nk];
+    }
+}
+
+inline void commit_all(const CommitLayerDesc* d_descs, int NL, const Rows& rw, const uint8_t* acc, int M, int H, cudaStream_t st)
+{
+    if (NL <= 0 || M <= 0) return;
+    k_ink2_commit_all<<<dim3(cells_grid(static_cast<size_t>(M) * H), static_cast<unsigned>(NL)), 256, 0, st>>>(d_descs, rw, acc, M, H);
+}
 #endif   // __CUDACC__
 }   // namespace ink2

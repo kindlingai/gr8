@@ -205,6 +205,11 @@ struct Config
     int tp = 1;                    // ranks the sharded sums are split over
     std::vector<uint8_t> global;   // [n_layers] 1 = full attention with the dynamic K / V convolution
     std::vector<uint8_t> mxfp8;    // [n_layers] 1 = MXFP8 experts, 0 = NVFP4
+    // looped core (Inkling-2-Mini): core_start .. core_end run loop_passes times; loop_passes <= 1 = unlooped
+    int loop_start = 0, loop_end = 0, loop_passes = 1, loop_gate_rank = 0;
+    bool is_looped() const { return loop_passes > 1 && loop_end > loop_start; }
+    int n_loop_layers() const { return is_looped() ? (loop_end - loop_start) : 0; }
+    int n_virtual_layers() const { return is_looped() ? n_layers + (loop_passes - 1) * (loop_end - loop_start) : n_layers; }
     // the MTP drafter; 0 layers = none. It has the trunk's hidden size, heads and head_dim.
     int mtp_layers = 0, mtp_inter = 0;
     int mtp_window = 0;                   // a local drafter layer sees the last mtp_window context rows
@@ -246,6 +251,12 @@ struct Layer
     //          MXFP8 fc1 [E][I/16][H/32][gate 528 | up 528], fc2 [E][H/16][I/32][528]
     std::vector<uint8_t> fc1, fc2;
     std::vector<float> s1, s2;
+    // loop controllers (core layers only): down [R][2*H], forget [H][R], gain [H][R], BF16 values as float
+    struct MsgGate
+    {
+        std::vector<float> down, forget, gain;
+    };
+    MsgGate q_gate, k_gate, v_gate, mlp_gate;
 };
 
 struct MtpLayer
@@ -297,6 +308,7 @@ struct VisionWeights
 struct Weights
 {
     std::vector<float> embed, embed_norm, final_norm, output_query, lm_head;   // [V][H], [H], [H], [H], [V][H]
+    std::vector<float> msg_queries;                                            // looped only: [n_loop_layers][4][H] F32 (q, k, v, mlp)
     std::vector<Layer> layers;
     MtpWeights mtp;
     VisionWeights vis;
@@ -314,7 +326,7 @@ struct ImageSpan
 class Model
 {
 public:
-    Model(const Config& c, const Weights& w) : C(c), W(w), st(static_cast<size_t>(c.n_layers))
+    Model(const Config& c, const Weights& w) : C(c), W(w), st(static_cast<size_t>(c.n_virtual_layers()))
     {
         const auto bad = [](const char* m) { throw std::runtime_error(std::string("ink2ref: ") + m); };
         if (C.n_layers < 1 || static_cast<int>(W.layers.size()) != C.n_layers) bad("layer count");
@@ -322,6 +334,19 @@ public:
         if (C.global[0]) bad("layer 0 must be a local layer");
         if (C.n_heads % C.n_kv_heads || C.tp < 1 || C.n_heads % C.tp || C.inter % (64 * C.tp) || C.hidden % 64) bad("geometry");
         if (C.top_k < 1 || C.top_k > C.n_exp || C.block < 1) bad("top_k or block");
+        if (C.is_looped())
+        {
+            if (C.loop_start < C.block || C.loop_end > C.n_layers || C.loop_start % C.block || C.loop_end % C.block || C.loop_gate_rank < 1)
+                bad("loop config");
+            if (W.msg_queries.size() != static_cast<size_t>(C.n_loop_layers()) * 4 * C.hidden) bad("msg_queries size");
+            const size_t ds = static_cast<size_t>(C.loop_gate_rank) * 2 * C.hidden, us = static_cast<size_t>(C.hidden) * C.loop_gate_rank;
+            for (int l = C.loop_start; l < C.loop_end; ++l)
+            {
+                const Layer& y = W.layers[l];
+                for (const Layer::MsgGate* g : {&y.q_gate, &y.k_gate, &y.v_gate, &y.mlp_gate})
+                    if (g->down.size() != ds || g->forget.size() != us || g->gain.size() != us) bad("loop controller size");
+            }
+        }
         if (C.mtp_layers > 0) mtp_init();
         if (C.has_vision)
         {
@@ -381,58 +406,133 @@ public:
             for (size_t t = 0; t < ntaps(); ++t)
                 if (C.mtp_target_layers[t] == layer) memcpy(&taps[(static_cast<size_t>(m) * ntaps() + t) * H], row, static_cast<size_t>(H) * sizeof(float));
         };
-        for (int l = 0; l < C.n_layers; ++l)
-        {
+        auto run_layer = [&](int v, int l, std::vector<std::vector<float>>& cur_states, std::vector<float>& cur_h, const std::vector<float>* msgs) {
             const Layer& w = W.layers[l];
-            for (int m = 0; m < M && ntaps(); ++m) tap(l, m, &h[static_cast<size_t>(m) * H]);
+            for (int m = 0; m < M && ntaps(); ++m) tap(v, m, &cur_h[static_cast<size_t>(m) * H]);
             const bool glob = C.global[l] != 0;
-            std::vector<float> qi(h.size()), ki, vi;
-            if (l == 0)
-                for (int m = 0; m < M; ++m) wnorm(&h[static_cast<size_t>(m) * H], w.attn_norm, &qi[static_cast<size_t>(m) * H]);
-            else if (!glob)
+            std::vector<float> qi(cur_h.size()), ki, vi;
+            if (!msgs)
             {
-                const std::vector<float> x = attn_res(states, h, w.attn_query, 1, M);
-                for (int m = 0; m < M; ++m) wnorm(&x[static_cast<size_t>(m) * H], w.attn_norm, &qi[static_cast<size_t>(m) * H]);
+                if (l == 0)
+                    for (int m = 0; m < M; ++m) wnorm(&cur_h[static_cast<size_t>(m) * H], w.attn_norm, &qi[static_cast<size_t>(m) * H]);
+                else if (!glob)
+                {
+                    const std::vector<float> x = attn_res(cur_states, cur_h, w.attn_query, 1, M);
+                    for (int m = 0; m < M; ++m) wnorm(&x[static_cast<size_t>(m) * H], w.attn_norm, &qi[static_cast<size_t>(m) * H]);
+                }
+                else
+                {
+                    const std::vector<float> x = attn_res(cur_states, cur_h, w.attn_query, 3, M);
+                    ki.resize(cur_h.size());
+                    vi.resize(cur_h.size());
+                    for (int m = 0; m < M; ++m)
+                    {
+                        const float* xm = &x[static_cast<size_t>(m) * 3 * H];
+                        wnorm(xm, w.q_norm, &qi[static_cast<size_t>(m) * H]);
+                        wnorm(xm + H, w.k_norm, &ki[static_cast<size_t>(m) * H]);
+                        wnorm(xm + 2 * H, w.v_norm, &vi[static_cast<size_t>(m) * H]);
+                    }
+                }
             }
             else
             {
-                const std::vector<float> x = attn_res(states, h, w.attn_query, 3, M);
-                ki.resize(h.size());
-                vi.resize(h.size());
+                // Loop pass >= 1: fp32 AttnRes + MessageGate for q, k, v, then norm (attn_norm for local, q/k/v_norm for global)
+                const std::vector<float> x = attn_res_f32(cur_states, cur_h, w.attn_query, glob ? 3 : 1, M);
+                ki.resize(cur_h.size());
+                vi.resize(cur_h.size());
+                std::vector<float> tmp(static_cast<size_t>(H));
                 for (int m = 0; m < M; ++m)
                 {
-                    const float* xm = &x[static_cast<size_t>(m) * 3 * H];
-                    wnorm(xm, w.q_norm, &qi[static_cast<size_t>(m) * H]);
-                    wnorm(xm + H, w.k_norm, &ki[static_cast<size_t>(m) * H]);
-                    wnorm(xm + 2 * H, w.v_norm, &vi[static_cast<size_t>(m) * H]);
+                    const float* xq = &x[static_cast<size_t>(m) * (glob ? 3 : 1) * H];
+                    const float* xk = glob ? xq + H : xq;
+                    const float* xv = glob ? xq + 2 * H : xq;
+                    const float* mm = &(*msgs)[static_cast<size_t>(m) * 4 * H];
+                    msg_gate(xq, mm + 0 * H, w.q_gate, tmp.data());
+                    wnorm(tmp.data(), glob ? w.q_norm : w.attn_norm, &qi[static_cast<size_t>(m) * H]);
+                    msg_gate(xk, mm + 1 * H, w.k_gate, tmp.data());
+                    wnorm(tmp.data(), glob ? w.k_norm : w.attn_norm, &ki[static_cast<size_t>(m) * H]);
+                    msg_gate(xv, mm + 2 * H, w.v_gate, tmp.data());
+                    wnorm(tmp.data(), glob ? w.v_norm : w.attn_norm, &vi[static_cast<size_t>(m) * H]);
                 }
             }
-            const std::vector<float> att = attention(l, qi, glob ? ki : qi, glob ? vi : qi, M);
-            const std::vector<float> a = sconv_static(w.attn_sconv, st[l].hist_a, att, M, H);
-            std::vector<float> mid(h.size());
+            const bool split_kv = glob || (msgs != nullptr);
+            const std::vector<float> att = attention_v(v, l, qi, split_kv ? ki : qi, split_kv ? vi : qi, M);
+            const std::vector<float> a = sconv_static(w.attn_sconv, st[v].hist_a, att, M, H);
+            std::vector<float> mid(cur_h.size());
             if (l % C.block == 0)
             {
-                states.push_back(h);
+                cur_states.push_back(cur_h);
                 mid = a;
             }
             else
-                for (size_t i = 0; i < h.size(); ++i) mid[i] = rbf(h[i] + a[i]);
-            const std::vector<float> xm = attn_res(states, mid, w.mlp_query, 1, M);
-            std::vector<float> mo(h.size()), xn(static_cast<size_t>(H));
-            for (int m = 0; m < M; ++m)
+                for (size_t i = 0; i < cur_h.size(); ++i) mid[i] = rbf(cur_h[i] + a[i]);
+            std::vector<float> mo(cur_h.size()), xn(static_cast<size_t>(H));
+            if (!msgs)
             {
-                wnorm(&xm[static_cast<size_t>(m) * H], w.mlp_norm, xn.data());
-                moe(l, xn.data(), &mo[static_cast<size_t>(m) * H]);
+                const std::vector<float> xm = attn_res(cur_states, mid, w.mlp_query, 1, M);
+                for (int m = 0; m < M; ++m)
+                {
+                    wnorm(&xm[static_cast<size_t>(m) * H], w.mlp_norm, xn.data());
+                    moe(l, xn.data(), &mo[static_cast<size_t>(m) * H]);
+                }
             }
-            const std::vector<float> ms = sconv_static(w.mlp_sconv, st[l].hist_m, mo, M, H);
-            for (size_t i = 0; i < h.size(); ++i) h[i] = rbf(mid[i] + ms[i]);
+            else
+            {
+                const std::vector<float> xm = attn_res_f32(cur_states, mid, w.mlp_query, 1, M);
+                std::vector<float> tmp(static_cast<size_t>(H));
+                for (int m = 0; m < M; ++m)
+                {
+                    const float* mm = &(*msgs)[static_cast<size_t>(m) * 4 * H];
+                    msg_gate(&xm[static_cast<size_t>(m) * H], mm + 3 * H, w.mlp_gate, tmp.data());
+                    wnorm(tmp.data(), w.mlp_norm, xn.data());
+                    moe(l, xn.data(), &mo[static_cast<size_t>(m) * H]);
+                }
+            }
+            const std::vector<float> ms = sconv_static(w.mlp_sconv, st[v].hist_m, mo, M, H);
+            for (size_t i = 0; i < cur_h.size(); ++i) cur_h[i] = rbf(mid[i] + ms[i]);
+        };
+
+        if (!C.is_looped())
+        {
+            for (int l = 0; l < C.n_layers; ++l) run_layer(l, l, states, h, nullptr);
+        }
+        else
+        {
+            const int n_loop = C.n_loop_layers();
+            int v = 0;
+            // Prelude: 0 .. loop_start - 1
+            for (int l = 0; l < C.loop_start; ++l, ++v) run_layer(v, l, states, h, nullptr);
+            const std::vector<float> pre_h = h;
+            const std::vector<std::vector<float>> pre_states = states;
+            const size_t num_pre = pre_states.size();
+            // Pass 0 of core: loop_start .. loop_end - 1, messages = nullptr
+            for (int l = C.loop_start; l < C.loop_end; ++l, ++v) run_layer(v, l, states, h, nullptr);
+            // Remaining passes: 1 .. loop_passes - 1
+            for (int pass = 1; pass < C.loop_passes; ++pass)
+            {
+                std::vector<std::vector<float>> prev_states;
+                for (size_t b = num_pre + 1; b < states.size(); ++b) prev_states.push_back(states[b]);
+                const std::vector<float> prev_h = h;
+                h = pre_h;
+                states = pre_states;
+                for (int j = 0; j < n_loop; ++j, ++v)
+                {
+                    const int l = C.loop_start + j;
+                    const float* qptr = &W.msg_queries[static_cast<size_t>(j) * 4 * H];
+                    const std::vector<float> qvec(qptr, qptr + static_cast<size_t>(4) * H);
+                    const std::vector<float> msgs = attn_res_f32(prev_states, prev_h, qvec, 4, M);
+                    run_layer(v, l, states, h, &msgs);
+                }
+            }
+            // Coda: loop_end .. n_layers - 1
+            for (int l = C.loop_end; l < C.n_layers; ++l, ++v) run_layer(v, l, states, h, nullptr);
         }
         const std::vector<float> xf = attn_res(states, h, W.output_query, 1, M);
         std::vector<float> logits(static_cast<size_t>(M) * C.vocab), hf(static_cast<size_t>(H));
         for (int m = 0; m < M; ++m)
         {
             wnorm(&xf[static_cast<size_t>(m) * H], W.final_norm, hf.data());
-            if (ntaps()) tap(C.n_layers, m, hf.data());
+            if (ntaps()) tap(C.n_virtual_layers(), m, hf.data());
             for (int v = 0; v < C.vocab; ++v)
             {
                 const float z = dot(hf.data(), &W.lm_head[static_cast<size_t>(v) * H], H);
@@ -859,10 +959,9 @@ public:
         for (int c = 0; c < C.hidden; ++c) out[c] = rbf(w[c] * (x[c] * r));
     }
 
-    // Depth attention over the finished blocks and the partial residual, per token: rows = states..., partial, each
-    // RMS normalised (no weight); logit = query . row / sqrt(H); out = bf16(sum softmax * row). Returns [M][Q][H].
-    std::vector<float> attn_res(const std::vector<std::vector<float>>& states, const std::vector<float>& partial,
-                                const std::vector<float>& query, int Q, int M) const
+    // Unrounded fp32 depth attention (BlockAttentionResidual / MessageAttentionResidual). Returns [M][Q][H] fp32.
+    std::vector<float> attn_res_f32(const std::vector<std::vector<float>>& states, const std::vector<float>& partial,
+                                    const std::vector<float>& query, int Q, int M) const
     {
         const int H = C.hidden, D = static_cast<int>(states.size()) + 1;
         std::vector<float> out(static_cast<size_t>(M) * Q * H), U(static_cast<size_t>(D) * H), lg(static_cast<size_t>(D));
@@ -892,10 +991,42 @@ public:
                 {
                     float s = 0.0f;
                     for (int d = 0; d < D; ++d) s += (lg[d] / den) * U[static_cast<size_t>(d) * H + c];
-                    o[c] = rbf(s);
+                    o[c] = s;
                 }
             }
         }
+        return out;
+    }
+
+    // Inkling2LoopMessageGate: mixes fp32 hidden_states and message as (1 - tanh(forget(g))) * h + tanh(gain(g)) * msg,
+    // where g = bf16(down_proj(bf16([unweighted_rms(h), unweighted_rms(msg)]))). Output is fp32 [H].
+    void msg_gate(const float* h_in, const float* msg, const Layer::MsgGate& g, float* out) const
+    {
+        const int H = C.hidden, R = C.loop_gate_rank;
+        std::vector<float> cat(static_cast<size_t>(2) * H), mid(static_cast<size_t>(R));
+        const float rh = rsqrtf(mean_sq(h_in, H) + EPS);
+        const float rm = rsqrtf(mean_sq(msg, H) + EPS);
+        for (int c = 0; c < H; ++c)
+        {
+            cat[c] = rbf(h_in[c] * rh);
+            cat[H + c] = rbf(msg[c] * rm);
+        }
+        for (int r = 0; r < R; ++r) mid[r] = rbf(dot(&g.down[static_cast<size_t>(r) * 2 * H], cat.data(), 2 * H));
+        for (int c = 0; c < H; ++c)
+        {
+            const float fg = std::tanh(dot(&g.forget[static_cast<size_t>(c) * R], mid.data(), R));
+            const float mg = std::tanh(dot(&g.gain[static_cast<size_t>(c) * R], mid.data(), R));
+            out[c] = (1.0f - fg) * h_in[c] + mg * msg[c];
+        }
+    }
+
+    // Depth attention over the finished blocks and the partial residual, per token: rows = states..., partial, each
+    // RMS normalised (no weight); logit = query . row / sqrt(H); out = bf16(sum softmax * row). Returns [M][Q][H].
+    std::vector<float> attn_res(const std::vector<std::vector<float>>& states, const std::vector<float>& partial,
+                                const std::vector<float>& query, int Q, int M) const
+    {
+        std::vector<float> out = attn_res_f32(states, partial, query, Q, M);
+        for (float& x : out) x = rbf(x);
         return out;
     }
 
@@ -944,11 +1075,11 @@ public:
 
     float tau(int p) const { return 1.0f + 0.1f * std::log(std::fmax(1.0f, static_cast<float>(p + 1) / static_cast<float>(C.log_scale_base))); }
 
-    // qi, ki, vi [M][H] -> wo(gated attention output) [M][H], BF16; appends the M tokens' K / V rows.
-    std::vector<float> attention(int l, const std::vector<float>& qi, const std::vector<float>& ki, const std::vector<float>& vi, int M)
+    // qi, ki, vi [M][H] -> wo(gated attention output) [M][H], BF16; appends the M tokens' K / V rows to virtual state v.
+    std::vector<float> attention_v(int v, int l, const std::vector<float>& qi, const std::vector<float>& ki, const std::vector<float>& vi, int M)
     {
         const Layer& w = W.layers[l];
-        State& s = st[l];
+        State& s = st[v];
         const bool glob = C.global[l] != 0;
         const int H = C.hidden, nh = C.n_heads, nkv = C.n_kv_heads, hd = C.head_dim, rd = C.rel_dim, nq = nh * hd, nk = nkv * hd, grp = nh / nkv;
         const float clip = 2.0f * std::sqrt(static_cast<float>(hd)), rclip = 2.0f * std::sqrt(static_cast<float>(rd));
@@ -1044,6 +1175,10 @@ public:
             }
         }
         return out;
+    }
+    std::vector<float> attention(int l, const std::vector<float>& qi, const std::vector<float>& ki, const std::vector<float>& vi, int M)
+    {
+        return attention_v(l, l, qi, ki, vi, M);
     }
 
     // The router of one token: the top_k experts by sigmoid(logit) + bias (ties to the lower index, in pick order) and
@@ -1142,7 +1277,7 @@ private:
         if (static_cast<int>(w.layers.size()) != L || static_cast<int>(C.mtp_global.size()) != L) bad("layer count");
         if (nt < 1 || static_cast<int>(w.fuse_weight.size()) != (L + 1) * nt) bad("taps");
         for (int t : C.mtp_target_layers)
-            if (t < 0 || t > C.n_layers) bad("target layer");
+            if (t < 0 || t > C.n_virtual_layers()) bad("target layer");
         if (C.mtp_block < 2 || C.mtp_drafts < 1 || C.mtp_drafts > C.mtp_block - 1 || C.mtp_window < 1 || R < 1) bad("block, drafts, window or rank");
         if (C.mtp_inter < 1 || C.mtp_inter % C.tp || C.head_dim % 2) bad("geometry");
         if (w.rnn_w.size() != static_cast<size_t>(3) * R * (2 * R + 2 * H) || w.markov_w1.size() != static_cast<size_t>(C.vocab) * R) bad("head sizes");

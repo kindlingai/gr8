@@ -563,7 +563,7 @@ fn options_and_errors() {
     let m = mini("opts");
     m.write();
     let full = plan(&m, 4, 1);
-    let lean = ink2::plan(&m.dir, 4, 1, &Opts { bf16_gv: false, with_mtp: false, with_vision: false }).unwrap();
+    let lean = ink2::plan(&m.dir, 4, 1, &Opts { bf16_gv: false, with_mtp: false, with_vision: false, variant: None }).unwrap();
     assert!(!lean.img.tensors.iter().any(|t| t.name.ends_with(".gv") || t.name.starts_with("MTP.") || t.name.starts_with("V.")));
     assert!(lean.img.tensors.iter().all(|t| full.img.tensors.iter().any(|u| u.name == t.name && u.shape == t.shape)));
     assert!(!lean.reads.contains_key("mtp.safetensors") && full.reads.contains_key("mtp.safetensors"));
@@ -1102,4 +1102,219 @@ fn rank_images_add_up_to_one_rank() {
         }
     }
     println!("rank_images_add_up_to_one_rank: lowest NVFP4 cosine with per-rank activation scales {low:.6}");
+}
+
+/// Looped Inkling-2-Mini native checkpoint: parses loop_config, merges cross-pass queries into G.loop.msg_queries
+/// in [q, k, v, mlp] order, and plans core-layer controllers.
+#[test]
+fn looped_native_checkpoint_plans_queries_and_controllers() {
+    let dir = std::env::temp_dir().join(format!("g6l-ink2-loop-native-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dstr = dir.to_string_lossy().into_owned();
+    let mut rng = Rng(0x51a0_0001);
+    let (h, nl, nh, nkv, hd, rd, rw, inter, nexp, topk, vocab, cs, ce, passes, gr) =
+        (256usize, 6usize, 24usize, 8usize, 16usize, 16usize, 8usize, 256usize, 16usize, 4usize, 512usize, 2usize, 4usize, 3usize, 16usize);
+    let cfg = format!(
+        "{{\"architectures\":[\"Inkling2LoopForConditionalGeneration\"],\"text_config\":{{\
+         \"hidden_size\":{h},\"num_hidden_layers\":{nl},\"num_attention_heads\":{nh},\
+         \"num_key_value_heads\":{nkv},\"head_dim\":{hd},\"intermediate_size\":{inter},\
+         \"n_routed_experts\":{nexp},\"num_experts_per_tok\":{topk},\"vocab_size\":{vocab},\
+         \"local_layer_ids\":[0,2,4],\"n_layers_per_attn_res_block\":2,\
+         \"loop_config\":{{\"core_start\":{cs},\"core_end\":{ce},\"num_passes\":{passes},\"gate_rank\":{gr},\"is_varloop\":false}}}}}}"
+    );
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+
+    let mut ts: Vec<Item> = Vec::new();
+    let mut mk_bf = |name: String, sh: Vec<usize>| -> Item {
+        let n: usize = sh.iter().product();
+        let b: Vec<u8> = (0..n).flat_map(|_| bf16((rng.next() & 0xff) as f32 / 128.0 - 1.0).to_le_bytes()).collect();
+        (name, "BF16", sh, b)
+    };
+    let mk_f32 = |name: String, sh: Vec<usize>, seed_off: usize| -> Item {
+        let n: usize = sh.iter().product();
+        let b: Vec<u8> = (0..n).flat_map(|i| ((seed_off + i) as f32 * 0.25).to_le_bytes()).collect();
+        (name, "F32", sh, b)
+    };
+    ts.push(mk_bf("model.llm.embed.weight".into(), vec![vocab, h]));
+    ts.push(mk_bf("model.llm.embed_norm.weight".into(), vec![h]));
+    ts.push(mk_bf("model.llm.norm.weight".into(), vec![h]));
+    ts.push(mk_bf("model.llm.unembed.weight".into(), vec![vocab, h]));
+    ts.push(mk_f32("model.llm.attn_res.output_query".into(), vec![h], 10));
+    let n_loop = ce - cs;
+    ts.push(mk_f32("model.llm.middle_cycle_cross_pass_queries".into(), vec![2 * n_loop, h], 1000));
+    ts.push(mk_f32("model.llm.middle_cycle_cross_pass_kv_queries".into(), vec![2 * n_loop, h], 5000));
+    for l in 0..nl {
+        let glob = l % 2 == 1;
+        if l >= 1 {
+            ts.push(mk_f32(format!("model.llm.attn_res.attn_queries.{}", l - 1), if glob { vec![3, h] } else { vec![h] }, 100 + l));
+        }
+        ts.push(mk_f32(format!("model.llm.attn_res.mlp_queries.{l}"), vec![h], 200 + l));
+        if glob {
+            for k in ["q_input_norm", "k_input_norm", "v_input_norm"] {
+                ts.push(mk_bf(format!("model.llm.layers.{l}.{k}.weight"), vec![h]));
+            }
+            for k in ["k_sconv", "v_sconv"] {
+                ts.push(mk_bf(format!("model.llm.layers.{l}.attn.{k}.static_w"), vec![4, nkv * hd]));
+                ts.push(mk_bf(format!("model.llm.layers.{l}.attn.{k}.weight_proj"), vec![nkv * 4, h]));
+            }
+        } else {
+            ts.push(mk_bf(format!("model.llm.layers.{l}.attn_norm.weight"), vec![h]));
+            for k in ["k_sconv", "v_sconv"] {
+                ts.push(mk_bf(format!("model.llm.layers.{l}.attn.{k}.weight"), vec![nkv * hd, 1, 4]));
+            }
+        }
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn.wq_du.weight"), vec![nh * hd, h]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn.wr_du.weight"), vec![nh * rd, h]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn.gate_attn.weight"), vec![nh * hd, h]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn.attn_sink_proj.weight"), vec![nh, h]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn.wk_dv.weight"), vec![nkv * hd, h]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn.wv_dv.weight"), vec![nkv * hd, h]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn.wo_ud.weight"), vec![h, nh * hd]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn.q_l2_clip.scale"), vec![nh, hd]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn.rel_l2_clip.scale"), vec![nh, rd]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn.rel_logits_proj.proj"), vec![rd, rw]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.attn_sconv.weight"), vec![h, 1, 4]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.mlp_sconv.weight"), vec![h, 1, 4]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.mlp_norm.weight"), vec![h]));
+        ts.push(mk_bf(format!("model.llm.layers.{l}.mlp.gate.weight"), vec![nexp, h]));
+        ts.push(mk_f32(format!("model.llm.layers.{l}.mlp.gate.bias"), vec![nexp], 300 + l));
+        if l >= cs && l < ce {
+            for src in ["attn", "k", "v", "mlp"] {
+                ts.push(mk_bf(format!("model.llm.layers.{l}.controllers.{src}.down_weight"), vec![gr, 2 * h]));
+                ts.push(mk_bf(format!("model.llm.layers.{l}.controllers.{src}.forget_weight"), vec![h, gr]));
+                ts.push(mk_bf(format!("model.llm.layers.{l}.controllers.{src}.gain_weight"), vec![h, gr]));
+            }
+        }
+        // MXFP8 on last 2 layers, NVFP4 on first 4
+        if l >= 4 {
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w13_weight"), "F8_E4M3", vec![nexp, 2 * inter, h], vec![0x38; nexp * 2 * inter * h]));
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w13_weight_scale"), "U8", vec![nexp, 2 * inter, h / 32], vec![127; nexp * 2 * inter * (h / 32)]));
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w2_weight"), "F8_E4M3", vec![nexp, h, inter], vec![0x38; nexp * h * inter]));
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w2_weight_scale"), "U8", vec![nexp, h, inter / 32], vec![127; nexp * h * (inter / 32)]));
+        } else {
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w13_weight"), "U8", vec![nexp, 2 * inter, h / 2], vec![0x22; nexp * 2 * inter * (h / 2)]));
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w13_weight_scale"), "F8_E4M3", vec![nexp, 2 * inter, h / 16], vec![0x38; nexp * 2 * inter * (h / 16)]));
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w13_weight_amax"), "F32", vec![nexp], 1f32.to_le_bytes().repeat(nexp)));
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w13_weight_outer_scale_denominator"), "F32", vec![1], 1f32.to_le_bytes().to_vec()));
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w2_weight"), "U8", vec![nexp, h, inter / 2], vec![0x22; nexp * h * (inter / 2)]));
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w2_weight_scale"), "F8_E4M3", vec![nexp, h, inter / 16], vec![0x38; nexp * h * (inter / 16)]));
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w2_weight_amax"), "F32", vec![nexp], 1f32.to_le_bytes().repeat(nexp)));
+            ts.push((format!("model.llm.layers.{l}.mlp.experts.w2_weight_outer_scale_denominator"), "F32", vec![1], 1f32.to_le_bytes().to_vec()));
+        }
+    }
+    std::fs::write(format!("{dstr}/model.safetensors"), st_bytes(&ts)).unwrap();
+
+    let p = ink2::plan(&dstr, 1, 0, &Opts::default()).unwrap();
+    assert_eq!(p.cfg.loop_cfg, Some(ink2::LoopConfig { core_start: cs, core_end: ce, num_passes: passes, gate_rank: gr }));
+    // Verify G.loop.msg_queries merge order: [q, k, v, mlp] per loop layer
+    let mq = meta(&p, "G.loop.msg_queries");
+    assert_eq!(mq.shape, vec![n_loop as i64, 4, h as i64]);
+    let raw = tensor(&p, "G.loop.msg_queries");
+    let vals: Vec<f32> = raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+    for j in 0..n_loop {
+        assert_eq!(vals[(j * 4 + 0) * h], (1000 + (2 * j) * h) as f32 * 0.25, "q[{j}]");
+        assert_eq!(vals[(j * 4 + 1) * h], (5000 + (2 * j) * h) as f32 * 0.25, "k[{j}]");
+        assert_eq!(vals[(j * 4 + 2) * h], (5000 + (2 * j + 1) * h) as f32 * 0.25, "v[{j}]");
+        assert_eq!(vals[(j * 4 + 3) * h], (1000 + (2 * j + 1) * h) as f32 * 0.25, "mlp[{j}]");
+    }
+    for l in cs..ce {
+        for dst in ["q", "k", "v", "mlp"] {
+            assert_eq!(meta(&p, &format!("L{l:03}.ctrl.{dst}.down")).shape, vec![gr as i64, (2 * h) as i64]);
+            assert_eq!(meta(&p, &format!("L{l:03}.ctrl.{dst}.forget")).shape, vec![h as i64, gr as i64]);
+            assert_eq!(meta(&p, &format!("L{l:03}.ctrl.{dst}.gain")).shape, vec![h as i64, gr as i64]);
+        }
+    }
+    // Also verify Option-1 exlr8 pmcgx release (non-experts in model.safetensors + experts/ + index-slices/ + manifests/)
+    let edir = std::env::temp_dir().join(format!("g6l-ink2-loop-exlr8-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&edir);
+    std::fs::create_dir_all(edir.join("experts")).unwrap();
+    std::fs::create_dir_all(edir.join("manifests")).unwrap();
+    for k in [2usize, 3, 4] {
+        std::fs::create_dir_all(edir.join(format!("index-slices/tp1/k{k}"))).unwrap();
+    }
+    std::fs::copy(dir.join("config.json"), edir.join("config.json")).unwrap();
+    let nonexp: Vec<_> = ts.into_iter().filter(|(n, _, _, _)| !n.contains(".mlp.experts.")).collect();
+    std::fs::write(format!("{}/model.safetensors", edir.display()), st_bytes(&nonexp)).unwrap();
+
+    let nh_blk = inter / 128; // 2
+    let blocks = h / 128;     // 2
+    for l in 0..nl {
+        for k in [2usize, 3, 4] {
+            let hb = h * 16 * k;
+            let nbytes = nexp * nh_blk * hb;
+            let mut hdr = String::from("{\"__metadata__\":{\"format\":\"exlr8-v2\",\"contents\":\"trellis\",\"codebook\":\"pmcgx V2 L20 0xCBAC1FED/0xBCA14C51, every value rounded to E4M3\"}");
+            for (pi, proj) in ["gate", "up", "down"].iter().enumerate() {
+                let a = pi * nbytes;
+                hdr += &format!(",\"trellis.{proj}.pmcgx\":{{\"dtype\":\"U8\",\"shape\":[{nbytes}],\"data_offsets\":[{a},{}]}}",(a + nbytes));
+            }
+            hdr += "}";
+            let mut hb_bytes = hdr.into_bytes();
+            hb_bytes.resize(65536 - 8, b' ');
+            let mut out = (hb_bytes.len() as u64).to_le_bytes().to_vec();
+            out.extend_from_slice(&hb_bytes);
+            let pth = edir.join(format!("experts/exlr8-layer-{l:03}.k{k}.safetensors"));
+            std::fs::write(&pth, &out).unwrap();
+            std::fs::OpenOptions::new().write(true).open(&pth).unwrap().set_len(65536 + (3 * nbytes) as u64).unwrap();
+        }
+    }
+    // Index slices for TP=1 at k=2,3,4
+    for k in [2usize, 3, 4] {
+        let hb = h * 16 * k;
+        let nbytes = nexp * nh_blk * hb;
+        let mut st_t: Vec<(String, &'static str, Vec<usize>, Vec<u8>)> = Vec::new();
+        for l in 0..nl {
+            let rows = nexp * nh_blk;
+            let mut units: Vec<u8> = Vec::with_capacity(rows * 2 * 2);
+            let mut offs: Vec<u8> = Vec::with_capacity(rows * 3 * 8);
+            for e in 0..nexp {
+                for u in 0..nh_blk {
+                    units.extend_from_slice(&(e as i16).to_le_bytes());
+                    units.extend_from_slice(&(u as i16).to_le_bytes());
+                    let idx = e * nh_blk + u;
+                    for pi in 0..3 {
+                        let off = 65536u64 + (pi * nbytes + idx * hb) as u64;
+                        offs.extend_from_slice(&(off as i64).to_le_bytes());
+                    }
+                }
+            }
+            st_t.push((format!("L{l:03}.units"), "I16", vec![rows, 2], units));
+            st_t.push((format!("L{l:03}.offset"), "I64", vec![rows, 3], offs));
+            st_t.push((format!("L{l:03}.chan"), "F16", vec![rows, 3, 128], vec![0x00, 0x3C].repeat(rows * 3 * 128)));
+            st_t.push((format!("L{l:03}.block"), "F16", vec![nexp, 3, blocks], vec![0x00, 0x3C].repeat(nexp * 3 * blocks)));
+            st_t.push((format!("L{l:03}.signs"), "I8", vec![2, h], vec![1u8; 2 * h]));
+        }
+        std::fs::write(format!("{}/index-slices/tp1/k{k}/rank0.safetensors", edir.display()), st_bytes(&st_t)).unwrap();
+    }
+    // Mixed per-expert uniform manifest (K2/K3/K4 across experts, uniform within each expert -> kmix == 0)
+    let mut layers_json = Vec::new();
+    for l in 0..nl {
+        let mut g_rows = Vec::new();
+        let mut u_rows = Vec::new();
+        let mut d_rows = Vec::new();
+        for e in 0..nexp {
+            let kw = 2 + ((l + e) % 3);
+            g_rows.push(format!("[{kw},{kw}]"));
+            u_rows.push(format!("[{kw},{kw}]"));
+            d_rows.push(kw.to_string());
+        }
+        layers_json.push(format!("\"{l}\":{{\"gate\":[{}],\"up\":[{}],\"down\":[{}]}}", g_rows.join(","), u_rows.join(","), d_rows.join(",")));
+    }
+    let mjson = format!("{{\"format\":\"exlr8-v2-manifest\",\"layers\":{{{}}}}}", layers_json.join(","));
+    std::fs::write(edir.join("manifests/exlr8-manifest-bit300.json"), mjson).unwrap();
+
+    let pe = ink2::plan(edir.to_str().unwrap(), 1, 0, &Opts::default()).unwrap();
+    assert_eq!(pe.experts.len(), nl);
+    for l in 0..nl {
+        assert_eq!(pe.experts[l], ExpertFormat::Exlr8(g6load::codebook::Codebook::Pmcgx));
+        assert_eq!(meta(&pe, &format!("L{l:03}.tr3.fc1")).expert_format.as_deref(), Some("exlr8-e4m3-pmcgx"));
+        assert_eq!(meta(&pe, &format!("L{l:03}.tr3.fc2")).expert_format.as_deref(), Some("exlr8-e4m3-pmcgx"));
+        assert_eq!(meta(&pe, &format!("L{l:03}.tr3.v1")).shape, vec![(nexp * nh_blk) as i64, 2, h as i64]);
+        assert_eq!(meta(&pe, &format!("L{l:03}.tr3.v2")).shape, vec![(nexp * nh_blk) as i64, 3, 128]);
+        assert_eq!(meta(&pe, &format!("L{l:03}.tr3.v3")).shape, vec![(nexp * nh_blk) as i64, h as i64]);
+        let km = tensor(&pe, &format!("L{l:03}.tr3.kmix"));
+        assert!(km.iter().all(|&b| b == 0), "L{l}: per-expert uniform widths must give kmix == 0");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&edir);
 }
