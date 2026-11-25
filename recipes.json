@@ -36,6 +36,11 @@
       "id": "glm-5.3-flash-exlr8-2x-spark",
       "nodes": 2,
       "card": true
+    },
+    {
+      "id": "inkling-2-mini-exlr8-1x-spark",
+      "nodes": 1,
+      "card": true
     }
   ]
 }

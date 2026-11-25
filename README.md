@@ -6,7 +6,7 @@ involved) before asking the setup questions or touching a box.
 
 Need help? Join us on Discord: https://discord.gg/8EAvYPV2rE
 
-gr8 serves GLM-5.3, GLM-5.3-Flash, DeepSeek-V4.1-Flash and Qwen3.8-Flash-Next on one to six DGX Spark (GB10) boxes (the count depends on
+gr8 serves GLM-5.3, GLM-5.3-Flash, DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next and Inkling-2-Mini on one to six DGX Spark (GB10) boxes (the count depends on
 the model, see below), with an OpenAI-compatible API on the first box. gr8 is written from scratch in CUDA and uses no
 vLLM, PyTorch or NCCL at serve time. *Beta release. If you run it, please tell us what breaks:
 [issues](https://github.com/kindlingai/gr8/issues) and PRs are welcome.*
@@ -103,6 +103,19 @@ computed; 233,458 at 8 with `TUNE=context`, computed) · the same image on both 
 
 **[Recipe](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8)** · [Model page](docs/FLASH.md)
 
+### Inkling-2-Mini on 1 Spark
+
+[![Inkling-2-Mini on one DGX Spark: decode, prefill and concurrency](docs/cards/inkling-2-mini-exlr8-1x-spark.png)](https://github.com/kindlingai/recipes/tree/main/inkling-2-mini/dgx-spark/1x/exlr8-gr8)
+
+`k4` default (`-27.4%` KL vs Official NVFP4, 93.54% on 1,362 tasks, tying Official W4A4 `p=0.6655`): 64.6 tok/s code ·
+107.3 tok/s math · 90.9 tok/s JSON · 162.8 tok/s counting · 3,457 tok/s 8K prefill · 139.1 tok/s at 6 streams ·
+bundled DFlash (`MTP=7`, `bit325` verified 8/8 exact greedy parity) · 1,048,576-token (`1M`) KV pool (`CAP=262144 × 4`
+default, 10.3 s boot, 12.2 GiB free after 146.4K needle PASS; `131072 × 8` and `1048576 × 1` also verified) · switch
+one line in `.env` to `bit325`, `bit250`, or `k2` speed (100.5 code / 167.5 math / 230.0 C=6 / 479.5 6× Math) ·
+measured 2026-11-25 on `gr8` commit `6b874803`.
+
+**[Recipe](https://github.com/kindlingai/recipes/tree/main/inkling-2-mini/dgx-spark/1x/exlr8-gr8)** · [Model page](docs/INKLING.md)
+
 <sub>Each card is drawn by `bench/gif.py card` from the recipe's `kindling.json` ([docs/cards/make.sh](docs/cards/make.sh)
 redraws them from the list in [recipes.json](recipes.json), reading each recipe from
 [kindlingai/recipes](https://github.com/kindlingai/recipes)). The model pages give each benchmark and its date.</sub>
@@ -122,6 +135,7 @@ measured results, pinned to one gr8 image. gr8 holds the engine only.
 | DeepSeek-V4.1-Flash | 4 | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/recipes/tree/main/deepseek-v4.1-flash/dgx-spark/4x/exlr8-gr8) |
 | GLM-5.3-Flash | 1 | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/1x/exlr8-gr8) |
 | GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8) |
+| Inkling-2-Mini (`k4`/`bit325`/`k2`, 1M KV pool, DFlash) | 1 | [inkling-2-mini-exlr8-1x-spark](https://github.com/kindlingai/recipes/tree/main/inkling-2-mini/dgx-spark/1x/exlr8-gr8) |
 
 ## How `int4` KV and mixed-precision compression preserve quality
 
@@ -238,6 +252,7 @@ If you are an agent (or developer) building on gr8, start from the matching entr
 | [GLM-5.3-Flash](docs/FLASH.md) | 1 | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/1x/exlr8-gr8): one `docker run` | 87 GB | [kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) |
 | GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8): the same image on both boxes | about 76 GB a box (86 GB with `TUNE=quality`) | |
 | GLM-5.3-Flash | 3 or 4 | [docs/FLASH.md](docs/FLASH.md) | see the page | |
+| [Inkling-2-Mini](docs/INKLING.md) | 1 | [inkling-2-mini-exlr8-1x-spark](https://github.com/kindlingai/recipes/tree/main/inkling-2-mini/dgx-spark/1x/exlr8-gr8): `k4`/`bit325`/`bit250`/`k2`, DFlash, 1M KV pool | ~31 GB (full K2/K3/K4 pack) | [kindlingai/inkling-2-mini-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/inkling-2-mini-exlr8-k2-k3-k4) |
 
 Each model's page has its results, how to start it and its known issues.
 
