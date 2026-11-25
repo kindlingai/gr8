@@ -172,13 +172,22 @@ inline std::vector<int> s2_cp_map(const S2Model& s, const G6Attn& a, const std::
     }
     if (a.cp_nr)
     {
-        int j = 0;
+        // Single O(|list| + n) pass matching s2_list_place(list, rp + j++, s.pool_pages):
+        // skip the first rp entries below s.pool_pages (the prefix), then yield each
+        // subsequent entry below s.pool_pages in list order for owned tail pages.
+        size_t idx = 0;
+        int skipped = 0;
+        while (idx < list.size() && skipped < rp)
+            if (list[idx++] < s.pool_pages) ++skipped;
         for (size_t lp = 0; lp < t.size(); ++lp)
         {
             if ((int)lp < rp)
                 t[lp] = lp < list.size() ? list[lp] : -1;
             else if ((int)lp % a.cp_nr == a.cp_rank)
-                t[lp] = s2_list_place(list, rp + j++, s.pool_pages);
+            {
+                while (idx < list.size() && list[idx] >= s.pool_pages) ++idx;
+                t[lp] = idx < list.size() ? list[idx++] : -1;
+            }
             else
                 t[lp] = G6_CP_REMOTE;
         }
@@ -707,11 +716,16 @@ inline void s2_solo_pages(Model& m, const std::vector<int>& list)
 {
     S2Model& s = *m.s2;
     s2_check_pages(s, list, s.run_pages, s.pool_pages, "s2_solo_pages");
+    // Group layers sharing the same table length so one table build + one pinned staging copy
+    // and one stream sync updates all layers instead of N_layers synchronous copies.
+    std::map<size_t, std::vector<void*>> groups;
     for (size_t l = 0; l < s.pool.size(); ++l)
+        groups[m.s2_below ? s.tab0[l].size() : (size_t)s.pool_pages].push_back(const_cast<int*>(s.pool[l]->args.block_table));
+    for (const auto& kv : groups)
     {
-        std::vector<int> t(m.s2_below ? s.tab0[l].size() : s.pool_pages, -1);   // the CP map has table_size entries
+        std::vector<int> t(kv.first, -1);   // the CP map has table_size entries
         std::copy(list.begin(), list.end(), t.begin());
-        G6RT_CK(g6h2d::copy(const_cast<int*>(s.pool[l]->args.block_table), t.data(), t.size() * 4));
+        G6RT_CK(g6h2d::copy_broadcast(kv.second.data(), kv.second.size(), t.data(), t.size() * 4));
     }
 }
 // S=1 for a run past R (S2 below R only): the layers' tables as built, with the CP map
@@ -719,8 +733,11 @@ inline void s2_solo_built(Model& m)
 {
     const S2Model& s = *m.s2;
     if (!m.s2_below) die("s2_solo_built: only S2 below R has runs past R");
+    std::vector<g6h2d::BatchItem> items;
+    items.reserve(s.pool.size());
     for (size_t l = 0; l < s.pool.size(); ++l)
-        G6RT_CK(g6h2d::copy(const_cast<int*>(s.pool[l]->args.block_table), s.tab0[l].data(), s.tab0[l].size() * 4));
+        items.push_back({const_cast<int*>(s.pool[l]->args.block_table), s.tab0[l].data(), s.tab0[l].size() * 4});
+    G6RT_CK(g6h2d::copy_many(items.data(), items.size()));
 }
 
 // S=1 for a run past R on the page classes: the layers' tables become the run's CP map over its list (s2_cp_map).
@@ -731,10 +748,27 @@ inline void s2_solo_cp_pages(Model& m, const std::vector<int>& list, int most, i
     S2Model& s = *m.s2;
     if (!m.s2_below) die("s2_solo_cp_pages: only S2 below R has runs past R");
     s2_check_pages(s, list, most, most, "s2_solo_cp_pages");
+    // Build s2_cp_map once per distinct (cp_nr, cp_rank, table_size) and broadcast via one
+    // pinned staging transfer + sync instead of recomputing and syncing per layer.
+    struct Group { const G6Attn* args; size_t len; std::vector<void*> dsts; };
+    std::map<std::tuple<int, int, size_t>, Group> groups;
     for (size_t l = 0; l < s.pool.size(); ++l)
     {
-        const std::vector<int> t = s2_cp_map(s, s.pool[l]->args, list, rp, s.tab0[l].size());
-        G6RT_CK(g6h2d::copy(const_cast<int*>(s.pool[l]->args.block_table), t.data(), t.size() * 4));
+        const G6Attn& a = s.pool[l]->args;
+#if defined(G6_CP) && G6_CP
+        const std::tuple<int, int, size_t> key{a.cp_nr, a.cp_rank, s.tab0[l].size()};
+#else
+        const std::tuple<int, int, size_t> key{0, 0, s.tab0[l].size()};
+#endif
+        Group& g = groups[key];
+        if (!g.args) { g.args = &a; g.len = s.tab0[l].size(); }
+        g.dsts.push_back(const_cast<int*>(a.block_table));
+    }
+    for (const auto& kv : groups)
+    {
+        const Group& g = kv.second;
+        const std::vector<int> t = s2_cp_map(s, *g.args, list, rp, g.len);
+        G6RT_CK(g6h2d::copy_broadcast(g.dsts.data(), g.dsts.size(), t.data(), t.size() * 4));
     }
 }
 
