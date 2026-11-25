@@ -23,7 +23,7 @@ inline Find dtr_overlay(const Find& base, bool prefill, cudaStream_t st, int ran
     if (!knob::pf_dtr8()) return base;
 #elif G6_NR == 2
     // TP=2: keep prefill dense trellis matrices on raw tiles (make_gemm_tr, bit-equal) unless GR8_DTR_PF_COPY=1;
-    // saves ~1.68 GB/rank of FP8 prefill copies so 743B bit225 + INT4 DFlash2 + 128K+ KV fits comfortably on 2 Sparks.
+    // saves ~1.68 GB/rank of FP8 prefill copies so 743B bit225 + INT4 DFlash2 + 96K default KV (up to 128K with tight headroom) fits on 2 Sparks.
     if (!knob::dtr_pf_copy()) return base;
 #endif
     const bool ocopy = knob::dtr_pf_copy();

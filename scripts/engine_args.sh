@@ -36,7 +36,7 @@ share_cap() {
 # the model's estimates.
 int4_pages() {
   case $TP:$1 in
-    2:1024) echo 1056 ;;   # 1,056 int4 pages/rank = 131,072 CAP at SHARE_LIMIT=4096 (~2.44 GiB KV/rank, full 128K + NVMe KV_STORE headroom)
+    2:768) echo 800 ;;     # 800 int4 pages/rank = 98,304 CAP (96K) at SHARE_LIMIT=4096 (~1.85 GiB KV/rank, ~1.1 GiB live headroom; --cap 131072 fits tightly)
     4:2280) echo 2390 ;;   # measured against fp8 at 1,920 pages, and not re-measured since the drafter's prefill shares
                            # the target's scratch: int4 keeps the memory of 1,981 fp8 pages
     3:1941) echo 2480 ;;
@@ -430,7 +430,7 @@ engine_defaults() {
        tp4_default DEC_DENSE_OPT 1; tp4_default DTR_EXACT_OPT 1; tp4_default MOE_RTR_FIN_OPT 1
        tp4_default TR3_WIDE4 1; tp4_default PF_ATTN_OPT 1; tp4_default PF_DENSE_OPT 1; tp4_default PF_ISGRT_CLEAN 1
        tp4_default MOE_UNION_CAP 48 ;;
-    2) SHARE_LIMIT=${SHARE_LIMIT:-4096}; _base_p=1024; CAP=${CAP:-$(pool_cap 1024)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=${SESS:-4}; S2PORT=${S2PORT:-7341}
+    2) SHARE_LIMIT=${SHARE_LIMIT:-4096}; _base_p=768; CAP=${CAP:-$(pool_cap 768)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}; SESS=${SESS:-4}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1}
        [ -z "${V2_DENSE:-}" ] || KVB=${KVB:-fp8}
        case " ${EXTRA_ENV:-} " in *" GR8_TR3_W2ALL="*) ;; *) TR3_W2ALL=${TR3_W2ALL:-1} ;; esac
@@ -577,6 +577,7 @@ GR8_PF_BLAS_ROWS=$_pf_blas GR8_PF_HASH_GPU=1 GR8_PF_RSDIRECT=1 GR8_DEC_SPLIT=3 G
 GR8_CP=1 GR8_CP_R=$SHARE_LIMIT${SHARE_LIMIT_BUSY:+ GR8_CP_R2=$SHARE_LIMIT_BUSY}${SHARE_BIG:+ GR8_CP_R2_BIG=$SHARE_BIG} \
 GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   if [ "$TP" = 2 ]; then
+    case " ${EXTRA_ENV:-} " in *" GR8_MEM_MIN="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_MEM_MIN=2" ;; esac
     case " ${EXTRA_ENV:-} " in *" GR8_V2_SHARED="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_V2_SHARED=trellis" ;; esac
     if [ "${REUSE:-0}" = 1 ]; then
       case " ${EXTRA_ENV:-} " in *" GR8_KV_SHARE_PAGES="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_KV_SHARE_PAGES=1" ;; esac
