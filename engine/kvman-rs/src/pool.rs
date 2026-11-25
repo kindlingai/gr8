@@ -1378,6 +1378,7 @@ impl Pool {
             return Err(Error::NoRoom);
         }
         let mut h = self.held.remove(&r.table_version).expect("shrinkable() found it");
+        h.from = None;
         let gone: Vec<Kept>;
         if self.window > 0 {
             let (old, w) = (h.rp as usize, self.window as usize);
@@ -1827,10 +1828,12 @@ impl Pool {
         // a past-R grant restores its tail into pages past the hit's, so it passes its whole list
         let into = if exclusive { &list[..] } else { &list[..a as usize] };
         self.stash.as_mut().expect("found in it").restore(tier, &e, into, pool_base, exclusive);
-        // the grant's pages below the hit's full pages are byte copies of e's (D2: its store extends e in place).
-        // Only for a run that continues e: it then holds all e holds, and replaces it
-        if !exclusive && cont {
-            self.next_from = Some((e.id, ((skip as u64 / PAGE) as usize).min(e.below())));
+        // the grant's logical pages below the hit's full pages are byte copies of e's (D2: its store extends e in
+        // place). Only for a run that continues e (and, past R, at the pool's R without window records): it then holds
+        // all e holds, and replaces it
+        if cont && (!exclusive || (self.window == 0 && rp == self.rp0())) {
+            let cap = if exclusive { e.pages() } else { e.below() };
+            self.next_from = Some((e.id, ((skip as u64 / PAGE) as usize).min(cap)));
         }
         let (rows, how) = (if exclusive { worst } else { rows }, if pool_base { "stored+pool" } else { "stored" });
         Ok(self.grant(list, exclusive, w as u32, rows, how, &gone, hits, rp))
@@ -1864,12 +1867,21 @@ impl Pool {
         }
     }
 
-    // the rows of retained run k a tier would store when the pool evicts it (stash.rs storable; a run past R keeps
-    // its valid rows, its tail is not cut)
+    // the rows of retained run k a tier would store when the pool evicts it (stash.rs storable, matching put_evicted)
     fn stored_rows(&self, k: &Kept) -> u64 {
+        if k.exclusive && (self.window > 0 || k.rp as u64 != self.rp0()) {
+            return 0;
+        }
         match &self.stash {
-            Some(s) if !k.exclusive => s.storable(&k.st),
-            _ => k.st.valid.max(0) as u64,
+            Some(s) => {
+                let max_pages = if k.exclusive && !s.has_tail() {
+                    k.list.len().min((self.below_rows as u64 / PAGE) as usize)
+                } else {
+                    k.list.len()
+                };
+                s.storable_capped(&k.st, max_pages as u64 * PAGE)
+            }
+            None => k.st.valid.max(0) as u64,
         }
     }
 
@@ -1963,7 +1975,7 @@ impl Pool {
         // a hit on the run's own conversation has no rows past skip and spills nothing.
         // With no reuse grid, `skip` may end inside a page. The grant will rewrite that page,
         // but the retained run has nothing *past* the hit when its valid rows end at `skip`.
-        let spills_past_hit = if k.exclusive { k.st.valid > skip } else { self.stored_rows(&k) > skip as u64 };
+        let spills_past_hit = self.stored_rows(&k) > skip as u64;
         if spills_past_hit {
             self.spill(std::slice::from_ref(&k));
         } else {
@@ -1986,12 +1998,18 @@ impl Pool {
                 let gone = std::mem::take(&mut self.kept);
                 self.spill(&gone);
                 list.extend(a as u32..n as u32);
+                if self.window == 0 && rp == self.rp0() {
+                    self.next_from = from;
+                }
                 return Ok(self.grant(list, true, w as u32, worst, "hit", &gone, hits, rp));
             }
             // its own pages: the adopted ones, then the two classes fill the rest (the low ones first, so the run's
             // pages below place stay a prefix of its low pages in list order)
             let gone = self.fill_hit(&mut list, a, n, worst, rp);
             self.spill(&gone);
+            if self.window == 0 && rp == self.rp0() {
+                self.next_from = from;
+            }
             return Ok(self.grant(list, true, w as u32, worst, "hit", &gone, hits, rp));
         }
         let gone = self.fill(&mut list, n as usize);

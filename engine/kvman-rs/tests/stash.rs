@@ -867,7 +867,9 @@ fn a_run_past_r_comes_back_with_every_ranks_shard_of_its_tail() {
         r.write(&run, 0, &b, bp, place);
         (run, io, r.pool.digest())
     });
-    let tail = (a_hist.len() - 1).div_ceil(ROWS) - bp; // logical pages past R the run held
+    // cut to storable (GRID = 128), matching below-R runs: pages past the last grid cell can never be restored
+    let storable_pages = ((a_hist.len() - 1) / GRID as usize * GRID as usize).div_ceil(ROWS);
+    let tail = storable_pages - bp;
     let owns = io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Own, .. })).count();
     let reps = io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Rep(_), .. })).count();
     assert_eq!((owns, reps), (tail.div_ceil(NR), tail), "{io:?}");
@@ -941,11 +943,11 @@ fn a_long_run_spills_the_runs_it_evicts_for_either_class() {
         r.write(&run, 0, &b, bp, place);
         (run, io, r.pool.digest())
     });
-    // a's spill: its 4 prefix pages as full blocks, its 8 shard pages, the drafter's copy of its 32 tail pages
+    // a's spill: storable rows = 2303 / 128 * 128 = 2176 (34 pages = 4 prefix + 30 tail -> 8 shard, 30 rep)
     let fulls = io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Full, .. })).count();
     let owns = io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Own, .. })).count();
     let reps = io.iter().filter(|x| matches!(x, Io::Spill { part: Part::Rep(_), .. })).count();
-    assert_eq!((fulls, owns, reps), (4, 8, 32), "the drafter's class eviction spilled nothing: {io:?}");
+    assert_eq!((fulls, owns, reps), (4, 8, 30), "the drafter's class eviction spilled nothing: {io:?}");
     all(&mut ranks, &mut |r| {
         r.pool.release(&runb).unwrap();
         (runb, Vec::new(), r.pool.digest())

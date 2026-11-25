@@ -474,6 +474,7 @@ Thanks to:
     `usage.prompt_tokens_details.cached_tokens` reaches clients on glm clusters.
 - [@bertholomus](https://github.com/bertholomus)
   - Batched H2D upload and host-mirror fast path for S2 context-parallel page-table rebuilds.
+  - In-place CP-tail KV stash extension and storable-range truncation to eliminate self-hit SSD write amplification.
 
 ### Upstream projects and research
 

@@ -312,11 +312,19 @@ impl Stash {
     /// reuse grid, min(valid, pf_end) cut to it (reuse.rs begin), else valid. The pages past them would be computed
     /// again by the next turn's prefill, so a tier stores no more.
     pub fn storable(&self, st: &Finished) -> u64 {
-        let valid = st.valid.max(0) as u64;
+        self.storable_capped(st, u64::MAX)
+    }
+
+    pub(crate) fn storable_capped(&self, st: &Finished, max_rows: u64) -> u64 {
+        let valid = (st.valid.max(0) as u64).min(max_rows);
         if self.reuse_grid == 0 {
             return valid;
         }
         valid.min(st.pf_end.max(0) as u64) / self.reuse_grid * self.reuse_grid
+    }
+
+    pub(crate) fn has_tail(&self) -> bool {
+        self.tail.is_some()
     }
 
     /// A tier after the others. With an index, its committed shared prefixes come back (in commit order).
@@ -735,29 +743,32 @@ impl Stash {
             if k.st.valid <= 0 {
                 continue;
             }
-            let mut n = pages(k.st.valid as u64).min(k.list.len());
+            // the rows a later hit can restore (storable): the pages past them are written again by its prefill
+            let max_pages = if k.exclusive && self.tail.is_none() {
+                k.list.len().min(below_pages)
+            } else {
+                k.list.len()
+            };
+            let cut = self.storable_capped(&k.st, max_pages as u64 * PAGE);
+            let total = pages(cut).min(max_pages);
+            if total == 0 {
+                continue;
+            }
             let mut st = k.st.clone();
-            let mut tail = 0;
-            if k.exclusive {
-                if self.tail.is_some() && n > below_pages {
-                    tail = n - below_pages;
+            st.valid = cut as i32;
+            let (n, tail) = if k.exclusive {
+                if self.tail.is_some() && total > below_pages {
+                    (below_pages, total - below_pages)
                 } else {
-                    st.valid = st.valid.min((n.min(below_pages) as u64 * PAGE) as i32);
+                    (total.min(below_pages), 0)
                 }
-                n = n.min(below_pages);
-            }
-            let mut from = None;
-            if tail == 0 {
-                // the rows a later hit can restore (storable): the pages past them are written again by its prefill
-                let cut = self.storable(&st);
-                st.valid = cut as i32;
-                n = n.min(pages(cut));
-                from = k.from;
-            }
+            } else {
+                (total, 0)
+            };
             if n == 0 {
                 continue;
             }
-            self.store_tail(Kind::Evicted, 0, st, &k.list[..n], &k.list, k.hits, resident, tail as u32, k.namespace, from);
+            self.store_tail(Kind::Evicted, 0, st, &k.list[..n], &k.list, k.hits, resident, tail as u32, k.namespace, k.from);
         }
     }
 
@@ -823,8 +834,8 @@ impl Stash {
             }
             return;
         }
-        if let (Kind::Evicted, Some((eid, p)), 0) = (kind, from, tail) {
-            if self.extend(eid, p, key, &st, pages, hits, namespace) {
+        if let (Kind::Evicted, Some((eid, p))) = (kind, from) {
+            if self.extend(eid, p, key, &st, pages, full, tail, hits, namespace) {
                 return;
             }
         }
@@ -893,11 +904,13 @@ impl Stash {
         }
     }
 
-    // Extend in place: the run's pages [0, p) are byte copies of stored run eid's pages [0, p). The run must also
-    // match eid's full history; if eid ends mid-page, the first page past p is rewritten. The run replaces eid in
-    // eid's tier: eid's base and blocks below p, then new blocks for pages [p, n) only. Returns false for the usual way
-    // (eid gone or moved on, pinned by this call's hit, another namespace, a tail, or not covered by the copies). True
-    // also when nothing is written: no page past p (eid stays as it is), or its tier refused or had no room (eid stays).
+    // Extend in place: the run's logical pages [0, p) are byte copies of stored run eid's logical pages [0, p).
+    // The run must also match eid's full history; if eid ends mid-page (or a CP tail ends mid-nr/per-slot boundary),
+    // the partial boundary block is rewritten while all complete blocks strictly below p are reused unchanged. The run
+    // replaces eid in eid's tier: eid's base and unchanged blocks below p (below-R, shard Part::Own, replicated
+    // Part::Rep), then new blocks for the remaining pages only. Returns false for the usual way (eid gone or moved on,
+    // pinned by this call's hit, another namespace, boundary state, or not covered by the copies). True also when
+    // nothing is written: no page past p (eid stays as it is), or its tier refused or had no room (eid stays).
     #[allow(clippy::too_many_arguments)]
     fn extend(
         &mut self,
@@ -906,25 +919,31 @@ impl Stash {
         key: u64,
         st: &Finished,
         pages: &[u32],
+        full: &[u32],
+        tail: u32,
         hits: u32,
         namespace: crate::pool::Namespace,
     ) -> bool {
-        let n = pages.len();
+        let below_n = pages.len();
+        let tail_n = if self.tail.is_some() { tail as usize } else { 0 };
+        let n = below_n + tail_n;
         let Some(te) = self.tiers.iter().position(|t| t.entries.iter().any(|e| e.id == eid)) else { return false };
         let e = self.tiers[te].entries.iter().find(|e| e.id == eid).expect("found");
         let b = e.base.map_or(0, |b| b.1);
         let cut = self.storable(&e.st) as usize;
         let m = (cut + 1).min(e.st.history.len());
+        let old_below = e.below();
         let ok = e.kind == Kind::Evicted
-            && e.tail.is_none()
+            && e.state == 0
             && e.namespace == namespace
             && !self.pin.contains(&eid)
             // A grid-off hit may stop mid-page. Its last partial page must be rewritten,
             // while the full pages before it still come from eid unchanged.
             && p >= cut / PAGE as usize
-            && p <= e.below()
+            && p <= e.pages()
             && p >= b
             && p <= n
+            && (e.tail.is_none() || below_n == old_below || p <= old_below)
             && st.history.len() >= m
             && st.history[..m] == e.st.history[..m];
         if !ok {
@@ -933,24 +952,49 @@ impl Stash {
         if n == p {
             return true;
         }
+        let new_t = self.tail.filter(|_| tail_n > 0).map(|(nr, per)| Tail {
+            logical: tail_n as u32,
+            own: (tail_n as u32).div_ceil(nr),
+            rep: (tail_n as u32).div_ceil(per),
+        });
+        let old_below_slots = old_below - b;
+        let keep_below_logical = p.min(old_below).min(below_n);
+        let keep_below_slots = keep_below_logical - b;
+        let new_below_slots = below_n - keep_below_logical;
+        let (keep_own, keep_rep) = match (e.tail, new_t, self.tail) {
+            (Some(old_t), Some(nt), Some((nr, per))) if p >= old_below && below_n == old_below => {
+                let p_tail = (p - old_below) as u32;
+                (
+                    (p_tail / nr).min(old_t.own).min(nt.own) as usize,
+                    (p_tail / per).min(old_t.rep).min(nt.rep) as usize,
+                )
+            }
+            _ => (0, 0),
+        };
+        let new_own = new_t.map_or(0, |nt| nt.own as usize - keep_own);
+        let new_rep = new_t.map_or(0, |nt| nt.rep as usize - keep_rep);
+        let need = new_below_slots + new_own + new_rep;
+        if need == 0 {
+            return true;
+        }
         let base = e.base;
         let pinned = self.pin.len();
         self.pin.push(eid);
         self.pin.extend(base.map(|b| b.0));
-        let placed = self.try_place(te, Kind::Evicted, n - p, st.valid.max(0) as u64, hits);
+        let placed = self.try_place(te, Kind::Evicted, need, st.valid.max(0) as u64, hits);
         self.pin.truncate(pinned);
         let new = match placed {
             Ok(slots) => slots,
             Err(refused) => {
                 if refused {
                     self.tiers[te].stats.refused += 1;
-                    self.tiers[te].stats.refused_pages += (n - p) as u64;
+                    self.tiers[te].stats.refused_pages += need as u64;
                 }
                 return true;
             }
         };
-        // eid leaves: its drop record reaches the disk before any of its slots is reused (its blocks below p are the new
-        // entry's, whose add record commits at io_done; a crash in between loses this session, never names reused blocks)
+        // eid leaves: its drop record reaches the disk before any of its slots is reused (its kept blocks below p are
+        // the new entry's, whose add record commits at io_done; a crash in between loses this session, never names reused blocks)
         let tier = &mut self.tiers[te];
         let i = tier.entries.iter().position(|e| e.id == eid).expect("pinned through the placement");
         let old = tier.entries.remove(i);
@@ -960,18 +1004,64 @@ impl Stash {
             }
         }
         self.commits.retain(|c| *c != (te, eid));
-        let keep = p - b;
-        // an entry stored past its storable rows (an older engine): those blocks go
-        tier.alloc.release(&old.slots[keep..]);
+        let old_own = old.tail.map_or(0, |t| t.own as usize);
+        let old_own_slots = &old.slots[old_below_slots..old_below_slots + old_own];
+        let old_rep_slots = &old.slots[old_below_slots + old_own..];
+        // an entry stored past its storable rows (an older engine) or past the kept boundary: those blocks go
+        tier.alloc.release(&old.slots[keep_below_slots..old_below_slots]);
+        tier.alloc.release(&old_own_slots[keep_own..]);
+        tier.alloc.release(&old_rep_slots[keep_rep..]);
         let t = te as u32;
-        self.io.extend(pages[p..].iter().zip(&new).map(|(&page, &slot)| Io::Spill { tier: t, page, slot, part: Part::Full }));
-        let mut slots = old.slots[..keep].to_vec();
-        slots.extend(new);
+        let new_below = &new[..new_below_slots];
+        let new_own_slots = &new[new_below_slots..new_below_slots + new_own];
+        let new_rep_slots = &new[new_below_slots + new_own..];
+        self.io.extend(
+            pages[keep_below_logical..]
+                .iter()
+                .zip(new_below)
+                .map(|(&page, &slot)| Io::Spill { tier: t, page, slot, part: Part::Full }),
+        );
+        if let Some(x) = new_t {
+            let (below, per, place) = (below_n as u32, self.tail.expect("set").1, self.tail_place);
+            let shard: Vec<u32> =
+                full.iter().filter(|&&pg| pg < place).skip(below_n + keep_own).take(new_own).copied().collect();
+            self.io.extend(shard.into_iter().zip(new_own_slots).map(|(page, &slot)| Io::Spill {
+                tier: t,
+                page,
+                slot,
+                part: Part::Own,
+            }));
+            let rep_start = keep_rep as u32 * per;
+            self.io.extend((rep_start..x.logical).map(|i| Io::Spill {
+                tier: t,
+                page: full[(below + i) as usize],
+                slot: new_rep_slots[(i / per) as usize - keep_rep],
+                part: Part::Rep(i % per),
+            }));
+        }
+        let mut slots = Vec::with_capacity(keep_below_slots + new_below_slots + new_t.map_or(0, |x| (x.own + x.rep) as usize));
+        slots.extend_from_slice(&old.slots[..keep_below_slots]);
+        slots.extend_from_slice(new_below);
+        slots.extend_from_slice(&old_own_slots[..keep_own]);
+        slots.extend_from_slice(new_own_slots);
+        slots.extend_from_slice(&old_rep_slots[..keep_rep]);
+        slots.extend_from_slice(new_rep_slots);
         let id = self.next_id;
         self.next_id += 1;
         let tier = &mut self.tiers[te];
-        tier.stats.spilled_pages += (n - p) as u64;
-        tier.entries.push(Entry { id, kind: Kind::Evicted, key, st: st.clone(), slots, base, hits, tail: None, state: 0, namespace });
+        tier.stats.spilled_pages += need as u64;
+        tier.entries.push(Entry {
+            id,
+            kind: Kind::Evicted,
+            key,
+            st: st.clone(),
+            slots,
+            base,
+            hits,
+            tail: new_t,
+            state: 0,
+            namespace,
+        });
         if tier.index.is_some() && tier.whole {
             self.commits.push((te, id));
         }
@@ -2499,7 +2589,7 @@ mod tests {
                 assert!(loaded.iter().all(|e| e.namespace == namespace));
 
                 let next = Finished { history: (0..129).collect(), valid: 128, written_end: 128, pf_end: 128 };
-                assert!(stash.extend(old.id, 1, 0, &next, &[0, 1], 1, namespace));
+                assert!(stash.extend(old.id, 1, 0, &next, &[0, 1], &[0, 1], 0, 1, namespace));
                 let extended = stash.entries(0)[0].clone();
                 assert_ne!(extended.id, old.id);
                 assert_eq!(extended.namespace, namespace);
