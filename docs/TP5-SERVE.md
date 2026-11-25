@@ -1,6 +1,6 @@
 # TP5 serve: T5X (GLM 5.3 full, five DGX Sparks)
 
-T5X is the TP5 serve config: the `.env.example` of the recipe [glm-5.3-exlr8-5x-spark](https://github.com/kindlingai/glm-5.3-exlr8-5x-spark). The numbers here were measured on the pre-release TP5 build that the recipe README describes. It is the TP4 FSM win set,
+T5X is the TP5 serve config: the `.env.example` of the recipe [glm-5.3-exlr8-5x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/5x/exlr8-gr8). The numbers here were measured on the pre-release TP5 build that the recipe README describes. It is the TP4 FSM win set,
 all on from the first TP5 boot, plus five knobs measured at TP5 (K1_TLBW, PF_GEMMF32, ATTN_CTX3, PF_ISGRT_RG, PF_ATTN_ROWS). Output is byte-identical to the
 first checked TP5 build (T5S2).
 

@@ -48,7 +48,7 @@ one model at a time: stop the running recipe's container on every box before you
 
 ### GLM-5.3 on 3 Sparks
 
-[![GLM-5.3 on three DGX Sparks, 384K context: decode, prefill and concurrency](docs/cards/glm-5.3-exlr8-3x-spark.png)](https://github.com/kindlingai/glm-5.3-exlr8-3x-spark)
+[![GLM-5.3 on three DGX Sparks, 384K context: decode, prefill and concurrency](docs/cards/glm-5.3-exlr8-3x-spark.png)](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/3x/exlr8-gr8)
 
 51.6 tok/s for one request writing code · 764 tok/s prefill on an 8K prompt (646 at 32K, 562 at 128K) · 8 requests at
 once (`SESS=8`), 106.5 tok/s in total (119.1 tok/s with `MOE_UNION_CAP=32`) · `bit273` (2.73 bpw) experts, int4 KV
@@ -56,11 +56,11 @@ once (`SESS=8`), 106.5 tok/s in total (119.1 tok/s with `MOE_UNION_CAP=32`) · `
 HumanEval-164 150/164 (91.5%), a fact hidden in a 128K prompt found, 12/12 clean from 119K–359K single-session & 4×87K
 concurrent · one boot on `gr8 v1.1.1`, measured 2026-11-21.
 
-**[Recipe](https://github.com/kindlingai/glm-5.3-exlr8-3x-spark)** · [Model page](docs/GLM-5.3.md)
+**[Recipe](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/3x/exlr8-gr8)** · [Model page](docs/GLM-5.3.md)
 
 ### GLM-5.3 on 4 Sparks
 
-[![GLM-5.3 on four DGX Sparks: decode, prefill and concurrency](docs/cards/glm-5.3-exlr8-4x-spark.png)](https://github.com/kindlingai/glm-5.3-exlr8-4x-spark)
+[![GLM-5.3 on four DGX Sparks: decode, prefill and concurrency](docs/cards/glm-5.3-exlr8-4x-spark.png)](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/4x/exlr8-gr8)
 
 67.1 tok/s for one request writing code (73.2 tok/s with `MOE_UNION_CAP=32`) · 1,605 tok/s prefill on a 32K prompt
 (1,470 tok/s at 128K) · 8 requests at once (`SESS=8`), 120.5 tok/s in total (139.0 tok/s with `MOE_UNION_CAP=32`) ·
@@ -68,11 +68,11 @@ int4 KV default: 513,536-token KV pool, 13.53 GiB lowest `MemAvailable` across b
 156/164, a fact hidden in a 128K prompt found · one boot on `gr8 v1.1.0`, measured 2026-11-20 · the same recipe serves
 three to six boxes.
 
-**[Recipe](https://github.com/kindlingai/glm-5.3-exlr8-4x-spark)** · [Model page](docs/GLM-5.3.md)
+**[Recipe](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/4x/exlr8-gr8)** · [Model page](docs/GLM-5.3.md)
 
 ### DeepSeek-V4.1-Flash on 4 Sparks
 
-[![DeepSeek-V4.1-Flash on four GB10s in fast mode: decode, prefill and concurrency](docs/cards/deepseek-v4.1-flash-exlr8-4x-spark.png)](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
+[![DeepSeek-V4.1-Flash on four GB10s in fast mode: decode, prefill and concurrency](docs/cards/deepseek-v4.1-flash-exlr8-4x-spark.png)](https://github.com/kindlingai/recipes/tree/main/deepseek-v4.1-flash/dgx-spark/4x/exlr8-gr8)
 
 One request: 83.9 tok/s on prose and 137.5 tok/s on code (65-71-token prompts) · 7,720 tok/s prefill on a 32K prompt
 (8,408 tok/s at 128K, 8,344 tok/s at 256K) · 238.7 tok/s in total for 16 requests at once, first token median 2.56 s
@@ -81,45 +81,46 @@ One request: 83.9 tok/s on prose and 137.5 tok/s on code (65-71-token prompts) �
 identical to the exact model's; `TUNE=quality` gives the exact model's output · the recipe's image on four boxes: first
 boot (cold disk) 212.7 s, a switch from GLM-5.3 after that 37-39 s (release 1 image)
 
-**[Recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)** · [Model page](docs/DEEPSEEK.md)
+**[Recipe](https://github.com/kindlingai/recipes/tree/main/deepseek-v4.1-flash/dgx-spark/4x/exlr8-gr8)** · [Model page](docs/DEEPSEEK.md)
 
 ### GLM-5.3-Flash on 1 Spark
 
-[![GLM-5.3-Flash on one GB10: decode, prefill and concurrency](docs/cards/glm-5.3-flash-exlr8-1x-spark.png)](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark)
+[![GLM-5.3-Flash on one GB10: decode, prefill and concurrency](docs/cards/glm-5.3-flash-exlr8-1x-spark.png)](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/1x/exlr8-gr8)
 
 53.8 tok/s for one request writing code · 995 tok/s prefill on an 8K prompt · 4 requests at once from a 700,032-token KV
 pool · one `docker run`
 
-**[Recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark)** · [Model page](docs/FLASH.md)
+**[Recipe](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/1x/exlr8-gr8)** · [Model page](docs/FLASH.md)
 
 ### GLM-5.3-Flash on 2 Sparks
 
-[![GLM-5.3-Flash on two GB10s: decode, prefill and concurrency](docs/cards/glm-5.3-flash-exlr8-2x-spark.png)](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)
+[![GLM-5.3-Flash on two GB10s: decode, prefill and concurrency](docs/cards/glm-5.3-flash-exlr8-2x-spark.png)](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8)
 
 76.5 tok/s for one request writing code · 1,670 tok/s prefill on an 8K prompt · 4 requests at once (`SESS=4`; 8 with
 `TUNE=context`) from a 2,097,152-token KV pool (max tokens per active chat: 262,144 at 1 measured, 262,144 at 2 and 4
 computed; 233,458 at 8 with `TUNE=context`, computed) · the same image on both boxes
 
-**[Recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)** · [Model page](docs/FLASH.md)
+**[Recipe](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8)** · [Model page](docs/FLASH.md)
 
 <sub>Each card is drawn by `bench/gif.py card` from the recipe's `kindling.json` ([docs/cards/make.sh](docs/cards/make.sh)
-redraws them from the list in [recipes.json](recipes.json)). The model pages give each benchmark and its date.</sub>
+redraws them from the list in [recipes.json](recipes.json), reading each recipe from
+[kindlingai/recipes](https://github.com/kindlingai/recipes)). The model pages give each benchmark and its date.</sub>
 
 ### All recipes
 
-A recipe is its own repository: a `.env` file, a Compose file and measured results, pinned to one gr8 image. gr8 holds
-the engine only.
+A recipe is a folder in [kindlingai/recipes](https://github.com/kindlingai/recipes): a `.env` file, a Compose file and
+measured results, pinned to one gr8 image. gr8 holds the engine only.
 
 | Model | Boxes | Recipe |
 |---|---|---|
-| GLM-5.3, 384K context (`bit273`) | 3 | [glm-5.3-exlr8-3x-spark](https://github.com/kindlingai/glm-5.3-exlr8-3x-spark) |
-| GLM-5.3, 1M context | 4 (3 to 6) | [glm-5.3-exlr8-4x-spark](https://github.com/kindlingai/glm-5.3-exlr8-4x-spark) |
-| GLM-5.3, 983K context | 5 | [glm-5.3-exlr8-5x-spark](https://github.com/kindlingai/glm-5.3-exlr8-5x-spark) |
-| GLM-5.3, 1M context | 6 | [glm-5.3-exlr8-6x-spark](https://github.com/kindlingai/glm-5.3-exlr8-6x-spark) |
-| GLM-5.3 K4 (`bit387`, uncapped routing) | 4 | [glm-5.3-exlr8-k4-4x-spark](https://github.com/kindlingai/glm-5.3-exlr8-k4-4x-spark) |
-| DeepSeek-V4.1-Flash | 4 | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark) |
-| GLM-5.3-Flash | 1 | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark) |
-| GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark) |
+| GLM-5.3, 384K context (`bit273`) | 3 | [glm-5.3-exlr8-3x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/3x/exlr8-gr8) |
+| GLM-5.3, 1M context | 4 (3 to 6) | [glm-5.3-exlr8-4x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/4x/exlr8-gr8) |
+| GLM-5.3, 983K context | 5 | [glm-5.3-exlr8-5x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/5x/exlr8-gr8) |
+| GLM-5.3, 1M context | 6 | [glm-5.3-exlr8-6x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/6x/exlr8-gr8) |
+| GLM-5.3 K4 (`bit387`, uncapped routing) | 4 | [glm-5.3-exlr8-k4-4x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/4x/exlr8-k4-gr8) |
+| DeepSeek-V4.1-Flash | 4 | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/recipes/tree/main/deepseek-v4.1-flash/dgx-spark/4x/exlr8-gr8) |
+| GLM-5.3-Flash | 1 | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/1x/exlr8-gr8) |
+| GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8) |
 
 ## How `int4` KV and mixed-precision compression preserve quality
 
@@ -230,11 +231,11 @@ If you are an agent (or developer) building on gr8, start from the matching entr
 
 | model | boxes | start here | download | weights on Hugging Face |
 |---|---|---|---|---|
-| [GLM-5.3](docs/GLM-5.3.md) | 3 | [glm-5.3-exlr8-3x-spark](https://github.com/kindlingai/glm-5.3-exlr8-3x-spark): `bit273` (2.73 bpw), 384K context | about 97 GB a box | [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) |
-| GLM-5.3 | 4 to 6 | [glm-5.3-exlr8-4x-spark](https://github.com/kindlingai/glm-5.3-exlr8-4x-spark) ([5x](https://github.com/kindlingai/glm-5.3-exlr8-5x-spark), [6x](https://github.com/kindlingai/glm-5.3-exlr8-6x-spark)), Docker Compose (below), or [docs/DEPLOY.md](docs/DEPLOY.md) for bare metal and Kubernetes | about 90 GB a box with 4 boxes (TP=4) | |
-| [DeepSeek-V4.1-Flash](docs/DEEPSEEK.md) | 4 | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): the same image on all four boxes, fast mode by default; or [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) with gr8's own launcher, exact output by default | 510.6 GB a box, fetched before the first boot | [kindlingai/deepseek-v4.1-flash-exlr8-native](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native) |
-| [GLM-5.3-Flash](docs/FLASH.md) | 1 | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark): one `docker run` | 87 GB | [kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) |
-| GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark): the same image on both boxes | about 76 GB a box (86 GB with `TUNE=quality`) | |
+| [GLM-5.3](docs/GLM-5.3.md) | 3 | [glm-5.3-exlr8-3x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/3x/exlr8-gr8): `bit273` (2.73 bpw), 384K context | about 97 GB a box | [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) |
+| GLM-5.3 | 4 to 6 | [glm-5.3-exlr8-4x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/4x/exlr8-gr8) ([5x](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/5x/exlr8-gr8), [6x](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/6x/exlr8-gr8)), Docker Compose (below), or [docs/DEPLOY.md](docs/DEPLOY.md) for bare metal and Kubernetes | about 90 GB a box with 4 boxes (TP=4) | |
+| [DeepSeek-V4.1-Flash](docs/DEEPSEEK.md) | 4 | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/recipes/tree/main/deepseek-v4.1-flash/dgx-spark/4x/exlr8-gr8): the same image on all four boxes, fast mode by default; or [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) with gr8's own launcher, exact output by default | 510.6 GB a box, fetched before the first boot | [kindlingai/deepseek-v4.1-flash-exlr8-native](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native) |
+| [GLM-5.3-Flash](docs/FLASH.md) | 1 | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/1x/exlr8-gr8): one `docker run` | 87 GB | [kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) |
+| GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8): the same image on both boxes | about 76 GB a box (86 GB with `TUNE=quality`) | |
 | GLM-5.3-Flash | 3 or 4 | [docs/FLASH.md](docs/FLASH.md) | see the page | |
 
 Each model's page has its results, how to start it and its known issues.
@@ -256,7 +257,7 @@ setting, and has bare metal and Kubernetes. An agent that installs or starts gr8
 (and explains what is involved) before asking the setup questions.
 
 **DeepSeek-V4.1-Flash** (four boxes): the recipe
-[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
+[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/recipes/tree/main/deepseek-v4.1-flash/dgx-spark/4x/exlr8-gr8)
 is the quickest way: the same image on every box, in fast mode by default. We booted that image (`sha-ad3efdf`) on four
 boxes on 2026-11-09: first boot (cold disk) 212.7 s to `serving:`, a switch from GLM-5.3 after that 37-39 s, a chat
 answered after each boot, and 73 of 75 on the 75-item check.
@@ -283,7 +284,7 @@ Each model's page gives its box count. [docs/GLM-5.3.md](docs/GLM-5.3.md#what-yo
   ([docs/FLASH.md](docs/FLASH.md#one-box-tp1)).
 - Two or more boxes need a RoCE v2 fabric with two rails: each box's ConnectX-7 has one address on each PCIe root. Two
   boxes need no switch: one 200G cable joins their ConnectX ports, as in the
-  [two-box recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark#clustering). For three or more we use one
+  [two-box recipe](https://github.com/kindlingai/recipes/blob/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8/README.md#clustering). For three or more we use one
   200G switch. At TP=3 or 4, `--shape ring` runs without one: each box's f0 port is cabled to the next box's f1 port, and
   at TP=4 the diagonal's writes are relayed by the box between, through a 32 MB ring per fabric (about 0.25 GB pinned
   per rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited. With mentat

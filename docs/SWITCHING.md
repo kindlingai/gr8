@@ -1,7 +1,7 @@
 # Switching models on the same boxes
 
 A box runs one gr8 model at a time. To move four boxes between GLM-5.3 at TP=4 and DeepSeek-V4.1-Flash at TP=4
-([the DeepSeek recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)), stop one model and start
+([the DeepSeek recipe](https://github.com/kindlingai/recipes/tree/main/deepseek-v4.1-flash/dgx-spark/4x/exlr8-gr8)), stop one model and start
 the other on every box. A two-box pair can also switch with GLM-5.3-Flash at TP=2;
 [the pair's numbers](#the-glm-53-flash-pair-tp2) are at the bottom of this page. Both models keep their files on
 the boxes, so a switch fetches nothing. The settings below make the switch fast; each one keeps its data on the
@@ -296,7 +296,7 @@ TP=4.
 ## The GLM-5.3-Flash pair (TP=2)
 
 A two-box pair can also switch between GLM-5.3-Flash at TP=2
-([the two-box recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)) and the TP=4 models above. The
+([the two-box recipe](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8)) and the TP=4 models above. The
 pair in the runs below was two DGX Sparks; the TP=4 models ran on their four-box set. Measured on 2026-11-07,
 warm, two runs each way, with GLM-5.3-Flash on a local build of its recipe at `319ed60` with gr8 `4ed9e7b` (the
 engine the recipe pins after its gr8 bump). Same columns as above; "Down" here is the parallel
