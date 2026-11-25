@@ -212,9 +212,15 @@ inline std::string libc_version()
 // Step times at TP4, 2200 MHz, contexts < 2K (GR8_DEC_EVPROF / GR8_S2_ROUNDLOG), ms
 struct S2Cost
 {
+#if G6_MODEL_INK2
+    double main0 = 17.0, main_row = 2.2;        // Inkling-2-Mini 1x GB10: verify(M) ~= 17 + 2.2 * M ms
+    double draft0 = 2.2, draft_sess = 0.35;     // DFlash2 Q4_0 batched draft: ~2.2 + 0.35 * S ms
+    double chain0 = 0.0, chain_sess = 0.0;      // DFlash2 drafts all K in 1 pass (zero chain cost)
+#else
     double main0 = 44, main_row = 7;            // verify step of M rows: main0 + main_row * M
     double draft0 = 2.1, draft_sess = 0.25;     // first-form draft step of S sessions' accepted rows
     double chain0 = 2.0, chain_sess = 0.15;     // chain step, one row per session
+#endif
 #if G6_MODEL_FLASH
     // A/B switch for Flash solo serving (GR8_GLM53F_S2_COST=1): spec_len.h's Flash table for this build's width, a host
     // build without one (the tests) TP2's. Never changes the full-GLM cost model.
@@ -494,6 +500,13 @@ public:
     {
         static const bool abi = g6sch_layout() == g6sch_layout_cpp();
         if (!abi) throw std::runtime_error("scheduler-rs: struct layouts differ from g6sched.h (the planner)");
+#if G6_MODEL_INK2
+        if (const auto& ec = knob::ink2_s2_cost(); ec && ec->size() == 6) {
+            cost_.main0 = (*ec)[0]; cost_.main_row = (*ec)[1];
+            cost_.draft0 = (*ec)[2]; cost_.draft_sess = (*ec)[3];
+            cost_.chain0 = (*ec)[4]; cost_.chain_sess = (*ec)[5];
+        }
+#endif
         g6s2_cost c{cost_.main0, cost_.main_row, cost_.draft0, cost_.draft_sess, cost_.chain0, cost_.chain_sess, false, {}, 0, 0};
 #if G6_MODEL_FLASH
         c.flash = cost_.flash;

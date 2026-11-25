@@ -256,3 +256,4 @@ __global__ void k_ink2_attn_prefill_tc(AttnCoreArgs a, int gq)
         }
     }
 }
+#include "ink2_attn_tc_fast.cuh"

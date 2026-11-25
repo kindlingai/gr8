@@ -235,13 +235,21 @@ impl Builder {
     }
 }
 
-/// The tr3.kmix word packs 8 bits per block in one i64, so mixed widths fit at most 8 blocks of an expert on a rank:
-/// None past that (all 16 blocks at TP=1, for one).
-fn kmix_word(gw: &[u8; NH_MAX], uw: &[u8; NH_MAX], dk: u8, hs: &[usize]) -> Option<i64> {
+/// The tr3.kmix word packs 8 bits per block in one i64, so per-block mixed widths fit at most 8 blocks of an expert on
+/// a rank: None past that (all 16 blocks at TP=1, for one). When `allow_uniform_matrix` is true (Inkling-2-Mini at TP=1
+/// with 9 blocks) and gate/up widths are each uniform across `hs`, bit 63 is set (`(1i64 << 63) | gk | (uk << 4)`) so
+/// per-matrix `(gate, up, down)` widths work at any block count.
+fn kmix_word(gw: &[u8; NH_MAX], uw: &[u8; NH_MAX], dk: u8, hs: &[usize], allow_uniform_matrix: bool) -> Option<i64> {
     if hs.iter().all(|&h| gw[h] == dk && uw[h] == dk) {
         return Some(0);
     }
     if hs.len() > 8 {
+        if allow_uniform_matrix {
+            let (gk, uk) = (gw[hs[0]], uw[hs[0]]);
+            if hs.iter().all(|&h| gw[h] == gk && uw[h] == uk) {
+                return Some((1i64 << 63) | (gk as i64) | ((uk as i64) << 4));
+            }
+        }
         return None;
     }
     Some(hs.iter().enumerate().fold(0i64, |v, (b, &h)| v | (gw[h] as i64) << (8 * b) | (uw[h] as i64) << (8 * b + 4)))
@@ -489,11 +497,12 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
     let fc1_bytes: u64 = experts.iter().zip(&own).map(|(&e, hs)| hs.iter().map(|&h| hb(of(e).0[h]) + hb(of(e).1[h])).sum::<u64>()).sum();
     let fc1 = b.begin(format!("{p}.tr3.fc1"), "u8", vec![fc1_bytes as i64], fc1_bytes, Some(xf));
     let (mut off, mut row) = (0u64, 0usize);
+    let allow_uniform_matrix = hidden == 2304 && w.nh == 9;
     for (i, &e) in experts.iter().enumerate() {
         let (gw, uw, dk) = of(e);
         let hs = &own[i];
         table[i] = [off as i64, 0, row as i64, hs.len() as i64, dk as i64, *hs.first().unwrap_or(&0) as i64];
-        kmix[i] = kmix_word(&gw, &uw, dk, hs).ok_or_else(|| format!(
+        kmix[i] = kmix_word(&gw, &uw, dk, hs, allow_uniform_matrix).ok_or_else(|| format!(
             "layer {l}: expert {e} has {} blocks on this rank with mixed widths; tr3.kmix holds at most 8 (a \
              uniform-width manifest or a larger TP avoids it)", hs.len()))?;
         for &h in hs {
@@ -710,11 +719,28 @@ mod tests {
         let all: Vec<usize> = (0..16).collect();
         let (mut gw, uw) = ([3u8; NH_MAX], [3u8; NH_MAX]);
         // uniform widths need no word at any block count
-        assert_eq!(kmix_word(&gw, &uw, 3, &all), Some(0));
+        assert_eq!(kmix_word(&gw, &uw, 3, &all, false), Some(0));
         gw[1] = 4;
-        assert_eq!(kmix_word(&gw, &uw, 3, &all[..2]), Some(0x3433));
-        assert!(kmix_word(&gw, &uw, 3, &all[..8]).is_some());
-        assert_eq!(kmix_word(&gw, &uw, 3, &all[..9]), None);
-        assert_eq!(kmix_word(&gw, &uw, 3, &all), None);
+        assert_eq!(kmix_word(&gw, &uw, 3, &all[..2], false), Some(0x3433));
+        assert!(kmix_word(&gw, &uw, 3, &all[..8], false).is_some());
+        assert_eq!(kmix_word(&gw, &uw, 3, &all[..9], false), None);
+        assert_eq!(kmix_word(&gw, &uw, 3, &all, false), None);
+        // non-uniform within gate/up still fails above 8 blocks even with uniform-matrix mode
+        assert_eq!(kmix_word(&gw, &uw, 3, &all[..9], true), None);
+    }
+
+    #[test]
+    fn kmix_holds_uniform_per_matrix_above_8_blocks() {
+        let nine: Vec<usize> = (0..9).collect();
+        let (gw, uw) = ([3u8; NH_MAX], [2u8; NH_MAX]);
+        // disallowed on models without uniform-matrix support
+        assert_eq!(kmix_word(&gw, &uw, 4, &nine, false), None);
+        // bit 63 sentinel encodes (gk=3, uk=2) with dk=4 from table[4]
+        let word = kmix_word(&gw, &uw, 4, &nine, true).unwrap();
+        assert!(word < 0);
+        assert_eq!(word & 15, 3);
+        assert_eq!((word >> 4) & 15, 2);
+        // uniform across all three matrices still encodes as 0
+        assert_eq!(kmix_word(&[3u8; NH_MAX], &[3u8; NH_MAX], 3, &nine, true), Some(0));
     }
 }

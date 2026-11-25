@@ -361,9 +361,228 @@ __global__ void __launch_bounds__(NRT) k_ink2_msg_gate_apply_norm(const float* h
     }
 }
 
+inline bool& msg_bf16_enabled()
+{
+    static bool enabled = true;
+    return enabled;
+}
+// 1-pass dynamic-SMEM zero-spill vectorized uint4 unrounded fp32 depth attention (QC = 1..4).
+template <int QC>
+__global__ void __launch_bounds__(NRT) k_ink2_attn_res_f32_fast(AttnResF32Args a)
+{
+    extern __shared__ __align__(16) uint4 s_rows[];
+    __shared__ float s_red[8 * (QC + 1)];
+    __shared__ float s_vss[MAX_DEPTH];
+    __shared__ float s_sq[QC][MAX_DEPTH];
+    __shared__ float s_weff[QC][MAX_DEPTH];
+
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int H = a.H, D = a.D;
+    const int H8 = H >> 3;
+    const size_t off8 = static_cast<size_t>(blockIdx.x) * H8;
+    const float inv_root_h = rsqrtf(static_cast<float>(H));
+
+    for (int d = 0; d < D; ++d)
+    {
+        const uint4* r8 = reinterpret_cast<const uint4*>(a.rows[d]) + off8;
+        float s = 0.0f;
+        float qacc[QC];
+        #pragma unroll
+        for (int q = 0; q < QC; ++q) qacc[q] = 0.0f;
+
+        for (int i = t; i < H8; i += NRT)
+        {
+            const uint4 xv = __ldg(r8 + i);
+            s_rows[d * H8 + i] = xv;
+            const __nv_bfloat162* bp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+            float f[8];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                const float2 fp = __bfloat1622float2(bp[k]);
+                f[2 * k] = fp.x; f[2 * k + 1] = fp.y;
+                s = fmaf(fp.x, fp.x, fmaf(fp.y, fp.y, s));
+            }
+            #pragma unroll
+            for (int q = 0; q < QC; ++q)
+            {
+                const float4* q4 = reinterpret_cast<const float4*>(a.query + static_cast<size_t>(q) * H) + (i << 1);
+                const float4 qa = __ldg(q4), qb = __ldg(q4 + 1);
+                float dq = qacc[q];
+                dq = fmaf(qa.x, f[0], dq); dq = fmaf(qa.y, f[1], dq);
+                dq = fmaf(qa.z, f[2], dq); dq = fmaf(qa.w, f[3], dq);
+                dq = fmaf(qb.x, f[4], dq); dq = fmaf(qb.y, f[5], dq);
+                dq = fmaf(qb.z, f[6], dq); dq = fmaf(qb.w, f[7], dq);
+                qacc[q] = dq;
+            }
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            s += __shfl_xor_sync(0xffffffffu, s, o);
+            #pragma unroll
+            for (int q = 0; q < QC; ++q) qacc[q] += __shfl_xor_sync(0xffffffffu, qacc[q], o);
+        }
+        if (lane == 0)
+        {
+            s_red[warp] = s;
+            #pragma unroll
+            for (int q = 0; q < QC; ++q) s_red[(q + 1) * 8 + warp] = qacc[q];
+        }
+        __syncthreads();
+        if (t == 0)
+        {
+            s_vss[d] = s_red[0] + s_red[1] + s_red[2] + s_red[3] + s_red[4] + s_red[5] + s_red[6] + s_red[7];
+            #pragma unroll
+            for (int q = 0; q < QC; ++q)
+            {
+                const float* p = s_red + (q + 1) * 8;
+                s_sq[q][d] = p[0] + p[1] + p[2] + p[3] + p[4] + p[5] + p[6] + p[7];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (t == 0)
+    {
+        float r[MAX_DEPTH];
+        for (int d = 0; d < D; ++d) r[d] = rsqrtf(s_vss[d] / static_cast<float>(H) + RMS_EPS);
+        #pragma unroll
+        for (int q = 0; q < QC; ++q)
+        {
+            float mx = -INFINITY, den = 0.0f;
+            float lg[MAX_DEPTH];
+            for (int d = 0; d < D; ++d)
+            {
+                lg[d] = s_sq[q][d] * r[d] * inv_root_h;
+                mx = fmaxf(mx, lg[d]);
+            }
+            for (int d = 0; d < D; ++d) { lg[d] = __expf(lg[d] - mx); den += lg[d]; }
+            const float iden = 1.0f / den;
+            for (int d = 0; d < D; ++d) s_weff[q][d] = lg[d] * iden * r[d];
+        }
+    }
+    __syncthreads();
+
+    for (int i = t; i < H8; i += NRT)
+    {
+        float acc[QC][8];
+        #pragma unroll
+        for (int q = 0; q < QC; ++q)
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) acc[q][k] = 0.0f;
+
+        for (int d = 0; d < D; ++d)
+        {
+            const uint4 xv = s_rows[d * H8 + i];
+            const __nv_bfloat162* bp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+            float f[8];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                const float2 fp = __bfloat1622float2(bp[k]);
+                f[2 * k] = fp.x; f[2 * k + 1] = fp.y;
+            }
+            #pragma unroll
+            for (int q = 0; q < QC; ++q)
+            {
+                const float w = s_weff[q][d];
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) acc[q][k] = fmaf(w, f[k], acc[q][k]);
+            }
+        }
+        #pragma unroll
+        for (int q = 0; q < QC; ++q)
+        {
+            float4* o4 = reinterpret_cast<float4*>(a.out[q] + static_cast<size_t>(blockIdx.x) * H) + (i << 1);
+            o4[0] = make_float4(acc[q][0], acc[q][1], acc[q][2], acc[q][3]);
+            o4[1] = make_float4(acc[q][4], acc[q][5], acc[q][6], acc[q][7]);
+        }
+    }
+}
+
+// Zero-spill SMEM vectorized float4/uint2 MessageGate finish (reads BF16 sf/sm -> 2x less DRAM, STACK:0!)
+__global__ void __launch_bounds__(NRT) k_ink2_msg_gate_finish_bf16(
+    const float* __restrict__ h_f32, const float* __restrict__ msg_f32,
+    const uint16_t* __restrict__ sf_in, const uint16_t* __restrict__ sm_in,
+    const uint16_t* __restrict__ norm_w, uint16_t* __restrict__ out_bf16, int H)
+{
+    __shared__ float4 s_v[1024]; // up to H=4096 (16 KB SMEM -> 4 CTAs/SM, STACK:0!)
+    __shared__ float s_red[8];
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int H4 = H >> 2;
+    const size_t off4 = static_cast<size_t>(blockIdx.x) * H4;
+    const float4* hf4 = reinterpret_cast<const float4*>(h_f32) + off4;
+    const float4* mf4 = reinterpret_cast<const float4*>(msg_f32) + off4;
+    const uint2* sf2 = reinterpret_cast<const uint2*>(sf_in) + off4;
+    const uint2* sm2 = reinterpret_cast<const uint2*>(sm_in) + off4;
+    const uint2* nw2 = reinterpret_cast<const uint2*>(norm_w);
+    uint2* out2 = reinterpret_cast<uint2*>(out_bf16) + off4;
+
+    float ss = 0.0f;
+    for (int i = t; i < H4; i += NRT)
+    {
+        const float4 hv = __ldg(hf4 + i), mv = __ldg(mf4 + i);
+        const uint2 svf = __ldg(sf2 + i), svm = __ldg(sm2 + i);
+        const float2 fa = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&svf.x));
+        const float2 fb = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&svf.y));
+        const float2 ma = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&svm.x));
+        const float2 mb = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&svm.y));
+        const float4 vv = make_float4(
+            fmaf(1.0f - tanhf(fa.x), hv.x, tanhf(ma.x) * mv.x),
+            fmaf(1.0f - tanhf(fa.y), hv.y, tanhf(ma.y) * mv.y),
+            fmaf(1.0f - tanhf(fb.x), hv.z, tanhf(mb.x) * mv.z),
+            fmaf(1.0f - tanhf(fb.y), hv.w, tanhf(mb.y) * mv.w));
+        s_v[i] = vv;
+        ss = fmaf(vv.x, vv.x, fmaf(vv.y, vv.y, fmaf(vv.z, vv.z, fmaf(vv.w, vv.w, ss))));
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if (lane == 0) s_red[warp] = ss;
+    __syncthreads();
+    if (t == 0)
+    {
+        const float tot = s_red[0] + s_red[1] + s_red[2] + s_red[3] + s_red[4] + s_red[5] + s_red[6] + s_red[7];
+        s_red[0] = rsqrtf(tot / static_cast<float>(H) + RMS_EPS);
+    }
+    __syncthreads();
+    const float rn = s_red[0];
+    for (int i = t; i < H4; i += NRT)
+    {
+        const float4 vv = s_v[i];
+        const uint2 nv = __ldg(nw2 + i);
+        const float2 na = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&nv.x));
+        const float2 nb = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&nv.y));
+        const __nv_bfloat162 oa = __floats2bfloat162_rn(na.x * vv.x * rn, na.y * vv.y * rn);
+        const __nv_bfloat162 ob = __floats2bfloat162_rn(nb.x * vv.z * rn, nb.y * vv.w * rn);
+        uint2 ov;
+        ov.x = *reinterpret_cast<const uint32_t*>(&oa);
+        ov.y = *reinterpret_cast<const uint32_t*>(&ob);
+        out2[i] = ov;
+    }
+}
+
 inline void attn_res_f32(const AttnResF32Args& a, int M, cudaStream_t st)
 {
     if (a.D < 1 || a.D > MAX_DEPTH || a.Q < 1 || a.Q > LOOP_MAX_Q || M < 1) throw std::runtime_error("ink2::attn_res_f32: D, Q or M");
+    const bool fast_res = fast_res_enabled();
+    const size_t smem = static_cast<size_t>(a.D) * a.H * sizeof(uint16_t);
+    if (fast_res && (a.H & 7) == 0 && smem <= 65536)
+    {
+        static const bool attr_ok = []() {
+            cudaFuncSetAttribute(k_ink2_attn_res_f32_fast<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+            cudaFuncSetAttribute(k_ink2_attn_res_f32_fast<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+            cudaFuncSetAttribute(k_ink2_attn_res_f32_fast<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+            cudaFuncSetAttribute(k_ink2_attn_res_f32_fast<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+            return true;
+        }();
+        (void)attr_ok;
+        if (a.Q == 1) k_ink2_attn_res_f32_fast<1><<<M, NRT, smem, st>>>(a);
+        else if (a.Q == 2) k_ink2_attn_res_f32_fast<2><<<M, NRT, smem, st>>>(a);
+        else if (a.Q == 3) k_ink2_attn_res_f32_fast<3><<<M, NRT, smem, st>>>(a);
+        else k_ink2_attn_res_f32_fast<4><<<M, NRT, smem, st>>>(a);
+        return;
+    }
     k_ink2_attn_res_f32<<<M, NRT, 0, st>>>(a);
 }
 
@@ -587,6 +806,66 @@ __global__ void __launch_bounds__(NRT) k_ink2_msg_gate_finish_3(MsgGate3Args a, 
     }
 }
 
+__global__ void __launch_bounds__(NRT) k_ink2_msg_gate_finish_bf16_3(
+    MsgGate3Args a, const uint16_t* __restrict__ sf_in, const uint16_t* __restrict__ sm_in, int M, int H)
+{
+    __shared__ float4 s_v[1024]; // up to H=4096 (16 KB SMEM -> 4 CTAs/SM, STACK:0!)
+    __shared__ float s_red[8];
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int m = blockIdx.x, ctrl = blockIdx.y;
+    const int H4 = H >> 2;
+    const size_t off4 = static_cast<size_t>(m) * H4;
+    const size_t soff4 = (static_cast<size_t>(ctrl) * M + m) * H4;
+    const float4* hf4 = reinterpret_cast<const float4*>(a.h_f32[ctrl]) + off4;
+    const float4* mf4 = reinterpret_cast<const float4*>(a.msg_f32[ctrl]) + off4;
+    const uint2* sf2 = reinterpret_cast<const uint2*>(sf_in) + soff4;
+    const uint2* sm2 = reinterpret_cast<const uint2*>(sm_in) + soff4;
+    const uint2* nw2 = reinterpret_cast<const uint2*>(a.norm_w[ctrl]);
+    uint2* out2 = reinterpret_cast<uint2*>(a.out_bf16[ctrl]) + off4;
+
+    float ss = 0.0f;
+    for (int i = t; i < H4; i += NRT)
+    {
+        const float4 hv = __ldg(hf4 + i), mv = __ldg(mf4 + i);
+        const uint2 svf = __ldg(sf2 + i), svm = __ldg(sm2 + i);
+        const float2 fa = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&svf.x));
+        const float2 fb = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&svf.y));
+        const float2 ma = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&svm.x));
+        const float2 mb = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&svm.y));
+        const float4 vv = make_float4(
+            fmaf(1.0f - tanhf(fa.x), hv.x, tanhf(ma.x) * mv.x),
+            fmaf(1.0f - tanhf(fa.y), hv.y, tanhf(ma.y) * mv.y),
+            fmaf(1.0f - tanhf(fb.x), hv.z, tanhf(mb.x) * mv.z),
+            fmaf(1.0f - tanhf(fb.y), hv.w, tanhf(mb.y) * mv.w));
+        s_v[i] = vv;
+        ss = fmaf(vv.x, vv.x, fmaf(vv.y, vv.y, fmaf(vv.z, vv.z, fmaf(vv.w, vv.w, ss))));
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if (lane == 0) s_red[warp] = ss;
+    __syncthreads();
+    if (t == 0)
+    {
+        const float tot = s_red[0] + s_red[1] + s_red[2] + s_red[3] + s_red[4] + s_red[5] + s_red[6] + s_red[7];
+        s_red[0] = rsqrtf(tot / static_cast<float>(H) + RMS_EPS);
+    }
+    __syncthreads();
+    const float rn = s_red[0];
+    for (int i = t; i < H4; i += NRT)
+    {
+        const float4 vv = s_v[i];
+        const uint2 nv = __ldg(nw2 + i);
+        const float2 na = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&nv.x));
+        const float2 nb = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&nv.y));
+        const __nv_bfloat162 oa = __floats2bfloat162_rn(na.x * vv.x * rn, na.y * vv.y * rn);
+        const __nv_bfloat162 ob = __floats2bfloat162_rn(nb.x * vv.z * rn, nb.y * vv.w * rn);
+        uint2 ov;
+        ov.x = *reinterpret_cast<const uint32_t*>(&oa);
+        ov.y = *reinterpret_cast<const uint32_t*>(&ob);
+        out2[i] = ov;
+    }
+}
+
 inline void msg_gate_norm_3(const MsgGate3Args& a, uint16_t* cat_bf16, uint16_t* g_bf16,
                             float* sf_buf, float* sm_buf, int M, int H, cudaStream_t st)
 {
@@ -606,6 +885,29 @@ inline void msg_gate_norm_3(const MsgGate3Args& a, uint16_t* cat_bf16, uint16_t*
     {
         for (int c = 0; c < 3; ++c)
             gemm_bf16(cat_bf16 + static_cast<size_t>(c) * M * K, a.down_w[c], M, K, 64, g_bf16 + static_cast<size_t>(c) * M * 64, st);
+    }
+    if (M > 64)
+    {
+        const bool msg_bf16 = msg_bf16_enabled();
+        if (msg_bf16 && (H & 3) == 0 && H <= 4096)
+        {
+            uint16_t* sf_b = reinterpret_cast<uint16_t*>(sf_buf);
+            uint16_t* sm_b = reinterpret_cast<uint16_t*>(sm_buf);
+            for (int c = 0; c < 3; ++c)
+            {
+                gemm_bf16(g_bf16 + static_cast<size_t>(c) * M * 64, a.forget_w[c], M, 64, H, sf_b + static_cast<size_t>(c) * M * H, st);
+                gemm_bf16(g_bf16 + static_cast<size_t>(c) * M * 64, a.gain_w[c], M, 64, H, sm_b + static_cast<size_t>(c) * M * H, st);
+            }
+            k_ink2_msg_gate_finish_bf16_3<<<dim3(static_cast<unsigned>(M), 3), NRT, 0, st>>>(a, sf_b, sm_b, M, H);
+            return;
+        }
+        for (int c = 0; c < 3; ++c)
+        {
+            gemm_f32(g_bf16 + static_cast<size_t>(c) * M * 64, a.forget_w[c], M, 64, H, sf_buf + static_cast<size_t>(c) * M * H, st);
+            gemm_f32(g_bf16 + static_cast<size_t>(c) * M * 64, a.gain_w[c], M, 64, H, sm_buf + static_cast<size_t>(c) * M * H, st);
+        }
+        k_ink2_msg_gate_finish_3<<<dim3(static_cast<unsigned>(M), 3), NRT, 0, st>>>(a, sf_buf, sm_buf, M, H);
+        return;
     }
     const unsigned gx = static_cast<unsigned>((H + 3) / 4);
     if (M == 1) k_ink2_msg_gate_fg_r64_3<1><<<dim3(gx, 1, 3), 128, 0, st>>>(g_bf16, a, sf_buf, sm_buf, M, H);
@@ -644,6 +946,15 @@ inline void msg_gate_norm(const float* h_f32, const float* msg_f32, const uint16
         }
         if (M > 64)
         {
+            if (msg_bf16_enabled() && (H & 3) == 0 && H <= 4096)
+            {
+                uint16_t* sf_b = reinterpret_cast<uint16_t*>(sf_buf);
+                uint16_t* sm_b = reinterpret_cast<uint16_t*>(sm_buf);
+                gemm_bf16(g_bf16, forget_w, M, R, H, sf_b, st);
+                gemm_bf16(g_bf16, gain_w, M, R, H, sm_b, st);
+                k_ink2_msg_gate_finish_bf16<<<M, NRT, 0, st>>>(h_f32, msg_f32, sf_b, sm_b, norm_w, out_bf16, H);
+                return;
+            }
             gemm_f32(g_bf16, forget_w, M, R, H, sf_buf, st);
             gemm_f32(g_bf16, gain_w, M, R, H, sm_buf, st);
             k_ink2_msg_gate_finish<<<M, NRT, 0, st>>>(h_f32, msg_f32, sf_buf, sm_buf, norm_w, out_bf16, H);

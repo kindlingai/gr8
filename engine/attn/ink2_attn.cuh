@@ -31,6 +31,7 @@
 #pragma once
 #include "ink2_attn.h"
 #include "../kernels/ink2_sconv.cuh"
+#include "../kernels/ink2_mxfp8_pf.cuh"
 #include "../runtime/ink2_prof.cuh"
 
 namespace ink2
@@ -863,6 +864,7 @@ inline void attn_check(const AttnGeom& g)
 // rw: device arrays of the M rows; max_pos = the largest position among them. out [M][H] BF16, or out == nullptr and
 // out_f32 [M][H] = the rank's partial of the wo sum.
 #include "ink2_attn_tc.cuh"   // in this namespace: the tensor-core kernel of a prefill chunk
+#include "ink2_attn_dec_fast.cuh"
 
 // Set once at runtime startup; standalone kernel users retain the default dispatch.
 inline bool& local_grp_enabled()
@@ -870,19 +872,57 @@ inline bool& local_grp_enabled()
     static bool on = false;
     return on;
 }
+inline bool& pf_fast_attn_enabled()
+{
+    static bool on = true;
+    return on;
+}
+inline bool& dec_fast_attn_enabled()
+{
+    static bool on = true;
+    return on;
+}
 
 // tc: the rows are one run of one slot at consecutive positions (a prefill chunk), and the caller wants the
 // tensor-core kernel for them (ink2_attn_tc.cuh). Geometries it does not cover take the stock kernels.
 inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnState& s, AttnWork& wk, const Rows& rw, int max_pos, const uint16_t* qi,
-                         const uint16_t* ki, const uint16_t* vi, int M, uint16_t* out, float* out_f32, cudaStream_t st, bool tc = false, Prof* prof = nullptr)
+                         const uint16_t* ki, const uint16_t* vi, int M, uint16_t* out, float* out_f32, cudaStream_t st, bool tc = false, Prof* prof = nullptr,
+                         const mx8::Mx8AttnMats* mx8_w = nullptr)
 {
     attn_check(g);
     if (M < 1 || M > wk.M) throw std::runtime_error("ink2::attn_forward: rows");
     if (g.global && max_pos / KV_PAGE_TOKENS >= s.max_pps) throw std::runtime_error("ink2::attn_forward: position past the slot's page table");
     const int H = g.H, hd = g.hd, nk = g.nh_kv * hd, nq = g.nh_q * hd;
+    const bool use_mx8 = (mx8_w != nullptr && mx8_w->active(M));
     {
         ProfScope _ps(prof, PS_ATTN_QKV_PROJ, st);
-        if (qi == ki && qi == vi && !g.global)
+        if (use_mx8)
+        {
+            if (qi == ki && qi == vi && !g.global)
+            {
+                const mx8::Mx8MultiSpec tg[6] = {
+                    {&mx8_w->wk, wk.kp},
+                    {&mx8_w->wv, wk.vp},
+                    {&mx8_w->wq, wk.q_raw},
+                    {&mx8_w->wr, wk.r_raw},
+                    {&mx8_w->gate, wk.gate},
+                    {&mx8_w->sink, wk.sink},
+                };
+                mx8::gemm_mx8_multi(qi, mx8_w->x8_buf, tg, 6, M, H, st);
+            }
+            else
+            {
+                mx8::gemm_mx8_multi_3x(ki, vi, qi, mx8_w->x8_buf, mx8_w->x8_stride,
+                                       mx8_w->wk, mx8_w->wv, mx8_w->wq, mx8_w->wr, mx8_w->gate, mx8_w->sink,
+                                       wk.kp, wk.vp, wk.q_raw, wk.r_raw, wk.gate, wk.sink, M, H, st);
+                if (g.global)
+                {
+                    gemm_f32(ki, w.k_wproj, M, H, g.nh_kv * SCONV_TAPS, wk.dynk, st);
+                    gemm_f32(vi, w.v_wproj, M, H, g.nh_kv * SCONV_TAPS, wk.dynv, st);
+                }
+            }
+        }
+        else if (qi == ki && qi == vi && !g.global)
         {
             const GemmTarget tg[6] = {
                 {w.wk, wk.kp, nk, GEMM_BF16, 0},
@@ -958,19 +998,34 @@ inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnStat
         ProfScope _ps(prof, g.global ? PS_ATTN_CORE_GLOBAL : PS_ATTN_CORE_LOCAL, st);
         if (use_tc)
         {
-            static const cudaError_t attr = cudaFuncSetAttribute(k_ink2_attn_prefill_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(attn_tc_smem(TC_MAX_GQ)));
-            if (attr != cudaSuccess) throw std::runtime_error("ink2::attn_forward: shared memory of the tensor-core kernel");
             k_ink2_attn_qr_prep<<<M * g.nh_q, ACT, 0, st>>>(wk.q_raw, wk.r_raw, w.q_clip, w.rel_clip, rw, g.nh_q, hd, g.rel_dim, g.log_scale_base, g.global ? 1 : 0);
             a.m0 = 0;
             a.rows = M;
-            k_ink2_attn_prefill_tc<<<dim3((M + 15) / 16, g.nh_kv), g.gqa * 32, attn_tc_smem(g.gqa), st>>>(a, g.gqa);
+            if (pf_fast_attn_enabled() && M >= 32 && g.gqa <= 3)
+            {
+                static const cudaError_t fattr = cudaFuncSetAttribute(k_ink2_attn_prefill_tc_fast, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(attn_tc_fast_smem(3)));
+                if (fattr != cudaSuccess) throw std::runtime_error("ink2::attn_forward: shared memory of fast tensor-core kernel");
+                k_ink2_attn_prefill_tc_fast<<<dim3((M + 16 * FATC_NQB - 1) / (16 * FATC_NQB), g.nh_kv), FATC_NQB * g.gqa * 32, attn_tc_fast_smem(g.gqa), st>>>(a, g.gqa);
+            }
+            else
+            {
+                static const cudaError_t attr = cudaFuncSetAttribute(k_ink2_attn_prefill_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(attn_tc_smem(TC_MAX_GQ)));
+                if (attr != cudaSuccess) throw std::runtime_error("ink2::attn_forward: shared memory of the tensor-core kernel");
+                k_ink2_attn_prefill_tc<<<dim3((M + 15) / 16, g.nh_kv), g.gqa * 32, attn_tc_smem(g.gqa), st>>>(a, g.gqa);
+            }
         }
+        const bool fast_dec_attn = dec_fast_attn_enabled();
+        const uint16_t* rpt = mx8_w ? mx8_w->rel_proj_t : nullptr;
         for (int m0 = 0; m0 < M && !use_tc; m0 += mb)
         {
             const int rows = M - m0 < mb ? M - m0 : mb;
             a.m0 = m0;
             a.rows = rows;
-            if (g.global)
+            if (fast_dec_attn && hd == ATTN_MAX_HD)
+            {
+                k_ink2_attn_core_fast<<<dim3(rows * g.nh_q, smax), ACT, 0, st>>>(a, rpt);
+            }
+            else if (g.global)
             {
                 const int max_ngrp = (rows * max_gq + GRP_Q - 1) / GRP_Q;
                 k_ink2_attn_global_grp<<<dim3(max_ngrp, smax, g.nh_kv), ACT, 0, st>>>(a);
@@ -986,7 +1041,12 @@ inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnStat
     }
     {
         ProfScope _ps(prof, PS_ATTN_WO, st);
-        if (out != nullptr) gemm_bf16(wk.og, w.wo, M, nq, H, out, st);
+        if (use_mx8 && out != nullptr)
+        {
+            if (M >= mx8::mx8_tc_min_m()) mx8::bf16_to_mx8_a(wk.og, mx8_w->x8_buf, M, nq, st);
+            mx8::gemm_mx8<false>(wk.og, mx8_w->x8_buf, mx8_w->wo, out, M, st);
+        }
+        else if (out != nullptr) gemm_bf16(wk.og, w.wo, M, nq, H, out, st);
         else gemm_f32(wk.og, w.wo, M, nq, H, out_f32, st);
     }
 }

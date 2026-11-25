@@ -20,6 +20,7 @@
 #include "../kernels/ink2_tr3_moe.cuh"
 #include "../attn/ink2_attn.cuh"
 #include "../kernels/ink2_mtp.cuh"
+#include "../kernels/ink2_dflash2.cuh"
 #include "../kernels/ink2_head.cuh"
 #include "ink2_prof.cuh"
 #include "../model_geom_ink2.h"
@@ -319,7 +320,7 @@ struct Image
         }
     };
 
-    void open(const std::string& dir, int nr, int r, const std::string& variant = "")
+    void open(const std::string& dir, int nr, int r, const std::string& variant = "", bool with_mtp = true)
     {
         rank = r;
         const std::string sfx = ".manifest.json";
@@ -328,8 +329,8 @@ struct Image
         if (fd < 0) die(p + ": " + strerror(errno));
         close(fd);
         char err[1024] = "";
-        plan = g6l_ink2_plan_ex(dir.c_str(), static_cast<uint32_t>(nr), static_cast<uint32_t>(r),
-                                variant.empty() ? nullptr : variant.c_str(), p.c_str(), err, sizeof err);
+        plan = g6l_ink2_plan_ex2(dir.c_str(), static_cast<uint32_t>(nr), static_cast<uint32_t>(r),
+                                 variant.empty() ? nullptr : variant.c_str(), with_mtp ? 1 : 0, p.c_str(), err, sizeof err);
         if (!plan)
         {
             unlink(p.c_str());
@@ -551,6 +552,8 @@ struct RankPart
     int tr3_nblk = 0;
     const __half *tr3_sg = nullptr, *tr3_v1b = nullptr, *tr3_v3b = nullptr;
     int tr3_wide = 0;
+    ink2::mx8::Mx8AttnMats mx8_aw;
+    ink2::mx8::MoeMx8Layer mx8_moe;
 };
 struct CtrlWeights
 {
@@ -700,10 +703,29 @@ public:
         c = read_config(dir);
         if (c.heads % o.nr || o.nloc < 1 || o.rank0 + o.nloc > o.nr) die("TP " + std::to_string(o.nr) + " does not divide the heads");
         layer_ids = parse_layers(o.layers, c.n_layers);
+        std::string df2_path;
+        if (o.nr == 1 && o.nloc == 1 && o.mtp > 0)
+        {
+            const auto& df2_knob = knob::ink2_dflash2();
+            std::string cand = ink2::df2::resolve_dflash2_path(dir, df2_knob);
+            if (!cand.empty())
+            {
+                if (c.H != ink2::df2::HID)
+                {
+                    if (df2_knob && !df2_knob->empty())
+                        die("GR8_INK2_DFLASH2 requires hidden_size == " + std::to_string(ink2::df2::HID));
+                }
+                else
+                {
+                    df2_path = std::move(cand);
+                }
+            }
+        }
+        const bool load_built_in_mtp = (o.mtp > 0 && df2_path.empty());
         for (int i = 0; i < o.nloc; ++i)
         {
             img.push_back(std::make_unique<Image>());
-            img[i]->open(dir, o.nr, o.rank0 + i, o.variant);
+            img[i]->open(dir, o.nr, o.rank0 + i, o.variant, load_built_in_mtp);
             if (o.whole_image) img[i]->whole();
         }
         Image& a = *img[0];
@@ -728,6 +750,11 @@ public:
         ink2::splitk_enabled() = knob::ink2_splitk();
         ink2::fast_router_enabled() = knob::ink2_fast_router();
         ink2::tr3::tr3_wide_enabled() = knob::ink2_tr3_wide();
+        ink2::pf_fast_attn_enabled() = knob::ink2_pf_fast_attn();
+        ink2::dec_fast_attn_enabled() = knob::ink2_dec_fast_attn();
+        ink2::fast_res_enabled() = knob::ink2_fast_res();
+        ink2::msg_bf16_enabled() = knob::ink2_msg_bf16();
+        ink2::mx8::mx8_tc_min_m_ref() = static_cast<int>(knob::ink2_mx8_tc_min_m());
         const size_t mh = static_cast<size_t>(o.max_rows) * c.H;
         embed = a.get<uint16_t>("G.embed");
         embed_norm = a.get<uint16_t>("G.embed_norm");
@@ -768,6 +795,12 @@ public:
                 tr3_x_had.push_back(dalloc<__half>(static_cast<size_t>(o.max_rows) * c.H));
             }
         }
+        if (o.nr == 1 && o.nloc == 1)
+        {
+            ink2::mx8::init_mx8_attrs();
+            if (max_tr3_eb > 0) init_mx8_moe();
+            init_mx8_dense();
+        }
         if (max_tr3_eb > 0) init_tr3_wide();
         d_slot = dalloc<int>(o.max_rows);
         d_pos = dalloc<int>(o.max_rows);
@@ -797,7 +830,7 @@ public:
         parts = dalloc<float>(static_cast<size_t>(o.nr) * part_stride);
         host_logits.resize(static_cast<size_t>(o.max_rows) * vr);
         head_parts.resize(static_cast<size_t>(o.nr) * head_bytes(o.max_rows));
-        if (use_blas && cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) die("cublasCreate failed");
+        if ((use_blas || !df2_path.empty()) && cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) die("cublasCreate failed");
         if (use_ghp) head_dev = dalloc<uint8_t>(head_bytes(std::max(o.max_rows, o.slots)));
         h_arg_val = dalloc<float>(static_cast<size_t>(o.max_rows) * ink2::HEAD_ARGMAX_NG);
         h_arg_id = dalloc<int>(static_cast<size_t>(o.max_rows) * ink2::HEAD_ARGMAX_NG);
@@ -815,7 +848,11 @@ public:
             INK2RT_CK(cudaHostAlloc(&h_acc_pin, static_cast<size_t>(o.max_rows), cudaHostAllocDefault));
             use_graph = o.use_graph < 0 ? knob::ink2_graph() : o.use_graph != 0;
         }
-        if (o.mtp > 0) init_mtp();
+        if (o.mtp > 0)
+        {
+            if (!df2_path.empty()) init_dflash2(df2_path);
+            else init_mtp();
+        }
         if (o.nr == 1 && o.nloc == 1 && o.mtp > 0)
         {
             INK2RT_CK(cudaHostAlloc(&h_mtp_meta_pin, sizeof(int) * (static_cast<size_t>(4) * o.slots + static_cast<size_t>(o.slots) * c.mtp_block), cudaHostAllocDefault));
@@ -909,6 +946,12 @@ public:
             }
         }
         if (o.mtp < 1) return;
+        if (df2.loaded)
+        {
+            df2.reset_slot(slot, stream);
+            if (last_taps) INK2RT_CK(cudaMemset(last_taps + s * ntaps * c.H, 0, static_cast<size_t>(ntaps) * c.H * 2));
+            return;
+        }
         for (MtpLayer& y : ML)
             for (int i = 0; i < o.nloc; ++i)
             {
@@ -1104,7 +1147,7 @@ public:
                 {
                     RankPart& x = s.rk[i];
                     ink2::attn_forward(x.g, x.aw, x.as, x.wk, rw, rh.max_pos, qi, split_kv ? ki : qi, split_kv ? vi : qi, M, T == 1 ? s.att : nullptr,
-                                       parts + static_cast<size_t>(o.rank0 + i) * n, st, tc, pf);
+                                       parts + static_cast<size_t>(o.rank0 + i) * n, st, tc, pf, T == 1 ? &x.mx8_aw : nullptr);
                 }
                 if (T > 1)
                 {
@@ -1183,7 +1226,9 @@ public:
                 const int r = o.rank0 + i;
                 {
                     ink2::ProfScope _ps(pf, ink2::PS_TRUNK_LM_HEAD, st);
-                    ink2::lm_head(hf, lm[i], M, c.H, vr, r * vr, c.valid, logits[i], st);
+                    const bool use_lm_mx8 = (T == 1 && lm_mx8.ready() && (lm_mx8_mode == 1 || (lm_mx8_mode == 2 && M >= 64)));
+                    if (use_lm_mx8) ink2::mx8::lm_head_mx8(hf, mx8_x8, lm_mx8, M, r * vr, c.valid, logits[i], st);
+                    else ink2::lm_head(hf, lm[i], M, c.H, vr, r * vr, c.valid, logits[i], st);
                 }
                 if (head_mode == 1)
                 {
@@ -1313,7 +1358,8 @@ public:
         if (o.mtp > 0)
         {
             ink2::ProfScope _ps(pf, ink2::PS_COMMIT_MTP, st);
-            mtp_commit(rw, am, st);
+            if (df2.loaded) df2.commit(step_taps, static_cast<size_t>(o.max_rows) * c.H, rw, acc, M, blas, st);
+            else mtp_commit(rw, am, st);
         }
         INK2RT_CK(cudaStreamSynchronize(st));
         if (pf) pf->end_op(st);
@@ -1333,6 +1379,12 @@ public:
         const cudaStream_t st = stream;
         ink2::Prof* pf = prof.enabled ? &prof : nullptr;
         if (pf) pf->begin_op(4, S);
+        if (df2.loaded)
+        {
+            df2.draft(slots, q_pos, golden, K, embed, embed_norm, lm[0], blas, out, st);
+            if (pf) pf->end_op(st);
+            return;
+        }
         const int MB = S * B;
         std::vector<int> nctx(static_cast<size_t>(S)), pos(static_cast<size_t>(MB));
         int nctx_max = 0;
@@ -1722,6 +1774,17 @@ public:
     }
     uint8_t* mtp_last_taps() const { return reinterpret_cast<uint8_t*>(last_taps); }
     int mtp_taps() const { return ntaps; }
+    bool dflash2_active() const { return df2.loaded; }
+    void set_dflash2_ctx_lo(int slot, int lo) { df2.set_ctx_lo(slot, lo); }
+    void copy_logits_valid(int rows, float* dst_host) const
+    {
+        if (logits.empty() || !logits[0]) die("copy_logits_valid: no logits buffer");
+        if (stream) INK2RT_CK(cudaStreamSynchronize(stream));
+        INK2RT_CK(cudaMemcpy2D(dst_host, static_cast<size_t>(c.valid) * sizeof(float),
+                               logits[0], static_cast<size_t>(vr) * sizeof(float),
+                               static_cast<size_t>(c.valid) * sizeof(float),
+                               static_cast<size_t>(rows), cudaMemcpyDeviceToHost));
+    }
 
 private:
     static std::string lname(int l, const char* what)
@@ -1888,6 +1951,27 @@ private:
         return b;
     }
     // The drafter of the checkpoint: its weights, its per-slot context rows and the buffers of a draft.
+    void init_dflash2(const std::string& df2_path)
+    {
+        c.mtp_targets = {5, 23, 41, 48};
+        ntaps = ink2::df2::NT;
+        c.mtp_block = ink2::df2::B;
+        c.mtp_drafts = ink2::df2::K_MAX;
+        if (o.mtp > c.mtp_drafts) die("--mtp " + std::to_string(o.mtp) + ": DFlash2 makes at most 7 drafts");
+        const size_t mh = static_cast<size_t>(o.max_rows) * c.H;
+        step_taps = dalloc<uint16_t>(static_cast<size_t>(ntaps) * mh);
+        last_taps = dalloc<uint16_t>(static_cast<size_t>(o.slots) * ntaps * c.H);
+        ink2::df2::Ink2DFlash2::InitOpts dopts;
+        dopts.use_emb_norm = knob::ink2_df2_embnorm() ? 1 : 0;
+        dopts.use_head2 = knob::ink2_df2_head2() ? 1 : 0;
+        dopts.use_q8 = knob::ink2_df2_q8() ? 1 : 0;
+        dopts.use_dp = knob::ink2_df2_dp() ? 1 : 0;
+        dopts.use_graph = knob::ink2_df2_graph() ? 1 : 0;
+        dopts.sel_alpha = static_cast<float>(knob::ink2_df2_sel_alpha());
+        if (!df2.init(df2_path, o.slots, o.max_rows, c.valid, lm[0], dopts, stream))
+            die("failed to load DFlash2 drafter from " + df2_path);
+    }
+
     void init_mtp()
     {
         Image& a = *img[0];
@@ -2190,6 +2274,130 @@ private:
             fprintf(stderr, "# ink2: tr3 wide+factorized enabled on %d physical PMCGX layers (H=%d, HB=%d)\n", n_widened, c.H, HB);
     }
 
+    void init_mx8_moe()
+    {
+        const int mode = static_cast<int>(knob::ink2_pf_mx8_moe());
+        if (mode <= 0 || !ink2::mx8::mx8_supported() || c.H % 128 != 0) return;
+        const int HB = c.H / 128;
+        const int I = c.I;
+        if (I % 128 != 0) return;
+        const int eb = I / 128;
+
+        mx8_moe_sc.max_M = o.max_rows;
+        mx8_moe_sc.max_rb = (o.max_rows * c.TK + 15) / 16 + c.NE;
+        mx8_moe_sc.max_cta_y = (mx8_moe_sc.max_rb + 3) / 4 + c.NE;
+        mx8_moe_sc.x8 = dalloc<uint8_t>(static_cast<size_t>(mx8_moe_sc.max_rb) * (c.H >> 5) * ink2::mx8::MX8_REC);
+        mx8_moe_sc.act_bf16 = dalloc<uint16_t>(static_cast<size_t>(mx8_moe_sc.max_rb) * 16 * I);
+        mx8_moe_sc.a8 = dalloc<uint8_t>(static_cast<size_t>(mx8_moe_sc.max_rb) * (I >> 5) * ink2::mx8::MX8_REC);
+        mx8_moe_sc.out_f32 = dalloc<float>(static_cast<size_t>(o.max_rows) * c.H);
+        mx8_moe_sc.tok_list = dalloc<int>(static_cast<size_t>(mx8_moe_sc.max_rb) * 16);
+        mx8_moe_sc.rw_list = dalloc<float>(static_cast<size_t>(mx8_moe_sc.max_rb) * 16);
+        mx8_moe_sc.map4 = dalloc<ink2::mx8::MoeTileMap4>(static_cast<size_t>(mx8_moe_sc.max_cta_y));
+        mx8_moe_sc.d_counts = dalloc<int>(2);
+
+        std::vector<ink2::mx8::MoeMx8Layer> phys(static_cast<size_t>(c.n_layers));
+        std::vector<bool> done(static_cast<size_t>(c.n_layers), false);
+        int n_cached = 0;
+        constexpr int DEC_SMEM = 128 * 132 * sizeof(float);
+        for (Layer& s : L)
+        {
+            if (s.exp_fmt != 3) continue;
+            if (mode == 1 && s.loop_j < 0) continue;
+            RankPart& x = s.rk[0];
+            if (!done[static_cast<size_t>(s.l)])
+            {
+                done[static_cast<size_t>(s.l)] = true;
+                ink2::mx8::MoeMx8Layer ly{};
+                ly.NE = c.NE; ly.H = c.H; ly.I = I;
+                const size_t gu_el = static_cast<size_t>(c.NE) * 2 * I * c.H;
+                const size_t dn_el = static_cast<size_t>(c.NE) * c.H * I;
+                ly.gu_q = dalloc<uint8_t>(gu_el);
+                ly.gu_sc = dalloc<uint8_t>(gu_el >> 5);
+                ly.dn_q = dalloc<uint8_t>(dn_el);
+                ly.dn_sc = dalloc<uint8_t>(dn_el >> 5);
+                INK2RT_CK(cudaMemset(ly.gu_q, 0, gu_el));
+                INK2RT_CK(cudaMemset(ly.gu_sc, 127, gu_el >> 5));
+                INK2RT_CK(cudaMemset(ly.dn_q, 0, dn_el));
+                INK2RT_CK(cudaMemset(ly.dn_sc, 127, dn_el >> 5));
+                ink2::mx8::k_ink2_tr3_decode_fc1_mx8<ink2::tr3::CB_PMCGX><<<static_cast<unsigned>(c.NE * 2 * eb * HB), 256, DEC_SMEM, 0>>>(
+                    x.tr3_fc1, x.tr3_v1, x.tr3_v2, x.tr3_tab, x.tr3_kmix, ly.gu_q, ly.gu_sc, eb, c.H);
+                ink2::mx8::k_ink2_tr3_decode_fc2_mx8<ink2::tr3::CB_PMCGX><<<static_cast<unsigned>(c.NE * eb * HB), 256, DEC_SMEM, 0>>>(
+                    x.tr3_fc2, x.tr3_v2, x.tr3_v3, x.tr3_tab, ly.dn_q, ly.dn_sc, eb, c.H);
+                phys[static_cast<size_t>(s.l)] = ly;
+                ++n_cached;
+            }
+            x.mx8_moe = phys[static_cast<size_t>(s.l)];
+        }
+        INK2RT_CK(cudaDeviceSynchronize());
+        if (n_cached > 0)
+            fprintf(stderr, "# ink2: cached MXFP8 prefill MoE on %d physical layers (mode=%d, %.2f GiB)\n",
+                    n_cached, mode, (double)n_cached * c.NE * 3.0 * I * c.H * 1.03125 / (1024.0 * 1024.0 * 1024.0));
+    }
+
+    void init_mx8_dense()
+    {
+        const bool sm120 = ink2::mx8::mx8_supported();
+        const int mode = sm120 ? static_cast<int>(knob::ink2_mx8_dense()) : 0;
+        lm_mx8_mode = sm120 ? static_cast<int>(knob::ink2_mx8_lm_head()) : 0;
+
+        size_t x8_bytes = 0;
+        if (mode > 0 || lm_mx8_mode > 0)
+        {
+            int max_k = c.H;
+            for (const Layer& s : L) max_k = std::max(max_k, s.rk[0].g.nh_q * s.rk[0].g.hd);
+            x8_bytes = static_cast<size_t>((o.max_rows + 15) / 16) * (max_k >> 5) * ink2::mx8::MX8_REC;
+            mx8_x8 = dalloc<uint8_t>(3 * x8_bytes);
+        }
+
+        auto alloc_q = [&](const uint16_t* src, ink2::mx8::Mx8Mat& dst, int N, int K) {
+            dst.q = dalloc<uint8_t>(static_cast<size_t>(N) * K);
+            dst.sc = dalloc<uint8_t>(static_cast<size_t>(N) * (K >> 5));
+            ink2::mx8::quantize_w(src, dst, N, K, 0);
+        };
+
+        // Always transpose rel_proj_t on TP=1 so coalesced decode attention works even when GR8_INK2_MX8_DENSE=0.
+        std::vector<ink2::mx8::Mx8AttnMats> phys(static_cast<size_t>(c.n_layers));
+        std::vector<bool> done(static_cast<size_t>(c.n_layers), false);
+        int n_phys = 0;
+        for (Layer& s : L)
+        {
+            RankPart& x = s.rk[0];
+            if (!done[static_cast<size_t>(s.l)])
+            {
+                done[static_cast<size_t>(s.l)] = true;
+                ink2::mx8::Mx8AttnMats m{};
+                m.rel_proj_t = dalloc<uint16_t>(static_cast<size_t>(x.g.rel_win) * x.g.rel_dim);
+                ink2::mx8::transpose_bf16(x.aw.rel_proj, m.rel_proj_t, x.g.rel_dim, x.g.rel_win, 0);
+                if (mode > 0)
+                {
+                    const int nk = x.g.nh_kv * x.g.hd;
+                    const int nq = x.g.nh_q * x.g.hd;
+                    alloc_q(x.aw.wk, m.wk, nk, c.H);
+                    alloc_q(x.aw.wv, m.wv, nk, c.H);
+                    alloc_q(x.aw.wq, m.wq, nq, c.H);
+                    alloc_q(x.aw.wr, m.wr, x.g.nh_q * x.g.rel_dim, c.H);
+                    alloc_q(x.aw.gate, m.gate, nq, c.H);
+                    alloc_q(x.aw.sink, m.sink, x.g.nh_q, c.H);
+                    alloc_q(x.aw.wo, m.wo, c.H, nq);
+                    m.x8_buf = mx8_x8;
+                    m.x8_stride = x8_bytes;
+                    m.mode = mode;
+                    ++n_phys;
+                }
+                phys[static_cast<size_t>(s.l)] = m;
+            }
+            x.mx8_aw = phys[static_cast<size_t>(s.l)];
+        }
+        if (n_phys > 0)
+            fprintf(stderr, "# ink2: MXFP8 dense attn enabled on %d physical layers (mode=%d)\n", n_phys, mode);
+        if (lm_mx8_mode > 0)
+        {
+            alloc_q(lm[0], lm_mx8, vr, c.H);
+            fprintf(stderr, "# ink2: MXFP8 lm_head enabled (mode=%d, vr=%d, H=%d)\n", lm_mx8_mode, vr, c.H);
+        }
+        INK2RT_CK(cudaDeviceSynchronize());
+    }
+
     void moe_tr3(Layer& s, int j, cudaStream_t st = 0)
     {
         ink2::Work& w0 = mw[0];
@@ -2198,6 +2406,12 @@ private:
         {
             ink2::ProfScope _ps(pf, ink2::PS_ROUTER, st);
             ink2::route(xm, s.router_w, s.router_bias, M, c.H, c.NE, c.TK, c.route_scale, w0.score, w0.idx, w0.wt, w0.plan, st);
+        }
+        const int pf_mx8_min_m = static_cast<int>(knob::ink2_pf_mx8_min_m());
+        if (T == 1 && M >= pf_mx8_min_m && s.rk[0].mx8_moe.ready())
+        {
+            ink2::mx8::launch_moe_mx8_prefill(s.rk[0].mx8_moe, mx8_moe_sc, xm, w0.plan, M, c.TK, s.mo, st, pf);
+            return;
         }
         const int cb = s.exp_fmt == 3 ? ink2::tr3::CB_PMCGX : s.exp_fmt == 2 ? ink2::tr3::CB_MUL1 : ink2::tr3::CB_MCG;
         const size_t picks = static_cast<size_t>(M) * c.TK * c.H;
@@ -2359,5 +2573,10 @@ private:
     std::map<MtpGraphKey, cudaGraphExec_t> mtp_graphs;
     ink2::CommitLayerDesc* commit_descs = nullptr;
     ink2::Prof prof;
+    ink2::df2::Ink2DFlash2 df2;
+    ink2::mx8::MoeMx8Scratch mx8_moe_sc;
+    uint8_t* mx8_x8 = nullptr;
+    ink2::mx8::Mx8Mat lm_mx8;
+    int lm_mx8_mode = 0;
 };
 }   // namespace ink2rt

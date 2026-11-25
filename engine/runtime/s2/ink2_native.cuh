@@ -336,7 +336,11 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
                 fprintf(stderr, "# rank %d ink2 kv restore id %llu tier %u slot %d pos %u pages %zu hits %u\n",
                         c.rank, (unsigned long long)cl.age, cl.tier, q, g.reuse, r.full_pages, ss.hits);
             }
-            if (g.reuse > 0) c.engine.stage_partial_page(q, g.reuse, false);
+            if (g.reuse > 0)
+            {
+                c.engine.stage_partial_page(q, g.reuse, false);
+                c.engine.set_dflash2_ctx_lo(q, int(g.reuse));
+            }
             store_slots[size_t(q)] = ss;
         }
     };

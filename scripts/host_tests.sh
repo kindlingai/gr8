@@ -672,6 +672,11 @@ run_job test_ink2_geom '
   g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_INK2=1 -I "$REPO/engine" "$REPO/engine/tests/test_ink2_geom.cpp" -o "$D/test_ink2_geom" "${KNOBS[@]}"
   "$D/test_ink2_geom"
 '
+run_job test_ink2_dflash2_melded '
+  g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -DG6_MODEL_INK2=1 -I "$REPO/engine" -I "$REPO/engine/runtime" \
+    "$REPO/engine/tests/test_ink2_dflash2_melded.cpp" -o "$D/test_ink2_dflash2_melded" "${KVLIB[@]}"
+  "$D/test_ink2_dflash2_melded"
+'
 # EL5 (#153) resizable KV pool chunk coordination (kv_chunks_plan.h) against kvman-rs RunPool
 run_job kv_chunks_plan_test '
   g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" -I "$REPO/engine/runtime/s2" -I "$REPO/engine" \
