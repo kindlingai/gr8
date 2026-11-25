@@ -130,7 +130,7 @@ struct SpecLen
     // no level <= n the caller drafted too few, and a non-level could ask for a verify graph that was never captured.
     int choose(const float* lp, int n, int drafted, double* e_out = nullptr) const
     {
-        int best = 0;
+        int best = -1;
         double br = -1, be = 1;
         for (int k : levels)
         {
@@ -139,7 +139,7 @@ struct SpecLen
             const double r = ratio(k, lp, drafted, &e);
             if (r > br * (1 + 1e-9)) { br = r; best = k; be = e; }
         }
-        if (!best) { fprintf(stderr, "g6: spec_len: %d drafts, below every level\n", n); abort(); }
+        if (best < 0) { fprintf(stderr, "g6: spec_len: %d drafts, below every level\n", n); abort(); }
         if (e_out) *e_out = be;
         return best;
     }
@@ -193,11 +193,15 @@ struct SpecLen
         levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
         return !levels.empty();
     }
+    void allow_k0()
+    {
+        if (levels.empty() || levels[0] != 0) levels.insert(levels.begin(), 0);
+    }
     std::string summary() const
     {
         std::string s = "# spec-adaptive: " + std::to_string(rounds) + " rounds, chosen k";
         char b[128];
-        for (int k = 1; k <= KX; ++k) if (chosen[k]) { snprintf(b, sizeof b, " %d:%ld", k, chosen[k]); s += b; }
+        for (int k = 0; k <= KX; ++k) if (chosen[k]) { snprintf(b, sizeof b, " %d:%ld", k, chosen[k]); s += b; }
         snprintf(b, sizeof b, "; tokens per round predicted %.3f, got %.3f", rounds ? pred_sum / rounds : 0., rounds ? got_sum / rounds : 0.);
         return s + b;
     }

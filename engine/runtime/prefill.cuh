@@ -1136,7 +1136,7 @@ inline void pf_inputs(Prefill& P, int M, const int* tok, const int* pos)
 }
 inline void pf_embed(Model& m, Prefill& P, int M, cudaStream_t st)
 {
-    glue::EmbedArgs a{P.tok, m.emb, m.layers[0].attn_norm, P.resid, P.x, glue::RMS_EPS};
+    glue::EmbedArgs a{P.tok, m.emb, m.layers[0].attn_norm, P.resid, P.x, glue::RMS_EPS, m.emb_i8, m.emb_scale};
     glue::k_embed_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
 }
 inline void pf_set_step(Prefill& P, u64 ls, cudaStream_t st) { k_set_step<<<1, 1, 0, st>>>(P.stepp, ls); }
@@ -1966,7 +1966,7 @@ inline void pf_draft(Draft& D, DraftPrefill& Q, const __half* hid, int M, int co
         if (const char* e = bindp::make_gemm(Q.codes, Q.scales, M, Q.x8, Q.eh_out, 0, g)) die(std::string("MTP prefill eh_proj: ") + e);
         if (g.K != 2 * HID || g.N != HID) die(G6_MTP_L ".eh.mx.codes is not [HID][2 * HID]");
     }
-    k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{P.tok, P.pos, d.emb, D.enorm, D.hnorm, hid, glue::RMS_EPS, Q.eh_in});
+    k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{P.tok, P.pos, d.emb, D.enorm, D.hnorm, hid, glue::RMS_EPS, Q.eh_in, d.emb_i8, d.emb_scale});
     bindp::Xq xq;
     xq.on = 1; xq.src = Q.eh_in; xq.ld = 2 * HID; xq.K = 2 * HID; xq.M = M; xq.dst = Q.x8;
     bindp::launch(xq, st);

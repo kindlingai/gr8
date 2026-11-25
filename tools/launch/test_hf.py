@@ -743,6 +743,11 @@ if os.environ.get('STUB_CONVERT_FAIL'):
     sys.exit('config hidden_size = 1, this converter is written for 6144')
 if a[a.index('--nr') + 1] != os.environ.get('STUB_WANT_NR', '4'):
     sys.exit('stub: --nr ' + a[a.index('--nr') + 1])
+if os.environ.get('STUB_WANT_INT4') == '1':
+    if '--int4' not in a or a[a.index('--int4') + 1] != 'body' or a[a.index('--int4-codebooks') + 1] != '1':
+        sys.exit('stub: missing --int4 body --int4-codebooks 1: ' + repr(a))
+elif '--int4' in a or '--int4-codebooks' in a:
+    sys.exit('stub: unexpected --int4 flags: ' + repr(a))
 open(os.path.join(out, 'args.json'), 'w').write(json.dumps(a))
 open(os.path.join(out, f'dflash.r{r}.pack'), 'wb').write(bytes(1000 + r))
 json.dump({'pack_bytes': 1000 + r}, open(os.path.join(out, f'dflash.r{r}.manifest.json'), 'w'))
@@ -880,6 +885,47 @@ class DrafterTests(unittest.TestCase):
         plan = opt.engine_plan(o, rank=5, rank_dir='/r', aux_dir='/a', home='/h', epoch=1)
         self.assertIn(os.path.join(ms.drafter.out, 'dflash.r5.pack'), plan['args'])
         self.assertIn('--spec-adaptive', plan['args'])
+
+    def test_tp2_int4_drafter_auto_fetch_and_convert(self):
+        """GLM-5.3 TP=2 auto-fetches models.GLM53.drafter_url into MODEL_CACHE and converts it with native INT4 flags."""
+        import models
+        import options as opt
+        import supervisor as S
+        from test_modelset import make_release as local_release
+        rel = local_release(os.path.join(self.t, 'local2'), variants=('bit225',))
+        # Direct hfsource.Drafter(tp=2, int4=True) writes to tp2-int4 and passes --int4 body --int4-codebooks 1
+        d = hfsource.Drafter(self.cache, 'fakeorg/drafter', 'main', log=lambda m: None, tp=2, int4=True)
+        self.assertEqual(d.out, os.path.join(d.dir, 'tp2-int4'))
+        with mock.patch.dict(os.environ, {'STUB_WANT_NR': '2', 'STUB_WANT_INT4': '1'}):
+            d.fetch_rank(0)
+        self.assertEqual(d.check(0), [])
+        with open(os.path.join(d.out, 'rank0.COMPLETE')) as f:
+            self.assertTrue(json.load(f).get('int4'))
+        # Auto-fetch via supervisor.resolve_model when MODEL_CACHE is set and DRAFTER is omitted
+        base = ['--no-config', '--peers', '10.0.0.1,10.0.0.2', '--model', rel, '--model-cache', self.cache]
+        logs = []
+        orig_url = models.GLM53.drafter_url
+        object.__setattr__(models.GLM53, 'drafter_url', 'https://huggingface.co/fakeorg/drafter')
+        try:
+            o = opt.parse(base, GLM)
+            opt.validate(o)
+            ms, v, err = S.resolve_model(o, log=logs.append)
+        finally:
+            object.__setattr__(models.GLM53, 'drafter_url', orig_url)
+        self.assertEqual(err, '')
+        self.assertIsNotNone(ms.drafter)
+        self.assertTrue(ms.drafter.int4)
+        self.assertEqual(ms.drafter.out, os.path.join(ms.drafter.dir, 'tp2-int4'))
+        self.assertEqual(o.get('DFLASH_DIR'), ms.drafter.out)
+        plan = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', epoch=1)
+        self.assertIn(os.path.join(ms.drafter.out, 'dflash.r1.pack'), plan['args'])
+        self.assertIn('GR8_DFL_VERIFY_CAP=0.35', plan['env'])
+        self.assertIn('GR8_SPEC_K0=1', plan['env'])
+        # --dflash 0 opts out cleanly
+        o_off = opt.parse([*base, '--dflash', '0'], GLM)
+        opt.validate(o_off)
+        ms_off, _, err_off = S.resolve_model(o_off, log=logs.append)
+        self.assertEqual((err_off, ms_off.drafter), ('', None))
 
 
 if __name__ == '__main__':

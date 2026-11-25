@@ -315,6 +315,7 @@ public:
     }
     // DFlash2 sessions verify up to kv drafts with the --spec-adaptive policy sl (s2_batch.h Batch::dflash)
     void dflash(int kv, const g6rt::SpecLen& sl) { m_->batch.dflash(kv, sl); }
+    void dfl_verify_cap(double cap) { m_->batch.dfl_verify_cap(cap); }
     void dsel(const s2::DSel& d) { m_->batch.dsel(d); }
     void kstop(const s2::KStop& k) { m_->batch.kstop(k); }
     void dfl_reuse(const s2::DflReuse& r) { m_->batch.dfl_reuse(r); }

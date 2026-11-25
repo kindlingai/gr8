@@ -691,18 +691,49 @@ impl Planner<'_> {
         let f = Arc::new(StFile::open(&exlr8::dense_path(dir, None))?);
         let t = self.threads;
         let em = Matrix::open(&f, "embed_tokens")?;
-        self.note(L_MTP + 1, Form { what: "embedding", src: fmt_name(&em), form: "BF16",
-                                     exact: if em.rec.fmt == exlr8::BF16 { EXACT } else { BF16_OF } });
-        let f2 = f.clone();
-        self.gen("G.embed".into(), vec![("G.embed".into(), "bf16", vec![VOCAB as i64, H as i64])], move || {
-            let m = Matrix::open(&f2, "embed_tokens")?;
-            let mut out = Vec::with_capacity(VOCAB * H * 2);
-            for a in (0..VOCAB).step_by(8192) {
-                let w = exlr8::decode_par(&m, a..(a + 8192).min(VOCAB), 0..H, t)?;
-                out.extend(w.iter().flat_map(|&x| bf16_bits(x).to_le_bytes()));
-            }
-            Ok(vec![out])
-        });
+        if self.layout.nr() == 2 {
+            // TP=2: per-row symmetric INT8 embedding (~0.95 GB vs 1.90 GB BF16, 7-bit precision) saves 0.95 GB/rank
+            self.note(L_MTP + 1, Form { what: "embedding", src: fmt_name(&em), form: "INT8 per-row", exact: ROUNDED });
+            let f2 = f.clone();
+            self.gen("G.embed".into(), vec![
+                ("G.embed.i8".into(), "u8", vec![VOCAB as i64, H as i64]),
+                ("G.embed.scale".into(), "f32", vec![VOCAB as i64]),
+            ], move || {
+                let m = Matrix::open(&f2, "embed_tokens")?;
+                let mut qout = Vec::with_capacity(VOCAB * H);
+                let mut sout = Vec::with_capacity(VOCAB * 4);
+                for a in (0..VOCAB).step_by(8192) {
+                    let b = (a + 8192).min(VOCAB);
+                    let w = exlr8::decode_par(&m, a..b, 0..H, t)?;
+                    for r in 0..(b - a) {
+                        let row = &w[r * H..(r + 1) * H];
+                        let mut mx = 0.0f32;
+                        for &x in row { let ax = x.abs(); if ax > mx { mx = ax; } }
+                        let sc = if mx > 0.0 { mx / 127.0 } else { 0.0 };
+                        let inv = if sc > 0.0 { 1.0 / sc } else { 0.0 };
+                        sout.extend_from_slice(&sc.to_le_bytes());
+                        for &x in row {
+                            let q = (x * inv).round().clamp(-127.0, 127.0) as i8;
+                            qout.push(q as u8);
+                        }
+                    }
+                }
+                Ok(vec![qout, sout])
+            });
+        } else {
+            self.note(L_MTP + 1, Form { what: "embedding", src: fmt_name(&em), form: "BF16",
+                                         exact: if em.rec.fmt == exlr8::BF16 { EXACT } else { BF16_OF } });
+            let f2 = f.clone();
+            self.gen("G.embed".into(), vec![("G.embed".into(), "bf16", vec![VOCAB as i64, H as i64])], move || {
+                let m = Matrix::open(&f2, "embed_tokens")?;
+                let mut out = Vec::with_capacity(VOCAB * H * 2);
+                for a in (0..VOCAB).step_by(8192) {
+                    let w = exlr8::decode_par(&m, a..(a + 8192).min(VOCAB), 0..H, t)?;
+                    out.extend(w.iter().flat_map(|&x| bf16_bits(x).to_le_bytes()));
+                }
+                Ok(vec![out])
+            });
+        }
         self.vector("G.final_norm".into(), &f, "norm.weight")?;
         let lm = Matrix::open(&f, "lm_head")?;
         self.note(L_MTP + 1, Form { what: "lm_head", src: fmt_name(&lm), form: "MXFP8 decode record", exact: ROUNDED });

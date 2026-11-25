@@ -96,8 +96,14 @@ fn run() -> Result<i32, String> {
     let num = |k: &str| need(k)?.parse::<usize>().map_err(|_| format!("{k}: not a number"));
     if cmd == "dflash2" {
         let nr = opt.get("--nr").map_or(Ok(4), |_| num("--nr"))?;
-        dflash2::main(need("--src")?, need("--out")?, nr, opt.get("--ranks").copied(),
-                      opt.get("--bf16").copied().unwrap_or(""))?;
+        let i4cb = match opt.get("--int4-codebooks").copied().unwrap_or("0") {
+            "0" | "false" | "off" => false,
+            "1" | "true" | "on" => true,
+            v => return Err(format!("--int4-codebooks {v}: want 0 or 1")),
+        };
+        dflash2::main_ex(need("--src")?, need("--out")?, nr, opt.get("--ranks").copied(),
+                         opt.get("--bf16").copied().unwrap_or(""),
+                         opt.get("--int4").copied().unwrap_or(""), i4cb)?;
         return Ok(0);
     }
     let choice = match (opt.get("--manifest"), opt.get("--widths")) {

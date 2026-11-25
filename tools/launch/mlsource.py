@@ -562,10 +562,11 @@ class Drafter:
 
     FILES = ('config.json', 'model.safetensors')
 
-    def __init__(self, store, addr, model, repo, rev, work, name, log=print, tp=4, token=None):
+    def __init__(self, store, addr, model, repo, rev, work, name, log=print, tp=4, token=None, int4=False):
         if not safe_path(model):
             raise modelset.ModelError(f'MODEL_LOADER_DRAFTER_MODEL {model!r}: not a catalog name')
         self.client, self.model, self.hf_repo, self.log, self.tp = Client(addr, token), model, repo, log, tp
+        self.int4 = bool(int4)
         self.request_name, self.revision = name, rev
         self.where = f'model-loader {model}'
         st = self.put()
@@ -587,7 +588,7 @@ class Drafter:
             raise modelset.ModelError(f'the drafter {self} has no {", ".join(missing)}')
         self.files = man
         safe = re.sub(r'[^A-Za-z0-9._-]', '_', f'{model}@{self.revision}')
-        self.out = os.path.join(work, safe, f'tp{tp}')
+        self.out = os.path.join(work, safe, f'tp{tp}-int4' if self.int4 else f'tp{tp}')
 
     def put(self):
         b = {'model': self.model, 'include': list(self.FILES), 'priority': 5}
@@ -629,6 +630,8 @@ class Drafter:
             return [f'the drafter {self} is not converted for rank {rank} yet']
         if c.get('drafter') != self.id:
             return [f'the drafter for rank {rank} was converted from {c.get("drafter")}, not {self.id}']
+        if bool(c.get('int4', False)) != self.int4:
+            return [f'the drafter {self} for rank {rank} was converted with a different quantization mode']
         return [f'{p}: missing or not {n} bytes' for p, n in sorted(c['files'].items())
                 if not os.path.isfile(os.path.join(self.out, p)) or os.path.getsize(os.path.join(self.out, p)) != n]
 
@@ -646,7 +649,7 @@ class Drafter:
             return
         os.makedirs(os.path.dirname(self.out), exist_ok=True)
         hfsource.convert_drafter(convert, self.dir, self.out, self.tp, rank, self.id, self.log, str(self),
-                                 scratch=os.path.dirname(self.out))
+                                 scratch=os.path.dirname(self.out), int4=self.int4)
 
 
 def of(o, repo, rev, log=print):
@@ -661,13 +664,14 @@ def of(o, repo, rev, log=print):
                    log=log, layout=o.get('LAYOUT'), token=client.token)
 
 
-def drafter_of(o, repo, rev, log=print):
+def drafter_of(o, repo, rev, log=print, int4=False, url=None):
     """The model-loader Drafter for --fetch model-loader and --drafter https://huggingface.co/<repo>[@rev]."""
     store = o.get('MODEL_CACHE')
-    named = bool(re.search(r'(@|/tree/)[^/]+/?$', o.get('DRAFTER') or ''))
+    named = bool(re.search(r'(@|/tree/)[^/]+/?$', url if url is not None else (o.get('DRAFTER') or '')))
     client = client_of(o)
     model = o.get('MODEL_LOADER_DRAFTER_MODEL') or catalog_name(client, repo, rev if named else '',
                                                                 'MODEL_LOADER_DRAFTER_MODEL', log)
     work = os.path.join(os.path.abspath(o.get('GR8_WORK_DIR')), 'run', 'model-loader')
     return Drafter(store, client.addr, model, repo, rev if named else '', work,
-                   f'gr8-{o.get("GR8_MODEL") or "glm53"}-drafter', log=log, tp=int(o.get('TP')), token=client.token)
+                   f'gr8-{o.get("GR8_MODEL") or "glm53"}-drafter', log=log, tp=int(o.get('TP')), token=client.token,
+                   int4=int4)

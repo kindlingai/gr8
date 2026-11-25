@@ -20,6 +20,7 @@
 //! checks the output against checked-in fixtures byte for byte.
 
 use crate::json::{self, Json};
+use crate::records;
 use crate::sha256::Sha256;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -223,6 +224,58 @@ fn bf16_record(w: &[u16], o: usize, k: usize) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Native INT4 g32 decode record (records::int4_quantize + records::rt_record): [O, K] BF16 -> [O/16][K/32][288].
+/// Matches engine/kernels/head_i4.cuh and densev.cuh Int4v bit-for-bit, avoiding a resident MXFP8 copy in VRAM.
+fn int4_record(w: &[u16], o: usize, k: usize) -> Result<Vec<u8>, String> {
+    let (t, g) = (o / 16, k / 32);
+    let mut out = vec![0u8; t * g * 288];
+    let work = |ti: usize, dst: &mut [u8]| -> Result<(), String> {
+        let mut f = vec![0f32; 16 * k];
+        for (o_f, &b) in f.iter_mut().zip(&w[ti * 16 * k..(ti + 1) * 16 * k]) {
+            *o_f = f32::from_bits((b as u32) << 16);
+        }
+        let (q, sc) = records::int4_quantize(&f, k);
+        dst.copy_from_slice(&records::rt_record(&q, &sc, k));
+        Ok(())
+    };
+    par_tiles(&mut out, t, g * 288, work)?;
+    Ok(out)
+}
+
+/// INT4 g32 selector codebook: [V, C] BF16 (C % 32 == 0) -> (q4 [V, C/2] u8 nibbles, s4 [V, C/32] f16 le bytes).
+pub fn int4_codebook(w: &[u16], shape: &[usize]) -> Result<(Vec<u8>, Vec<u8>, Vec<usize>, Vec<usize>), String> {
+    if shape.len() != 2 || shape[1] % 32 != 0 {
+        return Err(format!("int4 codebook: shape {shape:?} is not [V, 32 m]"));
+    }
+    let (v, c) = (shape[0], shape[1]);
+    let (qb, sb) = (c / 2, (c / 32) * 2);
+    let mut q_out = vec![0u8; v * qb];
+    let mut s_out = vec![0u8; v * sb];
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(v.max(1));
+    let per = v.div_ceil(threads);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = q_out.chunks_mut(per * qb).zip(s_out.chunks_mut(per * sb)).enumerate().map(|(i, (qc, scb))| {
+            sc.spawn(move || {
+                let r0 = i * per;
+                let rn = qc.len() / qb;
+                let mut f = vec![0f32; rn * c];
+                for (dst, &b) in f.iter_mut().zip(&w[r0 * c..(r0 + rn) * c]) {
+                    *dst = f32::from_bits((b as u32) << 16);
+                }
+                let (q, s) = records::int4_quantize(&f, c);
+                qc.copy_from_slice(&q);
+                for (dst, &bits) in scb.chunks_exact_mut(2).zip(&s) {
+                    dst.copy_from_slice(&bits.to_le_bytes());
+                }
+            })
+        }).collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+    });
+    Ok((q_out, s_out, vec![v, c / 2], vec![v, c / 32]))
+}
+
 /// Runs work(tile, its bytes of out) for tiles 0..n, split across the cores.
 fn par_tiles<F>(out: &mut [u8], n: usize, per: usize, work: F) -> Result<(), String>
 where F: Fn(usize, &mut [u8]) -> Result<(), String> + Sync {
@@ -407,6 +460,15 @@ pub fn replicated(dims: &Dims, nr: usize) -> bool {
 /// classes kept in BF16. Returns the manifest.
 pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: &str, bf16: &[String])
                     -> Result<Json, String> {
+    convert_rank_ex(st, cfg, dims, nr, r, out, bf16, &[], false)
+}
+
+/// Rank r of nr with optional native INT4 g32 body record classes (`int4`) and INT4 g32 selector codebooks
+/// (`int4_codebooks`). When both are empty/false, output is byte-identical to `convert_rank`.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_rank_ex(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: &str,
+                       bf16: &[String], int4: &[String], int4_codebooks: bool)
+                       -> Result<Json, String> {
     let d = key(cfg, "dflash_config")?;
     let Dims { hid, hd, .. } = *dims;
     let rep = replicated(dims, nr);
@@ -415,6 +477,9 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
     let mut classes: Vec<String> = bf16.to_vec();
     classes.sort();
     classes.dedup();
+    let mut i4_classes: Vec<String> = int4.to_vec();
+    i4_classes.sort();
+    i4_classes.dedup();
     let mut meta = BTreeMap::new();
     let copy = |m: &mut BTreeMap<String, Json>, name: &str, v: &Json| m.insert(name.to_string(), v.clone());
     meta.insert("format_dflash".into(), Json::Str(VERSION.into()));
@@ -431,6 +496,12 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
     copy(&mut meta, "selector_rank", get_or(d, "selector_rank", &Json::Null));
     copy(&mut meta, "selector_top_k", get_or(d, "selector_top_k", &Json::Null));
     meta.insert("bf16_classes".into(), Json::Arr(classes.iter().map(|c| Json::Str(c.clone())).collect()));
+    if !i4_classes.is_empty() {
+        meta.insert("int4_classes".into(), Json::Arr(i4_classes.iter().map(|c| Json::Str(c.clone())).collect()));
+    }
+    if int4_codebooks {
+        meta.insert("int4_codebooks".into(), Json::Bool(true));
+    }
     if rep {
         meta.insert("replicated_ks".into(), Json::Int(REF_NR as i64));
     }
@@ -443,6 +514,8 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
         let (o, k) = (shape[0], shape[1]);
         let (rec, layout, rshape) = if classes.iter().any(|c| c == cls) {
             (bf16_record(&a, o, k)?, "bf16_gv_record[O/16][K/16][512]", vec![o / 16, k / 16, 512])
+        } else if i4_classes.iter().any(|c| c == cls) {
+            (int4_record(&a, o, k)?, "int4_gv_record[O/16][K/32][288]", vec![o / 16, k / 32, 288])
         } else {
             (mxfp8_record(&a, o, k)?, "mxfp8_gv_record[O/16][K/32][528]", vec![o / 16, k / 32, 528])
         };
@@ -498,8 +571,18 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
     }
     if st.has("candidate_selector.hidden_projection.weight") {
         put_rec(&mut w, "D.sel.hproj.gv", st.get("candidate_selector.hidden_projection.weight", None)?, "sel")?;
-        w.put_bf16("D.sel.pred", st.get("candidate_selector.predecessor_codebook", None)?)?;
-        w.put_bf16("D.sel.succ", st.get("candidate_selector.successor_codebook", None)?)?;
+        if int4_codebooks {
+            for (dst, src) in [("D.sel.pred", "candidate_selector.predecessor_codebook"),
+                               ("D.sel.succ", "candidate_selector.successor_codebook")] {
+                let (vals, shape) = st.get(src, None)?;
+                let (q4, s4, qshape, sshape) = int4_codebook(&vals, &shape)?;
+                w.put(&format!("{dst}.q4"), &q4, "u8", &qshape, vec![])?;
+                w.put(&format!("{dst}.s4"), &s4, "f16", &sshape, vec![])?;
+            }
+        } else {
+            w.put_bf16("D.sel.pred", st.get("candidate_selector.predecessor_codebook", None)?)?;
+            w.put_bf16("D.sel.succ", st.get("candidate_selector.successor_codebook", None)?)?;
+        }
     }
     w.close(meta)
 }
@@ -508,6 +591,12 @@ pub fn convert_rank(st: &St, cfg: &Json, dims: &Dims, nr: usize, r: usize, out: 
 /// --nr 6 or 3: the replicated layout, one pack per rank. The model (dims_of) from the config's hidden size.
 /// Prints one JSON line per rank.
 pub fn main(src: &str, out: &str, nr: usize, ranks: Option<&str>, bf16: &str) -> Result<(), String> {
+    main_ex(src, out, nr, ranks, bf16, "", false)
+}
+
+/// Extended entry point supporting `--int4 <classes|body|all>` and `--int4-codebooks 1`.
+pub fn main_ex(src: &str, out: &str, nr: usize, ranks: Option<&str>, bf16: &str, int4: &str, int4_codebooks: bool)
+               -> Result<(), String> {
     let cp = format!("{src}/config.json");
     let cfg = json::parse(&std::fs::read_to_string(&cp).map_err(|e| format!("{cp}: {e}"))?)?;
     let dims = dims_of(&cfg)?;
@@ -525,12 +614,24 @@ pub fn main(src: &str, out: &str, nr: usize, ranks: Option<&str>, bf16: &str) ->
     if let Some(c) = bf16.iter().find(|c| !CLASSES.contains(&c.as_str())) {
         return Err(format!("--bf16: unknown class {c} (classes: {})", CLASSES.join(",")));
     }
+    let mut i4: Vec<String> = Vec::new();
+    for tok in int4.split(',').filter(|x| !x.is_empty()) {
+        match tok {
+            "body" => i4.extend(["fc", "attn", "mlp", "conv"].into_iter().map(String::from)),
+            "all" => i4.extend(CLASSES.into_iter().map(String::from)),
+            c if CLASSES.contains(&c) => i4.push(c.to_string()),
+            c => return Err(format!("--int4: unknown class {c} (classes: {}, body, all)", CLASSES.join(","))),
+        }
+    }
+    if let Some(c) = i4.iter().find(|c| bf16.contains(c)) {
+        return Err(format!("class {c} listed in both --bf16 and --int4"));
+    }
     check_config(&cfg, dims)?;
     let st = St::open(&format!("{src}/model.safetensors"))?;
     std::fs::create_dir_all(out).map_err(|e| format!("{out}: {e}"))?;
     for r in ranks {
         let t0 = std::time::Instant::now();
-        let m = convert_rank(&st, &cfg, dims, nr, r, out, &bf16)?;
+        let m = convert_rank_ex(&st, &cfg, dims, nr, r, out, &bf16, &i4, int4_codebooks)?;
         println!("{{\"rank\": {r}, \"tensors\": {}, \"bytes\": {}, \"seconds\": {:.1}}}",
                  m.get("tensors").and_then(|t| t.arr()).map_or(0, |t| t.len()),
                  m.get("pack_bytes").and_then(|b| b.int()).unwrap_or(0), t0.elapsed().as_secs_f64());

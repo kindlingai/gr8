@@ -14,7 +14,7 @@ options:
   TP:
     scope: cluster
     doc: >-
-      4, 6 or 3 (glm53f: 4 or 2); needed with mentat. Default: the number of peers.
+      4, 6, 3, 5 or 2 (glm53f: 4, 3, 2 or 1); needed with mentat. Default: the number of peers.
   SHAPE:
     scope: cluster
     default: "mesh"
@@ -995,8 +995,10 @@ options:
   DRAFTER:
     scope: box
     doc: >-
-      TP=4: the DFlash2 drafter's repo, https://huggingface.co/incoai/GLM-5.3-DFlash2. Each box fetches it and converts
-      its rank into MODEL_CACHE. Its repo and commit go into the id the boxes compare
+      TP=4, TP=6 or TP=2: the DFlash2 drafter's repo, https://huggingface.co/incoai/GLM-5.3-DFlash2. Each box fetches
+      it and converts its rank into MODEL_CACHE (GLM-5.3 TP=2 auto-fetches and converts it as native INT4 with
+      --int4 body --int4-codebooks 1 when MODEL_CACHE is set and neither DFLASH=0 nor DFLASH_DIR is given). Its repo
+      and commit go into the id the boxes compare
   DFLASH_DIR:
     scope: box
     doc: >-

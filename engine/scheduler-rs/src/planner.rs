@@ -706,6 +706,7 @@ pub struct Batch<E: Engine> {
     pub wf_ng_shared_only: bool,
     pub wf_lp: [[f32; DFL_B]; MAX_SLOTS],
     dkv: i32,
+    dfl_verify_cap: f64,
     par: bool,
     fresh_spec: bool,
     pub dsl: SpecLen,
@@ -750,6 +751,7 @@ impl<E: Engine> Batch<E> {
             wf_ng_shared_only: false,
             wf_lp: [[f32::NAN; DFL_B]; MAX_SLOTS],
             dkv: DFL_B as i32 - 1,
+            dfl_verify_cap: 0.0,
             par,
             fresh_spec,
             dsl: SpecLen::default(),
@@ -820,6 +822,9 @@ impl<E: Engine> Batch<E> {
     pub fn dflash(&mut self, kv: i32, sl: SpecLen) {
         self.dkv = kv;
         self.dsl = sl;
+    }
+    pub fn set_dfl_verify_cap(&mut self, cap: f64) {
+        self.dfl_verify_cap = if cap.is_finite() && cap > 0.0 { cap.min(1.0) } else { 0.0 };
     }
     pub fn dsel(&mut self, d: DSel) {
         self.sel = d;
@@ -1577,6 +1582,30 @@ impl<E: Engine> Batch<E> {
         } else {
             self.dkv
         };
+        // GR8_DFL_VERIFY_CAP: lossless confidence survival cap on solo DFlash2 rounds (K* in 0..=k).
+        // Every rank evaluates identical f64 exp() products on bit-identical st[qu].dl -> zero fabric divergence.
+        if !m && self.dfl_verify_cap > 0.0 {
+            let mut surv = 1.0_f64;
+            let mut cap_k = 0_i32;
+            let dl = &self.st[qu].dl;
+            for j in 1..=k.max(0) as usize {
+                let lp = dl[j];
+                if !lp.is_finite() {
+                    break;
+                }
+                surv *= (lp as f64).exp();
+                if surv < self.dfl_verify_cap {
+                    break;
+                }
+                cap_k = j as i32;
+            }
+            if cap_k < k {
+                k = cap_k;
+                if self.dsl.on {
+                    self.dsl.ratio(k, Some(&self.st[qu].dl), self.dkv, Some(&mut pe));
+                }
+            }
+        }
         // the drafts this round verifies: MTP's, DFlash2's, or the n-gram table's chain (GR8_NGRAM)
         let mut dr = [0i32; 16];
         {
@@ -2517,6 +2546,7 @@ pub(crate) mod tests {
             wf_ng_shared_only: _, // agreed setting in optional facade learn record
             wf_lp: _, // exported by g6s2_batch_waterfill_lp
             dkv: _,
+            dfl_verify_cap: _,
             par: _,
             fresh_spec: _,
             dsl: _,

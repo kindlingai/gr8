@@ -323,6 +323,10 @@ static size_t weight_layout(G6AttnPrefill& p,void* base){
     p.uk=(half*)base;p.uv=(half*)((uintptr_t)base+uk_bytes);return uk_bytes+uv_bytes;
 }
 static size_t scratch_layout(G6AttnPrefill& p,G6Attn a,void* base){size_t used=0;auto take=[&](size_t n){size_t at=used;used=(used+n+255)&~size_t(255);return (void*)((uintptr_t)base+at);};size_t H=p.H,R=p.R,C=p.C;
+#if G6_NR == 2
+    // TP=2: share one FP16 UK/UV staging buffer across all serialized layers instead of 79 private copies (~1.16 GB saved/rank, bit-equal).
+    p.uk=(half*)take(H*512*192*2);p.uv=(half*)take(H*256*512*2);
+#endif
     p.cache=(half*)take(C*576*2);p.ikey=(half*)take(p.full_index?C*128*2:0);p.kscale=(float*)take(p.full_index?C*4:0);
     p.qf=(float*)take(H*R*512*4);p.q=(half*)take(H*R*576*2);p.prob=(float*)take(H*R*TOP*4);p.ctx=(float*)take(H*R*512*4);p.ctxh=(half*)take(H*R*512*2);p.next=(int*)take(R*TOP*4);
     size_t T=std::min(C,size_t((p.dense_limit+31)&~31));p.dense=(float*)take(H*R*T*4);p.densep=(half*)take(H*R*T*2);a.rows=p.maxrows;a.query_tile=p.R;a.context=p.cap;p.indexwork=take(index_workspace(a,nullptr,p.full_index).total);return used;
@@ -356,6 +360,17 @@ static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefi
     // Charge the shared allocation exactly once to its original root for
     // existing runtime sum(bytes) reporting. Refcounts, not this accounting,
     // control lifetime if that root is destroyed before its borrowers.
+#if G6_NR == 2
+    p->weight_bytes=0;
+    p->bytes=owner?0:p->workspace->bytes;
+    p->storage=nullptr;
+    e=profile_create(p->profile,events,p->maxrows,p->R);
+    if(e!=cudaSuccess){release_scratch(p->workspace);delete p;return int(e);}
+    scratch_layout(*p,b->args,p->workspace->data);
+    p->blas=p->workspace->blas;
+    (void)s;
+    *out=p;return 0;
+#else
     p->bytes=p->weight_bytes+(owner?0:p->workspace->bytes);
     e=cudaMalloc(&p->storage,p->weight_bytes);if(e!=cudaSuccess){release_scratch(p->workspace);delete p;return int(e);}
     e=profile_create(p->profile,events,p->maxrows,p->R);
@@ -369,6 +384,7 @@ static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefi
     else{weight_half<<<(p->H*512*192+255)/256,256,0,st>>>(b->args.uk,p->uk,p->H*512*192);weight_half<<<(p->H*256*512+255)/256,256,0,st>>>(b->args.uv,p->uv,p->H*256*512);}
     e=cudaGetLastError();
     if(e!=cudaSuccess){profile_release(p->profile);cudaFree(p->storage);release_scratch(p->workspace);delete p;return int(e);}*out=p;return 0;
+#endif
 }
 }
 extern "C" int g6a_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding* b,void* s){return gp::create_state(out,b,s,nullptr,false);}
@@ -393,6 +409,10 @@ extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6
     bool profiling=false;rc=int(gp::profile_begin(p->profile,st,a.rows,a.context,a.heads,p->R,!a.reuse_indices,trace!=nullptr,profiling));if(rc)return rc;
 #define GP_PROFILE() do{if(profiling){rc=int(gp::profile_mark(p->profile,st));if(rc)return rc;}}while(0)
     G6_PF_MARK(0,st);rc=g6a_append(&a,s);if(rc)return rc;
+#if G6_NR == 2
+    if(b->args.uks){gp::weight_half_uk<<<(p->H*512*192+255)/256,256,0,st>>>(b->args,p->uk,p->H*512*192);gp::weight_half_uv<<<(p->H*256*512+255)/256,256,0,st>>>(b->args,p->uv,p->H*256*512);}
+    else{gp::weight_half<<<(p->H*512*192+255)/256,256,0,st>>>(b->args.uk,p->uk,p->H*512*192);gp::weight_half<<<(p->H*256*512+255)/256,256,0,st>>>(b->args.uv,p->uv,p->H*256*512);}
+#endif
     // Append validates the public <=64 decode scratch tile. Only the private
     // prefill workspace below uses the larger tile; no decode ABI is widened.
     a.query_tile=p->R;int expanded=(a.context+31)&~31;

@@ -715,7 +715,7 @@ class RequiredTests(unittest.TestCase):
 
     def test_the_listing(self):
         glm, flash = models.describe(models.GLM53), models.describe(models.GLM53F)
-        self.assertIn('--tp       4, 6, 3 or 5', glm)
+        self.assertIn('--tp       4, 6, 3, 5 or 2', glm)
         self.assertIn('TP=3 bit260 else bit225', glm)
         self.assertIn(models.GLM53.release, glm)
         self.assertIn('--tp       4, 3, 2 or 1', flash)

@@ -111,6 +111,7 @@ struct NativeHooks {
     DispatchHooks dispatch;
     // DFlash2 (dispatch.dfl set): drafts a round verifies and the --spec-adaptive policy (s2_batch.h Batch::dflash)
     int dfl_kv = 7;
+    double dfl_verify_cap = 0.0;
     g6rt::SpecLen dfl_spec;
     s2::DSel dsel;                    // drafter choice (GR8_S2_DSEL)
     // Optional per-request draft diagnostics. The terminal hook runs once, on every rank.
@@ -491,6 +492,7 @@ public:
         driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h),dp);
         if (m.dfl) {
             driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); driver_->kstop(native_.kstop);
+            if (native_.dfl_verify_cap > 0.0) driver_->dfl_verify_cap(native_.dfl_verify_cap);
             driver_->dfl_reuse(native_.dfl_reuse);
             driver_->ngram(native_.ngram);
         }

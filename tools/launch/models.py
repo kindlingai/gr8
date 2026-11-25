@@ -84,12 +84,13 @@ class Model:
 # TP=3 with the default KV pool, smoke and an 87K needle passed; not booted on v0.6). bit325 puts 99.8 GB on a rank at
 # TP=3, which leaves no room for the KV pool on a 128 GB box. A release without bit260 boots bit225.
 GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4', 'g6m4', 'glm',
-              ('4', '6', '3', '5'),
+              ('4', '6', '3', '5', '2'),
               {'bit200': 2.0, 'bit225': 2.25, 'bit239': 2.39, 'bit260': 2.60, 'bit273': 2.73,
                'bit300': 3.0, 'bit325': 3.25, 'bit332': 3.32, 'bit390': 3.92, 'bit400': 4.0},
-              {3: ('bit260', 'bit225'), 4: ('bit325',), 5: ('bit325',), 6: ('bit325',)}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, True,
+              {2: ('bit225', 'bit200'), 3: ('bit260', 'bit225'), 4: ('bit325',), 5: ('bit325',), 6: ('bit325',)},
+              'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, True,
               vocab=154880, eos_ids=(154820, 154827, 154829), shim_legacy=True, drafter_url='https://huggingface.co/incoai/GLM-5.3-DFlash2', grammar=True, kv4_fold=True, legacy_identity=True,
-              tp_defaults={'4': {'KV_FORMAT': 'int4'}}, scalable=True)
+              tp_defaults={'2': {'KV_FORMAT': 'int4'}, '4': {'KV_FORMAT': 'int4'}}, scalable=True)
 # GLM-5.3-Flash: uniform-width releases, K4 by default. K2 is the width whose experts fit one box (TP=1).
 GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4',
                'g6m4_flash', 'flash', ('4', '3', '2', '1'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},

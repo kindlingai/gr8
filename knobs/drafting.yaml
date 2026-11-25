@@ -63,6 +63,25 @@ knobs:
     doc: >-
       The DFlash2 selector walk scores each candidate as logit + a * correction instead of logit + correction. Drafts
       only. Needs --dflash-manifest and the selector.
+  GR8_DFL_VERIFY_CAP:
+    scope: agree
+    kind: float
+    default: "0"
+    values: "0..1"
+    legacy: []
+    doc: >-
+      With --dflash-manifest under S2, 0 (off) or a confidence threshold in (0, 1]: on solo DFlash2 rounds, truncates
+      verified drafts once cumulative draft survival (prod exp(lp_j)) drops below this threshold (K* in 0..--dflash-k).
+      Target verification and emitted tokens stay 100% lossless.
+  GR8_SPEC_K0:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      With --dflash-manifest and --spec-adaptive, includes K=0 (plain 1-row decode) in SpecLen's allowed draft levels so
+      low-acceptance rounds avoid paying multi-row verify overhead. Target verification stays 100% lossless.
   GR8_DRAFT_HEAD2:
     scope: agree
     kind: int
