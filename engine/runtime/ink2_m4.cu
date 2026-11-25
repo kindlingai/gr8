@@ -141,7 +141,8 @@ std::vector<std::string> split(const std::string& s)
 int main(int argc, char** argv)
 {
     using namespace ink2rt;
-    std::string dir, layers = "all", variant, tokens, s2dir, set_id, ips, ips2, kv_keep = "all";
+    std::string dir, layers = "all", variant, tokens, s2dir, set_id, ips, ips2, kv_keep = "all", eval_inkl;
+    int eval_rows = 40;
     std::vector<std::string> kv_tiers;
     int rank = -1, proxy_cpu = -1, gen = 16, chunk = 8, prefill = 512, nc = 256, cap = 262144, mtp = 0, s2port = 7341, s2sess = 1, s2epoch = 0, kv_sys_after = 2, graph_opt = -1;
     double kv_wlim = 0.0;
@@ -185,6 +186,8 @@ int main(int argc, char** argv)
         else if (a == "--kv-keep") kv_keep = val();
         else if (a == "--kv-system-after") kv_sys_after = atoi(val().c_str());
         else if (a == "--kv-write-limit") kv_wlim = atof(val().c_str());
+        else if (a == "--eval-inkl") eval_inkl = val();
+        else if (a == "--eval-rows") eval_rows = atoi(val().c_str());
         else die("unknown option " + a);
     }
     if (!kv_tiers.empty()) reuse = true;
@@ -195,9 +198,9 @@ int main(int argc, char** argv)
     if (rank < 0 || rank >= nr) die("--rank must be 0.." + std::to_string(nr - 1));
     if (dir.empty()) die("name the checkpoint: --v2-dense DIR");
     if (mtp < 0 || mtp > 7) die("--mtp " + std::to_string(mtp) + ": Inkling-2-Small drafts 0 to 7 tokens a round");
-    const int max_chunk = s2dir.empty() ? 256 : 8;
-    if (s2sess < 1 || s2sess > 8 || chunk < 1 || chunk > max_chunk || prefill < 1 || prefill > 2048 || cap < 64)
-        die("--s2-sessions 1..8, --chunk 1.." + std::to_string(max_chunk) + ", --prefill 1..2048, --cap >= 64");
+    const int max_chunk = !eval_inkl.empty() ? 2048 : (s2dir.empty() ? 256 : 8);
+    if (s2sess < 1 || s2sess > 8 || chunk < 1 || chunk > max_chunk || prefill < 1 || prefill > 8192 || cap < 64)
+        die("--s2-sessions 1..8, --chunk 1.." + std::to_string(max_chunk) + ", --prefill 1..8192, --cap >= 64");
     if (kv_keep != "system" && kv_keep != "sessions" && kv_keep != "all") die("--kv-keep must be system, sessions or all");
     if (kv_sys_after < 1 || kv_wlim < 0.0) die("--kv-system-after >= 1, --kv-write-limit >= 0");
     if (!ip2.empty() && ip2.size() != ip.size()) die("--ips2 must name as many addresses as --ips");
@@ -317,6 +320,42 @@ int main(int argc, char** argv)
             die(x.what());
         }
         if (nr > 1) w.fab.stop_proxy();
+        return 0;
+    }
+
+    if (!eval_inkl.empty())
+    {
+        FILE* tf = fopen(eval_inkl.c_str(), "rb");
+        if (!tf) die("cannot open --eval-inkl " + eval_inkl);
+        constexpr int SEQLEN = 2048;
+        const int n_rows = eval_rows;
+        std::vector<int32_t> all_toks(static_cast<size_t>(n_rows) * SEQLEN);
+        if (fread(all_toks.data(), sizeof(int32_t), all_toks.size(), tf) != all_toks.size())
+            die("--eval-inkl: short read");
+        fclose(tf);
+        const int32_t hdr[4] = {0x494E4B4C, n_rows, SEQLEN, e.c.valid};
+        if (fwrite(hdr, sizeof(int32_t), 4, stdout) != 4) die("--eval-inkl: header write failed");
+        std::vector<float> lbuf(static_cast<size_t>(chunk) * e.c.valid);
+        std::vector<RowOut> out;
+        for (int r = 0; r < n_rows; ++r)
+        {
+            e.reset_slot(0);
+            const int32_t* seq = all_toks.data() + static_cast<size_t>(r) * SEQLEN;
+            for (int p = 0; p < SEQLEN; p += chunk)
+            {
+                const int n = std::min(chunk, SEQLEN - p);
+                ink2::RowsHost rh;
+                rh.add(0, p, n);
+                std::vector<RowSample> sm(static_cast<size_t>(n));
+                for (int i = 0; i < n; ++i) sm[i] = RowSample{0.0f, 1.0f, 1234u, static_cast<uint32_t>(p + i + 1)};
+                step(rh, seq + p, sm.data(), out);
+                e.copy_logits_valid(n, lbuf.data());
+                const size_t nw = static_cast<size_t>(n) * e.c.valid;
+                if (fwrite(lbuf.data(), sizeof(float), nw, stdout) != nw) die("--eval-inkl: logit write failed");
+            }
+            fflush(stdout);
+            fprintf(stderr, "# eval-inkl: row %d/%d done\n", r + 1, n_rows);
+        }
         return 0;
     }
 

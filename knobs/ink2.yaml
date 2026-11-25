@@ -226,3 +226,154 @@ knobs:
       1 (the default) = quantize MTP drafter body and LM head weights to per-row INT8 at load time for
       faster speculative drafting (drafter-only; trunk verification remains exact). 0 = keep MTP weights in
       BF16. Every rank must agree.
+  GR8_INK2_DFLASH2:
+    scope: local
+    kind: path
+    unset: "auto-discover <model_dir>/dflash2-melded.safetensors on TP=1 when --mtp > 0; set 0 or off to force built-in MTP"
+    legacy: []
+    doc: >-
+      Optional path to a DFlash2 parallel block drafter safetensors file (pre-quantized melded Q4_0/Q8_0 or BF16)
+      for Inkling-2-Mini on TP=1 with --mtp > 0. Set to 0 or off to disable auto-discovery and use built-in MTP.
+  GR8_INK2_DF2_Q8:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      When loading a BF16 DFlash2 checkpoint, 0 (the default) quantizes body weights to Q4_0 (__dp4a) for peak
+      decode speed, and 1 quantizes to Q8_0. Pre-quantized melded DFlash2 packs use their stored format directly.
+  GR8_INK2_DF2_HEAD2:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = use the 2-bit shortlist screen plus exact BF16 top-64 rescore for the DFlash2 draft LM
+      head (sharing target lm_head weights). 0 = full BF16 cuBLAS draft LM head.
+  GR8_INK2_DF2_DP:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      0 (the default) = greedy bilinear candidate selector walk in DFlash2. 1 = calibrated expected-reach Viterbi
+      DP path selection across the K x 16 candidate lattice.
+  GR8_INK2_DF2_GRAPH:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = capture and replay per-session-count (S = 1..8) CUDA graphs for DFlash2 block drafting.
+      0 = eager launches.
+  GR8_INK2_DF2_EMBNORM:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = apply target embed_norm when embedding DFlash2 input tokens. 0 = raw target embeddings.
+  GR8_INK2_DF2_SEL_ALPHA:
+    scope: local
+    kind: float
+    default: "1.0"
+    legacy: []
+    doc: >-
+      Bilinear candidate-selector correction scale alpha applied before final logit softcapping in DFlash2.
+  GR8_INK2_PF_MX8_MOE:
+    scope: agree
+    kind: int
+    default: "2"
+    values: "0..2"
+    legacy: []
+    doc: >-
+      Blackwell (sm_120+) cached physical-layer grouped MXFP8 MoE prefill for exlr8 tr3 layers on TP=1 when
+      M >= GR8_INK2_PF_MX8_MIN_M: 2 (the default) = all physical layers, 1 = looped core layers only, 0 = off.
+      Automatically disabled on pre-Blackwell GPUs. Decode/verify stays W*A16 exlr8 trellis. Every rank must agree.
+  GR8_INK2_PF_MX8_MIN_M:
+    scope: agree
+    kind: int
+    default: "128"
+    values: "16..8192"
+    legacy: []
+    doc: >-
+      Minimum step row count M to dispatch cached grouped MXFP8 MoE prefill when GR8_INK2_PF_MX8_MOE > 0.
+      Every rank must agree.
+  GR8_INK2_MX8_DENSE:
+    scope: agree
+    kind: int
+    default: "2"
+    values: "0..2"
+    legacy: []
+    doc: >-
+      Blackwell (sm_120+) MXFP8 dense attention projections on TP=1: 0 = BF16 always, 1 = MXFP8 at all M,
+      2 (the default) = MXFP8 on prefill (M >= 64) and BF16 on decode/verify (M < 64) for lowest decode KL
+      and full prefill throughput. Automatically disabled on pre-Blackwell GPUs. Every rank must agree.
+  GR8_INK2_MX8_LM_HEAD:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..2"
+    legacy: []
+    doc: >-
+      Blackwell (sm_120+) MXFP8 trunk LM head on TP=1: 0 (the default) = BF16 always, 1 = MXFP8 at all M,
+      2 = MXFP8 for M >= 64 only. Automatically disabled on pre-Blackwell GPUs. Every rank must agree.
+  GR8_INK2_MX8_TC_MIN_M:
+    scope: local
+    kind: int
+    default: "9"
+    values: "1..64"
+    legacy: []
+    doc: >-
+      Row threshold where MXFP8 dense projections switch from coalesced E4M3 GEMV (M < threshold) to Blackwell
+      m16n8k32 MXFP8 Tensor Core MMA (M >= threshold).
+  GR8_INK2_PF_FAST_ATTN:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = use the 64-Q-row overlapped-SMEM single-BF16 p@v prefill attention kernel when
+      GR8_INK2_TC_PREFILL_ATTN=1, M >= 32, and GQA <= 3. 0 = stock 16-Q-row tensor-core prefill attention.
+      Every rank must agree.
+  GR8_INK2_DEC_FAST_ATTN:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = use the coalesced warp-per-head decode/verify attention kernel with transposed
+      rel_proj_t for head_dim == 128. 0 = stock decode attention kernel.
+  GR8_INK2_FAST_RES:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = use the 1-pass dynamic-SMEM zero-spill vectorized depth-attention kernels for Inkling-2.
+      0 = stock multi-pass depth-attention kernels.
+  GR8_INK2_MSG_BF16:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = compute looped message-gate forget/gain projections in BF16 with the zero-spill SMEM
+      finish kernel for M > 64. 0 = FP32 forget/gain projections. Every rank must agree.
+  GR8_INK2_S2_COST:
+    scope: agree
+    kind: floats
+    unset: "Inkling-2-Mini calibrated defaults (17.0,2.2,2.2,0.35,0.0,0.0)"
+    legacy: []
+    doc: >-
+      Optional 6-float override (main0,main_row,draft0,draft_sess,chain0,chain_sess) for the GR8_S2_ADAPT=1
+      speculative cost model in Inkling-2 builds. Every rank must agree.

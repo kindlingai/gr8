@@ -19,6 +19,9 @@
 // Shapes are arguments. H is any multiple of 16; M >= 1. This header also compiles as plain C++ (the scalar helpers).
 #pragma once
 #include "ink2_router.cuh"
+#ifdef __CUDACC__
+#include <cuda_bf16.h>
+#endif
 
 namespace ink2
 {
@@ -522,9 +525,233 @@ inline void embed_norm(const int* toks, const uint16_t* embed, const uint16_t* w
 {
     k_ink2_embed_norm<<<M, NRT, 0, st>>>(toks, embed, w, vis, image_token, out, H);
 }
+inline bool& fast_res_enabled()
+{
+    static bool enabled = true;
+    return enabled;
+}
+// 1-pass dynamic-SMEM zero-spill vectorized uint4 depth attention + fused RMSNorm (QC = 1, 2, 3).
+// Caches all D<=9 BF16 input rows in SMEM during Pass 1 (<=41.5 KB -> 2 CTAs/SM), eliminating the 2nd DRAM read
+// and eliminating all stack spills (STACK:0)!
+template <int QC>
+__global__ void __launch_bounds__(NRT) k_ink2_attn_res_fast(AttnResArgs a)
+{
+    extern __shared__ __align__(16) uint4 s_rows[];
+    __shared__ float s_red[8 * (QC + 1)];
+    __shared__ float s_vss[MAX_DEPTH];
+    __shared__ float s_sq[QC][MAX_DEPTH];
+    __shared__ float s_weff[QC][MAX_DEPTH];
+    __shared__ float s_rr[QC];
+
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int H = a.H, D = a.D;
+    const int H8 = H >> 3;
+    const size_t off8 = static_cast<size_t>(blockIdx.x) * H8;
+    const float inv_root_h = rsqrtf(static_cast<float>(H));
+
+    for (int d = 0; d < D; ++d)
+    {
+        const uint4* r8 = reinterpret_cast<const uint4*>(a.rows[d]) + off8;
+        float s = 0.0f;
+        float qacc[QC];
+        #pragma unroll
+        for (int q = 0; q < QC; ++q) qacc[q] = 0.0f;
+
+        for (int i = t; i < H8; i += NRT)
+        {
+            const uint4 xv = __ldg(r8 + i);
+            s_rows[d * H8 + i] = xv;
+            const __nv_bfloat162* bp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+            float f[8];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                const float2 fp = __bfloat1622float2(bp[k]);
+                f[2 * k] = fp.x; f[2 * k + 1] = fp.y;
+                s = fmaf(fp.x, fp.x, fmaf(fp.y, fp.y, s));
+            }
+            #pragma unroll
+            for (int q = 0; q < QC; ++q)
+            {
+                const float4* q4 = reinterpret_cast<const float4*>(a.query + static_cast<size_t>(q) * H) + (i << 1);
+                const float4 qa = __ldg(q4), qb = __ldg(q4 + 1);
+                float dq = qacc[q];
+                dq = fmaf(qa.x, f[0], dq); dq = fmaf(qa.y, f[1], dq);
+                dq = fmaf(qa.z, f[2], dq); dq = fmaf(qa.w, f[3], dq);
+                dq = fmaf(qb.x, f[4], dq); dq = fmaf(qb.y, f[5], dq);
+                dq = fmaf(qb.z, f[6], dq); dq = fmaf(qb.w, f[7], dq);
+                qacc[q] = dq;
+            }
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            s += __shfl_xor_sync(0xffffffffu, s, o);
+            #pragma unroll
+            for (int q = 0; q < QC; ++q) qacc[q] += __shfl_xor_sync(0xffffffffu, qacc[q], o);
+        }
+        if (lane == 0)
+        {
+            s_red[warp] = s;
+            #pragma unroll
+            for (int q = 0; q < QC; ++q) s_red[(q + 1) * 8 + warp] = qacc[q];
+        }
+        __syncthreads();
+        if (t == 0)
+        {
+            float ts = s_red[0] + s_red[1] + s_red[2] + s_red[3] + s_red[4] + s_red[5] + s_red[6] + s_red[7];
+            s_vss[d] = ts;
+            #pragma unroll
+            for (int q = 0; q < QC; ++q)
+            {
+                const float* p = s_red + (q + 1) * 8;
+                s_sq[q][d] = p[0] + p[1] + p[2] + p[3] + p[4] + p[5] + p[6] + p[7];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (t == 0)
+    {
+        float r[MAX_DEPTH];
+        for (int d = 0; d < D; ++d) r[d] = rsqrtf(s_vss[d] / static_cast<float>(H) + RMS_EPS);
+        #pragma unroll
+        for (int q = 0; q < QC; ++q)
+        {
+            float mx = -INFINITY, den = 0.0f;
+            float lg[MAX_DEPTH];
+            for (int d = 0; d < D; ++d)
+            {
+                lg[d] = s_sq[q][d] * r[d] * inv_root_h;
+                mx = fmaxf(mx, lg[d]);
+            }
+            for (int d = 0; d < D; ++d) { lg[d] = __expf(lg[d] - mx); den += lg[d]; }
+            const float iden = 1.0f / den;
+            for (int d = 0; d < D; ++d) s_weff[q][d] = lg[d] * iden * r[d];
+        }
+    }
+    __syncthreads();
+
+    float ss_q[QC];
+    #pragma unroll
+    for (int q = 0; q < QC; ++q) ss_q[q] = 0.0f;
+
+    for (int i = t; i < H8; i += NRT)
+    {
+        float acc[QC][8];
+        #pragma unroll
+        for (int q = 0; q < QC; ++q)
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) acc[q][k] = 0.0f;
+
+        for (int d = 0; d < D; ++d)
+        {
+            const uint4 xv = s_rows[d * H8 + i];
+            const __nv_bfloat162* bp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+            float f[8];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                const float2 fp = __bfloat1622float2(bp[k]);
+                f[2 * k] = fp.x; f[2 * k + 1] = fp.y;
+            }
+            #pragma unroll
+            for (int q = 0; q < QC; ++q)
+            {
+                const float w = s_weff[q][d];
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) acc[q][k] = fmaf(w, f[k], acc[q][k]);
+            }
+        }
+        #pragma unroll
+        for (int q = 0; q < QC; ++q)
+        {
+            uint4 ov;
+            __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&ov);
+            float sq_loc = ss_q[q];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                const __nv_bfloat162 b2 = __floats2bfloat162_rn(acc[q][2 * k], acc[q][2 * k + 1]);
+                op[k] = b2;
+                const float2 fp = __bfloat1622float2(b2);
+                sq_loc = fmaf(fp.x, fp.x, fmaf(fp.y, fp.y, sq_loc));
+            }
+            ss_q[q] = sq_loc;
+            if (a.norm[q] != nullptr) s_rows[q * H8 + i] = ov;
+            else reinterpret_cast<uint4*>(a.out[q])[off8 + i] = ov;
+        }
+    }
+
+    bool any_norm = false;
+    #pragma unroll
+    for (int q = 0; q < QC; ++q) if (a.norm[q] != nullptr) any_norm = true;
+    if (!any_norm) return;
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        #pragma unroll
+        for (int q = 0; q < QC; ++q) ss_q[q] += __shfl_xor_sync(0xffffffffu, ss_q[q], o);
+    if (lane == 0)
+        #pragma unroll
+        for (int q = 0; q < QC; ++q) s_red[q * 8 + warp] = ss_q[q];
+    __syncthreads();
+    if (t == 0)
+        #pragma unroll
+        for (int q = 0; q < QC; ++q)
+        {
+            const float* p = s_red + q * 8;
+            const float tot = p[0] + p[1] + p[2] + p[3] + p[4] + p[5] + p[6] + p[7];
+            s_rr[q] = rsqrtf(tot / static_cast<float>(H) + RMS_EPS);
+        }
+    __syncthreads();
+
+    #pragma unroll
+    for (int q = 0; q < QC; ++q)
+    {
+        if (a.norm[q] == nullptr) continue;
+        const float rr = s_rr[q];
+        const uint4* nw8 = reinterpret_cast<const uint4*>(a.norm[q]);
+        uint4* o8 = reinterpret_cast<uint4*>(a.out[q]) + off8;
+        for (int i = t; i < H8; i += NRT)
+        {
+            const uint4 xv = s_rows[q * H8 + i];
+            const uint4 wv = __ldg(nw8 + i);
+            const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&xv);
+            const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            uint4 ov;
+            __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&ov);
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                const float2 xf = __bfloat1622float2(xp[k]);
+                const float2 wf = __bfloat1622float2(wp[k]);
+                op[k] = __floats2bfloat162_rn(wf.x * xf.x * rr, wf.y * xf.y * rr);
+            }
+            o8[i] = ov;
+        }
+    }
+}
+
 inline void attn_res(const AttnResArgs& a, int M, cudaStream_t st)
 {
     if (a.D < 1 || a.D > MAX_DEPTH || a.Q < 1 || a.Q > MAX_Q || M < 1) throw std::runtime_error("ink2::attn_res: D, Q or M");
+    const bool fast_res = fast_res_enabled();
+    const size_t smem = static_cast<size_t>(a.D > a.Q ? a.D : a.Q) * a.H * sizeof(uint16_t);
+    if (fast_res && (a.H & 7) == 0 && smem <= 65536)
+    {
+        static const bool attr_ok = []() {
+            cudaFuncSetAttribute(k_ink2_attn_res_fast<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+            cudaFuncSetAttribute(k_ink2_attn_res_fast<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+            cudaFuncSetAttribute(k_ink2_attn_res_fast<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+            return true;
+        }();
+        (void)attr_ok;
+        if (a.Q == 1) k_ink2_attn_res_fast<1><<<M, NRT, smem, st>>>(a);
+        else if (a.Q == 2) k_ink2_attn_res_fast<2><<<M, NRT, smem, st>>>(a);
+        else k_ink2_attn_res_fast<3><<<M, NRT, smem, st>>>(a);
+        return;
+    }
     k_ink2_attn_res<<<M, NRT, 0, st>>>(a);
 }
 inline void add_bf16(const uint16_t* a, const uint16_t* b, uint16_t* out, size_t n, cudaStream_t st)

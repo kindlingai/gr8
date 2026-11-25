@@ -931,14 +931,15 @@ pub fn plan(dir: &str, nr: usize, rank: usize, opts: &Opts) -> Result<Ink2Plan, 
 // ---------------------------------------------------------------------------------------------------- C interface
 
 /// Plans rank `rank`'s image at TP `nr` from the checkpoint directory `model_dir` with optional exlr8 `variant`
-/// (NULL or empty = auto-detect / `GR8_INK2_VARIANT` knob) and writes the image's manifest (sha256 fields zero) to
-/// `out_manifest`. Returns a handle for g6l_plan_load, g6l_plan_read and g6l_plan_free, or NULL with a message in `err`.
+/// (NULL or empty = auto-detect / `GR8_INK2_VARIANT` knob) and `with_mtp` flag (0 skips planning `mtp.safetensors`
+/// when an external/melded DFlash2 drafter is used), writing the image's manifest to `out_manifest`.
 ///
 /// # Safety
 /// The strings must be NUL-terminated, `err` must hold `errlen` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn g6l_ink2_plan_ex(model_dir: *const c_char, nr: u32, rank: u32, variant: *const c_char,
-                                          out_manifest: *const c_char, err: *mut c_char, errlen: usize) -> *mut c_void {
+pub unsafe extern "C" fn g6l_ink2_plan_ex2(model_dir: *const c_char, nr: u32, rank: u32, variant: *const c_char,
+                                           with_mtp: std::ffi::c_int, out_manifest: *const c_char,
+                                           err: *mut c_char, errlen: usize) -> *mut c_void {
     let t0 = Instant::now();
     let arg = |p, what| crate::cstr(p).ok_or(format!("g6l_ink2_plan: no {what}"));
     let r = (|| {
@@ -947,7 +948,7 @@ pub unsafe extern "C" fn g6l_ink2_plan_ex(model_dir: *const c_char, nr: u32, ran
         let var = crate::cstr(variant).filter(|s| !s.is_empty())
             .or_else(|| gr8knobs::INK2_VARIANT.get().filter(|s| !s.is_empty()).map(str::to_string));
         let (mpath, ppath) = (format!("{d}/tp{nr}.rank{rank}.manifest.json"), format!("{d}/tp{nr}.rank{rank}.pack"));
-        if var.is_none() && std::path::Path::new(&mpath).is_file() && std::path::Path::new(&ppath).is_file() {
+        if var.is_none() && with_mtp != 0 && std::path::Path::new(&mpath).is_file() && std::path::Path::new(&ppath).is_file() {
             let manifest = std::fs::read_to_string(&mpath).map_err(|e| format!("{mpath}: {e}"))?;
             let j = json::parse(&manifest).map_err(|e| format!("{mpath}: {e}"))?;
             let bytes = j.get("pack_bytes").and_then(Json::int).filter(|&v| v > 0)
@@ -962,7 +963,7 @@ pub unsafe extern "C" fn g6l_ink2_plan_ex(model_dir: *const c_char, nr: u32, ran
             let plan = Plan::from_segs(vec![ppath], segs, Vec::new(), Vec::new(), bytes)?;
             return Ok::<_, String>(V2Image { rank: rank as usize, tensors: Vec::new(), bytes, plan, cache: None });
         }
-        let opts = Opts { variant: var.clone(), ..Opts::default() };
+        let opts = Opts { variant: var.clone(), with_mtp: with_mtp != 0, ..Opts::default() };
         let p = plan(&dir, nr as usize, rank as usize, &opts)?;
         let out = arg(out_manifest, "output manifest")?;
         let zeros = vec!["0".repeat(64); p.img.tensors.len()];
@@ -971,7 +972,7 @@ pub unsafe extern "C" fn g6l_ink2_plan_ex(model_dir: *const c_char, nr: u32, ran
         // GR8_GEN_CACHE (gencache.rs): the key binds the engine binary, the planned manifest and the checkpoint directory.
         let mut img = p.img;
         let vtag = var.as_deref().unwrap_or("");
-        let key_text = format!("ink2 dir={dir} nr={nr} rank={rank} var={vtag}\n{manifest}\n{}", crate::gencache::source_identity(&[&dir]));
+        let key_text = format!("ink2 dir={dir} nr={nr} rank={rank} var={vtag} mtp={with_mtp}\n{manifest}\n{}", crate::gencache::source_identity(&[&dir]));
         img.cache = crate::gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)
     })();
@@ -982,6 +983,18 @@ pub unsafe extern "C" fn g6l_ink2_plan_ex(model_dir: *const c_char, nr: u32, ran
             std::ptr::null_mut()
         }
     }
+}
+
+/// Plans rank `rank`'s image at TP `nr` from the checkpoint directory `model_dir` with optional exlr8 `variant`
+/// (NULL or empty = auto-detect / `GR8_INK2_VARIANT` knob) and writes the image's manifest (sha256 fields zero) to
+/// `out_manifest`. Returns a handle for g6l_plan_load, g6l_plan_read and g6l_plan_free, or NULL with a message in `err`.
+///
+/// # Safety
+/// The strings must be NUL-terminated, `err` must hold `errlen` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_ink2_plan_ex(model_dir: *const c_char, nr: u32, rank: u32, variant: *const c_char,
+                                          out_manifest: *const c_char, err: *mut c_char, errlen: usize) -> *mut c_void {
+    g6l_ink2_plan_ex2(model_dir, nr, rank, variant, 1, out_manifest, err, errlen)
 }
 
 /// Plans rank `rank`'s image at TP `nr` from the checkpoint directory `model_dir` and writes the image's manifest

@@ -168,6 +168,16 @@ __device__ __forceinline__ int fc1_unit(const uint8_t* fc1, const long long* kmi
         mw = fc1 + static_cast<size_t>(tr[0]) + static_cast<size_t>(u) * static_cast<size_t>(k) * mb;
         return k;
     }
+    if (km < 0)
+    {
+        const int gk = static_cast<int>(km & 15);
+        const int uk = static_cast<int>((km >> 4) & 15);
+        const int b = u >> 1;
+        const int mat = u & 1;
+        mw = fc1 + static_cast<size_t>(tr[0]) +
+             (static_cast<size_t>(b) * static_cast<size_t>(gk + uk) + (mat ? static_cast<size_t>(gk) : 0u)) * mb;
+        return mat ? uk : gk;
+    }
     size_t off = static_cast<size_t>(tr[0]);
     for (int i = 0; i < u; ++i) off += static_cast<size_t>((km >> (4 * i)) & 15) * mb;
     mw = fc1 + off;
