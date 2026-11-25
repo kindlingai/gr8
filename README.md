@@ -62,11 +62,12 @@ concurrent · one boot on `gr8 v1.1.1`, measured 2026-11-21.
 
 [![GLM-5.3 on four DGX Sparks: decode, prefill and concurrency](docs/cards/glm-5.3-exlr8-4x-spark.png)](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/4x/exlr8-gr8)
 
-67.1 tok/s for one request writing code (73.2 tok/s with `MOE_UNION_CAP=32`) · 1,605 tok/s prefill on a 32K prompt
-(1,470 tok/s at 128K) · 8 requests at once (`SESS=8`), 120.5 tok/s in total (139.0 tok/s with `MOE_UNION_CAP=32`) ·
-int4 KV default: 513,536-token KV pool, 13.53 GiB lowest `MemAvailable` across boxes · GSM8K-250 246/250, HumanEval-164
-156/164, a fact hidden in a 128K prompt found · one boot on `gr8 v1.1.0`, measured 2026-11-20 · the same recipe serves
-three to six boxes.
+66.9 tok/s for one request writing code (74.6 tok/s with `MOE_UNION_CAP=32`) · 1,577 tok/s prefill on a 32K prompt
+(1,455 tok/s at 128K) · 8 requests at once (`SESS=8`), 125.2 tok/s in total (149.1 tok/s with `MOE_UNION_CAP=32`) ·
+`bit325` (3.25 bpw) experts, int4 KV: 1,130,496-token KV pool (`1,048,576` max context), 5.39 GiB lowest `MemAvailable`
+across boxes · GSM8K-250 246/250 (98.4%), HumanEval-164 156/164 (95.1%), a fact hidden in a 128K prompt found,
+live-proven at 3×300K, 4×153K, and 8×26K shared prefix · one boot on `gr8 v1.1.0`, measured 2026-11-20 · the same
+recipe serves three to six boxes.
 
 **[Recipe](https://github.com/kindlingai/recipes/tree/main/glm-5.3/dgx-spark/4x/exlr8-gr8)** · [Model page](docs/GLM-5.3.md)
 
