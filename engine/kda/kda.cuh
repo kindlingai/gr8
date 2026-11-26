@@ -31,6 +31,10 @@ struct KdaLayer
     const uint8_t *q = nullptr, *k = nullptr, *v = nullptr;   // .gv records at the own rows [nh*8][HID/16][512]
     const uint8_t *fa = nullptr, *ga = nullptr, *b = nullptr; // .gv records, whole: [8][HID/16][512], [4][HID/16][512]
     const uint8_t *fa_mx = nullptr, *ga_mx = nullptr;         // .mx.gv records, whole: [8][HID/32][528]
+    const uint8_t *q_i8 = nullptr, *k_i8 = nullptr, *v_i8 = nullptr; // .i8.gv records, own rows [nh*8][HID/G][GR]
+    const uint8_t *fa_i8 = nullptr, *ga_i8 = nullptr;         // .i8.gv records, whole: [8][HID/G][GR]
+    const uint8_t *o_i8 = nullptr;                            // o_proj shard .i8.gv [HID/16][nh*128/G][GR]
+    int qkv_i8_codec[3] = {}, fa_i8_codec = 0, ga_i8_codec = 0, o_i8_codec = 0; // 4..7 = Int8v<1/2/4/8>
     const uint8_t *o = nullptr;                               // o_proj shard .gv [HID/16][nh*8][512]
     dtr::Mat qt, kt, vt, ot;                                  // W8 trellis q, k, v (SIDE_OUT) and o_proj (SIDE_IN)
     const uint8_t *mxc[3] = {}, *mxs[3] = {};                 // q, k, v own rows as MXFP8 (prefill GEMM): [nh*128][HID], [..][HID/32]
@@ -113,12 +117,29 @@ template <class FindT> inline const char* bind_kda(KdaLayer& w, int l, const Fin
         if (!m.w || m.K != wantK || m.N != wantN)
             if (err.empty()) err = "KDA: bad trellis shape for " + base;
     };
+    auto i8_bind = [&](const std::string& n, long long ot, long long k, const uint8_t*& out_p, int& out_c) {
+        const auto r = find(n);
+        if (!r.p || r.nd != 3) { if (err.empty()) err = "KDA: bad int8 tensor " + n; return; }
+        const long long gr = r.shape[2];
+        const int grp = gr == 288 ? 1 : gr == 544 ? 2 : gr == 1056 ? 4 : gr == 2080 ? 8 : 0;
+        const int c = grp == 1 ? 4 : grp == 2 ? 5 : grp == 4 ? 6 : grp == 8 ? 7 : 0;
+        if (!grp || r.shape[0] != ot || r.shape[1] != k / (16 * grp))
+            { if (err.empty()) err = "KDA: bad int8 shape for " + n; return; }
+        out_p = static_cast<const uint8_t*>(r.p);
+        out_c = c;
+    };
     err.clear();
     if (find(A + "q_proj.weight.trellis").p)
     {
         tmat(A + "q_proj.weight", dtr::SIDE_OUT, HID, dl, w.qt);
         tmat(A + "k_proj.weight", dtr::SIDE_OUT, HID, dl, w.kt);
         tmat(A + "v_proj.weight", dtr::SIDE_OUT, HID, dl, w.vt);
+    }
+    else if (find(A + "q_proj.weight.i8.gv").p)
+    {
+        i8_bind(A + "q_proj.weight.i8.gv", dl / 16, HID, w.q_i8, w.qkv_i8_codec[0]);
+        i8_bind(A + "k_proj.weight.i8.gv", dl / 16, HID, w.k_i8, w.qkv_i8_codec[1]);
+        i8_bind(A + "v_proj.weight.i8.gv", dl / 16, HID, w.v_i8, w.qkv_i8_codec[2]);
     }
     else
     {
@@ -138,7 +159,7 @@ template <class FindT> inline const char* bind_kda(KdaLayer& w, int l, const Fin
     // GR8_GLM53F_KDA_MX (default on, =0 off): decode q / k / v read MXFP8 records with FP16 activations instead of the BF16
     // weights. Not byte-exact, and a third copy of q / k / v per rank (dl / 16 x HID / 32 x 528 B per matrix) outside the
     // loader's accounting.
-    if (knob::glm53f_kda_mx() && !w.qt.w && w.mxc[0] && w.mxc[1] && w.mxc[2] && w.mxs[0] && w.mxs[1] && w.mxs[2] && dl % 16 == 0)
+    if (knob::glm53f_kda_mx() && !w.qt.w && !w.q_i8 && w.mxc[0] && w.mxc[1] && w.mxc[2] && w.mxs[0] && w.mxs[1] && w.mxs[2] && dl % 16 == 0)
         for (int i = 0; i < 3; ++i)
         {
             const size_t recs = static_cast<size_t>(dl / 16) * (HID / 32);
@@ -146,17 +167,23 @@ template <class FindT> inline const char* bind_kda(KdaLayer& w, int l, const Fin
             k_kda_mx_record<<<static_cast<unsigned>(recs), 256>>>(w.mxc[i], w.mxs[i], HID, w.mxgv[i]);
             if (cudaDeviceSynchronize() != cudaSuccess) return "KDA: mx decode record build";
         }
-    if (find(A + "f_a_proj.weight.mx.gv").p)
+    if (find(A + "f_a_proj.weight.i8.gv").p)
+        i8_bind(A + "f_a_proj.weight.i8.gv", DK / 16, HID, w.fa_i8, w.fa_i8_codec);
+    else if (find(A + "f_a_proj.weight.mx.gv").p)
         w.fa_mx = static_cast<const uint8_t*>(get(A + "f_a_proj.weight.mx.gv", {DK / 16, HID / 32, 528}));
     else
         w.fa = static_cast<const uint8_t*>(get(A + "f_a_proj.weight.gv", {DK / 16, G, 512}));
-    if (find(A + "g_a_proj.weight.mx.gv").p)
+    if (find(A + "g_a_proj.weight.i8.gv").p)
+        i8_bind(A + "g_a_proj.weight.i8.gv", DK / 16, HID, w.ga_i8, w.ga_i8_codec);
+    else if (find(A + "g_a_proj.weight.mx.gv").p)
         w.ga_mx = static_cast<const uint8_t*>(get(A + "g_a_proj.weight.mx.gv", {DK / 16, HID / 32, 528}));
     else
         w.ga = static_cast<const uint8_t*>(get(A + "g_a_proj.weight.gv", {DK / 16, G, 512}));
     w.b = static_cast<const uint8_t*>(get(A + "b_proj.weight.gv", {HEADS / 16, G, 512}));
     if (find(P + "o_proj.trellis").p)
         tmat(P + "o_proj", dtr::SIDE_IN, dl, HID, w.ot);
+    else if (find(P + "o_proj.i8.gv").p)
+        i8_bind(P + "o_proj.i8.gv", G, dl, w.o_i8, w.o_i8_codec);
     else
         w.o = static_cast<const uint8_t*>(get(P + "o_proj.gv", {G, dl / 16, 512}));
     const char* cn[3] = {"q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"};
@@ -229,7 +256,7 @@ struct ProjArgs
         ctas += (ot + tpc - 1) / tpc;
     }
 };
-// several BF16 / MXFP8 GEMVs on one input, each part as gv_gemv would run it (gv_multi with up to 6 parts and NT row tiles)
+// several BF16 / MXFP8 / INT8 gG GEMVs on one input, each part as gv_gemv would run it (gv_multi with up to 6 parts and NT row tiles)
 template <int NT>
 __global__ void __launch_bounds__(1024) k_kda_proj(ProjArgs a)
 {
@@ -237,7 +264,28 @@ __global__ void __launch_bounds__(1024) k_kda_proj(ProjArgs a)
     while (i + 1 < a.n && static_cast<int>(blockIdx.x) >= a.p[i + 1].cta0) ++i;
     const ProjPart& p = a.p[i];
     if (p.codec == 1) gv_gemv_body<Mxfp8, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
+    else if (p.codec == 4) gv_gemv_body<Int8v<1>, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
+    else if (p.codec == 5) gv_gemv_body<Int8v<2>, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
+    else if (p.codec == 6) gv_gemv_body<Int8v<4>, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
+    else if (p.codec == 7) gv_gemv_body<Int8v<8>, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
     else gv_gemv_body<Bf16w, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
+}
+__global__ void __launch_bounds__(256) k_kda_oh_f16frag(const uint16_t* oh, u32* xf, int K, int M)
+{
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    const int ks = i >> 3, row = i & 7;
+    if (ks >= K / 16) return;
+    const int tile = blockIdx.y, grow = tile * 8 + row;
+    uint4 lo = make_uint4(0u, 0u, 0u, 0u), hi = lo;
+    if (grow < M)
+    {
+        const uint4* s = reinterpret_cast<const uint4*>(oh + static_cast<size_t>(grow) * K + ks * 16);
+        lo = s[0]; hi = s[1];
+    }
+    const size_t o = static_cast<size_t>(tile) * (K / 16) * 64 + (static_cast<size_t>(ks) * 32 + row * 4) * 2;
+    uint4* d = reinterpret_cast<uint4*>(xf + o);
+    d[0] = make_uint4(lo.x, hi.x, lo.y, hi.y);
+    d[1] = make_uint4(lo.z, hi.z, lo.w, hi.w);
 }
 inline void launch_proj(const ProjArgs& a, cudaStream_t st)
 {
@@ -389,8 +437,8 @@ inline Args make_args(const KdaLayer& w, const KdaState& s, const KdaScratch& sc
     a.row_slot = row_slot;
     a.src = s.src;
     a.P = sc.P; a.C = sc.C; a.G = sc.G; a.Z = sc.Z; a.O = sc.O; a.OG = sc.OG;
-    a.OF = w.ot.w ? nullptr : sc.OF;
-    a.OH = w.ot.w ? sc.OH : nullptr;
+    a.OF = (w.ot.w || w.o_i8) ? nullptr : sc.OF;
+    a.OH = (w.ot.w || w.o_i8) ? sc.OH : nullptr;
     return a;
 }
 
@@ -437,6 +485,20 @@ inline void launch_oproj(const KdaLayer& w, const uint16_t* OF, int M, void* par
         if (slot) g.a.slot = *slot;
 #endif
         dtr::launch(g, st);
+        return;
+    }
+    if (w.o_i8)
+    {
+        const int K = w.nh * DK;
+        u32* xf = reinterpret_cast<u32*>(const_cast<uint16_t*>(OF));
+        k_kda_oh_f16frag<<<dim3((K / 16 * 8 + 255) / 256, (M + 7) / 8), 256, 0, st>>>(OH, xf, K, M);
+        const int grp = 1 << (w.o_i8_codec - 4);
+        int ks = 8;
+        while (ks > 1 && (K / (16 * grp)) % ks) ks >>= 1;
+        ProjArgs po;
+        po.xfrag = xf; po.M = M; po.ld = HID; po.odt = odt;
+        po.add(w.o_i8, partial, K, HID, 4, ks, xf, w.o_i8_codec);
+        launch_proj(po, st);
         return;
     }
     ProjArgs po;
@@ -550,6 +612,10 @@ __global__ void __launch_bounds__(256) k_kda_rot_pa(ProjTrellisArgs a)
     while (i + 1 < a.pa.n && gcta >= a.pa.p[i + 1].cta0) ++i;
     const ProjPart& p = a.pa.p[i];
     if (p.codec == 1) gv_gemv_256_ks32<Mxfp8, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+    else if (p.codec == 4) gv_gemv_256_ks32<Int8v<1>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+    else if (p.codec == 5) gv_gemv_256_ks32<Int8v<2>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+    else if (p.codec == 6) gv_gemv_256_ks32<Int8v<4>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+    else if (p.codec == 7) gv_gemv_256_ks32<Int8v<8>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
     else              gv_gemv_256_ks32<Bf16w, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
 }
 
@@ -567,6 +633,10 @@ __global__ void __launch_bounds__(256, NT <= 2 ? 4 : 2) k_kda_proj_trellis_norot
         const ProjPart& p = a.pa.p[i];
         auto& red = *reinterpret_cast<float4 (*)[32][32]>(sm);
         if (p.codec == 1) gv_gemv_256_ks32<Mxfp8, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+        else if (p.codec == 4) gv_gemv_256_ks32<Int8v<1>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+        else if (p.codec == 5) gv_gemv_256_ks32<Int8v<2>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+        else if (p.codec == 6) gv_gemv_256_ks32<Int8v<4>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+        else if (p.codec == 7) gv_gemv_256_ks32<Int8v<8>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
         else              gv_gemv_256_ks32<Bf16w, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
         return;
     }
@@ -685,6 +755,10 @@ __global__ void __launch_bounds__(256) k_kda_proj_trellis(ProjTrellisArgs a)
         const ProjPart& p = a.pa.p[i];
         auto& red = *reinterpret_cast<float4 (*)[32][32]>(sm);
         if (p.codec == 1) gv_gemv_256_ks32<Mxfp8, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+        else if (p.codec == 4) gv_gemv_256_ks32<Int8v<1>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+        else if (p.codec == 5) gv_gemv_256_ks32<Int8v<2>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+        else if (p.codec == 6) gv_gemv_256_ks32<Int8v<4>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+        else if (p.codec == 7) gv_gemv_256_ks32<Int8v<8>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
         else              gv_gemv_256_ks32<Bf16w, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
         return;
     }
@@ -846,7 +920,12 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
     pa.xfrag = xb; pa.M = M; pa.ld = pl.ld(); pa.odt = gv::O_F32;
     if (!w.qt.w)
     {
-        if (w.mxgv[0] && xf)   // MXFP8 records (half the bytes of BF16), fp16 activations like f_a / g_a
+        if (w.q_i8 && xf)
+        {
+            const uint8_t* qs[3] = {w.q_i8, w.k_i8, w.v_i8};
+            for (int s = 0; s < 3; ++s) pa.add(qs[s], P + pl.q() + s * dl, HID, dl, 4, 8, xf, w.qkv_i8_codec[s]);
+        }
+        else if (w.mxgv[0] && xf)   // MXFP8 records (half the bytes of BF16), fp16 activations like f_a / g_a
         {
             for (int s = 0; s < 3; ++s) pa.add(w.mxgv[s], P + pl.q() + s * dl, HID, dl, 4, 8, xf, 1);
         }
@@ -857,10 +936,12 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
             pa.add(w.v, P + pl.q() + 2 * dl, HID, dl, 4, 8);
         }
     }
-    if (w.fa_mx) pa.add(w.fa_mx, P + pl.fa(), HID, DK, 1, 32, xf, 1);
-    else         pa.add(w.fa,    P + pl.fa(), HID, DK, 1, 32);
-    if (w.ga_mx) pa.add(w.ga_mx, P + pl.ga(), HID, DK, 1, 32, xf, 1);
-    else         pa.add(w.ga,    P + pl.ga(), HID, DK, 1, 32);
+    if (w.fa_i8)      pa.add(w.fa_i8, P + pl.fa(), HID, DK, 1, 32, xf, w.fa_i8_codec);
+    else if (w.fa_mx) pa.add(w.fa_mx, P + pl.fa(), HID, DK, 1, 32, xf, 1);
+    else              pa.add(w.fa,    P + pl.fa(), HID, DK, 1, 32);
+    if (w.ga_i8)      pa.add(w.ga_i8, P + pl.ga(), HID, DK, 1, 32, xf, w.ga_i8_codec);
+    else if (w.ga_mx) pa.add(w.ga_mx, P + pl.ga(), HID, DK, 1, 32, xf, 1);
+    else              pa.add(w.ga,    P + pl.ga(), HID, DK, 1, 32);
     pa.add(w.b, P + pl.b(), HID, HEADS, 1, 32);
     if (w.qt.w)
     {

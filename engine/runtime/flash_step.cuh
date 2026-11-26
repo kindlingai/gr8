@@ -150,6 +150,7 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     }
 #endif
     auto emb=find("G.embed"),norm=find("G.final_norm"),head=find("G.lm_head.r8.gv"),hscale=find("G.lm_head.scale");
+    if(!head.p) head=find("G.lm_head.i8.gv");
     if(!head.p) head=find("G.lm_head.mx.gv");
     if(!head.p) head=find("G.lm_head.gv");
     if(!emb.p || !emb.bf16 || emb.nd!=2 || emb.shape[0]!=geom::VOCAB || emb.shape[1]!=HID ||
@@ -360,7 +361,7 @@ inline void launch_consume_mhc(Model& m,int c,int M,cudaStream_t st) {
     } else {
         dmark(DP_MHC_OI,st);
         const int hcodec=head_for(m,M).lm_head.codec;
-        const bool f16_in=hcodec==bind::MXFP8 || hcodec==bind::FP8R;
+        const bool f16_in=hcodec==bind::MXFP8 || hcodec==bind::FP8R || bind::is_int8_codec(hcodec);
         flash_mhc::k_mhc_out_inv_final<<<M,flash_mhc::THREADS,0,st>>>(
             flash_mhc::side(mhc_buffers(m),c&1),MhcFabricBlock{m.f,m.stepp,c,wp},m.final_norm,HID,geom::RMS_EPS_FLASH,m.x,m.xn,m.resid,
             f16_in?m.sc.xf_head:nullptr,f16_in?nullptr:m.sc.xf_head);

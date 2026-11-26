@@ -99,7 +99,7 @@ template <class C, class Grp = RtGroup<C>, int NT = 1>
 __device__ __forceinline__ void rt_fc1_part(const uint8_t* gate, const uint8_t* up, int stride, const u32* xfrag, int chunk, int part,
                                             int nparts, float (&ag)[NT][4], float (&au)[NT][4])
 {
-    constexpr int PFB = 4 / C::G;
+    constexpr int PFB = (4 / C::G) > 0 ? (4 / C::G) : 1;
     constexpr int TS = KSH * 64;            // u32 between two row tiles' x fragment tables (K = HID)
     constexpr int NG = KSH / C::G;
     const int lane = threadIdx.x & 31;
@@ -212,7 +212,7 @@ __device__ __forceinline__ void rt_gemv_body(const uint8_t* stream, const u32* b
                                              const float* tok_scale /* [8 NT] */, float alpha, u32 mask,
                                              __half* y, int ystride, int bf16 = 0)
 {
-    constexpr int PFB = 4 / C::G;
+    constexpr int PFB = (4 / C::G) > 0 ? (4 / C::G) : 1;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int nwarps = blockDim.x >> 5;
     const int first = ot0 + warp;
@@ -281,7 +281,7 @@ __device__ __forceinline__ void rt_gemv_body(const uint8_t* stream, const u32* b
 template <class C>
 __device__ __forceinline__ void rt_tile_part(const uint8_t* tile, const u32* bf, int g0, int g1, float (&acc)[4])
 {
-    constexpr int PFB = 4 / C::G;
+    constexpr int PFB = (4 / C::G) > 0 ? (4 / C::G) : 1;
     const int lane = threadIdx.x & 31;
     const int Q = g1 - g0;
     RtGroup<C> nx[PFB];

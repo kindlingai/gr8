@@ -1565,7 +1565,7 @@ inline void pf_head_flash(Model& m, FlashPrefill& P, int M, cudaStream_t st, con
     {
         const int r = std::min(MX, M - m0);
         const bind::Head& H = head_for(m, r);
-        const bool f16_in = H.lm_head.codec == bind::MXFP8 || H.lm_head.codec == bind::FP8R;
+        const bool f16_in = H.lm_head.codec == bind::MXFP8 || H.lm_head.codec == bind::FP8R || bind::is_int8_codec(H.lm_head.codec);
         flash_mhc::fragments(P.xn + (size_t)m0 * HID, r, HID, f16_in ? m.sc.xf_head : nullptr, f16_in ? nullptr : m.sc.xf_head, st);
         bind::launch(H.lm_head, st);
         G6RT_CK(cudaStreamSynchronize(st));

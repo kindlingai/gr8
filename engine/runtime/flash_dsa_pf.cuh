@@ -91,6 +91,14 @@ inline void launch_gv_full(const bind::Gv& g, const u32* xfrag, int M, void* y, 
         if (b512) go(k_gv_full<Mxfp8, 512>); else go(k_gv_full<Mxfp8, 1024>);
     } else if (g.codec == bind::FP8R) {
         if (b512) go(k_gv_full<Fp8r, 512>); else go(k_gv_full<Fp8r, 1024>);
+    } else if (g.codec == bind::INT8_G16) {
+        if (b512) go(k_gv_full<Int8v<1>, 512>); else go(k_gv_full<Int8v<1>, 1024>);
+    } else if (g.codec == bind::INT8_G32) {
+        if (b512) go(k_gv_full<Int8v<2>, 512>); else go(k_gv_full<Int8v<2>, 1024>);
+    } else if (g.codec == bind::INT8_G64) {
+        if (b512) go(k_gv_full<Int8v<4>, 512>); else go(k_gv_full<Int8v<4>, 1024>);
+    } else if (g.codec == bind::INT8_G128) {
+        if (b512) go(k_gv_full<Int8v<8>, 512>); else go(k_gv_full<Int8v<8>, 1024>);
     } else {
         if (b512) go(k_gv_full<Bf16w, 512>); else go(k_gv_full<Bf16w, 1024>);
     }
@@ -127,6 +135,10 @@ inline void launch_gv_rows(const bind::Gv& g, const u32* xfrag, int M, void* y, 
         if (g.codec == bind::INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>); else if (b512) go(gv_gemv_lb512<Int4v, NTv>); else go(gv_gemv_lb<Int4v, NTv>); }
         else if (g.codec == bind::MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>); else if (b512) go(gv_gemv_lb512<Mxfp8, NTv>); else go(gv_gemv_lb<Mxfp8, NTv>); }
         else if (g.codec == bind::FP8R) { if constexpr (NTv == 1) go(gv_gemv<Fp8r, 1>); else if (b512) go(gv_gemv_lb512<Fp8r, NTv>); else go(gv_gemv_lb<Fp8r, NTv>); }
+        else if (g.codec == bind::INT8_G16) { if constexpr (NTv == 1) go(gv_gemv<Int8v<1>, 1>); else if (b512) go(gv_gemv_lb512<Int8v<1>, NTv>); else go(gv_gemv_lb<Int8v<1>, NTv>); }
+        else if (g.codec == bind::INT8_G32) { if constexpr (NTv == 1) go(gv_gemv<Int8v<2>, 1>); else if (b512) go(gv_gemv_lb512<Int8v<2>, NTv>); else go(gv_gemv_lb<Int8v<2>, NTv>); }
+        else if (g.codec == bind::INT8_G64) { if constexpr (NTv == 1) go(gv_gemv<Int8v<4>, 1>); else if (b512) go(gv_gemv_lb512<Int8v<4>, NTv>); else go(gv_gemv_lb<Int8v<4>, NTv>); }
+        else if (g.codec == bind::INT8_G128) { if constexpr (NTv == 1) go(gv_gemv<Int8v<8>, 1>); else if (b512) go(gv_gemv_lb512<Int8v<8>, NTv>); else go(gv_gemv_lb<Int8v<8>, NTv>); }
         else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>); else if (b512) go(gv_gemv_lb512<Bf16w, NTv>); else go(gv_gemv_lb<Bf16w, NTv>); }
     };
     const int nt = (M + 7) / 8;
@@ -358,6 +370,7 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
     const flash_dsa_pf::F16Layer& fl = f16 ? f16->L[i] : f16_none;
     flash_dsa_pf::F16Lane* fn = f16 ? &f16->lanes[&P] : nullptr;
 
+    auto uses_xf = [](int codec) { return codec == bind::MXFP8 || bind::is_int8_codec(codec); };
     // 1. Input projections: q_a, kv_a, idx_k, idx_w, idx_g (32-row multi-tile GEMVs, 0-ULP bit-identical to decode)
     if (full_gv)
     {
@@ -370,7 +383,7 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
         // MXFP8 on cuBLAS: P.x holds the same fp16 values as the f16 fragment table
         auto proj = [&](const flash_dsa_f16::Mat& w, const bind::Gv& g, __half* y) {
             if (w.w) flash_dsa_f16::gemm(fn->blas, w, P.x, HID, M, fn->y32, y, g.ld, st);
-            else flash_dsa_pf::launch_gv_full(g, g.codec == bind::MXFP8 ? xf : xb, M, y, st);
+            else flash_dsa_pf::launch_gv_full(g, uses_xf(g.codec) ? xf : xb, M, y, st);
         };
         proj(fl.qa, b1.q_a, S.q_a);
         proj(fl.kva, b1.kv_a, S.kv_a);
@@ -394,9 +407,9 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
             xf = xf_all + o; xb = xb_all + o;
         }
         else flash_mhc::fragments(P.xn + static_cast<size_t>(m0) * HID, r, HID, S.xf_x, S.xb_x, st);
-        flash_dsa_pf::launch_gv_rows(b1.q_a, b1.q_a.codec == bind::MXFP8 ? xf : xb, r, S.q_a + static_cast<size_t>(m0) * QA, st);
-        flash_dsa_pf::launch_gv_rows(b1.kv_a, b1.kv_a.codec == bind::MXFP8 ? xf : xb, r, S.kv_a + static_cast<size_t>(m0) * KVA, st);
-        flash_dsa_pf::launch_gv_rows(b1.idx_k, b1.idx_k.codec == bind::MXFP8 ? xf : xb, r, S.idx_k + static_cast<size_t>(m0) * IDXK, st);
+        flash_dsa_pf::launch_gv_rows(b1.q_a, uses_xf(b1.q_a.codec) ? xf : xb, r, S.q_a + static_cast<size_t>(m0) * QA, st);
+        flash_dsa_pf::launch_gv_rows(b1.kv_a, uses_xf(b1.kv_a.codec) ? xf : xb, r, S.kv_a + static_cast<size_t>(m0) * KVA, st);
+        flash_dsa_pf::launch_gv_rows(b1.idx_k, uses_xf(b1.idx_k.codec) ? xf : xb, r, S.idx_k + static_cast<size_t>(m0) * IDXK, st);
         flash_dsa_pf::launch_gv_rows(b1.idx_w, xb, r, S.idx_w + static_cast<size_t>(m0) * IDXW, st);
         flash_dsa_pf::launch_gv_rows(b1.idx_g, xb, r, S.idx_g + static_cast<size_t>(m0) * geom::IDX_DIM, st);
     }
@@ -407,12 +420,13 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
     if (full_gv && b1.idx_q.on && fl.iq.w)
         flash_dsa_f16::gemm(fn->blas, fl.iq, S.q_a_n, QA, M, fn->y32, S.idx_q, b1.idx_q.ld, st);
     else if (full_gv && b1.idx_q.on) {
-        const bool mx = b1.idx_q.codec == bind::MXFP8;
+        const bool mx = uses_xf(b1.idx_q.codec);
         flash_dsa_pf::launch_xfrag(S.q_a_n, QA, M, mx ? S.xq_full : nullptr, mx ? nullptr : S.xq_full, st);
         flash_dsa_pf::launch_gv_full(b1.idx_q, S.xq_full, M, S.idx_q, st);
     }
 
-    // 3. q_b (W8d k_gemm_tr_h16 over M rows, or lossless BF16 32-row GEMV) + idx.wq_b (32-row GEMV)
+    // 3. q_b (W8d k_gemm_tr_h16, native int8 gG k_gemm_i8g, or lossless BF16 32-row GEMV) + idx.wq_b (32-row GEMV)
+    const bool qb_i8_gemm = b1.q_b.on && bind::is_int8_codec(b1.q_b.codec) && !proj_p1;
     if (b1.q_b_t.on && !proj_p1)
     {
         const dtr::Mat qbm = flash_dsa_pf::mat_from_gemv(b1.q_b_t);
@@ -424,15 +438,26 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
         g_qb.osvh = qbm.svh;
         bindp::launch(g_qb, st);
     }
-    if (!full_gv || b1.q_b.on || (b1.q_b_t.on && proj_p1))
+    else if (qb_i8_gemm)
+    {
+        i8gemm::Args ga{};
+        ga.x = S.q_a_n; ga.w = b1.q_b.w; ga.y = S.q_b;
+        ga.M = M; ga.N = b1.q_b.O; ga.K = b1.q_b.K; ga.ldx = QA; ga.ldy = h * 256;
+        ga.grp = 1 << (b1.q_b.codec - bind::INT8_G16); ga.bf16 = 0;
+        i8gemm::launch(ga, st);
+    }
+    if (!full_gv || (b1.q_b.on && !qb_i8_gemm) || (b1.q_b_t.on && proj_p1))
     for (int m0 = 0; m0 < M; m0 += flash_dsa_pf::GV_ROWS)
     {
         const int r = std::min(flash_dsa_pf::GV_ROWS, M - m0);
-        const bool wqb_mx = b1.idx_q.codec == bind::MXFP8;
+        const bool wqb_xf = uses_xf(b1.idx_q.codec);
+        const bool qb_run = b1.q_b.on && !qb_i8_gemm;
+        const bool qb_xf = qb_run && uses_xf(b1.q_b.codec);
         flash_dsa_pf::launch_xfrag(S.q_a_n + static_cast<size_t>(m0) * QA, QA, r,
-                                   wqb_mx ? S.xf_qa : nullptr, (!wqb_mx || b1.q_b.on) ? S.xb_qa : nullptr, st);
-        if (b1.q_b.on)
-            flash_dsa_pf::launch_gv_rows(b1.q_b, S.xb_qa, r, S.q_b + static_cast<size_t>(m0) * (h * 256), st);
+                                   ((!full_gv && wqb_xf) || qb_xf) ? S.xf_qa : nullptr,
+                                   ((!full_gv && !wqb_xf) || (qb_run && !qb_xf)) ? S.xb_qa : nullptr, st);
+        if (qb_run)
+            flash_dsa_pf::launch_gv_rows(b1.q_b, qb_xf ? S.xf_qa : S.xb_qa, r, S.q_b + static_cast<size_t>(m0) * (h * 256), st);
         else if (b1.q_b_t.on && proj_p1)
         {
             for (int c0 = 0; c0 < r; c0 += MX)
@@ -451,7 +476,7 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
             }
         }
         if (!full_gv)
-            flash_dsa_pf::launch_gv_rows(b1.idx_q, wqb_mx ? S.xf_qa : S.xb_qa, r, S.idx_q + static_cast<size_t>(m0) * IDXQ, st);
+            flash_dsa_pf::launch_gv_rows(b1.idx_q, wqb_xf ? S.xf_qa : S.xb_qa, r, S.idx_q + static_cast<size_t>(m0) * IDXQ, st);
     }
     mark(3, st);
 
@@ -511,12 +536,25 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
         bindp::launch(g_o, st, ors);
         used_rs = ors.base != nullptr;
     }
+    else if (b1.o_proj.on && bind::is_int8_codec(b1.o_proj.codec) && !proj_p1)
+    {
+        i8gemm::Args ga{};
+        ga.x = attn_out; ga.w = b1.o_proj.w; ga.y = P.part[0];
+        ga.M = M; ga.N = HID; ga.K = h * 256; ga.ldx = h * 256; ga.ldy = HID;
+        ga.grp = 1 << (b1.o_proj.codec - bind::INT8_G16); ga.bf16 = 1;
+        i8gemm::Rs irs{};
+        if (ors.base) { irs.base = ors.base; irs.pstride = ors.pstride; irs.ss = ors.ss; irs.stepp = ors.stepp; irs.M = ors.M; irs.nr = ors.nr; }
+        i8gemm::launch(ga, st, irs);
+        used_rs = ors.base != nullptr;
+    }
     else if (b1.o_proj.on)
     {
+        const bool op_xf = uses_xf(b1.o_proj.codec);
         for (int m0 = 0; m0 < M; m0 += flash_dsa_pf::GV_ROWS)
         {
             const int r = std::min(flash_dsa_pf::GV_ROWS, M - m0);
-            flash_dsa_pf::launch_xfrag(attn_out + static_cast<size_t>(m0) * (h * 256), h * 256, r, nullptr, S.xf_attn, st);
+            flash_dsa_pf::launch_xfrag(attn_out + static_cast<size_t>(m0) * (h * 256), h * 256, r,
+                                       op_xf ? S.xf_attn : nullptr, op_xf ? nullptr : S.xf_attn, st);
             flash_dsa_pf::launch_gv_rows(b1.o_proj, S.xf_attn, r, P.part[0] + static_cast<size_t>(m0) * HID, st);
         }
     }

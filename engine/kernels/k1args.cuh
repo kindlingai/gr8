@@ -63,12 +63,13 @@ struct K1Args
     int n_nch, n_cw, n_ns2;    // 16-col chunks per rank, chunks per fc1 CTA, fc2 out splits
     int n_ks;                  // fc1 k parts per chunk (one warp each)
 
-    // shared expert, int4 g32 row-tile records; or MXFP8 gv records (densev.cuh) when s_mx
-    const uint8_t* s_fc1;      // [NCHs][192][2*288], NCHs*16 <= SACTW        s_mx: gate [NCHs][192][528]
-    const uint8_t* s_fc2;      // [384][NCHs/2][288]                         s_mx: down [384][NCHs/2][528]
-    const uint8_t* s_up;       //                                            s_mx: up   [NCHs][192][528]
+    // shared expert / dense MLP: int4 g32 row-tile records; MXFP8 gv records when s_mx; native int8 gG records when s_i8_fc1/fc2 (GRP = G/16 in {1,2,4,8})
+    const uint8_t* s_fc1;      // [NCHs][192][2*288], NCHs*16 <= SACTW        s_mx: gate [NCHs][192][528]  s_i8: gate [NCHs][K/G][GR]
+    const uint8_t* s_fc2;      // [384][NCHs/2][288]                         s_mx: down [384][NCHs/2][528] s_i8: down [384][NCHs/GRP][GR]
+    const uint8_t* s_up;       //                                            s_mx/s_i8: up [NCHs][K/G][GR]
     int s_nch, s_cw, s_ns2, s_ks;
     int s_mx;
+    int s_i8_fc1, s_i8_fc2;    // 0 = off, else GRP = G / 16 in {1, 2, 4, 8} for int8 g16/g32/g64/g128
 
     __half* act;               // [smax][8][ACTW] routed slots, then [8 ceil(M/8)][SACTW] shared / dense slot
     __half* ypart;             // [ysh/8 + ...] ysh rows, then the shared expert's [MX][6144] rows (M <= 8: [SMAX+1][8][6144])

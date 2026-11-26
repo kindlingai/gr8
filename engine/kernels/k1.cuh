@@ -13,7 +13,11 @@ __device__ __forceinline__ void k1_shared_fc1(const K1Args& A, int cta, float* s
     __half* act = A.act + static_cast<size_t>(A.smax) * 8 * ACTW;
     g6mx::nt_dispatch_dev(g6mx::tiles(A.M), [&](auto N) {
         constexpr int NTv = decltype(N)::value;
-        if (A.s_mx) rt_fc1_cta<Mxfp8, GvGroup<Mxfp8>, NTv>(A.s_fc1, A.s_up, Mxfp8::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
+        if (A.s_i8_fc1 == 1) rt_fc1_cta<Int8v<1>, GvGroup<Int8v<1>>, NTv>(A.s_fc1, A.s_up, Int8v<1>::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
+        else if (A.s_i8_fc1 == 2) rt_fc1_cta<Int8v<2>, GvGroup<Int8v<2>>, NTv>(A.s_fc1, A.s_up, Int8v<2>::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
+        else if (A.s_i8_fc1 == 4) rt_fc1_cta<Int8v<4>, GvGroup<Int8v<4>>, NTv>(A.s_fc1, A.s_up, Int8v<4>::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
+        else if (A.s_i8_fc1 == 8) rt_fc1_cta<Int8v<8>, GvGroup<Int8v<8>>, NTv>(A.s_fc1, A.s_up, Int8v<8>::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
+        else if (A.s_mx) rt_fc1_cta<Mxfp8, GvGroup<Mxfp8>, NTv>(A.s_fc1, A.s_up, Mxfp8::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
         else rt_fc1_cta<Int4, RtGroup<Int4>, NTv>(A.s_fc1, A.s_fc1 + Int4::GR, 2 * Int4::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
     });
 }
@@ -36,7 +40,11 @@ __device__ __forceinline__ void k1_shared_fc2(const K1Args& A, int os, u32* smem
         __syncthreads();
         g6mx::nt_dispatch_dev(n, [&](auto N) {
             constexpr int NTv = decltype(N)::value;
-            if (A.s_mx) rt_gemv_body<Mxfp8, GvGroup<Mxfp8>, NTv>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
+            if (A.s_i8_fc2 == 1) rt_gemv_body<Int8v<1>, GvGroup<Int8v<1>>, NTv>(A.s_fc2, smem, A.s_nch, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
+            else if (A.s_i8_fc2 == 2) rt_gemv_body<Int8v<2>, GvGroup<Int8v<2>>, NTv>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
+            else if (A.s_i8_fc2 == 4) rt_gemv_body<Int8v<4>, GvGroup<Int8v<4>>, NTv>(A.s_fc2, smem, A.s_nch / 4, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
+            else if (A.s_i8_fc2 == 8) rt_gemv_body<Int8v<8>, GvGroup<Int8v<8>>, NTv>(A.s_fc2, smem, A.s_nch / 8, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
+            else if (A.s_mx) rt_gemv_body<Mxfp8, GvGroup<Mxfp8>, NTv>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
             else rt_gemv_body<Int4, RtGroup<Int4>, NTv>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
         });
     }

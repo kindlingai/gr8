@@ -39,6 +39,7 @@
 #pragma once
 #include <cublas_v2.h>
 #include "bind.cuh"
+#include "int8_gemm.cuh"
 #include "gemm_x.cuh"
 #include "../knobs-rs/gr8_knobs.h"
 
@@ -106,6 +107,7 @@ struct Tensors
 {
     Tensor t[NT];                     // MXFP8 entries: the .codes tensor [N][K]
     Tensor s[NMX];                    //                the .scales tensor [N][K/32]
+    Tensor i8[NMX];                   // native exlr8 int8 gG records (.i8.gv): [N/16][K/G][GR]
     int fc1_wide = 0;                 // set if bind::widen_fc1 ran on this tr3.fc1 (K3 experts in the wide order, tr3_wide.cuh)
     int fc2_wide = 0;                 // set if bind::widen_fc2 ran on this tr3.fc2
     const uint8_t* const* ptab = nullptr;   // EL3 (#151): the layer's piece table (bind::LayerTensors::ptab); nullptr = the pack layout
@@ -148,6 +150,12 @@ template <class F> inline Tensors layer_tensors(int layer, F find)
         {
             snprintf(n, sizeof n, "L%03d.%s.scales", layer, NAMES[i]);
             T.s[i] = find(n);
+            const size_t len = strlen(NAMES[i]);
+            if (len > 3 && strcmp(NAMES[i] + len - 3, ".mx") == 0)
+            {
+                snprintf(n, sizeof n, "L%03d.%.*s.i8.gv", layer, static_cast<int>(len - 3), NAMES[i]);
+                T.i8[i] = find(n);
+            }
         }
     }
     for (int i = 0; i < dtr::NMAT; ++i)
@@ -419,6 +427,11 @@ struct Gemm
     int rgrp = 0;                     // k_gemm_mx8f full-M launches: > 1 = grouped raster of rgrp row blocks (PF_GEMMRF;
                                       // launch sets it from GR8_PF_GEMMG when 0). Launch order only: the same bits.
     uint8_t const_s = 0, const_s2 = 0; // 1 = weights come from dtr::make_fp8 (all scales == 127; GR8_PF_DENSE_OPT)
+    // Native exlr8 int8 gG (i8_grp = G/16 in {1, 2, 4, 8}): w is [N/16][K/G][GR] (exact same tensor as decode),
+    // x_f16 is raw FP16 [M][ldx] (no FP8 activation quantization).
+    int i8_grp = 0;
+    const __half* x_f16 = nullptr;
+    int ldx = 0;
 #if G6_MODEL_FLASH
     int h16 = 0;                      // 1: k_gemm_tr_h16 (fp16 m16n8k16 on shx_store_h16 A-fragments + Tr3Lane<4, true> B)
 #endif
@@ -1680,6 +1693,18 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
 {
     if (!g.on) return;
     launch(g.pre, st);
+    if (g.i8_grp)
+    {
+        i8gemm::Args ia;
+        ia.x = g.x_f16; ia.w = g.w; ia.y = g.y;
+        ia.M = g.M; ia.N = g.N; ia.K = g.K;
+        ia.ldx = g.ldx; ia.ldy = g.ldy; ia.bf16 = g.bf16;
+        ia.grp = g.i8_grp; ia.rgrp = g.rgrp;
+        if (g.w2) { ia.w2 = g.w2; ia.y2 = g.y2; ia.N2 = g.N2; ia.ldy2 = g.ldy2; ia.bf162 = g.bf162; }
+        i8gemm::Rs irs{rs.base, rs.pstride, rs.ss, rs.stepp, rs.M, rs.nr};
+        i8gemm::launch(ia, st, irs);
+        return;
+    }
 #if defined(PF_GEMMW) || defined(PF_GEMMP)
     if (g.osvh || g.osvh2) { fprintf(stderr, "bindp: Gemm::osvh needs the v2 or PF_GEMMF kernel (not PF_GEMMW / PF_GEMMP)\n"); exit(1); }
 #endif
@@ -1767,6 +1792,20 @@ inline void launch(const Gemm& g, cudaStream_t st, const RsOut& rs = RsOut()) { 
 // same mma calls as in its own launch, so the bits do not change
 inline void launch_pair(const Gemm& a, const Gemm& b, cudaStream_t st, int mode)
 {
+    if (a.i8_grp || b.i8_grp)
+    {
+        if (a.on && b.on && a.i8_grp == b.i8_grp && a.x_f16 == b.x_f16 && a.ldx == b.ldx && a.K == b.K && a.M == b.M &&
+            !a.w2 && !b.w2 && !(a.bf16 != b.bf16 && (a.bf16 == 2 || b.bf16 == 2)))
+        {
+            Gemm p = a;
+            p.w2 = b.w; p.N2 = b.N; p.y2 = b.y; p.ldy2 = b.ldy; p.bf162 = b.bf16;
+            launch(p, st, mode);
+            return;
+        }
+        launch(a, st, mode);
+        launch(b, st, mode);
+        return;
+    }
     if (mode == 1 || !a.on || !b.on || a.K != b.K || a.M != b.M || a.w2 || b.w2 || a.tw || b.tw || a.bf16 != b.bf16 && (a.bf16 == 2 || b.bf16 == 2))
     {
         launch(a, st, mode);
@@ -1793,6 +1832,26 @@ inline const char* make_gemm(const Tensor& codes, const Tensor& scales, int M, c
     g.x8 = x8;
     g.w = static_cast<const uint8_t*>(codes.p); g.ws = static_cast<const uint8_t*>(scales.p);
     g.N = static_cast<int>(codes.shape[0]); g.K = static_cast<int>(codes.shape[1]); g.M = M;
+    g.y = y; g.ldy = g.N; g.bf16 = bf16;
+    return nullptr;
+}
+
+// Native exlr8 int8 gG shared decode+prefill record [N/16][K/G][GR] -> FP16-TC GEMM of M rows from FP16 x [M][ldx] into y [M][N]
+inline const char* make_gemm_i8(const Tensor& rec, int M, const __half* x, int ldx, void* y, int bf16, Gemm& g)
+{
+    g = Gemm();
+    if (!rec.p) return nullptr;
+    const int grp = bind::int8_grp_of_bytes(rec.shape[2]);
+    if (rec.nd != 3 || !grp)
+        return "int8 gG tensor is not [N/16][K/G][GR] with GR in {288, 544, 1056, 2080}";
+    g.on = 1;
+    g.i8_grp = grp;
+    g.w = static_cast<const uint8_t*>(rec.p);
+    g.x_f16 = x;
+    g.ldx = ldx;
+    g.N = static_cast<int>(rec.shape[0]) * 16;
+    g.K = static_cast<int>(rec.shape[1]) * (16 * grp);
+    g.M = M;
     g.y = y; g.ldy = g.N; g.bf16 = bf16;
     return nullptr;
 }
@@ -5935,21 +5994,33 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if (M < 1 || M > sc.Mmax) return "M must be 1..Mmax of the scratch";
     L.M = M;
     L.moe = T.t[T_TR3_TAB].p != nullptr;
-    L.indexer = T.t[T_IDX_WQ_B].p != nullptr;
+    L.indexer = T.t[T_IDX_WQ_B].p != nullptr || T.i8[T_IDX_WQ_B].p != nullptr;
     const int GT = L.moe ? T_S_GATE : T_D_GATE, UT = L.moe ? T_S_UP : T_D_UP, DT = L.moe ? T_S_DOWN : T_D_DOWN;
     const char* e = nullptr;
     //                  codes            scales           records       output                              BF16
     if ((e = make_gemm(T.t[T_Q_A],      T.s[T_Q_A],      M, sc.x8_big,   io.q_a,                             0, L.q_a))) return e;
+    if (!L.q_a.on && T.i8[T_Q_A].p && (e = make_gemm_i8(T.i8[T_Q_A], M, io.x, HID, io.q_a, 0, L.q_a))) return e;
     if ((e = make_gemm(T.t[T_KV_A],     T.s[T_KV_A],     M, sc.x8_big,   io.kv_a,                            0, L.kv_a))) return e;
+    if (!L.kv_a.on && T.i8[T_KV_A].p && (e = make_gemm_i8(T.i8[T_KV_A], M, io.x, HID, io.kv_a, 0, L.kv_a))) return e;
     if ((e = make_gemm(T.t[T_Q_B],      T.s[T_Q_B],      M, sc.x8_small, io.q_b,                             0, L.q_b))) return e;
+    if (!L.q_b.on && T.i8[T_Q_B].p && (e = make_gemm_i8(T.i8[T_Q_B], M, io.q_a_n, L.q_a.N, io.q_b, 0, L.q_b))) return e;
     if ((e = make_gemm(T.t[T_IDX_WQ_B], T.s[T_IDX_WQ_B], M, sc.x8_small, io.idx_q,                           0, L.idx_q))) return e;
+    if (!L.idx_q.on && T.i8[T_IDX_WQ_B].p && (e = make_gemm_i8(T.i8[T_IDX_WQ_B], M, io.q_a_n, L.q_a.N, io.idx_q, 0, L.idx_q))) return e;
     if ((e = make_gemm(T.t[T_O_PROJ],   T.s[T_O_PROJ],   M, sc.x8_small, io.attn_part,                       1, L.o_proj))) return e;
+    if (!L.o_proj.on && T.i8[T_O_PROJ].p)
+    {
+        const int op_ldx = static_cast<int>(T.i8[T_O_PROJ].shape[1]) * 16 * bind::int8_grp_of_bytes(T.i8[T_O_PROJ].shape[2]);
+        if ((e = make_gemm_i8(T.i8[T_O_PROJ], M, io.attn, op_ldx, io.attn_part, 1, L.o_proj))) return e;
+    }
     // a dense trellis matrix without an FP8 copy (dtr_find.h): the GEMM decodes its tiles (bit-equal to the copy)
     if (!L.o_proj.on && T.tm.o_proj.w && (e = make_gemm_tr(T.tm.o_proj, M, sc.x8_small, io.attn_part, 1, L.o_proj))) return e;
     if (!L.q_b.on && T.tm.q_b.w && (e = make_gemm_tr(T.tm.q_b, M, sc.x8_small, io.q_b, 0, L.q_b))) return e;
     if ((e = make_gemm(T.t[GT],         T.s[GT],         M, sc.x8_big,   sc.g,                               0, L.gate))) return e;
+    if (!L.gate.on && T.i8[GT].p && (e = make_gemm_i8(T.i8[GT], M, io.x2, HID, sc.g, 0, L.gate))) return e;
     if ((e = make_gemm(T.t[UT],         T.s[UT],         M, sc.x8_big,   sc.u,                               0, L.up))) return e;
+    if (!L.up.on && T.i8[UT].p && (e = make_gemm_i8(T.i8[UT], M, io.x2, HID, sc.u, 0, L.up))) return e;
     if ((e = make_gemm(T.t[DT],         T.s[DT],         M, sc.x8_small, L.moe ? static_cast<void*>(sc.ysh) : static_cast<void*>(io.mlp_part), !L.moe, L.down))) return e;
+    if (!L.down.on && T.i8[DT].p && (e = make_gemm_i8(T.i8[DT], M, sc.act, L.gate.N, L.moe ? static_cast<void*>(sc.ysh) : static_cast<void*>(io.mlp_part), !L.moe, L.down))) return e;
     if (!L.moe)
     {
         if (!L.gate.on && T.tm.gate.w && (e = make_gemm_tr(T.tm.gate, M, sc.x8_big, sc.g, 0, L.gate))) return e;
@@ -5967,18 +6038,25 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         if ((!L.down.on || !dtr8) && T.tm.down.w && (e = make_gemm_tr(T.tm.down, M, sc.x8_small, io.mlp_part, 1, L.down))) return e;
     }
     if ((e = make_gemm(T.t[T_IDX_WK_MX], T.s[T_IDX_WK_MX], M, sc.x8_big, io.idx_k, 0, L.idx_k_mx))) return e;
-    L.kda = (T.t[T_KDA_FA].p != nullptr || T.t[T_KDA_Q].p != nullptr || T.kda_tm[0].w != nullptr) ? 1 : 0;
+    if (!L.idx_k_mx.on && T.i8[T_IDX_WK_MX].p && (e = make_gemm_i8(T.i8[T_IDX_WK_MX], M, io.x, HID, io.idx_k, 0, L.idx_k_mx))) return e;
+    L.kda = (T.t[T_KDA_FA].p != nullptr || T.t[T_KDA_Q].p != nullptr || T.kda_tm[0].w != nullptr ||
+             T.i8[T_KDA_FA].p != nullptr || T.i8[T_KDA_Q].p != nullptr) ? 1 : 0;
     if (L.kda)
     {
         const uint8_t* x8_fg = (T.kda_suh[0] != nullptr) ? sc.x8_up : sc.x8_big;
         if ((e = make_gemm(T.t[T_KDA_Q],  T.s[T_KDA_Q],  M, sc.x8_big, io.kda_q,  io.kda_bf16, L.kda_q))) return e;
+        if (!L.kda_q.on && T.i8[T_KDA_Q].p && (e = make_gemm_i8(T.i8[T_KDA_Q], M, io.x, HID, io.kda_q, io.kda_bf16, L.kda_q))) return e;
         if ((e = make_gemm(T.t[T_KDA_K],  T.s[T_KDA_K],  M, sc.x8_big, io.kda_k,  io.kda_bf16, L.kda_k))) return e;
+        if (!L.kda_k.on && T.i8[T_KDA_K].p && (e = make_gemm_i8(T.i8[T_KDA_K], M, io.x, HID, io.kda_k, io.kda_bf16, L.kda_k))) return e;
         if ((e = make_gemm(T.t[T_KDA_V],  T.s[T_KDA_V],  M, sc.x8_big, io.kda_v,  io.kda_bf16, L.kda_v))) return e;
+        if (!L.kda_v.on && T.i8[T_KDA_V].p && (e = make_gemm_i8(T.i8[T_KDA_V], M, io.x, HID, io.kda_v, io.kda_bf16, L.kda_v))) return e;
         if ((!L.kda_q.on || !dtr8) && T.kda_tm[0].w && (e = make_gemm_tr(T.kda_tm[0], M, sc.x8_big, io.kda_q, io.kda_bf16, L.kda_q))) return e;
         if ((!L.kda_k.on || !dtr8) && T.kda_tm[1].w && (e = make_gemm_tr(T.kda_tm[1], M, sc.x8_big, io.kda_k, io.kda_bf16, L.kda_k))) return e;
         if ((!L.kda_v.on || !dtr8) && T.kda_tm[2].w && (e = make_gemm_tr(T.kda_tm[2], M, sc.x8_big, io.kda_v, io.kda_bf16, L.kda_v))) return e;
         if ((e = make_gemm(T.t[T_KDA_FA], T.s[T_KDA_FA], M, x8_fg,     io.kda_fa, io.kda_bf16, L.kda_fa))) return e;
+        if (!L.kda_fa.on && T.i8[T_KDA_FA].p && (e = make_gemm_i8(T.i8[T_KDA_FA], M, io.x, HID, io.kda_fa, io.kda_bf16, L.kda_fa))) return e;
         if ((e = make_gemm(T.t[T_KDA_GA], T.s[T_KDA_GA], M, x8_fg,     io.kda_ga, io.kda_bf16, L.kda_ga))) return e;
+        if (!L.kda_ga.on && T.i8[T_KDA_GA].p && (e = make_gemm_i8(T.i8[T_KDA_GA], M, io.x, HID, io.kda_ga, io.kda_bf16, L.kda_ga))) return e;
         if (io.kda_ldy > 0)
         {
             L.kda_q.ldy = L.kda_k.ldy = L.kda_v.ldy = L.kda_fa.ldy = L.kda_ga.ldy = io.kda_ldy;
@@ -6049,6 +6127,19 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
 #endif
     L.act.on = 1; L.act.g = sc.g; L.act.u = sc.u; L.act.act = sc.act; L.act.I = L.inter; L.act.M = M;
     if (const char* e = dense_trellis(T, M, sc, io, L)) return e;
+    // Native int8 gG prefill GEMMs read FP16 activations directly: skip Xq when no consumer needs FP8 x8
+    if (L.q_b.i8_grp && (!L.idx_q.on || L.idx_q.i8_grp)) L.xq_qa.on = 0;
+    if (L.o_proj.i8_grp && !qo_dedup) L.xq_attn.on = 0;
+    if (!L.moe && L.gate.i8_grp && L.up.i8_grp) L.xq_x2.on = 0;
+    if (!L.moe && L.down.i8_grp) L.xq_act.on = 0;
+#if G6_MODEL_FLASH
+    if ((!L.q_a.on || L.q_a.i8_grp) && (!L.kv_a.on || L.kv_a.i8_grp) && (!L.idx_k_mx.on || L.idx_k_mx.i8_grp) &&
+        (!L.kda || ((!L.kda_q.on || L.kda_q.i8_grp) && (!L.kda_k.on || L.kda_k.i8_grp) && (!L.kda_v.on || L.kda_v.i8_grp) &&
+                    (!L.kda_fa.on || L.kda_fa.i8_grp) && (!L.kda_ga.on || L.kda_ga.i8_grp))))
+        L.xq_x.on = 0;
+#else
+    if (L.q_a.i8_grp && L.kv_a.i8_grp) L.xq_x.on = 0;
+#endif
 #if G6_MODEL_FLASH
     if (L.kda && L.o_proj.on) { L.kda_o = L.o_proj; L.kda_o.pre = L.xq_attn; }
 #endif
