@@ -41,6 +41,11 @@
       "id": "inkling-2-mini-exlr8-1x-spark",
       "nodes": 1,
       "card": true
+    },
+    {
+      "id": "inkling-2-mini-exlr8-1x-rtx5090",
+      "nodes": 1,
+      "card": true
     }
   ]
 }
