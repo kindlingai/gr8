@@ -126,11 +126,11 @@ knobs:
   GR8_QW38_DFL_PACK:
     scope: local
     kind: path
-    unset: "QSpine-DF2 drafter disabled"
+    unset: "auto-discover <release>/drafter/dflash.q4_0.pack when GR8_QW38_DFL=1"
     legacy: []
     doc: >-
-      Path to Qwen3.8 QSpine-DF2 drafter pack (.q4_0.pack or adapted pack). When set with GR8_QW38_DFL=1, enables
-      parallel B=8 DFlash2 speculative drafting reusing PR #599's 2-bit lm_head screen and read-only GDN replay.
+      Optional path to a Qwen3.8 DFlash drafter pack (.q4_0.pack). When unset and GR8_QW38_DFL=1, auto-discovers
+      <release>/drafter/dflash.q4_0.pack if present. Set to 0, off, or none to disable auto-discovery.
   GR8_QW38_DFL:
     scope: agree
     kind: flag
@@ -138,8 +138,8 @@ knobs:
     values: "0|1"
     legacy: []
     doc: >-
-      1 (the default when GR8_QW38_DFL_PACK is set) = enable QSpine-DF2 parallel block drafter. 0 = disable and
-      fall back to L048 MTP. Every rank must agree.
+      1 (the default when a DFlash drafter pack is present or set via GR8_QW38_DFL_PACK) = enable DFlash parallel
+      block speculative drafting. 0 = disable and fall back to Layer-48 MTP. Every rank must agree.
   GR8_QW38_DFL_DP:
     scope: agree
     kind: int
@@ -147,9 +147,9 @@ knobs:
     values: "0|1|2"
     legacy: []
     doc: >-
-      QSpine-DF2 candidate path selection mode: 0 = stock myopic greedy walk at fixed K; 1 = Calibrated Expected-Reach
-      Viterbi DP at fixed K; 2 (default) = Calibrated Expected-Reach Viterbi DP + per-round dynamic K* in 1..K maximizing
-      expected tok/s = E[tau(K)] / (T_draft + T_verify(K)). Every rank must agree.
+      DFlash candidate path selection mode: 0 = myopic greedy walk at fixed K; 1 = calibrated expected-reach Viterbi DP
+      at fixed K; 2 (default) = calibrated expected-reach Viterbi DP + per-round dynamic K* in 1..K maximizing expected
+      tok/s = E[tau(K)] / (T_draft + T_verify(K)). Every rank must agree.
   GR8_QW38_DFL_K:
     scope: agree
     kind: int
@@ -157,8 +157,8 @@ knobs:
     values: "1..7"
     legacy: []
     doc: >-
-      Maximum draft prefix length verified per QSpine-DF2 round (1..7; the drafter always executes its frozen
-      bidirectional B=8 block forward and truncates only proposals/verify). Every rank must agree.
+      Maximum draft prefix length verified per DFlash round (1..7; the drafter always executes its B=8 block forward
+      and truncates only proposals/verify). Every rank must agree.
   GR8_QW38_NO_MTP:
     scope: agree
     kind: flag
@@ -166,7 +166,7 @@ knobs:
     values: "0|1"
     legacy: []
     doc: >-
-      1 = omit loading Layer-48 MTP weights and KV pages (saves ~4-6 GB VRAM in QSpine-DF2-only mode).
+      1 = omit loading Layer-48 MTP weights and KV pages (saves ~5.2 GB VRAM in DFlash-only mode).
       0 (the default) = load Layer-48 MTP when --mtp > 0. Every rank must agree.
   GR8_QW38_TAP_DUMP:
     scope: local

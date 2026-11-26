@@ -6,6 +6,23 @@ One to four DGX Spark (GB10) boxes (`TP=1` to `TP=4`). Weights: the exlr8 v2 rel
 
 ## Results
 
+### 1× DGX Spark (`TP=1`) with auto-loaded DFlash + full native 256K context (2026-11-25)
+
+Measured on 2026-11-25 on one GB10 (DGX Spark, 128 GB) with local NVMe release storage using the live S2 serving path (`bench/bench.py`, `CAP=262,208`, `MAX_MODEL_LEN=262,144`, auto-loaded **DFlash** + Layer-48 `MTP=3`, `REUSE=1`, `KV_STORE=ssd:/var/lib/gr8/cache/kv,size=32G,keep=all` `O_DIRECT`, `GR8_QW38_PLE_CACHE_MIB=1024`):
+
+| Configuration | Manifest | Context × Slots (KV Pool) | Code | Prose | Structured | Counting | `c1` | `c2` | `c4` | Max Stream | Min Free RAM |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **1 box (`TP=1`, Hybrid DFlash + `MTP=3`)** | `bit300` | `262K × 6` (`1.57M`) | **114.2** | **58.5** | **140.8** | **147.7** | **78.1** | **98.6** | **120.5** | **138.4** (`c6`) | `5.59 GiB` |
+| **1 box (`TP=1`, Hybrid DFlash + `MTP=3`)** | `bit400` | `262K × 4` (`1.05M`) | **108.3** | **56.6** | **130.8** | **134.7** | **78.4** | **93.2** | **105.7** | **105.7** (`c4`) | `4.55 GiB` |
+| 1 box (`TP=1`, DFlash-only `NO_MTP=1`) | `bit400` | `262K × 5` (`1.31M`) | **109.8** | **57.0** | — | — | **78.8** | 54.6 | 77.1 | 84.7 (`c5`) | `8.01 GiB` |
+
+| Configuration | Manifest | 8K prefill (cold / cached) | 32K prefill (cold / cached) | 128K prefill (cold / cached) | Checks |
+|---|---|---:|---:|---:|---|
+| **1 box (`TP=1`, `6×262K`)** | `bit300` | **2,204** (`3.73 s` / **`0.27 s`**) | **2,315** (`14.20 s` / **`0.32 s`**) | **2,217** (`59.08 s` / **`0.56 s`**) | `8/8` smoke, **`8/8` exact greedy parity**, `3/3` count-200, **128K & 246K needle PASS** (`246,129` tok, `2,094 tok/s`), **RealMark RIPAL `1,780.7 A`** (`99.4%` cache hit across `11.74M` tok, `enable_thinking=false`) |
+| **1 box (`TP=1`, `4×262K`)** | `bit400` | **2,160** (`3.80 s` / **`0.26 s`**) | **2,285** (`14.33 s` / **`0.32 s`**) | **2,170** (`60.31 s` / **`0.61 s`**) | `8/8` smoke, `3/3` count-200, **128K & 246K needle PASS** (`245,478` tok, `2,050 tok/s`) |
+
+### Baseline `MTP=3` (pre-DFlash, 1× and 2× Spark, 2026-11-23)
+
 Measured on 2026-11-23 on GB10 (DGX Spark) boxes with local NVMe release storage using the live S2 serving path (`bench/bench.py`, `SESS=8`, `MTP=3`, `GR8_QW38_PLE_CACHE_MIB=4096`, `bit300` / K3 and `bit400` / K4 manifests, and dual-rail RoCE `GR8_QW38_FAST_AR=1` on `TP=2`).
 
 ### Live S2 decode & concurrency (`SESS=8`, `MTP=3`, `T=0.7`)
@@ -77,6 +94,11 @@ Every `GR8_QW38_*` knob is registered in `knobs/qw38.yaml` (documented in [ENV.m
 | `GR8_QW38_PLE_CACHE_MIB` | `1024` | Host LRU cache size (MiB) for PLE rows (`0` disables caching). |
 | `GR8_QW38_WIDTHS` | *(unset)* | Optional path to a width manifest JSON when `--widths` is not passed on the command line. |
 | `GR8_QW38_FAST_AR` | `1` | Single-step multi-collective device-driven RDMA all-reduce (`ncoll = 2*L+1 = 97` on `TP>=2`). Set `=0` for per-collective fallback. |
+| `GR8_QW38_DFL` | `1` | Enables **DFlash** parallel block speculative drafting for single-stream (`c1`) decode when `drafter/dflash.q4_0.pack` is present (or set via `GR8_QW38_DFL_PACK`). Set `=0` to disable and use Layer-48 MTP only. |
+| `GR8_QW38_DFL_PACK` | *(auto)* | Optional path to a Q4_0 DFlash drafter pack. Unset auto-discovers `<release>/drafter/dflash.q4_0.pack` (fallback `<release>/dflash.q4_0.pack`) when `GR8_QW38_DFL=1`. Set `0`, `off`, or `none` to disable auto-discovery. |
+| `GR8_QW38_DFL_K` | `7` | Maximum draft prefix length verified per DFlash round (`1..7`). |
+| `GR8_QW38_DFL_DP` | `2` | DFlash path selector (`0` = greedy, `1` = calibrated Viterbi DP, `2` = Viterbi DP + per-round dynamic `K*`). |
+| `GR8_QW38_NO_MTP` | `0` | Set `=1` (with `MTP=0`) to omit loading Layer-48 MTP weights and KV pages (~5.2 GB VRAM saved for extra 262K session capacity in DFlash-only mode). |
 | `GR8_QW38_VISION` | `0` | Opt-in multimodal image input (`--serve` only). Loads `dense/vision-bf16.safetensors` (27-layer BF16 ViT, ~898 MB per rank) with interleaved 3D MRoPE (`mrope_section=[11,11,10]`). Set `=0` (default) for text-only serving. |
 | `GR8_PTAB` | `0` | Fixed-address device piece table (`0`=off, `1`=paged, `2`=paged+slab pool) for minimal-move live scaling. |
 | `MTP` (`--mtp`) | `0` | Layer-48 MTP speculative draft depth (`0..5`). |

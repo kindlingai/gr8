@@ -385,7 +385,8 @@ class Release:
         dense = sorted(p for p in self.files if p.startswith('dense/') and p.endswith('.safetensors')
                        and (self.vision or not p.startswith('dense/vision-')))
         ple = sorted(p for p in self.files if p.startswith('ple/'))
-        return slices + dense + ple
+        drafter = sorted(p for p in self.files if p.startswith('drafter/') and p.endswith('.pack'))
+        return slices + dense + ple + drafter
 
     def key(self, tp, rank, variant):
         lay = f'.layout-{self.layout_sha256[:12]}' if self.layout else ''

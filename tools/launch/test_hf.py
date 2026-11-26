@@ -352,6 +352,29 @@ class HFTests(unittest.TestCase):
                 open(os.path.join(r.dir, 'dense', 'vision-bf16.safetensors'), 'rb') as b:
             self.assertEqual(a.read(), b.read())
 
+    def test_drafter_pack_fetched_and_checked(self):
+        c_dfl = 'd' * 40
+        r_dfl = shutil.copytree(self.r1, os.path.join(tempfile.mkdtemp(prefix='gr8dfl-'), 'release_dfl'))
+        pack_rel = os.path.join('drafter', 'dflash.q4_0.pack')
+        pack_abs = os.path.join(r_dfl, pack_rel)
+        os.makedirs(os.path.dirname(pack_abs), exist_ok=True)
+        payload = b'DF2P' + b'\x42' * 8192
+        with open(pack_abs, 'wb') as f:
+            f.write(payload)
+        hp = os.path.join(r_dfl, 'hashes', 'drafter', 'dflash.q4_0.pack.sha256')
+        os.makedirs(os.path.dirname(hp), exist_ok=True)
+        with open(hp, 'w') as f:
+            f.write(f'{hashlib.sha256(payload).hexdigest()} {len(payload)}\n')
+        self.hub.repos[RELEASE][c_dfl] = r_dfl
+        self.hub.refs[RELEASE]['dfl'] = c_dfl
+        r = self.release(rev='dfl')
+        v = self.variant(r)
+        self.assertIn('drafter/dflash.q4_0.pack', r.whole_files(4, 1))
+        r.fetch_rank(4, 1, v)
+        self.assertEqual(r.check(4, 1, v), [])
+        with open(os.path.join(r.dir, pack_rel), 'rb') as f:
+            self.assertEqual(f.read(), payload)
+
     def test_a_rerun_fetches_nothing_and_a_variant_adds_its_widths(self):
         r = self.release()
         r.fetch_rank(4, 2, self.variant(r))

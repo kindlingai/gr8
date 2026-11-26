@@ -888,9 +888,19 @@ struct Engine {
         o.profile = knob::qw38_profile();
         o.no_mtp = knob::qw38_no_mtp();
         o.dfl_dp = static_cast<int>(knob::qw38_dfl_dp());
-        if (o.dfl_pack_path.empty() && knob::qw38_dfl() && knob::qw38_dfl_pack() && !knob::qw38_dfl_pack()->empty()) {
-            o.dfl_pack_path = *knob::qw38_dfl_pack();
-            o.dfl_k = std::max(1, std::min(7, static_cast<int>(knob::qw38_dfl_k())));
+        if (o.dfl_pack_path.empty() && knob::qw38_dfl()) {
+            const auto& env_pack = knob::qw38_dfl_pack();
+            if (env_pack && !env_pack->empty()) {
+                if (*env_pack != "0" && *env_pack != "off" && *env_pack != "none")
+                    o.dfl_pack_path = *env_pack;
+            } else {
+                for (const char* cand : {"drafter/dflash.q4_0.pack", "dflash.q4_0.pack"}) {
+                    const std::string p = release_dir + "/" + cand;
+                    if (std::filesystem::exists(p)) { o.dfl_pack_path = p; break; }
+                }
+            }
+            if (!o.dfl_pack_path.empty())
+                o.dfl_k = std::max(1, std::min(7, static_cast<int>(knob::qw38_dfl_k())));
         }
         if (o.tap_dump_path.empty() && knob::qw38_tap_dump() && !knob::qw38_tap_dump()->empty()) {
             o.tap_dump_path = *knob::qw38_tap_dump();
@@ -1289,13 +1299,13 @@ struct Engine {
             }
         }
 
-        // 3c. Load QSpine-DF2 parallel block drafter (GR8_QW38_DFL_PACK) and/or inline tap capture (GR8_QW38_TAP_DUMP)
+        // 3c. Load DFlash parallel block drafter (GR8_QW38_DFL_PACK or auto-discovered) and/or inline tap capture (GR8_QW38_TAP_DUMP)
         if (!o.dfl_pack_path.empty() && o.dfl_k > 0) {
             std::string derr;
-            if (!dfl.load_df2p(o.dfl_pack_path, true, derr)) die("QSpine-DF2 load failed: " + derr);
+            if (!dfl.load_df2p(o.dfl_pack_path, true, derr)) die("DFlash load failed: " + derr);
             has_dfl = true;
             dfl_cand_host.assign(size_t(o.nr) * qw38::dfl::K_MAX * qw38::dfl::TOPK * sizeof(qw38::Cand16), 0);
-            std::fprintf(stderr, "# rank %d: QSpine-DF2 loaded %s (K=%d, dp=%d, head=%s, blob=%.1f MB, slot1_r=%d)\n",
+            std::fprintf(stderr, "# rank %d: DFlash loaded %s (K=%d, dp=%d, head=%s, blob=%.1f MB, slot1_r=%d)\n",
                          o.rank0, o.dfl_pack_path.c_str(), o.dfl_k, o.dfl_dp,
                          (!mtp_head2.empty() && mtp_head2[0].ready()) ? "pr599-head2" : "fp8",
                          dfl.blob_bytes / 1e6, dfl.slot1_rank);

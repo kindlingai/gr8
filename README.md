@@ -131,6 +131,19 @@ pool / `385K` long) · measured 2026-11-25 on `gr8` commit `6b874803`.
 
 **[Recipe](https://github.com/kindlingai/recipes/tree/main/inkling-2-mini/rtx-5090/1x/exlr8-gr8)** · [Model page](docs/INKLING.md)
 
+### Qwen3.8-Flash-Next on 1 Spark
+
+[![Qwen3.8-Flash-Next on one DGX Spark: decode, prefill and concurrency](docs/cards/qwen3.8-flash-next-exlr8-1x-spark.png)](https://github.com/kindlingai/recipes/tree/main/qwen3.8-flash-next/dgx-spark/1x/exlr8-gr8)
+
+114.2 tok/s for one request writing code (58.5 prose, 140.8 structured, 147.7 counting) with auto-loaded **DFlash** +
+Layer-48 `MTP=3` · 2,315 tok/s cold prefill at 32K (2,217 at 128K; **0.56 s** 128K cached restore from the 32 GiB
+`O_DIRECT` SSD KV store) · 6 dedicated 262,144-token sessions (`1,573,248` total KV rows, 138.4 tok/s at 6 streams,
+5.59 GiB lowest `MemAvailable`) on `bit300` (K3), or 4 dedicated 262K sessions (`1,048,832` KV rows, 108.3 code, 0.0046
+mean KL) on `bit400` (K4) · 8/8 exact greedy parity, 246K needle recall PASS, RealMark RIPAL **1,780.7 A** (99.4% prefix
+cache hit across 11.74M prompt tokens, `enable_thinking=false`) · measured 2026-11-25.
+
+**[Recipe](https://github.com/kindlingai/recipes/tree/main/qwen3.8-flash-next/dgx-spark/1x/exlr8-gr8)** · [Model page](docs/QWEN38.md)
+
 <sub>Each card is drawn by `bench/gif.py card` from the recipe's `kindling.json` ([docs/cards/make.sh](docs/cards/make.sh)
 redraws them from the list in [recipes.json](recipes.json), reading each recipe from
 [kindlingai/recipes](https://github.com/kindlingai/recipes)). The model pages give each benchmark and its date.</sub>
@@ -152,6 +165,7 @@ measured results, pinned to one gr8 image. gr8 holds the engine only.
 | GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8) |
 | Inkling-2-Mini (`bit325`/`k4`/`bit225`, 1.18M KV pool, 8 streams, DFlash) | 1 | [inkling-2-mini-exlr8-1x-spark](https://github.com/kindlingai/recipes/tree/main/inkling-2-mini/dgx-spark/1x/exlr8-gr8) |
 | Inkling-2-Mini (`bit325`/`k4`/`bit225`, 262K KV pool, DFlash, RTX 5090) | 1 GPU | [inkling-2-mini-exlr8-1x-rtx5090](https://github.com/kindlingai/recipes/tree/main/inkling-2-mini/rtx-5090/1x/exlr8-gr8) |
+| Qwen3.8-Flash-Next (256K, DFlash + MTP=3) | 1 | [qwen3.8-flash-next-exlr8-1x-spark](https://github.com/kindlingai/recipes/tree/main/qwen3.8-flash-next/dgx-spark/1x/exlr8-gr8) |
 
 ## How `int4` KV and mixed-precision compression preserve quality
 
@@ -269,6 +283,7 @@ If you are an agent (or developer) building on gr8, start from the matching entr
 | GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/recipes/tree/main/glm-5.3-flash/dgx-spark/2x/exlr8-gr8): the same image on both boxes | about 76 GB a box (86 GB with `TUNE=quality`) | |
 | GLM-5.3-Flash | 3 or 4 | [docs/FLASH.md](docs/FLASH.md) | see the page | |
 | [Inkling-2-Mini](docs/INKLING.md) | 1 (Spark or RTX 5090) | [1x Spark](https://github.com/kindlingai/recipes/tree/main/inkling-2-mini/dgx-spark/1x/exlr8-gr8) (`bit325` default, `1.18M` KV, 8 streams) · [1x RTX 5090](https://github.com/kindlingai/recipes/tree/main/inkling-2-mini/rtx-5090/1x/exlr8-gr8) (`bit325` default, `262K` KV / `303K` long) | ~31 GB (full K2/K3/K4 pack) | [kindlingai/inkling-2-mini-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/inkling-2-mini-exlr8-k2-k3-k4) |
+| [Qwen3.8-Flash-Next](docs/QWEN38.md) | 1 | [qwen3.8-flash-next-exlr8-1x-spark](https://github.com/kindlingai/recipes/tree/main/qwen3.8-flash-next/dgx-spark/1x/exlr8-gr8): `bit300` (K3, 6×262K) or `bit400` (K4, 4×262K), auto-loaded DFlash + `MTP=3` | about 164 GB (`bit300`) / 179 GB (`bit400`) incl. 102.4 GB PLE | [kindlingai/Qwen3.8-Flash-Next-exlr8](https://huggingface.co/kindlingai/Qwen3.8-Flash-Next-exlr8) |
 
 Each model's page has its results, how to start it and its known issues.
 
