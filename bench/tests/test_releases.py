@@ -100,10 +100,10 @@ class ReleaseRecordsTest(unittest.TestCase):
 
         rp_minor_and_patch = dict(raw)
         rp_block = (
-            b'## [1.3.0](https://github.com/kindlingai/gr8/compare/v1.2.1...v1.3.0) (2026-11-25)\n\n'
+            b'## [99.1.0](https://github.com/kindlingai/gr8/compare/v99.0.1...v99.1.0) (2099-11-25)\n\n'
             b'### Features\n\n'
             b'* **qw38:** add feature (#610)\n\n'
-            b'### [1.2.1](https://github.com/kindlingai/gr8/compare/v1.2.0...v1.2.1) (2026-11-24)\n\n'
+            b'### [99.0.1](https://github.com/kindlingai/gr8/compare/v99.0.0...v99.0.1) (2099-11-24)\n\n'
             b'### Bug Fixes\n\n'
             b'* **ci:** fix build (#605)\n\n'
             b'## [v1.2.0]'
@@ -122,21 +122,32 @@ class ReleaseRecordsTest(unittest.TestCase):
         errs = make_zip.check_release_records(dup_rp)
         self.assertTrue(any('duplicate section for v1.2.0' in e for e in errs), errs)
 
-        optional_spec_bad_date = dict(rp_minor_and_patch)
-        v130 = copy.deepcopy(json.loads(raw['releases/v1.2.0.json'].decode('utf-8')))
-        v130['version'] = '1.3.0'
-        v130['tag'] = 'v1.3.0'
-        v130['previous_tag'] = 'v1.2.0'
-        v130['date'] = '2026-11-26'
-        v130['release_url'] = 'https://github.com/kindlingai/gr8/releases/tag/v1.3.0'
-        v130['container']['image'] = 'ghcr.io/kindlingai/gr8:v1.3.0'
-        v130['container']['pinned'] = f"ghcr.io/kindlingai/gr8:v1.3.0@{v130['container']['digest']}"
-        optional_spec_bad_date['releases/v1.3.0.json'] = json.dumps(v130).encode('utf-8')
-        errs_date = make_zip.check_release_records(optional_spec_bad_date)
-        self.assertTrue(any('v1.3.0: CHANGELOG.md date 2026-11-25 != releases/v1.3.0.json date 2026-11-26' in e for e in errs_date), errs_date)
+        spec_docs = {
+            p[len('releases/'):-5]: json.loads(data.decode('utf-8'))
+            for p, data in raw.items()
+            if p.startswith('releases/') and p.endswith('.json')
+        }
+        prev_tags = {doc['previous_tag'] for doc in spec_docs.values() if doc.get('previous_tag')}
+        latest_spec_tag = next(tag for tag in spec_docs if tag not in prev_tags)
 
-        v130['date'] = '2026-11-25'
-        optional_spec_bad_date['releases/v1.3.0.json'] = json.dumps(v130).encode('utf-8')
+        optional_spec_bad_date = dict(rp_minor_and_patch)
+        v9910 = copy.deepcopy(spec_docs[latest_spec_tag])
+        v9910['version'] = '99.1.0'
+        v9910['tag'] = 'v99.1.0'
+        v9910['previous_tag'] = latest_spec_tag
+        v9910['date'] = '2099-11-26'
+        v9910['release_url'] = 'https://github.com/kindlingai/gr8/releases/tag/v99.1.0'
+        v9910['container']['image'] = 'ghcr.io/kindlingai/gr8:v99.1.0'
+        v9910['container']['pinned'] = f"ghcr.io/kindlingai/gr8:v99.1.0@{v9910['container']['digest']}"
+        optional_spec_bad_date['releases/v99.1.0.json'] = json.dumps(v9910).encode('utf-8')
+        errs_date = make_zip.check_release_records(optional_spec_bad_date)
+        self.assertTrue(
+            any('v99.1.0: CHANGELOG.md date 2099-11-25 != releases/v99.1.0.json date 2099-11-26' in e for e in errs_date),
+            errs_date,
+        )
+
+        v9910['date'] = '2099-11-25'
+        optional_spec_bad_date['releases/v99.1.0.json'] = json.dumps(v9910).encode('utf-8')
         self.assertEqual(make_zip.check_release_records(optional_spec_bad_date), [])
 
 
