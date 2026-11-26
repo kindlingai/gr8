@@ -100,10 +100,19 @@ fi
 WIDTHS=${WIDTHS:-6}
 # the flags of width N: the multi-session path (DEC_S2, which g6m4 needs) at every width, and PF_F12 (F12_NE=2 must
 # divide the expert blocks per rank: 4 at TP4, 3 at TP6) at 4, except in the Flash build, whose fp16 MoE refuses it
-# DS41_MX=48 (DeepSeek build only, opt-in): 48 rows a step (g6mx.h), so 8 sessions x DSpark (GR8_DS_MTP=5 + 1) verify rows are one step; unset = 32
+# DS41_MX=48 (DeepSeek build only, default 48): 48 rows a step (g6mx.h), so 8 sessions x DSpark (GR8_DS_MTP=5 + 1) verify rows are one step; 32 or 40 opt down
 wflags() {
   local f="-DG6_NR=$1 -DDEC_S2"
-  case ${DS41_MX:-} in '') ;; 32|40|48) [ "$ATTN_CU" = ../attn/ds41_attn_dspark.cu ] && f="$f -DG6_MX=$DS41_MX" ;; *) echo "DS41_MX=$DS41_MX: 32, 40 or 48" >&2 ;; esac
+  if [ "$ATTN_CU" = ../attn/ds41_attn_dspark.cu ]; then
+    case " ${EXTRA:-} " in
+      *" -DG6_MX="*) ;;
+      *)
+        case ${DS41_MX:-48} in
+          32|40|48) f="$f -DG6_MX=${DS41_MX:-48}" ;;
+          *) echo "DS41_MX=$DS41_MX: 32, 40 or 48" >&2 ;;
+        esac ;;
+    esac
+  fi
   case " ${F12_WIDTHS:-4} " in *" $1 "*) [ "$ATTN_CU" = ../attn/attn.cu ] && f="$f -DPF_F12" ;; esac   # PF_F12 (fat-CTA prefill fc1): TP4 by default; F12_WIDTHS="4 5" adds TP5; never in the Flash build
   echo "$f"
 }

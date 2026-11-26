@@ -715,6 +715,8 @@ jobs:
             python3 tools/steering/evaluate.py --help > /dev/null
             python3 tools/steering/trace_audit.py --help > /dev/null
             bin/g6front-rs --help > /dev/null
+            bin/g6front-rs engram-cmap --help > /dev/null
+            bin/g6m4_ds41 --rank 0 --ips a,b,c,d --image --layers all --v2-dense m --mtp 0 --check-args 2>&1 | grep -qF "TP4, 48 rows a step"
             echo smoke OK'
           # Every registered GPU model and supported TP must pass the entrypoint's config smoke.
           configs=$(docker run --rm --entrypoint python3 "$img" -c 'from tools.launch.models import SERVED; [print(m.name, tp, m.release) for m in SERVED for tp in m.tp]')

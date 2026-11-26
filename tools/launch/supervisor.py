@@ -45,6 +45,49 @@ REPO = opt.REPO
 ENGINE_ENV_KEEP = ('PATH', 'HOME', 'USER', 'LANG', 'LD_LIBRARY_PATH', 'DISPRAM_DISABLE', 'DISPRAM_SOCKET',
                    'DISPRAM_KEY_FILE')
 ENGINE_ENV_PREFIXES = ('CUDA_', 'NVIDIA_')
+# Fallback for kCmapSha256 when engine/engram/hash_consts.h is absent; normally read from the header.
+DS41_ENGRAM_CMAP_SHA256 = '46ed86d2ee83d4b764e4390d38393a373886efdf2baeaa71a5370090d85b76de'
+_CMAP_SHA_RE = re.compile(r'kCmapSha256\s*=\s*"([0-9a-f]{64})"')
+
+
+def engram_cmap_sha256():
+    """Expected SHA-256 of ds41.engram.cmap from engine/engram/hash_consts.h (kCmapSha256)."""
+    hdr = os.path.join(REPO, 'engine', 'engram', 'hash_consts.h')
+    try:
+        with open(hdr, 'r', encoding='utf-8') as f:
+            m = _CMAP_SHA_RE.search(f.read())
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return DS41_ENGRAM_CMAP_SHA256
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _ds41_engram_prefix(o):
+    """GR8_DS_ENGRAM_PREFIX when GR8_DS_ENGRAM=1 in EXTRA_ENV (last assignment wins, honoring G6_ aliases), else None."""
+    if models.of(o) is not models.DS41:
+        return None
+    kv = {}
+    for w in (o.get('EXTRA_ENV') or '').split():
+        if '=' in w:
+            k, _, v = w.partition('=')
+            if k.startswith('G6_'):
+                k = 'GR8_' + k[3:]
+            kv[k] = v
+    if kv.get('GR8_DS_ENGRAM') != '1':
+        return None
+    return kv.get('GR8_DS_ENGRAM_PREFIX') or None
 
 
 class Stop(Exception):
@@ -992,6 +1035,12 @@ class Supervisor:
             if not os.access(self.py(), os.X_OK):
                 fails.append(f'no {self.py()} for the shim: python3 -m venv {self.home}/venv && '
                              f'{self.home}/venv/bin/pip install -r frontend/requirements.txt')
+        else:
+            engram_prefix = _ds41_engram_prefix(o)
+            if engram_prefix and not os.path.exists(engram_prefix + '.engram.cmap') \
+                    and not os.access(self.front_bin(), os.X_OK):
+                fails.append(f'no {self.front_bin()}: ./gr8 ds41 build (needed to generate '
+                             f'{engram_prefix}.engram.cmap)')
         if p:
             return fails
         m = mem_available_gib()
@@ -1127,6 +1176,47 @@ class Supervisor:
     def front_bin(self):
         return self.o.get('FRONT_BIN') or os.path.join(REPO, 'bin', 'g6front-rs')
 
+    def ensure_engram_cmap(self, env):
+        """DS41 with GR8_DS_ENGRAM=1: ensure PREFIX.engram.cmap exists and matches kCmapSha256, generating it on first
+        boot from <release>/tokenizer.json via `g6front-rs engram-cmap` (no PyTorch or Python deps)."""
+        if models.of(self.o) is not models.DS41 or env.get('GR8_DS_ENGRAM') != '1':
+            return
+        prefix = env.get('GR8_DS_ENGRAM_PREFIX') or ''
+        if not prefix:
+            return
+        parent = os.path.dirname(os.path.abspath(prefix))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        cmap = prefix + '.engram.cmap'
+        want = engram_cmap_sha256()
+        tok_json = os.path.join(self.ms.tokenizer, 'tokenizer.json') if self.ms and self.ms.tokenizer else ''
+        if os.path.exists(cmap):
+            try:
+                got = _sha256_file(cmap)
+            except OSError as e:
+                raise Stop(1, f'engram: cannot read {cmap}: {e}')
+            if got == want:
+                return
+            raise Stop(1, f'engram: {cmap}: sha256 {got} != expected {want} (remove it so gr8 regenerates it from '
+                       f'{tok_json or "tokenizer.json"})')
+        if not tok_json or not os.path.isfile(tok_json):
+            raise Stop(1, f'engram: {tok_json or "tokenizer.json"} missing (needed to generate {cmap})')
+        front = self.front_bin()
+        if not os.access(front, os.X_OK):
+            raise Stop(1, f'engram: {front} is not executable (needed to generate {cmap})')
+        log(f'engram: generating {cmap} from {tok_json}')
+        r = subprocess.run([front, 'engram-cmap', tok_json, cmap], capture_output=True, text=True)
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout).strip() or f'exit {r.returncode}'
+            raise Stop(1, f'engram: failed to generate {cmap}: {detail}')
+        try:
+            got = _sha256_file(cmap)
+        except OSError as e:
+            raise Stop(1, f'engram: generated {cmap} is unreadable: {e}')
+        if got != want:
+            raise Stop(1, f'engram: generated {cmap}: sha256 {got} != expected {want}')
+        log(f'engram: wrote {cmap} (sha256 {want[:12]}...)')
+
     def py(self):
         return self.o.get('PY') or os.path.join(self.home, 'venv', 'bin', 'python')
 
@@ -1182,6 +1272,7 @@ class Supervisor:
         os.makedirs(work)
         self.check_n = 0
         env = self.engine_env(plan)
+        self.ensure_engram_cmap(env)
         # second_rail='prefill' (Flash) takes the second rail for prefill only
         ips2 = '--ips2' if models.of(o).second_rail == 'all' else '--pf-ips2'
         argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), ips2, ','.join(hs['ips2']),
