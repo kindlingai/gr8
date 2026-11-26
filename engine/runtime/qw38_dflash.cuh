@@ -1336,7 +1336,7 @@ struct Drafter {
             cudaHostAlloc(&h_tok_pinned, (K_MAX + 1) * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
             cudaHostAlloc(&h_lp_pinned, K_MAX * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
             cudaHostAlloc(&h_blk_meta, 3 * sizeof(int), cudaHostAllocDefault) != cudaSuccess) {
-            err = "cudaMalloc failed for QSpine-DF2 rings/scratch";
+            err = "cudaMalloc failed for DFlash rings/scratch";
             release();
             return false;
         }

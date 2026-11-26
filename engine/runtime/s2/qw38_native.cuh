@@ -536,7 +536,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             return o;
         };
         if (c.rank == 0) {
-            std::fprintf(stderr, "# qw38 s2: QSpine-DF2 enabled for solo c1 (k<=%d, dp=%d, adaptive=%d, hybrid_mtp=%d)\n",
+            std::fprintf(stderr, "# qw38 s2: DFlash enabled for solo c1 (k<=%d, dp=%d, adaptive=%d, hybrid_mtp=%d)\n",
                          dfl_k, c.engine.o.dfl_dp, h.dfl_spec.on ? 1 : 0, (K > 0 && c.engine.has_mtp) ? K : 0);
         }
     }
@@ -609,7 +609,7 @@ inline void serve_qw38(Qw38Context c, const BootstrapConfig& bc, int chunk) {
             return u;
         }
         if (sp.kind == s2::Step::DRAFT) {
-            require(spec_on, "qw38 draft step at MTP 0 without QSpine-DF2");
+            require(spec_on, "qw38 draft step at MTP 0 without DFlash");
             std::vector<int> u(size_t(M), 0), ds, dq, dg, dlast, gs, gk;
             std::vector<qw38rt::RowSample> dsm;
             const bool solo_dfl = use_dfl && (sp.sess.size() == 1) && dfl_active[size_t(sp.sess[0])];

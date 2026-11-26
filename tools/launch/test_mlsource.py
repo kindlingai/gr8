@@ -281,6 +281,16 @@ class ModelLoaderTests(unittest.TestCase):
         ms.release.fetch_rank(4, 1, v)
         self.assertIn('ple/exlr8-ple-L001.bin', self.ml.puts[-1][1]['include'])
 
+    def test_drafter_pack_included_and_pinned(self):
+        dfl_dir = os.path.join(self.rel, 'drafter')
+        os.makedirs(dfl_dir, exist_ok=True)
+        with open(os.path.join(dfl_dir, 'dflash.q4_0.pack'), 'wb') as f:
+            f.write(b'dflash-pack-bytes')
+        o, ms, v = self.resolve()
+        self.assertIn('drafter/dflash.q4_0.pack', ms.release.whole_files(4, 1))
+        ms.release.fetch_rank(4, 1, v)
+        self.assertIn('drafter/dflash.q4_0.pack', self.ml.puts[-1][1]['include'])
+
     def test_a_layout_requests_its_halves(self):
         o, ms, v = self.resolve()
         g6layout = os.path.join(os.path.dirname(T.hfsource.fetch_ranks().g6load()), 'g6layout')

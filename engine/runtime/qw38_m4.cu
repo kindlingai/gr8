@@ -951,7 +951,7 @@ int main(int argc, char** argv) {
             const double acc_rate = total_drafted > 0 ? (100.0 * total_accepted / total_drafted) : 0.0;
             const double tok_per_round = double(S * mtp_rounds + total_accepted) / double(S * mtp_rounds);
             std::fprintf(stderr, " [%s acc=%.1f%%, %.2f tok/round, %d rounds]",
-                         (e.has_dfl && S == 1) ? "qspine-df2" : "mtp", acc_rate, tok_per_round, mtp_rounds);
+                         (e.has_dfl && S == 1) ? "dflash" : "mtp", acc_rate, tok_per_round, mtp_rounds);
             if (e.has_dfl && S == 1) {
                 std::fprintf(stderr, " avgK=%.2f draft=%.2fms/r verify=%.2fms/r hist=[",
                              double(total_drafted) / mtp_rounds, e.dfl_draft_ms / mtp_rounds, e.dfl_verify_ms / mtp_rounds);

@@ -289,7 +289,8 @@ class Release:
         dense = sorted(p for p in t if p.startswith('dense/') and p.endswith('.safetensors')
                        and not p.startswith('dense/vision-'))
         ple = sorted(p for p in t if p.startswith('ple/'))
-        return slices + dense + ple + (self.vision_files() if self.vision else [])
+        drafter = sorted(p for p in t if p.startswith('drafter/') and p.endswith('.pack'))
+        return slices + dense + ple + drafter + (self.vision_files() if self.vision else [])
 
     def reuse(self):
         """Hard-link the files an older commit of this release left in the cache, where the hub gives the file the same
