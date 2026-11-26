@@ -207,7 +207,8 @@ chmod +x "$2"
                      (models.GLM53, 'fp8', {'GR8_TESTS': 'only'}),
                      (models.GLM53, 'fp8', {'GR8_TESTS': 'ship'}),
                      (models.GLM53F, 'fp8', {}), (models.GLM53F, 'int4', {}),
-                     (models.DS41, 'fp8', {}), (models.DS41, 'fp8', {'DS41_WHAT': 'sim'}),
+                     (models.DS41, 'fp8', {}), (models.DS41, 'fp8', {'DS41_MX': '32'}),
+                     (models.DS41, 'fp8', {'DS41_WHAT': 'sim'}),
                      (models.DS41, 'int4', {}),
                      (models.QW38, 'fp8', {}), (models.QW38, 'fp8', {'QW38_WHAT': 'sim'}),
                      (models.QW38, 'int4', {})]
@@ -250,6 +251,7 @@ chmod +x "$2"
                     self.assertIn('-D' + model.build_define + '=1', content)
                 if model.build_flags_script:
                     self.assertIn('-DDS_MHC_TRUNK_BF16', content)
+                    self.assertIn('-DG6_MX=' + changes.get('DS41_MX', '48'), content)
                 self.assertEqual((out / model.simulator).exists(), fmt == 'fp8')
                 if sim_only:
                     self.assertFalse((out / model.engine).exists())

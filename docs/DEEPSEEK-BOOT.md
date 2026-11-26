@@ -81,7 +81,7 @@ Two files sit at that prefix:
 | file | who writes it |
 |---|---|
 | `PREFIX.engram.json` | the loader, at every boot: this rank's runs of the release's split table files (`g6engram-v3-col` by default) |
-| `PREFIX.engram.cmap` | **you, once** — it is in neither the repo nor the release |
+| `PREFIX.engram.cmap` | `./gr8 ds41 up` on first boot (via `bin/g6front-rs engram-cmap` from `<release>/tokenizer.json`, verified against `kCmapSha256`), or you once ahead of time |
 
 So the prefix only needs a writable directory: with either layout the table rows are read straight out of the
 release's `dense/exlr8-split-001.engram.embed.p0NN.safetensors` and `exlr8-split-014.…` files, and no sidecar copy of
@@ -121,8 +121,14 @@ boot — on a good copy:
 
 which is the value in `engine/engram/hash_consts.h` and the same file on every rank.
 
-Write it with the generator. It reads two files out of the official DeepSeek repo and the tokenizer out of the
-release — not the original multi-hundred-GB checkpoint, so fetch just those two:
+`./gr8 ds41 up` (including the published container image) automatically creates the directory, generates
+`PREFIX.engram.cmap` on first boot from `<release>/tokenizer.json` using `bin/g6front-rs engram-cmap`, and verifies
+its sha256 against `kCmapSha256` before starting `g6m4_ds41`. To write it manually without PyTorch or Python
+dependencies:
+
+    bin/g6front-rs engram-cmap <release>/tokenizer.json /opt/gr8/engram/ds41.engram.cmap
+
+To regenerate `engine/engram/hash_consts.h` as well (from the official DeepSeek reference):
 
     pip install torch tokenizers numpy          # numpy is imported directly by the generator
     mkdir -p /opt/gr8/engram                    # nothing below creates this directory for you

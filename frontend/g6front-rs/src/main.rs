@@ -8,6 +8,7 @@ mod dialect;
 mod dschat;
 mod dsparser;
 mod engine;
+mod engram_cmap;
 mod gen;
 mod grammar;
 mod guard;
@@ -324,6 +325,10 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.first().map(String::as_str) == Some("engram-cmap") {
+        std::process::exit(engram_cmap::run_cli(&raw_args[1..]));
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

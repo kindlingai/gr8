@@ -1389,5 +1389,134 @@ class DispramTests(unittest.TestCase):
             s.lock.close()
 
 
+class Ds41EngramCmapTests(unittest.TestCase):
+    """First-boot generation and SHA-256 verification of ds41.engram.cmap in Supervisor."""
+
+    def _make_sup(self, t, extra_env='', front_bin=None, rank=0):
+        o = opt.parse(['--no-config', '--work-dir', t, '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4',
+                       '--model', t, '--extra-env', extra_env], {'GR8_MODEL': 'ds41'})
+        if front_bin is not None:
+            o.values['FRONT_BIN'] = front_bin
+        s = S.Supervisor(o)
+        s.rank = rank
+        tok_dir = os.path.join(t, 'release')
+        os.makedirs(tok_dir, exist_ok=True)
+        with open(os.path.join(tok_dir, 'tokenizer.json'), 'w') as f:
+            f.write('{}')
+        from types import SimpleNamespace
+        s.ms = SimpleNamespace(dir=tok_dir, tokenizer=tok_dir, release=None, drafter=None)
+        return s
+
+    def test_engram_cmap_sha256_matches_engine_header(self):
+        with open(os.path.join(S.REPO, 'engine', 'engram', 'hash_consts.h')) as f:
+            hdr = f.read()
+        self.assertIn(f'kCmapSha256 = "{S.engram_cmap_sha256()}"', hdr)
+        self.assertEqual(S.engram_cmap_sha256(), S.DS41_ENGRAM_CMAP_SHA256)
+
+    def test_noop_when_engram_off(self):
+        with tempfile.TemporaryDirectory() as t:
+            s = self._make_sup(t, front_bin='/nonexistent/g6front-rs')
+            prefix = os.path.join(t, 'engram', 'ds41')
+            s.ensure_engram_cmap({'GR8_DS_ENGRAM': '0', 'GR8_DS_ENGRAM_PREFIX': prefix})
+            self.assertFalse(os.path.exists(prefix + '.engram.cmap'))
+
+    def test_existing_valid_cmap_is_reused_without_invoking_front(self):
+        with tempfile.TemporaryDirectory() as t:
+            s = self._make_sup(t, front_bin='/nonexistent/g6front-rs')
+            prefix = os.path.join(t, 'engram', 'ds41')
+            os.makedirs(os.path.dirname(prefix), exist_ok=True)
+            cmap = prefix + '.engram.cmap'
+            data = b'G6ECMAP1valid-test-bytes'
+            with open(cmap, 'wb') as f:
+                f.write(data)
+            want = S.hashlib.sha256(data).hexdigest()
+            with mock.patch.object(S, 'engram_cmap_sha256', return_value=want), \
+                    mock.patch.object(S.subprocess, 'run') as run_mock:
+                s.ensure_engram_cmap({'GR8_DS_ENGRAM': '1', 'GR8_DS_ENGRAM_PREFIX': prefix})
+            run_mock.assert_not_called()
+
+    def test_existing_corrupt_cmap_fails_closed_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as t:
+            s = self._make_sup(t, front_bin='/nonexistent/g6front-rs')
+            prefix = os.path.join(t, 'engram', 'ds41')
+            os.makedirs(os.path.dirname(prefix), exist_ok=True)
+            cmap = prefix + '.engram.cmap'
+            with open(cmap, 'wb') as f:
+                f.write(b'corrupt')
+            with self.assertRaises(S.Stop) as ctx:
+                s.ensure_engram_cmap({'GR8_DS_ENGRAM': '1', 'GR8_DS_ENGRAM_PREFIX': prefix})
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn('sha256', str(ctx.exception))
+            with open(cmap, 'rb') as f:
+                self.assertEqual(f.read(), b'corrupt')
+
+    def test_missing_cmap_is_generated_and_verified(self):
+        with tempfile.TemporaryDirectory() as t:
+            fake_bytes = b'G6ECMAP1generated-bytes'
+            want = S.hashlib.sha256(fake_bytes).hexdigest()
+            front = os.path.join(t, 'fake-front')
+            with open(front, 'w') as f:
+                f.write(f'#!/usr/bin/env python3\n'
+                        f'import sys\n'
+                        f'assert sys.argv[1] == "engram-cmap", sys.argv\n'
+                        f'open(sys.argv[3], "wb").write({fake_bytes!r})\n')
+            os.chmod(front, 0o755)
+            s = self._make_sup(t, front_bin=front)
+            prefix = os.path.join(t, 'nested', 'engram', 'ds41')
+            with mock.patch.object(S, 'engram_cmap_sha256', return_value=want):
+                s.ensure_engram_cmap({'GR8_DS_ENGRAM': '1', 'GR8_DS_ENGRAM_PREFIX': prefix})
+            cmap = prefix + '.engram.cmap'
+            self.assertTrue(os.path.isfile(cmap))
+            with open(cmap, 'rb') as f:
+                self.assertEqual(f.read(), fake_bytes)
+
+    def test_generator_failure_and_bad_digest_fail_closed(self):
+        with tempfile.TemporaryDirectory() as t:
+            bad_front = os.path.join(t, 'bad-front')
+            with open(bad_front, 'w') as f:
+                f.write('#!/bin/sh\necho "bad tokenizer" >&2\nexit 1\n')
+            os.chmod(bad_front, 0o755)
+            s = self._make_sup(t, front_bin=bad_front)
+            prefix = os.path.join(t, 'engram', 'ds41')
+            with self.assertRaises(S.Stop) as ctx:
+                s.ensure_engram_cmap({'GR8_DS_ENGRAM': '1', 'GR8_DS_ENGRAM_PREFIX': prefix})
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn('bad tokenizer', str(ctx.exception))
+
+            wrong_front = os.path.join(t, 'wrong-front')
+            with open(wrong_front, 'w') as f:
+                f.write('#!/usr/bin/env python3\nimport sys\nopen(sys.argv[3], "wb").write(b"wrong")\n')
+            os.chmod(wrong_front, 0o755)
+            s2 = self._make_sup(t, front_bin=wrong_front)
+            prefix2 = os.path.join(t, 'engram2', 'ds41')
+            with self.assertRaises(S.Stop) as ctx2:
+                s2.ensure_engram_cmap({'GR8_DS_ENGRAM': '1', 'GR8_DS_ENGRAM_PREFIX': prefix2})
+            self.assertEqual(ctx2.exception.code, 1)
+            self.assertIn('sha256', str(ctx2.exception))
+
+    def test_worker_checks_require_front_bin_only_when_cmap_missing(self):
+        with tempfile.TemporaryDirectory() as t:
+            prefix = os.path.join(t, 'engram', 'ds41')
+            extra = f'GR8_DS_ENGRAM=1 GR8_DS_ENGRAM_PREFIX={prefix}'
+            s = self._make_sup(t, extra_env=extra, front_bin=os.path.join(t, 'missing-front'), rank=1)
+            s.build = 'ok'
+            with mock.patch.object(S, 'mem_available_gib', return_value=40.0), \
+                    mock.patch.object(S, 'running_engines', return_value=[]), \
+                    mock.patch.object(S.os.path, 'isdir', return_value=True), \
+                    mock.patch.object(S.modelset, 'check_tokenizer', return_value=[]):
+                fails_missing = s.checks(copy=False)
+            self.assertTrue(any('engram.cmap' in f for f in fails_missing), fails_missing)
+
+            os.makedirs(os.path.dirname(prefix), exist_ok=True)
+            with open(prefix + '.engram.cmap', 'wb') as f:
+                f.write(b'present')
+            with mock.patch.object(S, 'mem_available_gib', return_value=40.0), \
+                    mock.patch.object(S, 'running_engines', return_value=[]), \
+                    mock.patch.object(S.os.path, 'isdir', return_value=True), \
+                    mock.patch.object(S.modelset, 'check_tokenizer', return_value=[]):
+                fails_present = s.checks(copy=False)
+            self.assertFalse(any('engram.cmap' in f for f in fails_present), fails_present)
+
+
 if __name__ == '__main__':
     unittest.main()

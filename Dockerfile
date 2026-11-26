@@ -217,7 +217,7 @@ RUN --mount=type=cache,id=gr8-nvcc-flash-int4-${TARGETARCH},target=/var/cache/gr
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_flash-int4 -exec rm -rf {} +
 
 # DeepSeek-V4.1-Flash-1017: g6m4_ds41 and m4sim_ds41 (MODEL=ds41), TP 4. build.sh builds it without request grammars, so
-# it starts from engine-src and does not wait for XGrammar. Its build knobs (GR8_DS_TRUNK_BF16) come from
+# it starts from engine-src and does not wait for XGrammar. Its build knobs (GR8_DS_TRUNK_BF16=1, DS41_MX=48) come from
 # ds41_build_flags.sh, which only this stage copies, so the other engine stages keep their cache.
 FROM engine-src AS engine-ds41
 ARG TARGETARCH
