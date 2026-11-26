@@ -6,6 +6,36 @@ for versioning, release gates, and optional machine-readable specs in [`releases
 
 ---
 
+## [1.3.0](https://github.com/kindlingai/gr8/compare/v1.2.0...v1.3.0) (2026-11-26)
+
+
+### Features
+
+* **ci,docker:** build and publish linux/amd64 sm_120a container image ([#629](https://github.com/kindlingai/gr8/issues/629)) ([37ece27](https://github.com/kindlingai/gr8/commit/37ece27c067a6aea7d45fb019cabb27e24623157))
+* **dispram:** support DISPRAM_KEY_FILE for spark-attic on stock DGX OS ([#614](https://github.com/kindlingai/gr8/issues/614)) ([4c82532](https://github.com/kindlingai/gr8/commit/4c8253270a3f98d2c130fd9b692eb2b5f48101f4))
+* **ds41:** default DS41_MX=48 and first-boot engram cmap generation ([#630](https://github.com/kindlingai/gr8/issues/630)) ([9fb5370](https://github.com/kindlingai/gr8/commit/9fb5370beb8248316503928ab179c89b4260eb39))
+* **engine:** add in-process delta piece-prefetch into ptab::Pool (EL3 Stage 3, [#151](https://github.com/kindlingai/gr8/issues/151)) ([#564](https://github.com/kindlingai/gr8/issues/564)) ([959df5a](https://github.com/kindlingai/gr8/commit/959df5aed648d4df1a006865d3c330186c54d553))
+* **engine:** add in-process width-module lifecycle bridge and per-layout graph capture (EL7, [#155](https://github.com/kindlingai/gr8/issues/155)) ([#567](https://github.com/kindlingai/gr8/issues/567)) ([d13aefd](https://github.com/kindlingai/gr8/commit/d13aefdccb67fc298d114fb826cf2ef16de86d93))
+* **engine:** add online per-step weight defragmentation for ptab::Pool (EL3b, [#164](https://github.com/kindlingai/gr8/issues/164)) ([#565](https://github.com/kindlingai/gr8/issues/565)) ([adf9c8e](https://github.com/kindlingai/gr8/commit/adf9c8e1354d3f6a79e4b1f36ccc5a1e237ab60e))
+* **engine:** add ptab::Pool chunk release, contiguous-per-expert take_run (GR8_PTAB=3), and direct slab load (EL3, [#151](https://github.com/kindlingai/gr8/issues/151)) ([#561](https://github.com/kindlingai/gr8/issues/561)) ([e2caade](https://github.com/kindlingai/gr8/commit/e2caade62341b116bace33fabf3a9396bc603df2))
+* **frontend,protocol:** add /v1/embeddings endpoint and embed wire frame ([#624](https://github.com/kindlingai/gr8/issues/624)) ([37ffb80](https://github.com/kindlingai/gr8/commit/37ffb80e2647e1f823f97ab9af30e6107ff00161))
+* **glm53:** add TP=2 2-Spark support with native INT4 DFlash2 and adaptive drafting ([#617](https://github.com/kindlingai/gr8/issues/617)) ([8bbe6eb](https://github.com/kindlingai/gr8/commit/8bbe6ebf5b7edf4d648a8b39a0cbaa4d3d9abd6b))
+* **ink2:** add Inkling-2-Mini looped engine, exlr8 MoE, and Blackwell speedups ([#611](https://github.com/kindlingai/gr8/issues/611)) ([bd1711c](https://github.com/kindlingai/gr8/commit/bd1711cc2945ee38a85f601053b0436bfe07a0b2))
+* **ink2:** add melded DFlash2 drafter, Blackwell MXFP8 prefill, fast attention, and per-matrix kmix ([#615](https://github.com/kindlingai/gr8/issues/615)) ([6b87480](https://github.com/kindlingai/gr8/commit/6b8748038bc74cd746c2f83075b0fbb6ba5aa99e))
+* **loader:** support multi-group exlr8 dense profiles ([#625](https://github.com/kindlingai/gr8/issues/625)) ([04790cc](https://github.com/kindlingai/gr8/commit/04790cc003bb79705417fc08b7a5528a1077ea6c))
+* **qw38:** add QSpine-DF2 parallel block speculative drafter ([#609](https://github.com/kindlingai/gr8/issues/609)) ([903ad1b](https://github.com/kindlingai/gr8/commit/903ad1b1935532d7f1efbbd06544bf4bc575ac59))
+* **qw38:** add single-GPU Strata-mode expert cache, AVX-512 K3 CPU MoE, and lazy MTP ([#610](https://github.com/kindlingai/gr8/issues/610)) ([5cedece](https://github.com/kindlingai/gr8/commit/5cedece3c4371e8dbf974078bdd22129c38e71c8))
+* **qw38:** auto-fetch and auto-discover DFlash drafter pack and add 1x Spark recipe card ([#621](https://github.com/kindlingai/gr8/issues/621)) ([fa5d82d](https://github.com/kindlingai/gr8/commit/fa5d82d37751d8c71703e3d1e6f4c010427357d2))
+* **s2:** add event-fence session KV export and cross-width canonical import (EL4b, [#159](https://github.com/kindlingai/gr8/issues/159)) ([#563](https://github.com/kindlingai/gr8/issues/563)) ([6e46b93](https://github.com/kindlingai/gr8/commit/6e46b93e8593d18edc372b9f4995bf6a4ed3dc26))
+* **s2:** add in-process live width switch coordinator and --live scale (EL8, [#156](https://github.com/kindlingai/gr8/issues/156)) ([#568](https://github.com/kindlingai/gr8/issues/568)) ([12768a6](https://github.com/kindlingai/gr8/commit/12768a6a5df67b5a764898275925791a39269a3d))
+* **s2:** add two-phase live bulk-then-tail multi-session KV migration (EL4c, [#160](https://github.com/kindlingai/gr8/issues/160)) ([#566](https://github.com/kindlingai/gr8/issues/566)) ([ea07f03](https://github.com/kindlingai/gr8/commit/ea07f039f3a796732e578bbbf53de5f2599643c0))
+
+
+### Performance
+
+* **kvman:** extend CP-tail stashes in place to avoid SSD write amplification ([#613](https://github.com/kindlingai/gr8/issues/613)) ([77e82fe](https://github.com/kindlingai/gr8/commit/77e82fef72ec1c3628338e08344fa98cc0da79e7))
+* **runtime:** batch S2 page-table H2D uploads and O(N) CP page map ([#612](https://github.com/kindlingai/gr8/issues/612)) ([d4af92d](https://github.com/kindlingai/gr8/commit/d4af92d51d6f2313d7241cd3945b2ce5313a817d))
+
 ## [v1.2.0] — 2026-11-23
 
 - **Tag / commit:** [`v1.2.0`](https://github.com/kindlingai/gr8/releases/tag/v1.2.0) · `ab2eb95f426ff908543d5d002218cf5a2a5c5be6`
