@@ -7,7 +7,8 @@
 //! The block is one of N runs of whole units (record field 5) on the sharded side, the larger runs first. The file's
 //! metadata gives each block's range under the tensor's name. Norms and biases are written as stored.
 
-use g6load::exlr8::{self, Matrix, StFile, SIDE_IN, SIDE_REPLICATED};
+use g6load::exlr8::{self, DenseProfile, Matrix, StFile, SIDE_IN, SIDE_REPLICATED};
+use g6load::json::Json;
 use std::io::Write;
 use std::ops::Range;
 
@@ -28,7 +29,7 @@ fn run_of(n: usize, nr: usize, r: usize) -> Range<usize> {
 fn run() -> Result<(), String> {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 4 {
-        return Err("usage: exlr8dump DIR LAYER|vocab OUT.safetensors [--dtype f32|bf16] [--shard N R] [--threads T]".into());
+        return Err("usage: exlr8dump DIR LAYER|GROUP:LAYER|vocab OUT.safetensors [--dtype f32|bf16] [--shard N R] [--threads T]".into());
     }
     let (dir, which, out) = (&a[1], &a[2], &a[3]);
     let (mut bf16, mut shard, mut threads) = (false, None, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
@@ -45,17 +46,18 @@ fn run() -> Result<(), String> {
             x => return Err(format!("unknown option {x}")),
         }
     }
-    let layer = if which == "vocab" { None } else { Some(which.parse::<usize>().map_err(|_| "LAYER: a number or vocab")?) };
-    let f = StFile::open(&exlr8::dense_path(dir, layer))?;
-    let hf = |n: &str| -> String {
-        match layer {
-            Some(l) => format!("model.layers.{l}.{n}"),
-            None => match n {
-                "embed_tokens" => "model.embed_tokens".into(),
-                "norm.weight" => "model.norm.weight".into(),
-                x => x.into(),
-            },
-        }
+    let (group, layer, is_vocab) = if which == "vocab" {
+        (None, None, true)
+    } else if let Some((g, l)) = which.split_once(':') {
+        (Some(g.to_string()), Some(l.parse::<usize>().map_err(|_| "GROUP:LAYER: layer must be a number")?), false)
+    } else {
+        (None, Some(which.parse::<usize>().map_err(|_| "LAYER: a number, GROUP:LAYER, or vocab")?), false)
+    };
+    let f = StFile::open(&exlr8::group_dense_path(dir, group.as_deref(), layer))?;
+    let profile = DenseProfile::from_name(f.meta.get("model_profile").and_then(Json::str))?;
+    let eff_group = group.or_else(|| f.meta.get("group").and_then(Json::str).map(str::to_string));
+    let hf = |n: &str, is_matrix: bool| -> Result<String, String> {
+        exlr8::hf_tensor_name(profile, eff_group.as_deref(), layer, is_vocab, &f.meta, n, is_matrix)
     };
     let mats = Matrix::names(&f);
     // (name, dtype, shape, block) for the header, then the data in the same order
@@ -66,15 +68,16 @@ fn run() -> Result<(), String> {
         let mx = Matrix::open(&f, m)?;
         let r = mx.rec;
         let (mut rows, mut cols) = (0..r.out, 0..r.inp);
+        let hf_w = hf(m, true)?;
         if let (Some((n, k)), true) = (shard, r.side != SIDE_REPLICATED) {
             let span = if r.side == SIDE_IN { r.inp } else { r.out };
             let u = run_of(span / r.unit, n, k);
             let b = u.start * r.unit..u.end * r.unit;
             if r.side == SIDE_IN { cols = b } else { rows = b }
-            meta.push(format!("\"{}.weight\": \"rows {}:{} cols {}:{}\"", hf(m), rows.start, rows.end, cols.start, cols.end));
+            meta.push(format!("\"{hf_w}\": \"rows {}:{} cols {}:{}\"", rows.start, rows.end, cols.start, cols.end));
         }
         let shape = vec![rows.len(), cols.len()];
-        plan.push((format!("{}.weight", hf(m)), if bf16 { "BF16" } else { "F32" }.into(), shape, Some((mx, rows, cols))));
+        plan.push((hf_w, if bf16 { "BF16" } else { "F32" }.into(), shape, Some((mx, rows, cols))));
     }
     let owned: Vec<String> = mats.iter().flat_map(|m| {
         let fmt = Matrix::open(&f, m).map(|x| x.rec.fmt).unwrap_or(0);
@@ -83,7 +86,7 @@ fn run() -> Result<(), String> {
     for n in f.names() {
         if !owned.contains(n) {
             let i = f.info(n)?;
-            plan.push((hf(n), i.dtype.clone(), i.shape.clone(), None));
+            plan.push((hf(n, false)?, i.dtype.clone(), i.shape.clone(), None));
         }
     }
     let esz = |d: &str| match d { "F32" | "I32" => 4, "BF16" | "F16" | "I16" => 2, "I64" | "U64" => 8, _ => 1 };
@@ -116,7 +119,7 @@ fn run() -> Result<(), String> {
                 w.write_all(&bytes).map_err(io)?;
             }
             None => {
-                let stored = f.names().iter().find(|n| hf(n) == *name).ok_or(format!("lost {name}"))?;
+                let stored = f.names().iter().find(|n| hf(n, false).ok().as_deref() == Some(name.as_str())).ok_or(format!("lost {name}"))?;
                 w.write_all(&f.read_all(stored)?).map_err(io)?;
             }
         }
