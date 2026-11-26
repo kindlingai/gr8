@@ -15,12 +15,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Notify};
 
-use crate::wire::{self, FrameReader, GenParams};
+use crate::wire::{self, EmbedParams, FrameReader, GenParams};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Tokens,
     PromptLogprobs,
+    Embedding,
     Finish,
 }
 
@@ -172,6 +173,14 @@ impl Engine {
     pub fn sequence_penalty(&self) -> bool {
         self.hello().is_some_and(|h| h.get("sequence_penalty") == Some(&Value::Bool(true)))
     }
+    /// The engine supports dense embeddings via `embed` / `embedding` frames (its hello says `"embeddings": true`).
+    pub fn embeddings(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("embeddings") == Some(&Value::Bool(true)))
+    }
+    /// The engine's native embedding dimension, if advertised in `hello.embedding_dim`.
+    pub fn embedding_dim(&self) -> Option<usize> {
+        self.hello().and_then(|h| h.get("embedding_dim").and_then(Value::as_u64)).map(|d| d as usize)
+    }
 
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();
@@ -253,6 +262,7 @@ impl Engine {
         let kind = match h.kind.as_ref() {
             "tokens" => Kind::Tokens,
             "prompt_logprobs" => Kind::PromptLogprobs,
+            "embedding" => Kind::Embedding,
             "finish" => Kind::Finish,
             "metrics" => {
                 if let Some(seq) = h.seq {
@@ -297,6 +307,16 @@ impl Engine {
     /// Start a request. Frames arrive on the returned stream until `finish`.
     pub fn generate(self: &Arc<Self>, id: String, prompt: &[u32], p: &GenParams) -> Result<Stream, EngineError> {
         let frame = wire::generate(&id, prompt, p);
+        self.start_stream(id, frame)
+    }
+
+    /// Start an embedding request. Expects one `embedding` frame followed by `finish`.
+    pub fn embed(self: &Arc<Self>, id: String, prompt: &[u32], p: &EmbedParams) -> Result<Stream, EngineError> {
+        let frame = wire::embed(&id, prompt, p);
+        self.start_stream(id, frame)
+    }
+
+    fn start_stream(self: &Arc<Self>, id: String, frame: Bytes) -> Result<Stream, EngineError> {
         let (qtx, qrx) = mpsc::unbounded_channel();
         {
             let mut c = self.conn.lock().unwrap();

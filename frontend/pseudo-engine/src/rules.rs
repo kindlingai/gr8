@@ -47,6 +47,10 @@ pub struct Engine {
     /// Draft tokens per verify round, for the speculative-decoding counters (0: none, and no `spec` is reported). A
     /// `tokens` frame is then one round: 1 + its accepted drafts, from a fixed cycle, in place of `chunk`.
     pub draft_k: usize,
+    /// Advertise `"embeddings": true` in `hello` and serve `embed` frames with deterministic mock vectors.
+    pub embeddings: bool,
+    /// Native output dimension for mock embeddings (default 64).
+    pub embedding_dim: usize,
 }
 
 impl Default for Engine {
@@ -59,6 +63,8 @@ impl Default for Engine {
             prefill_tps: 0.0,
             reasoning: "Let me work out the answer.".into(),
             draft_k: 0,
+            embeddings: true,
+            embedding_dim: 64,
         }
     }
 }

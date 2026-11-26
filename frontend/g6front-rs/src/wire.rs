@@ -126,6 +126,13 @@ pub struct Tokens {
 }
 
 #[derive(Deserialize)]
+pub struct EmbeddingFrame {
+    pub embedding: Vec<f32>,
+    #[serde(default)]
+    pub prompt_tokens: Option<usize>,
+}
+
+#[derive(Deserialize)]
 pub struct Finish {
     pub reason: String,
     #[serde(default)]
@@ -425,6 +432,57 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
     w.finish()
 }
 
+/// `embed` parameters (PROTOCOL.md).
+#[derive(Clone, Debug)]
+pub struct EmbedParams {
+    pub dimensions: Option<usize>,
+    pub normalize: bool,
+    pub images: std::sync::Arc<Vec<crate::vision::Span>>,
+}
+
+pub fn embed(id: &str, prompt: &[u32], p: &EmbedParams) -> Bytes {
+    let img: usize = p.images.iter().map(|i| i.rgb_b64.len() + 96).sum();
+    let mut w = FrameWriter::with_capacity(128 + prompt.len() * 7 + img);
+    let b = &mut w.b;
+    b.extend_from_slice(b"{\"id\":");
+    pyjson::string(b, id);
+    b.extend_from_slice(b",\"prompt\":[");
+    for (i, t) in prompt.iter().enumerate() {
+        if i > 0 {
+            b.push(b',');
+        }
+        pyjson::int(b, *t);
+    }
+    b.push(b']');
+    if let Some(dim) = p.dimensions {
+        b.extend_from_slice(b",\"dimensions\":");
+        pyjson::int(b, dim);
+    }
+    b.extend_from_slice(if p.normalize { b",\"normalize\":true" } else { b",\"normalize\":false" });
+    if !p.images.is_empty() {
+        b.extend_from_slice(b",\"images\":[");
+        for (i, im) in p.images.iter().enumerate() {
+            if i > 0 {
+                b.push(b',');
+            }
+            b.extend_from_slice(b"{\"pos\":");
+            pyjson::int(b, im.pos as u64);
+            b.extend_from_slice(b",\"vit_h\":");
+            pyjson::int(b, im.vit_h as u64);
+            b.extend_from_slice(b",\"vit_w\":");
+            pyjson::int(b, im.vit_w as u64);
+            b.extend_from_slice(b",\"key\":");
+            pyjson::string(b, &im.key);
+            b.extend_from_slice(b",\"rgb\":\"");
+            b.extend_from_slice(im.rgb_b64.as_bytes());
+            b.extend_from_slice(b"\"}");
+        }
+        b.push(b']');
+    }
+    b.extend_from_slice(b",\"type\":\"embed\"}");
+    w.finish()
+}
+
 pub fn cancel(id: &str) -> Bytes {
     let mut w = FrameWriter::with_capacity(64);
     w.b.extend_from_slice(b"{\"type\":\"cancel\",\"id\":");
@@ -569,5 +627,25 @@ mod tests {
         let g = cancel("x");
         let mut r = FrameReader::new(&g[..g.len() - 1]);
         assert!(r.next().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn embed_frame_roundtrips() {
+        let p = EmbedParams { dimensions: Some(256), normalize: true, images: Default::default() };
+        let f = embed("emb-1", &[10, 20, 30], &p);
+        let mut r = FrameReader::new(&f[..]);
+        let body = r.next().await.unwrap().unwrap();
+        let h = head(&body).unwrap();
+        assert_eq!((h.kind.as_ref(), h.id.as_deref()), ("embed", Some("emb-1")));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["prompt"], serde_json::json!([10, 20, 30]));
+        assert_eq!(v["dimensions"], serde_json::json!(256));
+        assert_eq!(v["normalize"], serde_json::json!(true));
+        assert!(!v.as_object().unwrap().contains_key("images"));
+
+        let p2 = EmbedParams { dimensions: None, normalize: false, images: Default::default() };
+        let v2: serde_json::Value = serde_json::from_slice(&embed("emb-2", &[5], &p2)[4..]).unwrap();
+        assert!(!v2.as_object().unwrap().contains_key("dimensions"));
+        assert_eq!(v2["normalize"], serde_json::json!(false));
     }
 }

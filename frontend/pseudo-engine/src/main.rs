@@ -226,6 +226,11 @@ async fn connection(e: Arc<Engine>, s: tokio::net::UnixStream) -> Result<(), Str
     let mut hello = json!({"type": "hello", "version": 1, "model": e.rules.engine.model,
         "max_model_len": e.rules.engine.max_model_len, "vocab_size": e.vocab, "eos_ids": e.eos,
         "max_logprobs": MAX_LOGPROBS, "insert": true});
+    if e.rules.engine.embeddings {
+        hello["embeddings"] = Value::Bool(true);
+        hello["embedding_dim"] = Value::from(e.rules.engine.embedding_dim);
+        hello["matryoshka"] = Value::Bool(true);
+    }
     hello["pseudo"] = Value::Bool(true);
     let _ = tx.send(hello);
     let live: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> = Arc::default();
@@ -253,6 +258,20 @@ async fn connection(e: Arc<Engine>, s: tokio::net::UnixStream) -> Result<(), Str
                 let (e, tx, live) = (e.clone(), tx.clone(), live.clone());
                 tokio::spawn(async move {
                     generate(&e, &v, &cancel, &tx).await;
+                    live.lock().unwrap().remove(&id);
+                });
+            }
+            Some("embed") => {
+                let id = v["id"].as_str().unwrap_or("").to_string();
+                let cancel = Arc::new(AtomicBool::new(false));
+                if live.lock().unwrap().insert(id.clone(), cancel.clone()).is_some() {
+                    let _ = tx.send(json!({"type": "finish", "id": id, "reason": "error", "stop_id": null,
+                        "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0, "message": "duplicate id"}));
+                    continue;
+                }
+                let (e, tx, live) = (e.clone(), tx.clone(), live.clone());
+                tokio::spawn(async move {
+                    embed(&e, &v, &tx);
                     live.lock().unwrap().remove(&id);
                 });
             }
@@ -527,9 +546,97 @@ fn sample(w: &[f64], seed: u64) -> usize {
     w.len() - 1
 }
 
+/// Deterministic mock embedding vector from token ids: sums per-token splitmix64 projections (preserving cosine
+/// similarity across shared tokens and deterministic MRL prefix truncation), optionally L2-normalized.
+fn mock_embedding(prompt: &[u32], dim: usize, normalize: bool) -> Vec<f32> {
+    let mut out = vec![0.0f64; dim];
+    for (pos, &tok) in prompt.iter().enumerate() {
+        let w = 1.0 + (pos as f64 + 1.0) / (prompt.len() as f64 + 1.0); // slight recency bias
+        let mut z = (tok as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(0xbf58_476d_1ce4_e5b9);
+        for slot in &mut out {
+            z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut x = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            let u = ((x ^ (x >> 31)) >> 11) as f64 / (1u64 << 53) as f64;
+            *slot += w * (2.0 * u - 1.0);
+        }
+    }
+    if normalize {
+        let norm = out.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > 0.0 {
+            for x in &mut out {
+                *x /= norm;
+            }
+        }
+    }
+    out.into_iter().map(|x| x as f32).collect()
+}
+
+fn embed(e: &Engine, v: &Value, tx: &mpsc::UnboundedSender<Value>) {
+    let id = v["id"].as_str().unwrap_or("").to_string();
+    let prompt: Vec<u32> =
+        v["prompt"].as_array().map_or(Vec::new(), |a| a.iter().filter_map(Value::as_u64).map(|x| x as u32).collect());
+    let finish_err = |msg: &str, status: Option<u16>| {
+        let mut f = json!({"type": "finish", "id": id, "reason": "error", "stop_id": null,
+                           "prompt_tokens": prompt.len(), "cached_tokens": 0, "completion_tokens": 0,
+                           "message": msg});
+        if let Some(s) = status {
+            f["status"] = Value::from(s);
+        }
+        f
+    };
+    if !e.rules.engine.embeddings {
+        e.c.error.fetch_add(1, Ordering::Relaxed);
+        let _ = tx.send(finish_err("embeddings not enabled", Some(400)));
+        return;
+    }
+    if prompt.is_empty() || prompt.iter().any(|&t| t >= e.vocab) {
+        e.c.error.fetch_add(1, Ordering::Relaxed);
+        let _ = tx.send(finish_err("prompt is empty or holds an id outside the vocabulary", Some(400)));
+        return;
+    }
+    let full_dim = e.rules.engine.embedding_dim.max(1);
+    let dim = match v.get("dimensions") {
+        None | Some(Value::Null) => full_dim,
+        Some(d) => match d.as_u64().map(|x| x as usize) {
+            Some(n) if n >= 1 && n <= full_dim => n,
+            _ => {
+                e.c.error.fetch_add(1, Ordering::Relaxed);
+                let _ = tx.send(finish_err("dimensions out of range", Some(400)));
+                return;
+            }
+        },
+    };
+    let normalize = v.get("normalize").and_then(Value::as_bool).unwrap_or(true);
+    e.c.prompt.fetch_add(prompt.len() as u64, Ordering::Relaxed);
+    let vec = mock_embedding(&prompt, dim, normalize);
+    let _ = tx.send(json!({"type": "embedding", "id": id, "embedding": vec, "prompt_tokens": prompt.len()}));
+    e.c.stop.fetch_add(1, Ordering::Relaxed);
+    let _ = tx.send(json!({"type": "finish", "id": id, "reason": "stop", "stop_id": null,
+                           "prompt_tokens": prompt.len(), "cached_tokens": 0, "completion_tokens": 0}));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_embedding_is_deterministic_normalized_and_mrl_consistent() {
+        let a = mock_embedding(&[10, 20, 30], 64, true);
+        let a2 = mock_embedding(&[10, 20, 30], 64, true);
+        assert_eq!(a, a2);
+        let norm: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm={norm}");
+
+        // MRL truncation to 16 dims equals first 16 dims re-normalized
+        let a16 = mock_embedding(&[10, 20, 30], 16, true);
+        let raw_prefix = &a[..16];
+        let pnorm: f32 = raw_prefix.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let expected: Vec<f32> = raw_prefix.iter().map(|x| x / pnorm).collect();
+        for (x, y) in a16.iter().zip(expected) {
+            assert!((x - y).abs() < 1e-5, "{x} vs {y}");
+        }
+    }
 
     #[test]
     fn sampling_follows_the_weights_and_the_seed() {
