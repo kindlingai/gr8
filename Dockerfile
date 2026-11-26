@@ -1,9 +1,12 @@
-# gr8 for GB10 (DGX Spark / ASUS GX10): arm64, CUDA 13, sm_121a. docker/README.md has how to run it.
+# gr8 for Blackwell GPUs: GB10 (DGX Spark / ASUS GX10: linux/arm64, CUDA 13, sm_121a) and RTX 5090 / RTX PRO 6000
+# (linux/amd64, CUDA 13, sm_120a). docker/README.md has how to run it.
 #
-#   docker buildx build --platform linux/arm64 -t gr8 .                         the runtime image
+#   docker buildx build --platform linux/arm64 -t gr8 .                         the arm64 runtime image (sm_121a)
+#   docker buildx build --platform linux/amd64 -t gr8 .                         the amd64 runtime image (sm_120a)
 #   docker buildx build --platform linux/arm64 --target dist -o type=local,dest=out .
 #                                                                              only the binaries, into out/bin
 #
+# CUDA_ARCH overrides the CUDA SM target (empty defaults to 121a on arm64 and 120a on amd64 via scripts/build.sh).
 # Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader), kvman (the host Rust: page allocator,
 # scheduler, planner), knobs and front (the Rust front end) -> rust-dist -> engine, engine-int4, engine-flash,
 # engine-flash-int4, engine-ds41, engine-ink2, engine-qw38 and engine-tests-ship -> dist (the binaries only)
@@ -139,6 +142,9 @@ COPY scripts/build.sh scripts/build.sh
 COPY --from=rust-dist /lib/libg6load.a engine/loader-rs/target/release/libg6load.a
 COPY --from=rust-dist /lib/libg6host.a engine/target/release/libg6host.a
 COPY --from=rust-dist /lib/libgr8knobs.a engine/knobs-rs/target/release/libgr8knobs.a
+# Default CUDA SM target comes from scripts/build.sh (121a on arm64, 120a on amd64); CUDA_ARCH overrides it.
+ARG CUDA_ARCH=
+ENV ARCH=${CUDA_ARCH}
 
 # the GLM and Flash engine stages add XGrammar (and grammar_test.cc run by build_m4.sh); the tests build without it
 FROM engine-src AS engine-src-glm
@@ -153,8 +159,9 @@ ENV GR8_XGRAMMAR=/opt/xgrammar GR8_XGRAMMAR_LIB=/opt/xgrammar-lib/libxgrammar.a
 # GR8_WIDTHS builds a subset (build.sh): CI passes one on a pull request and
 # leaves it empty, for all seven widths (1 2 3 4 5 6 8), on main and on tags.
 FROM engine-src-glm AS engine
+ARG TARGETARCH
 ARG GR8_WIDTHS=
-RUN --mount=type=cache,id=gr8-nvcc-fp8,target=/var/cache/gr8-nvcc \
+RUN --mount=type=cache,id=gr8-nvcc-fp8-${TARGETARCH},target=/var/cache/gr8-nvcc \
     touch "$GR8_NVCC_CACHE_DIR/.start" \
  && GR8_WIDTHS="$GR8_WIDTHS" GR8_TESTS=0 scripts/build.sh /out/bin \
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
@@ -163,9 +170,10 @@ RUN --mount=type=cache,id=gr8-nvcc-fp8,target=/var/cache/gr8-nvcc \
 # the two test binaries the image ships (tr3_e4m3_test and gpuprobe), on their own CI runner: GR8_TESTS=ship builds only
 # them, so the image does not wait for the other test builds.
 FROM engine-src AS engine-tests-ship
+ARG TARGETARCH
 COPY engine/kernels/tests/tr3_e4m3_test.cu engine/kernels/tests/tr3_e4m3_test.cu
 COPY tools/health/gpuprobe.cu tools/health/gpuprobe.cu
-RUN --mount=type=cache,id=gr8-nvcc-tests-ship,target=/var/cache/gr8-nvcc \
+RUN --mount=type=cache,id=gr8-nvcc-tests-ship-${TARGETARCH},target=/var/cache/gr8-nvcc \
     touch "$GR8_NVCC_CACHE_DIR/.start" \
  && GR8_TESTS=ship scripts/build.sh /out/bin \
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
@@ -174,6 +182,7 @@ RUN --mount=type=cache,id=gr8-nvcc-tests-ship,target=/var/cache/gr8-nvcc \
 # every test binary build.sh makes after the GLM engine, a compile check on its own CI runner (nothing here ships).
 # Test sources are copied only here so test edits never invalidate the model engine stages.
 FROM engine-src AS engine-tests
+ARG TARGETARCH
 COPY engine/tests engine/tests
 COPY engine/attn/tests engine/attn/tests
 COPY engine/comms/tests engine/comms/tests
@@ -181,7 +190,7 @@ COPY engine/kernels/tests engine/kernels/tests
 COPY engine/runtime/tests engine/runtime/tests
 COPY tools/health/gpuprobe.cu tools/health/gpuprobe.cu
 ARG GR8_WIDTHS=
-RUN --mount=type=cache,id=gr8-nvcc-tests,target=/var/cache/gr8-nvcc \
+RUN --mount=type=cache,id=gr8-nvcc-tests-${TARGETARCH},target=/var/cache/gr8-nvcc \
     touch "$GR8_NVCC_CACHE_DIR/.start" \
  && GR8_WIDTHS="$GR8_WIDTHS" GR8_TESTS=only scripts/build.sh /out/bin \
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
@@ -189,8 +198,9 @@ RUN --mount=type=cache,id=gr8-nvcc-tests,target=/var/cache/gr8-nvcc \
 
 # GLM-5.3-Flash: g6m4_flash and m4sim_flash (MODEL=flash), TP 1, 2, 3 and 4 (or GR8_WIDTHS subset on PRs)
 FROM engine-src-glm AS engine-flash
+ARG TARGETARCH
 ARG GR8_WIDTHS=
-RUN --mount=type=cache,id=gr8-nvcc-flash,target=/var/cache/gr8-nvcc \
+RUN --mount=type=cache,id=gr8-nvcc-flash-${TARGETARCH},target=/var/cache/gr8-nvcc \
     touch "$GR8_NVCC_CACHE_DIR/.start" \
  && GR8_WIDTHS="$GR8_WIDTHS" MODEL=flash scripts/build.sh /out/bin \
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
@@ -198,8 +208,9 @@ RUN --mount=type=cache,id=gr8-nvcc-flash,target=/var/cache/gr8-nvcc \
 
 # GLM-5.3-Flash with the 4-bit KV latent (--kv-format int4, docs/FLASH.md): g6m4_flash-int4, TP 1, 2, 3 and 4
 FROM engine-src-glm AS engine-flash-int4
+ARG TARGETARCH
 ARG GR8_WIDTHS=
-RUN --mount=type=cache,id=gr8-nvcc-flash-int4,target=/var/cache/gr8-nvcc \
+RUN --mount=type=cache,id=gr8-nvcc-flash-int4-${TARGETARCH},target=/var/cache/gr8-nvcc \
     touch "$GR8_NVCC_CACHE_DIR/.start" \
  && GR8_WIDTHS="$GR8_WIDTHS" MODEL=flash KV_FORMAT=int4 scripts/build.sh /out/bin \
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
@@ -209,8 +220,9 @@ RUN --mount=type=cache,id=gr8-nvcc-flash-int4,target=/var/cache/gr8-nvcc \
 # it starts from engine-src and does not wait for XGrammar. Its build knobs (GR8_DS_TRUNK_BF16) come from
 # ds41_build_flags.sh, which only this stage copies, so the other engine stages keep their cache.
 FROM engine-src AS engine-ds41
+ARG TARGETARCH
 COPY scripts/ds41_build_flags.sh scripts/ds41_build_flags.sh
-RUN --mount=type=cache,id=gr8-nvcc-ds41,target=/var/cache/gr8-nvcc \
+RUN --mount=type=cache,id=gr8-nvcc-ds41-${TARGETARCH},target=/var/cache/gr8-nvcc \
     touch "$GR8_NVCC_CACHE_DIR/.start" \
  && MODEL=ds41 scripts/build.sh /out/bin \
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
@@ -218,8 +230,9 @@ RUN --mount=type=cache,id=gr8-nvcc-ds41,target=/var/cache/gr8-nvcc \
 
 # Inkling-2-Small: g6m4_ink2 and m4sim_ink2 (MODEL=ink2), TP 1, 4 and 6, without request grammars
 FROM engine-src AS engine-ink2
+ARG TARGETARCH
 ARG GR8_WIDTHS=
-RUN --mount=type=cache,id=gr8-nvcc-ink2,target=/var/cache/gr8-nvcc \
+RUN --mount=type=cache,id=gr8-nvcc-ink2-${TARGETARCH},target=/var/cache/gr8-nvcc \
     touch "$GR8_NVCC_CACHE_DIR/.start" \
  && GR8_WIDTHS="$GR8_WIDTHS" MODEL=ink2 scripts/build.sh /out/bin \
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
@@ -227,8 +240,9 @@ RUN --mount=type=cache,id=gr8-nvcc-ink2,target=/var/cache/gr8-nvcc \
 
 # Qwen3.8-Flash-Next: g6m4_qw38 and m4sim_qw38 (MODEL=qw38), TP 1, 2, 3 and 4, without request grammars
 FROM engine-src AS engine-qw38
+ARG TARGETARCH
 ARG GR8_WIDTHS=
-RUN --mount=type=cache,id=gr8-nvcc-qw38,target=/var/cache/gr8-nvcc \
+RUN --mount=type=cache,id=gr8-nvcc-qw38-${TARGETARCH},target=/var/cache/gr8-nvcc \
     touch "$GR8_NVCC_CACHE_DIR/.start" \
  && GR8_WIDTHS="$GR8_WIDTHS" MODEL=qw38 scripts/build.sh /out/bin \
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
@@ -237,8 +251,9 @@ RUN --mount=type=cache,id=gr8-nvcc-qw38,target=/var/cache/gr8-nvcc \
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
 FROM engine-src-glm AS engine-int4
+ARG TARGETARCH
 ARG GR8_WIDTHS=
-RUN --mount=type=cache,id=gr8-nvcc-int4,target=/var/cache/gr8-nvcc \
+RUN --mount=type=cache,id=gr8-nvcc-int4-${TARGETARCH},target=/var/cache/gr8-nvcc \
     touch "$GR8_NVCC_CACHE_DIR/.start" \
  && GR8_WIDTHS="$GR8_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \

@@ -1,6 +1,7 @@
 #!/bin/bash
-# Build the K1H2 engine (g6m4 = one rank on the real fabric, m4sim = one GPU simulating all NR ranks) on ONE Spark.
-# Needs CUDA 13 (nvcc with sm_121a), g++ with C++20, libibverbs-dev, cuBLAS. A few minutes on a GB10, CPU only.
+# Build the K1H2 engine (g6m4 = one rank on the real fabric, m4sim = one GPU simulating all NR ranks).
+# Needs CUDA 13 (nvcc with sm_121a on GB10 / aarch64 or sm_120a on RTX 50xx / x86_64), g++ with C++20, libibverbs-dev,
+# cuBLAS. ARCH defaults from the host CPU (120a on x86_64, 121a on aarch64); pass ARCH=120a or ARCH=121a to override.
 # One g6m4 and one m4sim run every TP width: g6m4 takes its width from --ips, m4sim from --tp N or --packs DIR. Each
 # width is compiled as its own build was (engine/runtime/build_m4.sh): DEC_S2 (the multi-session path) at every width,
 # and PF_F12 (the fat-CTA prefill fc1) at 4.
@@ -147,6 +148,12 @@ WIDTHS=${GR8_WIDTHS:-${GR8_NR:-$BUILD_WIDTHS}}
 fx=${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=$BUILD_FC2GL}
 [ -z "$BUILD_DEFINE" ] || fx="$fx -D$BUILD_DEFINE=1"
 if [ -n "$BUILD_FLAGS_SCRIPT" ]; then fx="$fx $(bash "$REPO/$BUILD_FLAGS_SCRIPT")"; fi
+if [ -z "${ARCH:-}" ]; then
+  case "${HOSTTYPE:-}" in
+    x86_64|amd64) ARCH=120a ;;
+    *)            ARCH=121a ;;
+  esac
+fi
 case "${KV_FORMAT:-fp8}" in
   fp8) ;;
   int4)
