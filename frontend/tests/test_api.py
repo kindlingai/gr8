@@ -527,6 +527,41 @@ class StepStats(unittest.TestCase):
         self.assertGreaterEqual(st['generated_tokens'], r['usage']['completion_tokens'])
 
 
+class Embeddings(unittest.TestCase):
+    def test_single_and_batch_and_mrl_and_base64(self):
+        import base64
+        import math
+        import struct
+
+        s, r = post('/v1/embeddings', {'model': 'glm-5.3', 'input': 'hello world'})
+        self.assertEqual(s, 200, r)
+        self.assertEqual(r['object'], 'list')
+        self.assertEqual(len(r['data']), 1)
+        vec = r['data'][0]['embedding']
+        self.assertEqual(len(vec), 64)
+        self.assertAlmostEqual(math.sqrt(sum(x * x for x in vec)), 1.0, places=4)
+        self.assertEqual(r['usage']['prompt_tokens'], r['usage']['total_tokens'])
+        self.assertGreater(r['usage']['prompt_tokens'], 0)
+
+        # Batch + MRL dimensions truncation
+        s, b = post('/v1/embeddings', {'model': 'glm-5.3', 'input': ['hello world', 'goodbye'], 'dimensions': 16})
+        self.assertEqual(s, 200, b)
+        self.assertEqual([d['index'] for d in b['data']], [0, 1])
+        self.assertEqual(len(b['data'][0]['embedding']), 16)
+        self.assertEqual(len(b['data'][1]['embedding']), 16)
+
+        # Base64 encoding format decodes to identical float32 bytes
+        s, b64 = post('/v1/embeddings', {'model': 'glm-5.3', 'input': 'hello world', 'encoding_format': 'base64'})
+        self.assertEqual(s, 200, b64)
+        decoded = list(struct.unpack('<64f', base64.b64decode(b64['data'][0]['embedding'])))
+        for x, y in zip(vec, decoded):
+            self.assertAlmostEqual(x, y, places=5)
+
+        # Invalid dimensions rejected with 400
+        self.assertEqual(post('/v1/embeddings', {'model': 'glm-5.3', 'input': 'hi', 'dimensions': 9999})[0], 400)
+        self.assertEqual(post('/v1/embeddings', {'model': 'glm-5.3', 'input': 'hi', 'dimensions': 0})[0], 400)
+
+
 class Misc(unittest.TestCase):
     def test_tokenize_text_count(self):
         s, r = post('/tokenize', {'model': 'glm-5.3', 'prompt': 'hello world'})

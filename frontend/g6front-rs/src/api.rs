@@ -445,6 +445,7 @@ pub async fn route(
             }
         }
         ("/v1/completions", &Method::POST) => completions(st, req).await,
+        ("/v1/embeddings", &Method::POST) => embeddings(st, req).await,
         ("/tokenize", &Method::POST) => tokenize(st, req).await,
         ("/detokenize", &Method::POST) => detokenize(st, req).await,
         ("/v1/models", &Method::GET | &Method::HEAD) => models(st),
@@ -452,7 +453,7 @@ pub async fn route(
         ("/health", &Method::GET | &Method::HEAD) => health(st),
         ("/internal/hold", &Method::GET | &Method::POST) => hold(st, &req, peer),
         ("/metrics", &Method::GET | &Method::HEAD) => metrics_route(st).await,
-        ("/v1/chat/completions" | "/v1/completions" | "/tokenize" | "/detokenize", _) => {
+        ("/v1/chat/completions" | "/v1/completions" | "/v1/embeddings" | "/tokenize" | "/detokenize", _) => {
             let mut r = response(405, "text/plain; charset=utf-8", b"405: Method Not Allowed".to_vec());
             r.headers_mut().insert(header::ALLOW, header::HeaderValue::from_static("POST"));
             r
@@ -1819,6 +1820,232 @@ async fn completions_stream(
     let _ = sse.send(Bytes::from_static(b"data: [DONE]\n\n")).await;
 }
 
+// ---- /v1/embeddings ----------------------------------------------------------------------------------------------
+
+fn parse_token_id_list(a: &[Value], vocab_size: usize) -> Result<Vec<u32>, ApiError> {
+    if a.is_empty() {
+        return Err(ApiError::bad("`input` token id list must not be empty", Some("input")));
+    }
+    let mut ids = Vec::with_capacity(a.len());
+    for v in a {
+        match v.as_i64() {
+            Some(i) if i >= 0 && (i as u64) < vocab_size as u64 => ids.push(i as u32),
+            _ => return Err(ApiError::bad("`input` contains a token id out of vocabulary range", Some("input"))),
+        }
+    }
+    Ok(ids)
+}
+
+async fn embed_inputs(
+    st: &'static State,
+    body: &Map<String, Value>,
+) -> Result<Vec<(Vec<u32>, std::sync::Arc<Vec<crate::vision::Span>>)>, ApiError> {
+    let empty_spans = std::sync::Arc::new(Vec::new());
+    if let Some(inp) = body.get("input") {
+        let add_special = body.get("add_special_tokens").is_none_or(|v| truthy(Some(v)));
+        return match inp {
+            Value::String(s) => {
+                let ids = st.tok.aencode(s.clone(), add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
+                Ok(vec![(ids, empty_spans)])
+            }
+            Value::Array(a) if a.is_empty() => {
+                Err(ApiError::bad("`input` must not be empty", Some("input")))
+            }
+            Value::Array(a) if a.iter().all(Value::is_string) => {
+                let mut out = Vec::with_capacity(a.len());
+                for v in a {
+                    let s = v.as_str().unwrap().to_string();
+                    let ids = st.tok.aencode(s, add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
+                    out.push((ids, empty_spans.clone()));
+                }
+                Ok(out)
+            }
+            Value::Array(a) if a.iter().all(|v| v.is_i64() || v.is_u64()) => {
+                Ok(vec![(parse_token_id_list(a, st.tok.vocab_size)?, empty_spans)])
+            }
+            Value::Array(a) if a.iter().all(Value::is_array) => {
+                let mut out = Vec::with_capacity(a.len());
+                for v in a {
+                    out.push((parse_token_id_list(v.as_array().unwrap(), st.tok.vocab_size)?, empty_spans.clone()));
+                }
+                Ok(out)
+            }
+            _ => Err(ApiError::bad(
+                "`input` must be a string, a non-empty list of strings, a list of token ids, or a list of token id lists",
+                Some("input"),
+            )),
+        };
+    }
+    if let Some(msgs) = body.get("messages") {
+        let agp = body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true));
+        let cfm = body.get("continue_final_message").cloned().unwrap_or(Value::Bool(false));
+        let (text, images) = if st.dialect == Dialect::Ds41 {
+            let (agp_b, cfm_b) = dialect::ds_gen_flags(body)?;
+            dialect::ds_prompt(Some(msgs), None, false, st.ds_effort, agp_b, cfm_b)?
+        } else {
+            let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, None, None)?;
+            if crate::template::has_images(msgs) {
+                st.tpl().render_images(Some(msgs), None, kw)?
+            } else {
+                (st.tpl().render(Some(msgs), None, kw)?, Vec::new())
+            }
+        };
+        let add_special = st.dialect != Dialect::Ds41 && truthy(body.get("add_special_tokens"));
+        let ids = st.tok.aencode(text, add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
+        if images.is_empty() {
+            return Ok(vec![(ids, empty_spans)]);
+        }
+        let model = image_model(st);
+        let (ids, spans, _) = with_images(st, model, &images, &ids).await?;
+        return Ok(vec![(ids, std::sync::Arc::new(spans))]);
+    }
+    Err(ApiError::bad("`input` or `messages` is required", Some("input")))
+}
+
+async fn embeddings(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {
+    let r = async {
+        let body = read_json(req).await?;
+        st.check_model(&body)?;
+        let _admit = st.require_engine().await?;
+        if !st.engine.embeddings() {
+            return Err(ApiError::bad("this engine does not support /v1/embeddings", None));
+        }
+        let as_base64 = match body.get("encoding_format") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(s)) if s == "float" => false,
+            Some(Value::String(s)) if s == "base64" => true,
+            _ => {
+                return Err(ApiError::bad(
+                    "`encoding_format` must be \"float\" or \"base64\"",
+                    Some("encoding_format"),
+                ));
+            }
+        };
+        let dimensions = match body.get("dimensions") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let d = v
+                    .as_u64()
+                    .and_then(|u| usize::try_from(u).ok())
+                    .filter(|&d| d > 0)
+                    .ok_or_else(|| ApiError::bad("`dimensions` must be a positive integer", Some("dimensions")))?;
+                if let Some(max_d) = st.engine.embedding_dim() {
+                    if d > max_d {
+                        return Err(ApiError::bad(
+                            format!("`dimensions` ({d}) exceeds model embedding_dim ({max_d})"),
+                            Some("dimensions"),
+                        ));
+                    }
+                }
+                Some(d)
+            }
+        };
+        let normalize = match body.get("normalize") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            _ => return Err(ApiError::bad("`normalize` must be a boolean", Some("normalize"))),
+        };
+        let items = embed_inputs(st, &body).await?;
+        let max_len = st.max_model_len() as usize;
+        for (ids, _) in &items {
+            if ids.is_empty() {
+                return Err(ApiError::bad("input tokenized to zero tokens", Some("input")));
+            }
+            if max_len > 0 && ids.len() > max_len {
+                return Err(ApiError::bad(
+                    format!("input length {} exceeds max_model_len {max_len}", ids.len()),
+                    Some("input"),
+                ));
+            }
+        }
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(items.len());
+        let mut total_prompt_tokens = 0usize;
+        for (prompt, images) in items {
+            let p = crate::wire::EmbedParams { dimensions, normalize, images };
+            let mut stream = st.engine.embed(new_id("emb"), &prompt, &p).map_err(|e| ApiError::new(503, &e.0, None))?;
+            let mut got: Option<crate::wire::EmbeddingFrame> = None;
+            loop {
+                match stream.next().await {
+                    Some(crate::engine::Msg::Frame(crate::engine::Kind::Embedding, bytes)) => {
+                        let ef: crate::wire::EmbeddingFrame = serde_json::from_slice(&bytes)
+                            .map_err(|e| ApiError::new(500, &format!("bad embedding frame: {e}"), None))?;
+                        got = Some(ef);
+                    }
+                    Some(crate::engine::Msg::Frame(crate::engine::Kind::Finish, bytes)) => {
+                        let fin: crate::wire::Finish = serde_json::from_slice(&bytes)
+                            .map_err(|e| ApiError::new(500, &format!("bad finish frame: {e}"), None))?;
+                        if fin.reason == "error" {
+                            let msg = fin.message.unwrap_or_else(|| "engine error".into());
+                            return Err(ApiError {
+                                status: fin.status.unwrap_or(500),
+                                message: msg,
+                                param: None,
+                                retry_after: fin.retry_after,
+                            });
+                        }
+                        if fin.reason != "stop" {
+                            return Err(ApiError::new(500, &format!("embedding finished with reason {}", fin.reason), None));
+                        }
+                        break;
+                    }
+                    Some(crate::engine::Msg::Frame(_, _)) => {}
+                    Some(crate::engine::Msg::Lost(msg)) => return Err(ApiError::new(500, msg, None)),
+                    None => return Err(ApiError::new(500, "engine stream closed before finish", None)),
+                }
+            }
+            let ef = got.ok_or_else(|| ApiError::new(500, "engine finished without an embedding frame", None))?;
+            total_prompt_tokens += ef.prompt_tokens.unwrap_or(prompt.len());
+            vectors.push(ef.embedding);
+        }
+        Ok((vectors, total_prompt_tokens, as_base64))
+    };
+    let (vectors, total_prompt_tokens, as_base64) = match r.await {
+        Ok(x) => x,
+        Err(e) => return e.response(),
+    };
+    let mut o = Vec::with_capacity(256 + vectors.iter().map(|v| v.len() * 12).sum::<usize>());
+    let mut c = Obj::new(&mut o);
+    c.str("id", &new_id("embd"));
+    c.str("object", "list");
+    {
+        let d = c.key("data");
+        d.push(b'[');
+        for (i, vec) in vectors.iter().enumerate() {
+            if i > 0 {
+                d.push(b',');
+            }
+            let mut item = Obj::new(d);
+            item.int("index", i);
+            item.str("object", "embedding");
+            if as_base64 {
+                let raw: Vec<u8> = vec.iter().flat_map(|x| x.to_le_bytes()).collect();
+                item.str("embedding", &crate::vision::b64_encode(&raw));
+            } else {
+                let emb = item.key("embedding");
+                emb.push(b'[');
+                for (j, &x) in vec.iter().enumerate() {
+                    if j > 0 {
+                        emb.push(b',');
+                    }
+                    pyjson::float(emb, x as f64);
+                }
+                emb.push(b']');
+            }
+            item.end();
+        }
+        d.push(b']');
+    }
+    c.str("model", &st.model_name);
+    {
+        let mut u = Obj::new(c.key("usage"));
+        u.int("prompt_tokens", total_prompt_tokens);
+        u.int("total_tokens", total_prompt_tokens);
+        u.end();
+    }
+    c.end();
+    json_response(200, o)
+}
+
 // ---- /tokenize, /detokenize, /v1/models, /health, /metrics -------------------------------------------------------
 
 async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {
@@ -2731,5 +2958,221 @@ mod http_tokenize_chat_tests {
             eprintln!("LITERAL_GOLDEN {name} ids={} exact", want.len());
         }
         assert_eq!(gens.lock().unwrap().len(), cases.len());
+    }
+
+    async fn fake_embed_engine(enabled: bool, dim: usize) -> (Arc<Engine>, Arc<Mutex<Vec<Value>>>) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::path::PathBuf::from(format!("/tmp/g6f-emb-{}-{n}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let reqs = Arc::new(Mutex::new(Vec::new()));
+        let r2 = reqs.clone();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            let mut hello = json!({"type": "hello", "version": 1, "max_model_len": 1024});
+            if enabled {
+                hello["embeddings"] = json!(true);
+                hello["embedding_dim"] = json!(dim);
+                hello["matryoshka"] = json!(true);
+            }
+            wr.write_all(&frame(hello)).await.unwrap();
+            let mut r = FrameReader::new(rd);
+            while let Ok(Some(f)) = r.next().await {
+                let v: Value = serde_json::from_slice(&f).unwrap();
+                if v["type"] != "embed" {
+                    continue;
+                }
+                r2.lock().unwrap().push(v.clone());
+                let id = v["id"].clone();
+                let prompt = v["prompt"].as_array().unwrap();
+                let d = v.get("dimensions").and_then(Value::as_u64).map_or(dim, |x| x as usize);
+                let norm = v.get("normalize").and_then(Value::as_bool).unwrap_or(true);
+                let mut vec: Vec<f32> = (0..d)
+                    .map(|i| ((i + 1) as f32) * (prompt.len() as f32))
+                    .collect();
+                if norm {
+                    let s: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    for x in &mut vec {
+                        *x /= s;
+                    }
+                }
+                wr.write_all(&frame(json!({"type": "embedding", "id": id, "embedding": vec, "prompt_tokens": prompt.len()})))
+                    .await
+                    .unwrap();
+                wr.write_all(&frame(json!({"type": "finish", "id": id, "reason": "stop", "stop_id": null,
+                                           "prompt_tokens": prompt.len(), "cached_tokens": 0, "completion_tokens": 0})))
+                    .await
+                    .unwrap();
+            }
+        });
+        let engine = Engine::new(path.to_string_lossy().into_owned());
+        engine.start();
+        for _ in 0..500 {
+            if engine.ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(engine.ready(), "fake embed engine did not connect");
+        (engine, reqs)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embeddings_http_endpoint_end_to_end_and_capability_gate() {
+        let tok = crate::tok::prefix_tests::fixture(true);
+        let dir = std::env::temp_dir().join(format!("g6front-emb-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tok.tk.save(dir.join("tokenizer.json"), false).unwrap();
+        let grammars = crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap();
+
+        // 1. Engine WITHOUT embeddings capability returns 400
+        let (eng_off, _) = fake_embed_engine(false, 16).await;
+        let st_off: &'static State = Box::leak(Box::new(State {
+            tok: crate::tok::prefix_tests::fixture(true),
+            template: None,
+            dialect: Dialect::Ds41,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine: eng_off,
+            served: vec!["qwen3-vl-embedding-2b".into()],
+            model_name: "qwen3-vl-embedding-2b".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: false,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars: crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap(),
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+            sessions: None,
+        }));
+        let l_off = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr_off = l_off.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = l_off.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st_off, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+        let (code, err) = post(addr_off, "/v1/embeddings", &json!({"model": "qwen3-vl-embedding-2b", "input": "hello"})).await;
+        assert_eq!(code, 400, "{err}");
+
+        // 2. Engine WITH embeddings capability serves single, batch, token ids, MRL, base64, messages
+        let (eng, reqs) = fake_embed_engine(true, 16).await;
+        let st: &'static State = Box::leak(Box::new(State {
+            tok,
+            template: None,
+            dialect: Dialect::Ds41,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine: eng,
+            served: vec!["qwen3-vl-embedding-2b".into()],
+            model_name: "qwen3-vl-embedding-2b".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: false,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars,
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+            sessions: None,
+        }));
+        let l = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = l.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+
+        let (code, v) = post(addr, "/v1/embeddings", &json!({"model": "qwen3-vl-embedding-2b", "input": "hello"})).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["model"], "qwen3-vl-embedding-2b");
+        let emb: Vec<f64> = v["data"][0]["embedding"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+        assert_eq!(emb.len(), 16);
+        let norm: f64 = emb.iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm={norm}");
+        assert_eq!(v["usage"]["prompt_tokens"], v["usage"]["total_tokens"]);
+
+        // Batch + MRL dimensions
+        let (code, b) = post(
+            addr,
+            "/v1/embeddings",
+            &json!({"model": "qwen3-vl-embedding-2b", "input": ["hello", "world"], "dimensions": 8}),
+        )
+        .await;
+        assert_eq!(code, 200, "{b}");
+        assert_eq!(b["data"].as_array().unwrap().len(), 2);
+        assert_eq!(b["data"][0]["index"], 0);
+        assert_eq!(b["data"][1]["index"], 1);
+        assert_eq!(b["data"][0]["embedding"].as_array().unwrap().len(), 8);
+        assert_eq!(b["data"][1]["embedding"].as_array().unwrap().len(), 8);
+
+        // Base64 encoding_format
+        let (code, b64) = post(
+            addr,
+            "/v1/embeddings",
+            &json!({"model": "qwen3-vl-embedding-2b", "input": "hello", "encoding_format": "base64"}),
+        )
+        .await;
+        assert_eq!(code, 200, "{b64}");
+        let raw = crate::vision::b64_decode(b64["data"][0]["embedding"].as_str().unwrap()).unwrap();
+        assert_eq!(raw.len(), 16 * 4);
+        let dec: Vec<f32> = raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+        for (x, y) in emb.iter().zip(&dec) {
+            assert!((*x - *y as f64).abs() < 1e-6);
+        }
+
+        // Token-id input & messages input
+        let (code, tid) = post(addr, "/v1/embeddings", &json!({"model": "qwen3-vl-embedding-2b", "input": [1, 2, 3]})).await;
+        assert_eq!(code, 200, "{tid}");
+        assert_eq!(tid["usage"]["prompt_tokens"], 3);
+        let (code, msg_r) = post(
+            addr,
+            "/v1/embeddings",
+            &json!({"model": "qwen3-vl-embedding-2b", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(code, 200, "{msg_r}");
+
+        // Validation errors: dimensions > embedding_dim, 0, bad model, empty input
+        assert_eq!(post(addr, "/v1/embeddings", &json!({"model": "qwen3-vl-embedding-2b", "input": "hi", "dimensions": 32})).await.0, 400);
+        assert_eq!(post(addr, "/v1/embeddings", &json!({"model": "qwen3-vl-embedding-2b", "input": "hi", "dimensions": 0})).await.0, 400);
+        assert_eq!(post(addr, "/v1/embeddings", &json!({"model": "nope", "input": "hi"})).await.0, 404);
+        assert_eq!(post(addr, "/v1/embeddings", &json!({"model": "qwen3-vl-embedding-2b", "input": []})).await.0, 400);
+        assert_eq!(reqs.lock().unwrap().len(), 6);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

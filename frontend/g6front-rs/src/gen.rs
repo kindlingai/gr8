@@ -372,6 +372,7 @@ impl Generation {
                         ..Default::default()
                     }));
                 }
+                Kind::Embedding => {}
             }
         }
     }

@@ -34,7 +34,7 @@ Every message in both directions is one frame:
 The front end refuses to serve if `version` != 1. `max_model_len` bounds prompt + max_tokens. `max_logprobs` is
 the largest k the engine accepts for `logprobs` and `prompt_logprobs`. `"insert": true` (absent = false) says the
 engine applies `generate`'s `insert` rule. `"grammar": true` (absent = false) says it masks a reply with `generate`'s
-`grammar`. `"vision": true` (absent = false) says it takes `generate`'s `images` (DeepSeek-V4.1 or GLM-5.3-Flash with its vision tower). `"penalties": true` (absent = false) says it applies `generate`'s `presence_penalty` and `frequency_penalty`, `"think_end_boost": true` its `think_end_boost`, `"sequence_penalty": true` its `sequence_penalty`.
+`grammar`. `"vision": true` (absent = false) says it takes `generate`'s `images` (DeepSeek-V4.1 or GLM-5.3-Flash with its vision tower). `"penalties": true` (absent = false) says it applies `generate`'s `presence_penalty` and `frequency_penalty`, `"think_end_boost": true` its `think_end_boost`, `"sequence_penalty": true` its `sequence_penalty`. `"embeddings": true` (absent = false) says the engine accepts `embed` frames and replies with `embedding` frames (optionally advertising `"embedding_dim": D`, its native output dimension, and `"matryoshka": true` when `embed`'s `dimensions` truncation is supported).
 
 An optional `steering` object advertises a loaded profile: `profile` (name), `digest` (64 lowercase hex
 manifest SHA-256), `scope` (`shared` or `full`), `layers` (positive active-layer count), `forced` (boolean),
@@ -88,6 +88,25 @@ Speculative decoding is invisible here: the engine may emit several accepted tok
 must never emit a token it later retracts. An insert is the same: the engine decides it from the tokens it commits, so
 tokens it sampled past the insert are never sent.
 
+### `embed`
+
+Only sent to an engine whose `hello` says `"embeddings": true`.
+
+```json
+{"type": "embed", "id": "emb-3f2a...",
+ "prompt": [151644, 8948, 198, 25062],
+ "dimensions": 1536, "normalize": true}
+```
+
+| field | meaning |
+|---|---|
+| `prompt` | prompt token ids, already tokenized (and chat-templated when `messages` was sent); non-empty, length <= `max_model_len` |
+| `dimensions` | optional positive integer (omitted when null): Matryoshka (MRL) output truncation dimension `1..=embedding_dim`. The engine truncates the pooled vector to its first `dimensions` components (before L2 normalization when `normalize` is true) |
+| `normalize` | optional boolean (default `true`): L2-normalize the returned embedding vector |
+| `images` | optional, only to an engine whose `hello` says both `"embeddings": true` and `"vision": true`; absent when the prompt has no image. Same schema as `generate`'s `images` |
+
+An `embed` request may be cancelled with `cancel` and ends with either an `embedding` frame followed by `finish` (`reason: "stop"`, `completion_tokens: 0`), or directly with `finish` (`reason: "error"`, `message`, optional `status` / `retry_after`).
+
 ### `cancel`
 
 ```json
@@ -139,6 +158,19 @@ entry 0 is `null`. Entry j describes `prompt[j]`, same fields as a `tokens` logp
 the `top` list always carries ranks 1..k by its order).
 Prefix-cache hits must not drop positions: if the engine cannot produce prompt logprobs for cached positions it
 must recompute them (or not use the cache for this request).
+
+### `embedding`
+
+```json
+{"type": "embedding", "id": "emb-3f2a...",
+ "embedding": [0.0123, -0.0456, 0.0789],
+ "prompt_tokens": 4}
+```
+
+Sent once in response to an `embed` frame, before its `finish` frame (`reason: "stop"`, `completion_tokens: 0`).
+
+- `embedding`: finite float32 values in order (length = `dimensions` if requested, else the model's native `embedding_dim`), pooled according to the loaded model's rule (e.g. last non-pad token for Qwen3-VL-Embedding, mean pooling for EmbeddingGemma 2) and L2-normalized when `normalize` is true.
+- `prompt_tokens`: `len(prompt)`.
 
 ### `finish`
 
@@ -220,3 +252,6 @@ The front end maps these to vLLM's Prometheus names on `/metrics` (see frontend/
   leaves the hello key out and the front end sends no `grammar`.
 - v1 (2026-11-04): `generate` `images` and hello `vision`, the same way: an engine without the vision tower leaves the
   hello key out and the front end refuses a request with images (400).
+- v1 (2026-11-26): `embed` request, `embedding` response, and hello `embeddings` (with optional `embedding_dim` and
+  `matryoshka`). An engine without dense embedding support leaves `embeddings` out of `hello`, and the front end
+  refuses `/v1/embeddings` requests (400), so the protocol version stays 1.
