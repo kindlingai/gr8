@@ -6,7 +6,7 @@
 #   docker buildx build --platform linux/arm64 --target dist -o type=local,dest=out .
 #                                                                              only the binaries, into out/bin
 #
-# GR8_ARCH overrides the CUDA SM target (empty defaults to 121a on arm64 and 120a on amd64 via scripts/build.sh).
+# CUDA_ARCH overrides the CUDA SM target (empty defaults to 121a on arm64 and 120a on amd64 via scripts/build.sh).
 # Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader), kvman (the host Rust: page allocator,
 # scheduler, planner), knobs and front (the Rust front end) -> rust-dist -> engine, engine-int4, engine-flash,
 # engine-flash-int4, engine-ds41, engine-ink2, engine-qw38 and engine-tests-ship -> dist (the binaries only)
@@ -142,9 +142,9 @@ COPY scripts/build.sh scripts/build.sh
 COPY --from=rust-dist /lib/libg6load.a engine/loader-rs/target/release/libg6load.a
 COPY --from=rust-dist /lib/libg6host.a engine/target/release/libg6host.a
 COPY --from=rust-dist /lib/libgr8knobs.a engine/knobs-rs/target/release/libgr8knobs.a
-# Default CUDA SM target comes from scripts/build.sh (121a on arm64, 120a on amd64); GR8_ARCH overrides it.
-ARG GR8_ARCH=
-ENV ARCH=${GR8_ARCH}
+# Default CUDA SM target comes from scripts/build.sh (121a on arm64, 120a on amd64); CUDA_ARCH overrides it.
+ARG CUDA_ARCH=
+ENV ARCH=${CUDA_ARCH}
 
 # the GLM and Flash engine stages add XGrammar (and grammar_test.cc run by build_m4.sh); the tests build without it
 FROM engine-src AS engine-src-glm

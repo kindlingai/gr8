@@ -97,8 +97,9 @@ class RegistryTests(unittest.TestCase):
         docker = (ROOT/'Dockerfile').read_text()
         for name in models.image_binaries():
             self.assertIn('/'+name, docker)
-        self.assertIn('ARG GR8_ARCH=', docker)
-        self.assertIn('ENV ARCH=${GR8_ARCH}', docker)
+        self.assertIn('ARG CUDA_ARCH=', docker)
+        self.assertIn('ENV ARCH=${CUDA_ARCH}', docker)
+        self.assertNotIn('GR8_ARCH', docker)
         self.assertIn('id=gr8-nvcc-qw38-${TARGETARCH}', docker)
         self.assertIn('id=gr8-nvcc-ink2-${TARGETARCH}', docker)
         for name in models.MODELS:

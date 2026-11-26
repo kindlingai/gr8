@@ -666,7 +666,7 @@ jobs:
           platforms: linux/amd64
           build-contexts: rust-dist=${{ runner.temp }}/rust-dist
           build-args: |
-            GR8_ARCH=120a
+            CUDA_ARCH=120a
             GR8_WIDTHS=${{ steps.w.outputs.widths }}
           outputs: type=local,dest=dist
           cache-from: ${{ steps.nvcc.outputs.cache_from }}
