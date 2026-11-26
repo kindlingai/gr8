@@ -9,6 +9,7 @@
 
 #include "embed_config.h"
 #include "embed_proto.h"
+#include "embed_text.cuh"
 #include "embed_weights.h"
 
 namespace {
@@ -120,22 +121,20 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "g6embed: failed to bind Unix socket %s\n", opts.socket_path.c_str());
             return 1;
         }
-        std::fprintf(stderr, "g6embed: listening on %s (model=%s, dim=%d, vision=%d)\n",
+        g6emb::TextRunner text_runner;
+        text_runner.init(weights, opts.max_batched_tokens);
+
+        cudaStream_t stream = nullptr;
+        EMB_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+        std::fprintf(stderr, "g6embed: text workspace %.1f MiB; listening on %s (model=%s, dim=%d, vision=%d)\n",
+                     double(text_runner.workspace_bytes()) / (1024.0 * 1024.0),
                      opts.socket_path.c_str(), weights.cfg.model_name.c_str(),
                      weights.cfg.embedding_dim, weights.cfg.has_vision ? 1 : 0);
 
         g6emb::EmbedMetrics metrics;
         auto runner = [&](const std::vector<g6emb::EmbedRequest>& batch) -> std::vector<g6emb::EmbedOutput> {
-            std::vector<g6emb::EmbedOutput> outs;
-            outs.reserve(batch.size());
-            for (const auto& r : batch) {
-                g6emb::EmbedOutput o;
-                o.id = r.id;
-                o.prompt_tokens = static_cast<int>(r.prompt.size());
-                o.error = "forward pass not yet attached";
-                outs.push_back(std::move(o));
-            }
-            return outs;
+            return text_runner.forward_batch(batch, nullptr, stream);
         };
 
         while (!g_stop) {
@@ -147,6 +146,7 @@ int main(int argc, char** argv) {
             g6emb::serve_connection(cfd, weights.cfg, opts.max_batched_tokens, metrics, runner);
             ::close(cfd);
         }
+        cudaStreamDestroy(stream);
         ::close(lfd);
         ::unlink(opts.socket_path.c_str());
         return 0;
