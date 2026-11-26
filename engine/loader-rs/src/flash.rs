@@ -210,6 +210,32 @@ fn quant_layer(p: &mut Planner, l: usize, f: Arc<StFile>) -> Result<(), String> 
                 }
                 p.trellis(l, name, &format!("L{l:03}"), &m, &[ch])?;
             },
+            INT8 => {
+                let (rows, cols) = match name {
+                    "q_b" => (vec![h0 * 256..(h0 + nh) * 256], vec![0..m.rec.inp]),
+                    "self_attn.q_proj.weight" | "self_attn.k_proj.weight" | "self_attn.v_proj.weight" =>
+                        (vec![h0 * 128..(h0 + nh) * 128], vec![0..m.rec.inp]),
+                    "o_proj" => {
+                        let head = m.rec.inp / 64;
+                        if ![128, 256].contains(&head) || m.rec.inp % 64 != 0 { return Err("invalid Flash o_proj head geometry".into()); }
+                        (vec![0..m.rec.out], vec![h0 * head..(h0 + nh) * head])
+                    }
+                    "dense.gate" | "dense.up" => {
+                        let (d0, nd) = p.chunk(Group::Dense(l))?;
+                        (vec![d0 * 128..(d0 + nd) * 128], vec![0..m.rec.inp])
+                    }
+                    "dense.down" => {
+                        let (d0, nd) = p.chunk(Group::Dense(l))?;
+                        (vec![0..m.rec.out], vec![d0 * 128..(d0 + nd) * 128])
+                    }
+                    "self_attn.b_proj.weight" | "self_attn.f_b_proj.weight" | "self_attn.g_b_proj.weight" => {
+                        kda_bf16(p, l, label, &f, &local, name)?;
+                        continue;
+                    }
+                    _ => (vec![0..m.rec.out], vec![0..m.rec.inp]),
+                };
+                p.int8_mat(l, "Flash int8 gG", &label, &f, &local, rows, cols)?;
+            }
             MXFP8 if KDA_BF16.contains(&name) => kda_bf16(p, l, label, &f, &local, name)?,
             MXFP8 => p.mxfp8(l, "Flash MXFP8", &label, &f, &local, false)?,
             FP8_BLOCK if hf == "self_attn.kv_b_proj.weight" => {
@@ -243,17 +269,45 @@ fn quant_globals(p: &mut Planner, f: Arc<StFile>) -> Result<(), String> {
         if !seen.insert(name) { return Err(format!("duplicate vocabulary tensor {name}")); }
         if name == "G.final_norm" { copied(p, &f, &local, name.into(), &shape)?; continue; }
         let m = Matrix::open(&f, &local)?;
-        if m.rec.fmt != exlr8::FP8_ROW || shape != [VOCAB,4096] { return Err(format!("{local}: expected Flash FP8-row vocabulary")); }
+        if ![exlr8::FP8_ROW, INT8].contains(&m.rec.fmt) || shape != [VOCAB, 4096] {
+            return Err(format!("{local}: expected Flash FP8-row or int8 gG vocabulary"));
+        }
         let src = f.clone();
         if name == "G.embed" {
+            let fmt = m.rec.fmt;
             let mut stripes: Vec<(u64, Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>)> = Vec::new();
             for a in (0..VOCAB).step_by(4096) {
                 let r = a..(a + 4096).min(VOCAB);
                 let span = (r.len() * 4096 * 2) as u64;
                 let (s2, loc) = (src.clone(), local.clone());
-                stripes.push((span, Box::new(move || Matrix::open(&s2, &loc)?.fp8_row_bf16_le(&r))));
+                stripes.push((span, Box::new(move || {
+                    let mx = Matrix::open(&s2, &loc)?;
+                    if fmt == exlr8::FP8_ROW {
+                        mx.fp8_row_bf16_le(&r)
+                    } else {
+                        Ok(le16(&bf16v(&mx.decode(r.clone(), 0..4096)?)))
+                    }
+                })));
             }
             p.gen_striped(name, name.into(), "bf16", vec![VOCAB as i64, 4096], stripes);
+        } else if m.rec.fmt == INT8 {
+            let (t0, nt) = p.chunk(Group::Vocab)?;
+            let rows = t0 * 128..(t0 + nt) * 128;
+            let n = rows.len();
+            let g = m.rec.k;
+            let gr = records::int8_record_bytes(g);
+            let mut stripes: Vec<(u64, Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>)> = Vec::new();
+            for a in (rows.start..rows.end).step_by(8192) {
+                let r = a..(a + 8192).min(rows.end);
+                let span = ((r.len() / 16) * (4096 / g) * gr) as u64;
+                let (s2, loc) = (src.clone(), local.clone());
+                stripes.push((span, Box::new(move || {
+                    let (q, s) = Matrix::open(&s2, &loc)?.int8(&r, &(0..4096))?;
+                    Ok(records::int8_record(&q, &s, 4096, g))
+                })));
+            }
+            p.note(L_MTP + 1, Form { what: "lm_head", src: fmt_name(&m), form: "int8 gG decode+prefill record", exact: EXACT });
+            p.gen_striped(name, "G.lm_head.i8.gv".into(), "u8", vec![(n / 16) as i64, (4096 / g) as i64, gr as i64], stripes);
         } else {
             let (t0, nt) = p.chunk(Group::Vocab)?;
             let rows = t0 * 128..(t0 + nt) * 128;

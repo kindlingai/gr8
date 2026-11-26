@@ -20,7 +20,7 @@
 //! channels rotate by layer, vocab rows do not. A rank's heads and dense blocks need not be contiguous: each tensor
 //! holds them in ascending order.
 
-use crate::exlr8::{self, bf16_bits, Matrix, StFile, FP8_BLOCK, INT4, MXFP8, TRELLIS};
+use crate::exlr8::{self, bf16_bits, Matrix, StFile, FP8_BLOCK, INT4, INT8, MXFP8, TRELLIS};
 use crate::json::Json;
 use crate::layout::{Group, Layout, Model};
 use crate::plan::{Gen, Op, Plan};
@@ -94,6 +94,17 @@ fn int4_runs(m: &Matrix, rows: &[Range<usize>], cols: &[Range<usize>]) -> Result
     Ok((cat_rows(q), cat_rows(s)))
 }
 
+/// Matrix::int8 over runs of rows and columns, as int4_runs.
+fn int8_runs(m: &Matrix, rows: &[Range<usize>], cols: &[Range<usize>]) -> Result<(Vec<i8>, Vec<u16>), String> {
+    let (mut q, mut s) = (Vec::new(), Vec::new());
+    for r in rows {
+        let (qs, ss): (Vec<_>, Vec<_>) = cols.iter().map(|c| m.int8(r, c)).collect::<Result<Vec<_>, _>>()?.into_iter().unzip();
+        q.push(cat_cols(qs, r.len()));
+        s.push(cat_cols(ss, r.len()));
+    }
+    Ok((cat_rows(q), cat_rows(s)))
+}
+
 fn le16(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -142,8 +153,10 @@ fn fmt_name(m: &Matrix) -> String {
     match m.rec.fmt {
         TRELLIS => format!("trellis K{}", m.rec.k),
         INT4 => "int4 g32".into(),
+        INT8 => format!("int8 g{}", m.rec.k),
         MXFP8 => "MXFP8".into(),
         FP8_BLOCK => "FP8 block".into(),
+        exlr8::FP8_B32 => "FP8 b32".into(),
         exlr8::FP8_ROW => "FP8 row".into(),
         exlr8::BF16 => "BF16".into(),
         _ => "FP32".into(),
@@ -262,11 +275,39 @@ impl Planner<'_> {
         self.copy(name, dtype, i.shape.iter().map(|&d| d as i64).collect(), f, t, 0)
     }
 
+    /// A native `int8 gG` matrix (EXACT q8 * s8, single shared `[O/16][K/G][GR]` decode+prefill record, zero MXFP8
+    /// re-quantization).
+    #[allow(clippy::too_many_arguments)]
+    fn int8_mat(&mut self, l: usize, what: &'static str, p: &str, f: &Arc<StFile>, m: &str,
+                rows: Vec<Range<usize>>, cols: Vec<Range<usize>>) -> Result<(), String> {
+        let mx = Matrix::open(f, m)?;
+        if mx.rec.fmt != INT8 {
+            return Err(format!("{}: {m} is {}, expected int8 gG", f.path, fmt_name(&mx)));
+        }
+        let (o, k, g) = (total(&rows), total(&cols), mx.rec.k);
+        if !o.is_multiple_of(16) || !k.is_multiple_of(g) {
+            return Err(format!("{}: {m} int8 g{g} slice [{o}, {k}] is not aligned to [16, {g}]", f.path));
+        }
+        let gr = records::int8_record_bytes(g) as i64;
+        let (f2, m2) = (f.clone(), m.to_string());
+        self.gen(format!("{p}.i8.gv"), vec![(format!("{p}.i8.gv"), "u8", vec![(o / 16) as i64, (k / g) as i64, gr])], move || {
+            let mx = Matrix::open(&f2, &m2)?;
+            let (q, s) = int8_runs(&mx, &rows, &cols)?;
+            Ok(vec![records::int8_record(&q, &s, k, g)])
+        });
+        self.note(l, Form { what, src: fmt_name(&mx), form: "int8 gG decode+prefill record", exact: EXACT });
+        Ok(())
+    }
+
     /// An MXFP8 matrix as stored (all rows): codes + scales copied (unless `decode_only`), and the decode record.
+    /// If the release stores this matrix as `int8 gG`, emits the exact native `.i8.gv` record instead (no MXFP8 rounding).
     fn mxfp8(&mut self, l: usize, what: &'static str, p: &str, f: &Arc<StFile>, m: &str, decode_only: bool) -> Result<(), String> {
         let mx = Matrix::open(f, m)?;
+        if mx.rec.fmt == INT8 {
+            return self.int8_mat(l, what, p, f, m, vec![0..mx.rec.out], vec![0..mx.rec.inp]);
+        }
         if mx.rec.fmt != MXFP8 {
-            return Err(format!("{}: {m} is {}, gr8 reads it as MXFP8", f.path, fmt_name(&mx)));
+            return Err(format!("{}: {m} is {}, gr8 reads it as MXFP8 or int8 gG", f.path, fmt_name(&mx)));
         }
         let (o, k) = (mx.rec.out, mx.rec.inp);
         if !decode_only {
@@ -292,14 +333,15 @@ impl Planner<'_> {
                 self.copy(p.to_string(), "bf16", vec![o as i64, k as i64], f, &format!("{m}.bf16"), 0)?;
                 self.note(l, Form { what, src: "BF16".into(), form: "BF16 + decode record", exact: EXACT });
             }
-            MXFP8 => {
+            MXFP8 | INT8 => {
                 let (f2, m2) = (f.clone(), m.to_string());
                 let t = self.threads;
                 self.gen(p.to_string(), vec![(p.to_string(), "bf16", vec![o as i64, k as i64])], move || {
                     let w = exlr8::decode_par(&Matrix::open(&f2, &m2)?, 0..o, 0..k, t)?;
                     Ok(vec![le16(&bf16v(&w))])
                 });
-                self.note(l, Form { what, src: "MXFP8".into(), form: "BF16 + decode record", exact: EXACT });
+                self.note(l, Form { what, src: fmt_name(&mx), form: "BF16 + decode record",
+                                    exact: if mx.rec.fmt == MXFP8 { EXACT } else { BF16_OF } });
             }
             _ => return Err(format!("{}: {m} is {}, gr8 reads it as BF16", f.path, fmt_name(&mx))),
         }
@@ -331,6 +373,8 @@ impl Planner<'_> {
         let rows = runs(&heads, 256);
         if qb.rec.fmt == TRELLIS && self.trellis {
             self.trellis(l, "q_b", &p, &qb, &rows)?;
+        } else if qb.rec.fmt == INT8 {
+            self.int8_mat(l, "q_b", &format!("{p}.q_b"), &f, "self_attn.q_b_proj", rows.clone(), vec![0..qb.rec.inp])?;
         } else {
             self.q_b_rounded(l, &p, &f, &qb, rows.clone());
         }
@@ -368,6 +412,8 @@ impl Planner<'_> {
         let cols = rows;
         if op.rec.fmt == TRELLIS && self.trellis {
             self.trellis(l, "o_proj", &p, &op, &cols)?;
+        } else if op.rec.fmt == INT8 {
+            self.int8_mat(l, "o_proj", &format!("{p}.o_proj"), &f, "self_attn.o_proj", vec![0..H], cols)?;
         } else {
             self.o_proj_rounded(l, &p, &f, &op, cols);
         }
@@ -389,6 +435,12 @@ impl Planner<'_> {
             for (n, m) in [("dense.gate", "mlp.gate_proj"), ("dense.up", "mlp.up_proj"), ("dense.down", "mlp.down_proj")] {
                 self.trellis(l, n, &p, &Matrix::open(&f, m)?, &ch)?;
             }
+        } else if ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"].iter()
+            .all(|m| Matrix::open(&f, m).is_ok_and(|x| x.rec.fmt == INT8)) {
+            let ch = runs(&self.layout.held(Group::Dense(l), self.rank)?, 128);
+            self.int8_mat(l, "dense MLP", &format!("{p}.dense.gate"), &f, "mlp.gate_proj", ch.clone(), vec![0..H])?;
+            self.int8_mat(l, "dense MLP", &format!("{p}.dense.up"), &f, "mlp.up_proj", ch.clone(), vec![0..H])?;
+            self.int8_mat(l, "dense MLP", &format!("{p}.dense.down"), &f, "mlp.down_proj", vec![0..H], ch)?;
         } else {
             self.dense_mlp(l, &p, &f)?;
         }
@@ -736,17 +788,21 @@ impl Planner<'_> {
         }
         self.vector("G.final_norm".into(), &f, "norm.weight")?;
         let lm = Matrix::open(&f, "lm_head")?;
-        self.note(L_MTP + 1, Form { what: "lm_head", src: fmt_name(&lm), form: "MXFP8 decode record", exact: ROUNDED });
         // contiguous: Layout::check holds vocab tiles to the formula
         let tiles = self.layout.held(Group::Vocab, self.rank)?;
         let rows = tiles[0] * 128..(tiles[tiles.len() - 1] + 1) * 128;
         let n = rows.len();
-        let f2 = f.clone();
-        self.gen("G.lm_head".into(), vec![("G.lm_head.mx.gv".into(), "u8", vec![(n / 16) as i64, (H / 32) as i64, 528])], move || {
-            let w = exlr8::decode_par(&Matrix::open(&f2, "lm_head")?, rows.clone(), 0..H, t)?;
-            let (c, s) = records::mxfp8_quantize(&w, H);
-            Ok(vec![records::mxfp8_record(&c, &s, H)])
-        });
+        if lm.rec.fmt == INT8 {
+            self.int8_mat(L_MTP + 1, "lm_head", "G.lm_head", &f, "lm_head", vec![rows], vec![0..H])?;
+        } else {
+            self.note(L_MTP + 1, Form { what: "lm_head", src: fmt_name(&lm), form: "MXFP8 decode record", exact: ROUNDED });
+            let f2 = f.clone();
+            self.gen("G.lm_head".into(), vec![("G.lm_head.mx.gv".into(), "u8", vec![(n / 16) as i64, (H / 32) as i64, 528])], move || {
+                let w = exlr8::decode_par(&Matrix::open(&f2, "lm_head")?, rows.clone(), 0..H, t)?;
+                let (c, s) = records::mxfp8_quantize(&w, H);
+                Ok(vec![records::mxfp8_record(&c, &s, H)])
+            });
+        }
         Ok(())
     }
 

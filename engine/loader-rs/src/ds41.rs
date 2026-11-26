@@ -316,7 +316,8 @@ impl Release {
         if f.info(&format!("{x}.record")).is_err() {
             return Ok(None);
         }
-        Ok(Some((f, x.clone(), i64s(f, &format!("{x}.record"))?)))
+        let rec = exlr8::matrix_record(f, &x)?;
+        Ok(Some((f, x, vec![rec.fmt, rec.out as i64, rec.inp as i64, rec.k as i64, rec.side, rec.unit as i64, rec.rotation, rec.solve])))
     }
 
     /// Is `native` a matrix record (`X` for `X.weight`) or a plain tensor of the release?
