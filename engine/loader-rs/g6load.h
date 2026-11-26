@@ -82,4 +82,39 @@ int g6l_delta_halves(const void* delta, uint32_t layer, uint32_t expert,
                      uint8_t* added, uint32_t* n_added,
                      uint8_t* dropped, uint32_t* n_dropped, char* err, size_t errlen);
 void g6l_delta_free(void* delta);
+
+// Multi-group exlr8 dense embedding release loader (src/embed_plan.rs, used by g6embed).
+struct g6l_embed_comp
+{
+    const char* suffix;
+    const char* dtype;
+    uint64_t nbytes;
+    uint32_t ndim;
+    uint64_t shape[6];
+};
+
+struct g6l_embed_item
+{
+    const char* hf_name;
+    const char* dtype;
+    int is_matrix;
+    int fmt;       // 1=TRELLIS, 2=INT4, 3=MXFP8, 4=FP8_BLOCK, 5=FP8_ROW, 6=BF16, 7=FP32, 0=raw
+    int side;      // 0=REPLICATED, 1=OUT, 2=IN
+    int k;         // trellis width (4)
+    int unit;
+    uint32_t ndim;
+    uint64_t shape[6];
+    uint32_t ncomp;
+    g6l_embed_comp comps[3];
+};
+
+void* g6l_embed_open(const char* release_dir, int verify_checksums, char* err, size_t errlen);
+const char* g6l_embed_profile(const void* h);
+size_t g6l_embed_item_count(const void* h);
+int g6l_embed_item_info(const void* h, size_t idx, g6l_embed_item* out);
+int g6l_embed_read_component(const void* h, size_t idx, size_t comp, void* dst, size_t dst_bytes,
+                             char* err, size_t errlen);
+int g6l_embed_decode_bf16(const void* h, size_t idx, void* dst, size_t dst_bytes, uint32_t threads,
+                          char* err, size_t errlen);
+void g6l_embed_close(void* h);
 }
