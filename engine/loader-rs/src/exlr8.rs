@@ -56,20 +56,31 @@ pub fn data_tensors(fmt: i64) -> &'static [&'static str] {
 
 /// The dense file of layer `l`, or the vocabulary file (`l` = None), under `dir/dense/` or `dir/`.
 pub fn dense_path(dir: &str, l: Option<usize>) -> String {
-    group_dense_path(dir, None, l)
+    group_dense_path(dir, None, l).expect("dense_path with group=None cannot fail validation")
+}
+
+/// Validates a multi-group dense group name for safe filename construction (ASCII `[A-Za-z0-9_-]+`).
+pub fn validate_group_name(group: &str) -> Result<(), String> {
+    if group.is_empty() || !group.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        return Err(format!("invalid exlr8 dense group name {group:?}"));
+    }
+    Ok(())
 }
 
 /// The dense file of `(group, layer)`, or the vocabulary file (`layer` = None), under `dir/dense/` or `dir/`.
 /// When `group` is `Some(g)` (multi-group dense profiles such as `embedding_gemma2` or `qwen3_vl`), selects
 /// `exlr8-dense-<g>-<L:03>.safetensors`; when `None`, selects `exlr8-dense-<L:03>.safetensors`.
-pub fn group_dense_path(dir: &str, group: Option<&str>, layer: Option<usize>) -> String {
+pub fn group_dense_path(dir: &str, group: Option<&str>, layer: Option<usize>) -> Result<String, String> {
+    if let Some(g) = group {
+        validate_group_name(g)?;
+    }
     let name = match (group, layer) {
         (_, None) => "exlr8-vocab.safetensors".to_string(),
         (None, Some(l)) => format!("exlr8-dense-{l:03}.safetensors"),
         (Some(g), Some(l)) => format!("exlr8-dense-{g}-{l:03}.safetensors"),
     };
     let nested = format!("{dir}/dense/{name}");
-    if Path::new(&nested).exists() { nested } else { format!("{dir}/{name}") }
+    Ok(if Path::new(&nested).exists() { nested } else { format!("{dir}/{name}") })
 }
 
 /// Known exlr8 dense model profiles (`model_profile` safetensors metadata).
@@ -146,6 +157,9 @@ impl DenseProfile {
 /// Maps a stored matrix base name or non-matrix tensor name inside an exlr8 dense/vocab file to its HF checkpoint key.
 /// Honors explicit `hf_names` / `hf_prefix` / `tensor_prefix` metadata when present, falling back to `profile` rules
 /// (which remain intact even after `strip_meta.py`).
+///
+/// For vocabulary files, when `hf_names` metadata is present it replaces the profile's default vocab table completely
+/// (unmapped keys stay literal, matching `exlr8/loader/exlr8.py:_vocab_names`).
 pub fn hf_tensor_name(
     profile: DenseProfile,
     group: Option<&str>,
@@ -158,17 +172,23 @@ pub fn hf_tensor_name(
     if is_vocab {
         if let Some(raw) = meta.get("hf_names") {
             let parsed = match raw {
-                Json::Str(s) => Some(json::parse(s)?),
-                Json::Obj(_) => Some(raw.clone()),
-                _ => None,
+                Json::Str(s) => json::parse(s)?,
+                Json::Obj(_) => raw.clone(),
+                _ => return Err("hf_names metadata must be a JSON object or JSON-encoded object string".into()),
             };
-            if let Some(mapped) = parsed.as_ref().and_then(|o| o.get(stored)).and_then(Json::str) {
-                return Ok(if is_matrix && !mapped.ends_with(".weight") {
-                    format!("{mapped}.weight")
-                } else {
-                    mapped.to_string()
-                });
+            if parsed.obj().is_none() {
+                return Err("hf_names metadata must decode to a JSON object".into());
             }
+            let mapped = match parsed.get(stored) {
+                Some(Json::Str(s)) => s.as_str(),
+                Some(_) => return Err(format!("hf_names entry for {stored:?} must be a string")),
+                None => stored,
+            };
+            return Ok(if is_matrix && !mapped.ends_with(".weight") {
+                format!("{mapped}.weight")
+            } else {
+                mapped.to_string()
+            });
         }
         return Ok(profile.vocab_hf_name(stored, is_matrix));
     }
@@ -196,13 +216,46 @@ pub fn parse_dense_filename(name: &str) -> Option<(Option<String>, Option<usize>
     }
     let stem = name.strip_prefix("exlr8-dense-")?.strip_suffix(".safetensors")?;
     if !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()) {
-        return Some((None, stem.parse::<usize>().ok(), false));
+        return Some((None, Some(stem.parse::<usize>().ok()?), false));
     }
     let (grp, num) = stem.rsplit_once('-')?;
     if grp.is_empty() || num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some((Some(grp.to_string()), num.parse::<usize>().ok(), false))
+    Some((Some(grp.to_string()), Some(num.parse::<usize>().ok()?), false))
+}
+
+fn is_width_suffix(w: &str) -> bool {
+    let Some(rest) = w.strip_prefix('k') else { return false };
+    let digits = rest.strip_suffix("p5").unwrap_or(rest);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Rejects unsupported exlr8-v4 dense features (non-v2 `format`, `__metadata__.matrices`, multi-width `.kK.record`
+/// tensors, or non-MCG `.trellis.<cb>` tensors) so v4 files fail closed instead of silently mis-decoding.
+pub fn check_v2_file(f: &StFile) -> Result<(), String> {
+    if let Some(fmt) = f.meta.get("format").and_then(Json::str) {
+        if fmt != "exlr8-v2" {
+            return Err(format!("{}: unsupported exlr8 format {fmt:?} (only \"exlr8-v2\" is supported)", f.path));
+        }
+    }
+    if f.meta.get("matrices").is_some() {
+        return Err(format!("{}: exlr8-v4 __metadata__.matrices is not supported by the v2 dense loader", f.path));
+    }
+    let names: HashSet<&str> = f.names().iter().map(String::as_str).collect();
+    for &n in &names {
+        if let Some(base) = n.strip_suffix(".record") {
+            if let Some((m, w)) = base.rsplit_once('.') {
+                if !m.is_empty() && is_width_suffix(w) && !names.contains(format!("{m}.record").as_str()) {
+                    return Err(format!("{}: multi-width exlr8-v4 matrix {base:?} is not supported", f.path));
+                }
+            }
+        }
+        if n.contains(".trellis.") {
+            return Err(format!("{}: non-MCG exlr8-v4 trellis tensor {n:?} is not supported", f.path));
+        }
+    }
+    Ok(())
 }
 
 /// One discovered dense or vocabulary file in an exlr8 release directory.
@@ -231,29 +284,44 @@ pub struct DenseRelease {
     pub files: Vec<DenseFileEntry>,
 }
 
+fn scan_dense_dir(dir: &str) -> Result<Vec<(String, Option<String>, Option<usize>, bool)>, String> {
+    let mut out = Vec::new();
+    for ent in std::fs::read_dir(dir).map_err(|e| format!("cannot read {dir}: {e}"))? {
+        let ent = ent.map_err(|e| format!("cannot read entry in {dir}: {e}"))?;
+        let fname = ent.file_name();
+        let Some(s) = fname.to_str() else { continue };
+        let Some((grp, layer, is_vocab)) = parse_dense_filename(s) else { continue };
+        let path = ent.path().to_string_lossy().into_owned();
+        out.push((path, grp, layer, is_vocab));
+    }
+    Ok(out)
+}
+
 impl DenseRelease {
-    /// Discovers all `exlr8-dense-*.safetensors` and `exlr8-vocab.safetensors` files under `dir/dense/` (if present
-    /// and populated) or `dir/`, reading `model_profile`, `group`, and `layer` metadata from each file header.
+    /// Discovers all `exlr8-dense-*.safetensors` and `exlr8-vocab.safetensors` files under `dir/dense/` (canonical,
+    /// checked first) or `dir/`. Also supports split layouts where dense shards sit in `dir/dense/` and
+    /// `exlr8-vocab.safetensors` sits at `dir/` (or vice versa).
     pub fn discover(dir: &str) -> Result<DenseRelease, String> {
         let nested = format!("{dir}/dense");
-        let scan_dir = if Path::new(&nested).is_dir()
-            && std::fs::read_dir(&nested)
-                .map_err(|e| format!("cannot read {nested}: {e}"))?
-                .filter_map(Result::ok)
-                .any(|e| e.file_name().to_str().and_then(parse_dense_filename).is_some())
-        {
-            nested
+        let mut raw_paths = if Path::new(&nested).is_dir() { scan_dense_dir(&nested)? } else { Vec::new() };
+        if raw_paths.is_empty() {
+            raw_paths = scan_dense_dir(dir)?;
         } else {
-            dir.to_string()
-        };
-        let mut raw_paths: Vec<(String, Option<String>, Option<usize>, bool)> = Vec::new();
-        for ent in std::fs::read_dir(&scan_dir).map_err(|e| format!("cannot read {scan_dir}: {e}"))? {
-            let ent = ent.map_err(|e| format!("cannot read entry in {scan_dir}: {e}"))?;
-            let fname = ent.file_name();
-            let Some(s) = fname.to_str() else { continue };
-            let Some((grp, layer, is_vocab)) = parse_dense_filename(s) else { continue };
-            let path = ent.path().to_string_lossy().into_owned();
-            raw_paths.push((path, grp, layer, is_vocab));
+            let has_vocab = raw_paths.iter().any(|(_, _, _, is_v)| *is_v);
+            let has_dense = raw_paths.iter().any(|(_, _, _, is_v)| !*is_v);
+            if !has_vocab {
+                let root_vocab = format!("{dir}/exlr8-vocab.safetensors");
+                if Path::new(&root_vocab).is_file() {
+                    raw_paths.push((root_vocab, None, None, true));
+                }
+            }
+            if !has_dense {
+                for entry in scan_dense_dir(dir)? {
+                    if !entry.3 {
+                        raw_paths.push(entry);
+                    }
+                }
+            }
         }
         if raw_paths.is_empty() {
             return Err(format!("{dir}: no exlr8 dense or vocab safetensors files found"));
@@ -264,11 +332,7 @@ impl DenseRelease {
         let mut files: Vec<DenseFileEntry> = Vec::with_capacity(raw_paths.len());
         for (path, fname_grp, fname_layer, is_vocab) in raw_paths {
             let f = StFile::open(&path)?;
-            if let Some(fmt) = f.meta.get("format").and_then(Json::str) {
-                if fmt != "exlr8-v2" && fmt != "exlr8-v4" {
-                    return Err(format!("{path}: unsupported exlr8 format {fmt:?}"));
-                }
-            }
+            check_v2_file(&f)?;
             if let Some(contents) = f.meta.get("contents").and_then(Json::str) {
                 let want = if is_vocab { "vocab" } else { "dense" };
                 if contents != want {
@@ -328,7 +392,10 @@ impl DenseRelease {
                 }
             };
             if let (Some(g), Some(l)) = (group.as_deref(), layer) {
-                let _ = file_profile.group_prefix(g, l)?;
+                validate_group_name(g)?;
+                if f.meta.get("hf_prefix").and_then(Json::str).is_none() {
+                    let _ = file_profile.group_prefix(g, l)?;
+                }
             }
             files.push(DenseFileEntry { path, profile: file_profile, group, layer, is_vocab });
         }
@@ -350,11 +417,15 @@ impl DenseRelease {
     }
 
     /// Looks up a discovered file by `(group, layer)` (pass `(None, None)` for the vocabulary file).
+    /// Passing `(None, Some(l))` matches only legacy single-group files (`group` is `None` or `"layers"`).
     pub fn file(&self, group: Option<&str>, layer: Option<usize>) -> Option<&DenseFileEntry> {
         self.files.iter().find(|e| match (group, layer) {
             (None, None) => e.is_vocab,
-            (g, Some(l)) => !e.is_vocab && e.layer == Some(l) && (g.is_none() || e.group.as_deref() == g),
-            _ => false,
+            (None, Some(l)) => {
+                !e.is_vocab && e.layer == Some(l) && (e.group.is_none() || e.group.as_deref() == Some("layers"))
+            }
+            (Some(g), Some(l)) => !e.is_vocab && e.layer == Some(l) && e.group.as_deref() == Some(g),
+            (Some(_), None) => false,
         })
     }
 
@@ -383,6 +454,7 @@ pub fn decode_dense_file(
     verify: bool,
     threads: usize,
 ) -> Result<BTreeMap<String, DecodedTensor>, String> {
+    check_v2_file(f)?;
     let mats = Matrix::names(f);
     let mut owned: HashSet<String> = HashSet::new();
     let mut out = BTreeMap::new();
@@ -406,7 +478,7 @@ pub fn decode_dense_file(
             true,
         )?;
         let (dtype, bytes) = if bf16 && mx.rec.fmt == BF16 {
-            mx.check_shape("bf16", &[mx.rec.out, mx.rec.inp])?;
+            mx.check_tensor("bf16", &["BF16"], &[mx.rec.out, mx.rec.inp])?;
             ("BF16".to_string(), f.read_all(&format!("{m}.bf16"))?)
         } else {
             let v = decode_par(&mx, 0..mx.rec.out, 0..mx.rec.inp, threads)?;
@@ -835,6 +907,35 @@ impl<'a> Matrix<'a> {
         Ok(i)
     }
 
+    fn check_tensor(&self, s: &str, dtypes: &[&str], shape: &[usize]) -> Result<&Info, String> {
+        let i = self.check_shape(s, shape)?;
+        if !dtypes.contains(&i.dtype.as_str()) {
+            return Err(format!("{}: {}.{s} has dtype {:?}, expected one of {dtypes:?}", self.f.path, self.name, i.dtype));
+        }
+        let esz: u64 = match i.dtype.as_str() {
+            "U8" | "I8" | "F8_E4M3" | "F8_E8M0" => 1,
+            "F16" | "BF16" | "I16" | "U16" => 2,
+            "F32" | "I32" | "U32" => 4,
+            "F64" | "I64" | "U64" => 8,
+            other => return Err(format!("{}: {}.{s} has unsupported dtype {other:?}", self.f.path, self.name)),
+        };
+        let want_bytes = shape
+            .iter()
+            .try_fold(esz, |acc, &d| acc.checked_mul(d as u64))
+            .ok_or_else(|| format!("{}: {}.{s} shape {shape:?} overflows byte size", self.f.path, self.name))?;
+        let got_bytes = i
+            .end
+            .checked_sub(i.start)
+            .ok_or_else(|| format!("{}: {}.{s} has inverted data_offsets", self.f.path, self.name))?;
+        if got_bytes != want_bytes {
+            return Err(format!(
+                "{}: {}.{s} has {got_bytes} bytes, expected {want_bytes} for dtype {} shape {shape:?}",
+                self.f.path, self.name, i.dtype
+            ));
+        }
+        Ok(i)
+    }
+
     /// Rows `rows` of a row-major [out, w] tensor (w elements of `esz` bytes per row).
     fn rows_of(&self, s: &str, rows: &Range<usize>, w: usize, esz: usize) -> Result<Vec<u8>, String> {
         let rb = (w * esz) as u64;
@@ -845,13 +946,14 @@ impl<'a> Matrix<'a> {
     /// matching `dense_format.checksums()` and `exlr8/loader/exlr8.py:dense_checksums()` byte for byte.
     pub fn verify_checksums(&self) -> Result<(), String> {
         let r = self.rec;
-        if r.fmt == FP8_ROW && r.side == SIDE_IN {
+        if r.side == SIDE_IN && matches!(r.fmt, MXFP8 | FP8_BLOCK | FP8_ROW | BF16 | FP32) {
             return Err(format!(
-                "{}: {}: FP8_ROW is row-major and requires side=OUT or side=REPLICATED, not side=IN",
-                self.f.path, self.name
+                "{}: {}: format {} is row-major and requires side=OUT or side=REPLICATED, not side=IN",
+                self.f.path, self.name, r.fmt
             ));
         }
         let n_blocks = (if r.side == SIDE_IN { r.inp } else { r.out }).div_ceil(128);
+        self.check_tensor("checksum", &["U64"], &[n_blocks])?;
         let raw_want = self.f.read_all(&self.t("checksum"))?;
         if raw_want.len() != n_blocks * 8 {
             return Err(format!(
@@ -866,6 +968,15 @@ impl<'a> Matrix<'a> {
         let want: Vec<u64> = raw_want.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
         match r.fmt {
             TRELLIS => {
+                if !(1..=8).contains(&r.k) {
+                    return Err(format!("{}: {} trellis width {} out of range 1..=8", self.f.path, self.name, r.k));
+                }
+                if !r.out.is_multiple_of(128) || !r.inp.is_multiple_of(128) {
+                    return Err(format!(
+                        "{}: {} trellis shape ({}, {}) must be divisible by 128",
+                        self.f.path, self.name, r.out, r.inp
+                    ));
+                }
                 let side_in = r.side == SIDE_IN;
                 let tb = 32 * r.k;
                 let (n_ent, ent_bytes) = if side_in {
@@ -873,9 +984,9 @@ impl<'a> Matrix<'a> {
                 } else {
                     (r.out / 128, r.inp * 128 / 256 * tb)
                 };
-                self.check_shape("trellis", &[n_ent, ent_bytes])?;
-                self.check_shape("suh", &[r.inp])?;
-                self.check_shape("svh", &[r.out])?;
+                self.check_tensor("trellis", &["U8"], &[n_ent, ent_bytes])?;
+                self.check_tensor("suh", &["F16"], &[r.inp])?;
+                self.check_tensor("svh", &["F16"], &[r.out])?;
                 let suh = self.f.read_all(&self.t("suh"))?;
                 let svh = self.f.read_all(&self.t("svh"))?;
                 for (b, &w) in want.iter().enumerate() {
@@ -884,11 +995,11 @@ impl<'a> Matrix<'a> {
                     let mut h = Xxh64::new(0);
                     h.update(&ent);
                     if side_in {
-                        let hi = (lo + 128).min(r.inp);
+                        let hi = lo + 128;
                         h.update(&suh[lo * 2..hi * 2]);
                         h.update(&svh);
                     } else {
-                        let hi = (lo + 128).min(r.out);
+                        let hi = lo + 128;
                         h.update(&svh[lo * 2..hi * 2]);
                         h.update(&suh);
                     }
@@ -899,8 +1010,14 @@ impl<'a> Matrix<'a> {
                 }
             }
             INT4 if r.side == SIDE_IN => {
-                self.check_shape("q4", &[r.inp / 128, r.out, 64])?;
-                self.check_shape("s4", &[r.inp / 128, r.out, 4])?;
+                if !r.inp.is_multiple_of(128) {
+                    return Err(format!(
+                        "{}: {} side=IN int4 inp {} must be divisible by 128",
+                        self.f.path, self.name, r.inp
+                    ));
+                }
+                self.check_tensor("q4", &["U8"], &[r.inp / 128, r.out, 64])?;
+                self.check_tensor("s4", &["F16"], &[r.inp / 128, r.out, 4])?;
                 for (b, &w) in want.iter().enumerate() {
                     let qb = self.f.read(&self.t("q4"), (b * r.out * 64) as u64, (r.out * 64) as u64)?;
                     let sb = self.f.read(&self.t("s4"), (b * r.out * 8) as u64, (r.out * 8) as u64)?;
@@ -914,8 +1031,14 @@ impl<'a> Matrix<'a> {
                 }
             }
             INT4 => {
-                self.check_shape("q4", &[r.out, r.inp / 2])?;
-                self.check_shape("s4", &[r.out, r.inp / 32])?;
+                if !r.inp.is_multiple_of(32) {
+                    return Err(format!(
+                        "{}: {} int4 inp {} must be divisible by 32",
+                        self.f.path, self.name, r.inp
+                    ));
+                }
+                self.check_tensor("q4", &["U8"], &[r.out, r.inp / 2])?;
+                self.check_tensor("s4", &["F16"], &[r.out, r.inp / 32])?;
                 for (b, &w) in want.iter().enumerate() {
                     let rows = b * 128..((b + 1) * 128).min(r.out);
                     let mut h = Xxh64::new(0);
@@ -928,8 +1051,14 @@ impl<'a> Matrix<'a> {
                 }
             }
             MXFP8 => {
-                self.check_shape("fp8", &[r.out, r.inp])?;
-                self.check_shape("e8m0", &[r.out, r.inp / 32])?;
+                if !r.inp.is_multiple_of(32) {
+                    return Err(format!(
+                        "{}: {} MXFP8 inp {} must be divisible by 32",
+                        self.f.path, self.name, r.inp
+                    ));
+                }
+                self.check_tensor("fp8", &["U8", "F8_E4M3"], &[r.out, r.inp])?;
+                self.check_tensor("e8m0", &["U8", "F8_E8M0"], &[r.out, r.inp / 32])?;
                 for (b, &w) in want.iter().enumerate() {
                     let rows = b * 128..((b + 1) * 128).min(r.out);
                     let mut h = Xxh64::new(0);
@@ -943,8 +1072,8 @@ impl<'a> Matrix<'a> {
             }
             FP8_BLOCK => {
                 let (bo, bi) = (r.out.div_ceil(128), r.inp.div_ceil(128));
-                self.check_shape("fp8", &[r.out, r.inp])?;
-                self.check_shape("scale", &[bo, bi])?;
+                self.check_tensor("fp8", &["U8", "F8_E4M3"], &[r.out, r.inp])?;
+                self.check_tensor("scale", &["F32"], &[bo, bi])?;
                 for (b, &w) in want.iter().enumerate() {
                     let rows = b * 128..((b + 1) * 128).min(r.out);
                     let mut h = Xxh64::new(0);
@@ -957,8 +1086,8 @@ impl<'a> Matrix<'a> {
                 }
             }
             FP8_ROW => {
-                self.check_shape("fp8", &[r.out, r.inp])?;
-                self.check_shape("scale", &[r.out])?;
+                self.check_tensor("fp8", &["U8", "F8_E4M3"], &[r.out, r.inp])?;
+                self.check_tensor("scale", &["F32"], &[r.out])?;
                 for (b, &w) in want.iter().enumerate() {
                     let rows = b * 128..((b + 1) * 128).min(r.out);
                     let mut h = Xxh64::new(0);
@@ -971,7 +1100,7 @@ impl<'a> Matrix<'a> {
                 }
             }
             BF16 => {
-                self.check_shape("bf16", &[r.out, r.inp])?;
+                self.check_tensor("bf16", &["BF16"], &[r.out, r.inp])?;
                 for (b, &w) in want.iter().enumerate() {
                     let rows = b * 128..((b + 1) * 128).min(r.out);
                     let mut h = Xxh64::new(0);
@@ -983,7 +1112,7 @@ impl<'a> Matrix<'a> {
                 }
             }
             FP32 => {
-                self.check_shape("fp32", &[r.out, r.inp])?;
+                self.check_tensor("fp32", &["F32"], &[r.out, r.inp])?;
                 for (b, &w) in want.iter().enumerate() {
                     let rows = b * 128..((b + 1) * 128).min(r.out);
                     let mut h = Xxh64::new(0);
