@@ -48,13 +48,14 @@ directory when it gets large, or delete what no build used lately: `find ~/.cach
 ## In the image build and CI
 
 Each engine stage of the `Dockerfile` mounts the cache at `/var/cache/gr8-nvcc` (`GR8_NVCC_CACHE_DIR`), as a BuildKit
-cache mount with one id a stage: `gr8-nvcc-fp8`, `-int4`, `-flash`, `-flash-int4`, `-ds41`, `-ink2`, `-tests` and
-`-tests-ship`. After its build the stage deletes the entries older than the build's start, the ones it did not read, so
+cache mount with one id per stage and platform: `gr8-nvcc-fp8-<arch>`, `-int4-<arch>`, `-flash-<arch>`,
+`-flash-int4-<arch>`, `-ds41-<arch>`, `-ink2-<arch>`, `-qw38-<arch>`, `-tests-<arch>` and `-tests-ship-<arch>`.
+After its build the stage deletes the entries older than the build's start, the ones it did not read, so
 the mount holds one build. A local `docker buildx build` keeps the mount between builds on the same builder.
 
-CI (`.github/workflows/ci.yml`, the engine job) keeps each leg's mount in the Actions cache, while BuildKit layer caches
+CI (`.github/workflows/ci.yml`, the `engine` and `engine-amd64` jobs) keeps each leg's mount in the Actions cache, while BuildKit layer caches
 live in a separate GHCR package (`ghcr.io/<repo>-cache`) so they do not exhaust the 10 GB Actions cache quota. Every run
-restores the newest copy for its leg (key `gr8-nvcc-<leg>--<hash of the compile inputs>`; the double-dash delimiter keeps
+restores the newest copy for its leg (key `gr8-nvcc-<leg>--<hash of the compile inputs>` on arm64 and `gr8-nvcc-amd64-<leg>--<hash>` on amd64; the double-dash delimiter keeps
 `flash--` from matching `flash-int4--`) and loads it into the builder with reproducible-containers/buildkit-cache-dance.
 Pushes to main save it, once for each set of inputs. The layer cache still comes first: when the engine layer is cached,
 nothing compiles. The compile cache matters when that layer has to run again: an edit to one engine file recompiles the

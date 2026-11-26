@@ -97,9 +97,31 @@ class RegistryTests(unittest.TestCase):
         docker = (ROOT/'Dockerfile').read_text()
         for name in models.image_binaries():
             self.assertIn('/'+name, docker)
+        self.assertIn('ARG GR8_ARCH=', docker)
+        self.assertIn('ENV ARCH=${GR8_ARCH}', docker)
+        self.assertIn('id=gr8-nvcc-qw38-${TARGETARCH}', docker)
+        self.assertIn('id=gr8-nvcc-ink2-${TARGETARCH}', docker)
         for name in models.MODELS:
             self.assertTrue((ROOT / models.query([name, 'smoke_script'])).is_file())
         with self.assertRaises(ValueError): models.query(['missing','build'])
+
+    def test_build_arch_defaults_by_hosttype(self):
+        source = (ROOT / 'scripts/build.sh').read_text()
+        block = source[source.index('if [ -z "${ARCH:-}" ]; then'):source.index('\ncase "${KV_FORMAT:-fp8}" in')]
+        for hosttype, arch_in, want in (
+            ('x86_64', '', '120a'),
+            ('amd64', '', '120a'),
+            ('aarch64', '', '121a'),
+            ('x86_64', '121a', '121a'),
+            ('aarch64', '120a', '120a'),
+        ):
+            with self.subTest(hosttype=hosttype, arch_in=arch_in):
+                env = {'PATH': '/nonexistent', 'ARCH': arch_in}
+                out = subprocess.check_output(
+                    ['/bin/bash', '-ec', f'HOSTTYPE={hosttype}\n{block}\nprintf "%s" "$ARCH"'],
+                    env=env, text=True,
+                )
+                self.assertEqual(out, want)
 
     def test_build_shell_is_quoted_and_model_specific(self):
         for name, model in models.MODELS.items():

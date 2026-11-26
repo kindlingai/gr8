@@ -1,6 +1,8 @@
 # The gr8 container
 
-One image for GB10 boxes (linux/arm64, CUDA 13, sm_121a): the engine for every TP width (`bin/`), the Rust front end,
+Multi-arch image for Blackwell boxes — GB10 (`linux/arm64`, CUDA 13, `sm_121a`) and x86-64 RTX 5090 / RTX PRO 6000
+(`linux/amd64`, CUDA 13, `sm_120a`, shipping `g6m4_qw38` with single-GPU Strata / AVX-512 K3 CPU MoE mode, `g6m4_ink2`,
+`gpuprobe`, `tr3_e4m3_test`, the Rust front end, loader and knobs): the engine (`bin/`), the Rust front end,
 the loader, the shims and the launcher, on the CUDA 13 runtime image (which brings cuBLAS) with libibverbs and the mlx5
 provider. Each box runs one container, which holds one rank. The head (rank 0) also runs the shim and the OpenAI front
 end. The container's entrypoint is `./gr8 $GR8_MODEL`, so it takes the launcher's commands and options (./gr8 knobs) and

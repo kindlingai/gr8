@@ -1,14 +1,16 @@
-# CPU tests, the Rust binaries, the arm64 engine build, the tester zip and the container image, which goes to
-# ghcr.io/kindlingai/gr8 from main (called by release.yml via workflow_call) and from tagged releases.
+# CPU tests, the Rust binaries, the arm64 (sm_121a) and amd64 (sm_120a) engine builds, the tester zip and the
+# multi-arch container image, which goes to ghcr.io/kindlingai/gr8 from main (called by release.yml via workflow_call)
+# and from tagged releases.
 #
 # Every job runs on GitHub's hosted runners, on every push to a pull request, forks included (with a read-only token),
 # on non-Markdown pushes to main via release.yml, on manual beta-* tag pushes, and on workflow_dispatch (with optional
-# `tag` input to build/republish an existing v* tag). The rust job builds rust-dist once on arm64, and the engine job
-# passes it to each leg via --build-context rust-dist, one leg per model/KV format, no GPU needed to compile. BuildKit
-# layer caches live in a separate GHCR package (ghcr.io/<repo>-cache) so they do not exhaust GitHub's 10 GB Actions
-# cache quota needed by Cargo and nvcc caches. The image job assembles the runtime image from the rust and engine
-# artifacts and pushes from main and from tagged releases, never from a pull request. Tagged v* releases also attach
-# the tester zip, SHA-256, container digest, and build-provenance attestations to the GitHub Release.
+# `tag` input to build/republish an existing v* tag). The rust and rust-amd64 jobs build rust-dist once per arch, and
+# the engine / engine-amd64 jobs pass it to each leg via --build-context rust-dist, one leg per model/KV format, no GPU
+# needed to compile. BuildKit layer caches live in a separate GHCR package (ghcr.io/<repo>-cache) so they do not exhaust
+# GitHub's 10 GB Actions cache quota needed by Cargo and nvcc caches. The image and image-amd64 jobs assemble and smoke-
+# test each platform's runtime image and push arch-specific tags on main/releases; image-manifest merges both digests
+# into the multi-arch OCI manifest list (linux/arm64 sm_121a + linux/amd64 sm_120a), never from a pull request. Tagged
+# v* releases also attach the tester zip, SHA-256, container digests, and build-provenance attestations to the GitHub Release.
 #
 # On a pull request the changes job picks the jobs from the files it changes (dorny/paths-filter, below): the
 # front-end and engine halves of the CPU tests, the Rust binaries, and the engine builds with the image around them.
@@ -337,6 +339,45 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  rust-amd64:
+    name: Rust binaries (amd64)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.engine == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs.changes.outputs.checkout_ref }}
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache repository
+        id: cache
+        run: echo "repo=$(echo "ghcr.io/${GITHUB_REPOSITORY}-cache" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - name: Build the loader, host libs, knobs and front end (Dockerfile target rust-dist)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          target: rust-dist
+          platforms: linux/amd64
+          outputs: type=local,dest=rust-dist
+          cache-from: type=registry,ref=${{ steps.cache.outputs.repo }}:rust-amd64
+          cache-to: ${{ needs.changes.outputs.save_cache == 'true' && format('type=registry,ref={0}:rust-amd64,mode=max', steps.cache.outputs.repo) || '' }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: rust-bin-amd64
+          path: rust-dist/
+          retention-days: 7
+          if-no-files-found: error
+
   engine:
     # The parts (GLM fp8 KV, GLM int4 KV, Flash, Flash int4 KV, DeepSeek-V4.1-Flash, Inkling-2-Small, Qwen3.8-Flash-Next,
     # and the two test binaries the image ships) share no CUDA compilation, so they get a runner each. All legs consume
@@ -446,7 +487,7 @@ jobs:
       - name: Put the compile cache in the builder's cache mount
         uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723  # v3.4.0
         with:
-          cache-map: '{"${{ runner.temp }}/nvcc-cache": {"target": "/var/cache/gr8-nvcc", "id": "gr8-nvcc-${{ matrix.leg }}"}}'
+          cache-map: '{"${{ runner.temp }}/nvcc-cache": {"target": "/var/cache/gr8-nvcc", "id": "gr8-nvcc-${{ matrix.leg }}-arm64"}}'
           scratch-dir: ${{ runner.temp }}/nvcc-dance
           # copy it back out only to save it: on main, when no copy has this key yet
           skip-extraction: ${{ env.NVCC_SAVE != 'true' || steps.nvcc-save.outputs.cache-hit == 'true' }}
@@ -517,6 +558,125 @@ jobs:
             target: engine-tests
             scope: gr8-tests
     steps: *engine-steps
+
+  # linux/amd64 sm_120a (RTX 5090 / RTX PRO 6000) engine legs: Qwen3.8-Flash-Next (including single-GPU Strata + AVX-512
+  # K3 CPU MoE mode), Inkling-2-Small/Mini, and the shipped GPU health/unit tests. Kept lean so amd64 nvcc caches do not
+  # crowd the 10 GB Actions cache quota used by the 8-leg arm64 GB10 build; Dockerfile supports all targets on amd64.
+  engine-amd64:
+    name: Engine build (${{ matrix.label }}, amd64, CUDA 13, sm_120a)
+    needs: [changes, rust-amd64]
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      NVCC_SAVE: ${{ needs.changes.outputs.save_cache }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: qw38
+            label: Qwen3.8-Flash-Next
+            target: dist-qw38
+            scope: gr8-amd64-qw38
+          - leg: ink2
+            label: Inkling-2-Small
+            target: dist-ink2
+            scope: gr8-amd64-ink2
+          - leg: tests-ship
+            label: shipped tests
+            target: dist-tests
+            scope: gr8-amd64-tests-ship
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs.changes.outputs.checkout_ref }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: rust-bin-amd64
+          path: ${{ runner.temp }}/rust-dist
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: The compile cache's key
+        id: nvcc
+        run: |
+          echo "key=gr8-nvcc-amd64-${{ matrix.leg }}--${{ hashFiles('Dockerfile', 'engine/**', 'knobs/**', 'scripts/build.sh', 'scripts/ds41_build_flags.sh', 'tools/health/gpuprobe.cu', 'frontend/g6front-rs/Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+          repo=$(echo "ghcr.io/${GITHUB_REPOSITORY}-cache" | tr '[:upper:]' '[:lower:]')
+          echo "cache_repo=$repo" >> "$GITHUB_OUTPUT"
+          {
+            echo "cache_from<<EOF"
+            echo "type=registry,ref=${repo}:gr8-amd64-qw38"
+            if [ "${{ matrix.scope }}" != "gr8-amd64-qw38" ]; then
+              echo "type=registry,ref=${repo}:${{ matrix.scope }}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Restore the compile cache, and save it after the build
+        id: nvcc-save
+        if: env.NVCC_SAVE == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ runner.temp }}/nvcc-cache
+          key: ${{ steps.nvcc.outputs.key }}
+          restore-keys: gr8-nvcc-amd64-${{ matrix.leg }}--
+      - name: Restore the compile cache
+        if: env.NVCC_SAVE != 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ runner.temp }}/nvcc-cache
+          key: ${{ steps.nvcc.outputs.key }}
+          restore-keys: gr8-nvcc-amd64-${{ matrix.leg }}--
+      - name: Put the compile cache in the builder's cache mount
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723  # v3.4.0
+        with:
+          cache-map: '{"${{ runner.temp }}/nvcc-cache": {"target": "/var/cache/gr8-nvcc", "id": "gr8-nvcc-${{ matrix.leg }}-amd64"}}'
+          scratch-dir: ${{ runner.temp }}/nvcc-dance
+          skip-extraction: ${{ env.NVCC_SAVE != 'true' || steps.nvcc-save.outputs.cache-hit == 'true' }}
+      - name: Widths
+        id: w
+        run: |
+          widths=''
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            case "${{ matrix.leg }}" in
+              qw38) widths='1 2' ;;
+            esac
+          fi
+          echo "widths=$widths" >> "$GITHUB_OUTPUT"
+          case "${{ matrix.leg }}" in
+            ink2)       echo "Inkling-2-Small (amd64, sm_120a), TP widths ${widths:-1 4 6}" ;;
+            qw38)       echo "Qwen3.8-Flash-Next (amd64, sm_120a), TP widths ${widths:-1 2 3 4}" ;;
+            tests-ship) echo "the shipped test binaries (amd64, sm_120a): tr3_e4m3_test and gpuprobe" ;;
+          esac >> "$GITHUB_STEP_SUMMARY"
+      - name: Build the binaries (Dockerfile target ${{ matrix.target }})
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          build-contexts: rust-dist=${{ runner.temp }}/rust-dist
+          build-args: |
+            GR8_ARCH=120a
+            GR8_WIDTHS=${{ steps.w.outputs.widths }}
+          outputs: type=local,dest=dist
+          cache-from: ${{ steps.nvcc.outputs.cache_from }}
+          cache-to: ${{ needs.changes.outputs.save_cache == 'true' && format('type=registry,ref={0}:{1},mode=max', steps.nvcc.outputs.cache_repo, matrix.scope) || '' }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: engine-bin-amd64-${{ matrix.leg }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
 
   # every environment read goes through the knob table (engine/knobs-rs): no bare getenv or std::env::var, every knob
   # read somewhere, the launcher's and recipes' values accepted, the generated header and docs/ENV.md current. On every
@@ -594,18 +754,15 @@ jobs:
 
   image:
     name: Container image (linux/arm64, push)
-    # The runtime image around the rust and engine jobs' binaries: the Dockerfile's dist stage is replaced by them (a
-    # named build context), so nothing is compiled here. This job runs on main (via release.yml), tagged releases, and
-    # manual tag dispatches and pushes to ghcr.io only after the CPU tests and engine-tests pass; image-pr runs the same
-    # steps for pull requests and untagged manual runs, which never push.
+    # The arm64 runtime image around the rust and engine jobs' binaries: the Dockerfile's dist stage is replaced by them
+    # (a named build context), so nothing is compiled here. This job pushes the arch-specific sha-<commit>-arm64 tag on
+    # main (via release.yml), tagged releases, and manual tag dispatches only after the CPU tests and engine-tests pass;
+    # image-manifest then merges it with image-amd64 into the multi-arch manifest list. image-pr runs the same steps for
+    # pull requests and untagged manual runs, which never push.
     needs: [changes, cpu, rust, engine, engine-tests]
     if: ${{ needs.changes.outputs.push == 'true' && !cancelled() && needs.engine.result == 'success' && needs.engine-tests.result == 'success' && needs.rust.result == 'success' && needs.cpu.result != 'failure' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
-    # main's runs overlap, so their pushes take turns, and latest and main move only to main's head (below)
-    concurrency:
-      group: image-${{ github.ref }}
-      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -644,44 +801,22 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Is this commit still main's head?
-        # a run that finishes after a newer commit's run pushes only its sha (and release tag), so latest never moves back
-        id: head
-        env:
-          TAG: ${{ needs.changes.outputs.tag }}
+      - name: Image metadata
+        id: info
         run: |
-          commit=$(git rev-parse HEAD)
           short_sha=$(git rev-parse --short=7 HEAD)
-          main_head=$(git ls-remote origin refs/heads/main | cut -f1)
-          prerelease=false
-          case "$TAG" in
-            *-*) prerelease=true ;;
-          esac
-          head=false
-          if [ "$commit" = "$main_head" ] && [ "$prerelease" = false ]; then
-            if [ "$GITHUB_REF" = refs/heads/main ] || [ -n "$TAG" ]; then
-              head=true
-            fi
-          fi
           {
-            echo "head=$head"
             echo "short_sha=$short_sha"
             echo "cache_repo=$(echo "ghcr.io/${GITHUB_REPOSITORY}-cache" | tr '[:upper:]' '[:lower:]')"
           } >> "$GITHUB_OUTPUT"
-          echo "main's head: $head (commit $short_sha, tag ${TAG:-none})"
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
           flavor: |
             latest=false
-          # latest and main follow main's head (never prereleases or older tag backfills); a tag gets its own name;
-          # every image also gets sha-<commit>
           tags: |
-            type=raw,value=latest,enable=${{ steps.head.outputs.head }}
-            type=raw,value=main,enable=${{ steps.head.outputs.head }}
-            type=raw,value=${{ needs.changes.outputs.tag || 'none' }},enable=${{ needs.changes.outputs.tag != '' }}
-            type=raw,value=sha-${{ steps.head.outputs.short_sha }}
+            type=raw,value=sha-${{ steps.info.outputs.short_sha }}-arm64
       - name: Build the runtime image
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
@@ -693,8 +828,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           load: true
-          cache-from: type=registry,ref=${{ steps.head.outputs.cache_repo }}:runtime
-          cache-to: ${{ needs.changes.outputs.save_cache == 'true' && format('type=registry,ref={0}:runtime,mode=max', steps.head.outputs.cache_repo) || '' }}
+          cache-from: type=registry,ref=${{ steps.info.outputs.cache_repo }}:runtime
+          cache-to: ${{ needs.changes.outputs.save_cache == 'true' && format('type=registry,ref={0}:runtime,mode=max', steps.info.outputs.cache_repo) || '' }}
       - name: Smoke test (no GPU)
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
@@ -764,12 +899,266 @@ jobs:
       PUSH: false
     steps: *image-steps
 
-  # Uploads the tester zip + SHA-256 (with build provenance when public) and appends the immutable GHCR image digest
+  image-amd64:
+    name: Container image (linux/amd64, push)
+    # The amd64 (sm_120a) runtime image around rust-amd64 and engine-amd64. Pushes sha-<commit>-amd64 on main/tags so
+    # image-manifest can combine it with the arm64 image into the multi-arch manifest list.
+    needs: [changes, cpu, rust-amd64, engine-amd64]
+    if: ${{ needs.changes.outputs.push == 'true' && !cancelled() && needs.engine-amd64.result == 'success' && needs.rust-amd64.result == 'success' && needs.cpu.result != 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      PUSH: 'true'
+    steps: &image-amd64-steps
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs.changes.outputs.checkout_ref }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: rust-bin-amd64
+          path: ${{ runner.temp }}/rust-dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: engine-bin-amd64-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dist
+      - name: Merge rust-dist binaries and restore executable bits (artifacts drop them)
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist/bin"
+          cp -a "$RUNNER_TEMP/rust-dist/bin/." "$RUNNER_TEMP/dist/bin/"
+          find "$RUNNER_TEMP/dist" -type f ! -name '*.a' -exec chmod 755 {} +
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image metadata
+        id: info
+        run: |
+          short_sha=$(git rev-parse --short=7 HEAD)
+          {
+            echo "short_sha=$short_sha"
+            echo "cache_repo=$(echo "ghcr.io/${GITHUB_REPOSITORY}-cache" | tr '[:upper:]' '[:lower:]')"
+          } >> "$GITHUB_OUTPUT"
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=sha-${{ steps.info.outputs.short_sha }}-amd64
+      - name: Build the runtime image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64
+          build-contexts: dist=${{ runner.temp }}/dist
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          load: true
+          cache-from: type=registry,ref=${{ steps.info.outputs.cache_repo }}:runtime-amd64
+          cache-to: ${{ needs.changes.outputs.save_cache == 'true' && format('type=registry,ref={0}:runtime-amd64,mode=max', steps.info.outputs.cache_repo) || '' }}
+      - name: Smoke test (no GPU)
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          img=$(echo "$TAGS" | head -1)
+          docker image ls "$img"
+          docker run --rm --entrypoint bash "$img" -c '
+            set -eu
+            [ "$(uname -m)" = x86_64 ] || { echo "expected x86_64 container, got $(uname -m)"; exit 1; }
+            for b in bin/g6m4_qw38 bin/m4sim_qw38 bin/g6m4_ink2 bin/m4sim_ink2 bin/gpuprobe bin/tr3_e4m3_test \
+                     bin/g6front-rs bin/g6load bin/g6layout bin/kvman-remote bin/kvman-peer; do
+              [ -x "$b" ] || { echo "$b: not in the image"; exit 1; }
+              if ldd "$b" | grep "not found"; then echo "$b: missing libraries"; exit 1; fi
+            done
+            [ -f bin/lib/libgr8knobs.so ] || { echo "bin/lib/libgr8knobs.so: not in the image"; exit 1; }
+            # Verify TP=1 support on both RTX 5090 targets and PR #610 Strata AVX-512 K3 CPU MoE build in g6m4_qw38.
+            bin/g6m4_qw38 --rank 0 --ips 127.0.0.1 --manifest m --pack p --top-p-cands 99999 2>&1 \
+              | grep -qF -- "--top-p-cands must be 0..2048" || { echo "g6m4_qw38 does not run TP=1"; exit 1; }
+            bin/g6m4_ink2 --rank 0 --ips 127.0.0.1 --manifest m --pack p --top-p-cands 99999 2>&1 \
+              | grep -qF -- "--top-p-cands must be 0..2048" || { echo "g6m4_ink2 does not run TP=1"; exit 1; }
+            grep -a -qF "qw38 strata CPU hybrid K3 MoE" bin/g6m4_qw38 \
+              || { echo "g6m4_qw38 missing Strata AVX-512 CPU MoE support"; exit 1; }
+            python3 -c "import g6s2shim"
+            PYTHONPATH=tools/launch python3 -c "import supervisor, steering_hf; from steering import release"
+            python3 tools/steering/release.py --help > /dev/null
+            python3 tools/steering/evaluate.py --help > /dev/null
+            python3 tools/steering/trace_audit.py --help > /dev/null
+            bin/g6front-rs --help > /dev/null
+            echo smoke OK'
+          # Verify qw38 single-GPU Strata mode and every supported qw38 / ink2 TP pass the entrypoint config smoke.
+          docker run --rm -e GR8_MODEL=qw38 -e CAP=40960 -e SESS=1 -e MTP=4 -e REUSE=1 \
+            -e ALLOW_THINKING_OFF=1 \
+            -e EXTRA_ENV="GR8_QW38_STRATA=1 GR8_QW38_VRAM_RESERVE_MIB=1920" \
+            -e EXTRA_ARGS="--prefill 13312" \
+            "$img" show-config --tp 1 --peers 127.0.0.1 \
+            --model https://huggingface.co/kindlingai/Qwen3.8-Flash-Next-exlr8 --variant bit300 --no-check > /dev/null
+          configs=$(docker run --rm --entrypoint python3 "$img" -c 'from tools.launch.models import QW38, INK2; [print(m.name, tp, m.release) for m in (QW38, INK2) for tp in m.tp]')
+          test -n "$configs"
+          while read -r model tp release; do
+            peers=$(python3 -c 'import sys; print(",".join("192.0.2." + str(i+1) for i in range(int(sys.argv[1]))))' "$tp")
+            docker run --rm -e GR8_MODEL="$model" "$img" show-config --tp "$tp" --peers "$peers" \
+              --model "$release" --no-check > /dev/null
+          done <<< "$configs"
+          # no model stops in the entrypoint, with exit 2 and the line to add: nothing picks one
+          rc=0; err=$(docker run --rm "$img" 2>&1 >/dev/null) || rc=$?
+          echo "$err"
+          [ "$rc" = 2 ] && echo "$err" | grep -q 'GR8_MODEL=glm53f' || { echo "model check: exit $rc"; exit 1; }
+          # up with a limited memlock stops in the entrypoint, with exit 2 and the setting to change
+          rc=0; err=$(docker run --rm -e GR8_MODEL=qw38 --ulimit memlock=65536:65536 "$img" 2>&1 >/dev/null) || rc=$?
+          echo "$err"
+          [ "$rc" = 2 ] && echo "$err" | grep -q 'memlock=-1' || { echo "memlock check: exit $rc"; exit 1; }
+      - name: Push
+        id: push
+        if: env.PUSH == 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          for t in $TAGS; do docker push "$t"; done
+          echo "digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$(echo "$TAGS" | head -1)" | cut -d@ -f2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: env.PUSH == 'true' && github.event.repository.visibility == 'public'
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  image-pr-amd64:
+    name: Container image (linux/amd64)
+    needs: [changes, rust-amd64, engine-amd64]
+    if: ${{ needs.changes.outputs.push != 'true' && !cancelled() && needs.engine-amd64.result == 'success' && needs.rust-amd64.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUSH: false
+    steps: *image-amd64-steps
+
+  image-manifest:
+    name: Container image (multi-arch manifest, push)
+    # Publishes the multi-arch OCI manifest list (linux/arm64 sm_121a + linux/amd64 sm_120a) under latest, main, <tag>
+    # and sha-<commit> so `ghcr.io/kindlingai/gr8:<tag>` resolves transparently on both GB10 and RTX 5090 hosts.
+    needs: [changes, image, image-amd64]
+    if: ${{ needs.changes.outputs.push == 'true' && !cancelled() && needs.image.result == 'success' && needs.image-amd64.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # main's runs overlap, so their pushes take turns, and latest and main move only to main's head (below)
+    concurrency:
+      group: image-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.merge.outputs.digest }}
+      arm64_digest: ${{ needs.image.outputs.digest }}
+      amd64_digest: ${{ needs.image-amd64.outputs.digest }}
+      short_sha: ${{ steps.head.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs.changes.outputs.checkout_ref }}
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Is this commit still main's head?
+        # a run that finishes after a newer commit's run pushes only its sha (and release tag), so latest never moves back
+        id: head
+        env:
+          TAG: ${{ needs.changes.outputs.tag }}
+        run: |
+          commit=$(git rev-parse HEAD)
+          short_sha=$(git rev-parse --short=7 HEAD)
+          main_head=$(git ls-remote origin refs/heads/main | cut -f1)
+          prerelease=false
+          case "$TAG" in
+            *-*) prerelease=true ;;
+          esac
+          head=false
+          if [ "$commit" = "$main_head" ] && [ "$prerelease" = false ]; then
+            if [ "$GITHUB_REF" = refs/heads/main ] || [ -n "$TAG" ]; then
+              head=true
+            fi
+          fi
+          {
+            echo "head=$head"
+            echo "short_sha=$short_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "main's head: $head (commit $short_sha, tag ${TAG:-none})"
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=false
+          # latest and main follow main's head (never prereleases or older tag backfills); a tag gets its own name;
+          # every image also gets sha-<commit>
+          tags: |
+            type=raw,value=latest,enable=${{ steps.head.outputs.head }}
+            type=raw,value=main,enable=${{ steps.head.outputs.head }}
+            type=raw,value=${{ needs.changes.outputs.tag || 'none' }},enable=${{ needs.changes.outputs.tag != '' }}
+            type=raw,value=sha-${{ steps.head.outputs.short_sha }}
+      - name: Create and push multi-arch manifest list
+        id: merge
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          ARM64_DIGEST: ${{ needs.image.outputs.digest }}
+          AMD64_DIGEST: ${{ needs.image-amd64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image=$(echo "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          args=()
+          while IFS= read -r t; do
+            [ -n "$t" ] && args+=(-t "$t")
+          done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" \
+            "${image}@${ARM64_DIGEST}" \
+            "${image}@${AMD64_DIGEST}"
+          first_tag=$(echo "$TAGS" | head -1)
+          docker buildx imagetools inspect "$first_tag"
+          docker buildx imagetools inspect --raw "$first_tag" > "$RUNNER_TEMP/manifest.json"
+          jq -e '([.manifests[].platform | "\(.os)/\(.architecture)"] | contains(["linux/arm64", "linux/amd64"]))' \
+            "$RUNNER_TEMP/manifest.json" >/dev/null
+          digest="sha256:$(sha256sum "$RUNNER_TEMP/manifest.json" | awk '{print $1}')"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Published multi-arch manifest list: $first_tag@$digest"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: github.event.repository.visibility == 'public'
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.merge.outputs.digest }}
+          push-to-registry: true
+
+  # Uploads the tester zip + SHA-256 (with build provenance when public) and appends the immutable GHCR image digests
   # and verification commands to the GitHub Release for tagged v* releases.
   github-release:
     name: GitHub Release artifacts
-    needs: [changes, zip, image]
-    if: ${{ needs.changes.outputs.push == 'true' && startsWith(needs.changes.outputs.tag, 'v') && !cancelled() && needs.image.result == 'success' && needs.zip.result == 'success' }}
+    needs: [changes, zip, image-manifest]
+    if: ${{ needs.changes.outputs.push == 'true' && startsWith(needs.changes.outputs.tag, 'v') && !cancelled() && needs.image-manifest.result == 'success' && needs.zip.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -791,7 +1180,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.changes.outputs.tag }}
           COMMIT: ${{ needs.changes.outputs.commit }}
-          DIGEST: ${{ needs.image.outputs.digest }}
+          SHORT_SHA: ${{ needs.image-manifest.outputs.short_sha }}
+          DIGEST: ${{ needs.image-manifest.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.image-manifest.outputs.arm64_digest }}
+          AMD64_DIGEST: ${{ needs.image-manifest.outputs.amd64_digest }}
           ZIP_NAME: ${{ needs.zip.outputs.artifact_name }}
           PUBLIC: ${{ github.event.repository.visibility == 'public' }}
         run: |
@@ -802,7 +1194,9 @@ jobs:
             echo "<!-- gr8-artifacts:start -->"
             echo "### Artifacts"
             echo
-            echo "- Container image (\`linux/arm64\`, \`sm_121a\`): \`ghcr.io/$GH_REPO:$TAG@$DIGEST\`"
+            echo "- Container image (multi-arch: \`linux/arm64\` \`sm_121a\`, \`linux/amd64\` \`sm_120a\`): \`ghcr.io/$GH_REPO:$TAG@$DIGEST\`"
+            echo "  - \`linux/arm64\` (\`sm_121a\`, GB10): \`ghcr.io/$GH_REPO:sha-$SHORT_SHA-arm64@$ARM64_DIGEST\`"
+            echo "  - \`linux/amd64\` (\`sm_120a\`, RTX 5090 / Blackwell): \`ghcr.io/$GH_REPO:sha-$SHORT_SHA-amd64@$AMD64_DIGEST\`"
             echo "- Tester archive: \`$ZIP_NAME.zip\`, \`$ZIP_NAME.zip.sha256\` (commit \`$COMMIT\`)"
             if [ "$PUBLIC" = true ]; then
               echo
@@ -851,7 +1245,7 @@ jobs:
     # The label counts only if it was added after GitHub first saw the head commit. pr-ready.yml removes it on a push,
     # but a run with only changes and zip-check can reach this step before that removal.
     if: always()
-    needs: [changes, cpu, cpu-macos, rust, engine, engine-tests, env-lint, zip-check, zip, image, image-pr, github-release]
+    needs: [changes, cpu, cpu-macos, rust, rust-amd64, engine, engine-amd64, engine-tests, env-lint, zip-check, zip, image, image-amd64, image-manifest, image-pr, image-pr-amd64, github-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
