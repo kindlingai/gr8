@@ -124,6 +124,46 @@ __global__ void __launch_bounds__(64) k_q3_head_norm_mrope(
     row[j + half] = __float2bfloat16_rn(b * cs + a * sn);
 }
 
+// Fused Q + K per-head RMSNorm + interleaved 3D M-RoPE with precomputed inv_freq[hd/2] (zero powf per token!).
+// Grid: (M, (nq + nkv + 3) / 4), Block: 256 (4 heads per CTA, 64 threads per head for hd=128).
+__global__ void __launch_bounds__(256) k_q3_qk_norm_mrope_fused(
+    bf16* __restrict__ q, bf16* __restrict__ k,
+    const bf16* __restrict__ q_norm_w, const bf16* __restrict__ k_norm_w,
+    const int3* __restrict__ mrope_thw, const float* __restrict__ inv_freq_tbl,
+    int M, int nq, int nkv, int hd, float eps, int s1_lim, int s2_lim) {
+    __shared__ float sm[8]; // 2 warps per head * 4 heads per CTA
+    const int m = blockIdx.x;
+    const int h_sub = threadIdx.x >> 6; // 0..3
+    const int j = threadIdx.x & 63;     // 0..63
+    const int h_glob = blockIdx.y * 4 + h_sub;
+    const int half = hd >> 1;
+    if (m >= M || h_glob >= nq + nkv || j >= half) return;
+
+    const bool is_k = (h_glob >= nq);
+    const int h = is_k ? (h_glob - nq) : h_glob;
+    bf16* row = is_k ? (k + (size_t(m) * nkv + h) * hd) : (q + (size_t(m) * nq + h) * hd);
+    const bf16* nw = is_k ? k_norm_w : q_norm_w;
+
+    float a = __bfloat162float(row[j]);
+    float b = __bfloat162float(row[j + half]);
+    float ss = a * a + b * b;
+    ss = emb_warp_sum(ss);
+    const int warp_id = threadIdx.x >> 5;
+    if ((threadIdx.x & 31) == 0) sm[warp_id] = ss;
+    __syncthreads();
+    const float tot = sm[h_sub * 2] + (half > 32 ? sm[h_sub * 2 + 1] : 0.f);
+    const float rs = rsqrtf(tot / float(hd) + eps);
+
+    a = __bfloat162float(__float2bfloat16_rn(__bfloat162float(__float2bfloat16_rn(a * rs)) * __bfloat162float(nw[j])));
+    b = __bfloat162float(__float2bfloat16_rn(__bfloat162float(__float2bfloat16_rn(b * rs)) * __bfloat162float(nw[j + half])));
+
+    const int pos = q3_mrope_coord(mrope_thw[m], j, s1_lim, s2_lim);
+    float sn, cs;
+    __sincosf(static_cast<float>(pos) * inv_freq_tbl[j], &sn, &cs);
+    row[j] = __float2bfloat16_rn(a * cs - b * sn);
+    row[j + half] = __float2bfloat16_rn(b * cs + a * sn);
+}
+
 // Packed variable-length causal GQA FlashAttention (head_dim=128, ephemeral K/V scratch, zero persistent KV cache).
 // Grid: (ceil(M / 4), nq), Block: 128 (4 warps; 1 warp = 1 query row, each lane holds 4 dims: lane + 0, 32, 64, 96).
 // Baseline clean implementation — prime target for Phase B Tensor-Core FlashAttention hill-climbing!
@@ -589,6 +629,7 @@ public:
     int* d_img_pos = nullptr;    // [max_tokens]
     int* d_req_dims = nullptr;   // [max_batch]
     int* d_req_norm = nullptr;   // [max_batch]
+    float* d_inv_freq = nullptr; // [head_dim / 2] precomputed RoPE inverse frequencies
     float* d_out_emb = nullptr;  // [max_batch, H]
 
     void init(const EmbedWeights& weights, int max_batched_tokens, int max_batch_seqs = 256, bool profile = false) {
@@ -622,7 +663,14 @@ public:
         alloc(&d_img_pos, size_t(max_tokens));
         alloc(&d_req_dims, size_t(max_batch));
         alloc(&d_req_norm, size_t(max_batch));
+        alloc(&d_inv_freq, size_t(c.head_dim / 2));
         alloc(&d_out_emb, size_t(max_batch) * c.embedding_dim);
+
+        std::vector<float> h_inv(size_t(c.head_dim / 2));
+        for (int j = 0; j < c.head_dim / 2; ++j) {
+            h_inv[size_t(j)] = static_cast<float>(1.0 / std::pow(double(c.rope_theta), double(2 * j) / double(c.head_dim)));
+        }
+        EMB_CK(cudaMemcpy(d_inv_freq, h_inv.data(), h_inv.size() * sizeof(float), cudaMemcpyHostToDevice));
     }
 
     size_t workspace_bytes() const {
@@ -640,7 +688,7 @@ public:
         fr(d_hidden); fr(d_normed); fr(d_q); fr(d_k); fr(d_v); fr(d_attn);
         fr(d_gate); fr(d_up); fr(d_act);
         fr(d_toks); fr(d_mrope); fr(d_cu_seqlens); fr(d_seq_of_row); fr(d_q_tiles); fr(d_img_pos);
-        fr(d_req_dims); fr(d_req_norm); fr(d_out_emb);
+        fr(d_req_dims); fr(d_req_norm); fr(d_inv_freq); fr(d_out_emb);
         ws.release();
         prof.release();
     }
@@ -753,12 +801,11 @@ public:
             });
 
             prof.record(prof.qknorm_mrope_ms, st, [&] {
-                k_q3_head_norm_mrope<<<total_M * c.num_q_heads, 64, 0, st>>>(
-                    d_q, L.q_norm, d_mrope, total_M, c.num_q_heads, c.head_dim,
-                    c.rms_norm_eps, c.rope_theta, s1_lim, s2_lim);
-                k_q3_head_norm_mrope<<<total_M * c.num_kv_heads, 64, 0, st>>>(
-                    d_k, L.k_norm, d_mrope, total_M, c.num_kv_heads, c.head_dim,
-                    c.rms_norm_eps, c.rope_theta, s1_lim, s2_lim);
+                const dim3 qk_grid(total_M, (c.num_q_heads + c.num_kv_heads + 3) / 4);
+                k_q3_qk_norm_mrope_fused<<<qk_grid, 256, 0, st>>>(
+                    d_q, d_k, L.q_norm, L.k_norm, d_mrope, d_inv_freq,
+                    total_M, c.num_q_heads, c.num_kv_heads, c.head_dim,
+                    c.rms_norm_eps, s1_lim, s2_lim);
             });
 
             prof.record(prof.attn_ms, st, [&] {
