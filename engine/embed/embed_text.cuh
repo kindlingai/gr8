@@ -681,6 +681,17 @@ public:
     float* d_inv_freq = nullptr; // [head_dim / 2] precomputed RoPE inverse frequencies
     float* d_out_emb = nullptr;  // [max_batch, H]
 
+    // Reusable pinned host staging buffers (64K-page safe, zero per-batch heap alloc or pageable copy stall)
+    int* h_toks_pin = nullptr;
+    int3* h_mrope_pin = nullptr;
+    int* h_cu_pin = nullptr;
+    int* h_seq_pin = nullptr;
+    int2* h_qtiles_pin = nullptr;
+    int* h_dims_pin = nullptr;
+    int* h_norm_pin = nullptr;
+    float* h_out_pin = nullptr;
+    std::vector<MropePos> tmp_pos;
+
     void init(const EmbedWeights& weights, int max_batched_tokens, int max_batch_seqs = 256, bool profile = false) {
         W = &weights;
         max_tokens = std::max(64, max_batched_tokens);
@@ -725,6 +736,18 @@ public:
             h_inv[size_t(j)] = static_cast<float>(1.0 / std::pow(double(c.rope_theta), double(2 * j) / double(c.head_dim)));
         }
         EMB_CK(cudaMemcpy(d_inv_freq, h_inv.data(), h_inv.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+        auto alloc_pin = [](auto** p, size_t n) {
+            EMB_CK(cudaHostAlloc(p, std::max<size_t>(1, n) * sizeof(**p), cudaHostAllocDefault));
+        };
+        alloc_pin(&h_toks_pin, size_t(max_tokens));
+        alloc_pin(&h_mrope_pin, size_t(max_tokens));
+        alloc_pin(&h_cu_pin, size_t(max_batch + 1));
+        alloc_pin(&h_seq_pin, size_t(max_tokens));
+        alloc_pin(&h_qtiles_pin, size_t(max_tokens / TEXT_TC_BQ + max_batch + 16));
+        alloc_pin(&h_dims_pin, size_t(max_batch));
+        alloc_pin(&h_norm_pin, size_t(max_batch));
+        alloc_pin(&h_out_pin, size_t(max_batch) * c.embedding_dim);
     }
 
     size_t workspace_bytes() const {
@@ -744,6 +767,9 @@ public:
         fr(d_gate); fr(d_up); fr(d_act);
         fr(d_toks); fr(d_mrope); fr(d_cu_seqlens); fr(d_seq_of_row); fr(d_q_tiles); fr(d_img_pos);
         fr(d_req_dims); fr(d_req_norm); fr(d_inv_freq); fr(d_out_emb);
+        auto fr_pin = [](auto*& p) { if (p) { cudaFreeHost(p); p = nullptr; } };
+        fr_pin(h_toks_pin); fr_pin(h_mrope_pin); fr_pin(h_cu_pin); fr_pin(h_seq_pin);
+        fr_pin(h_qtiles_pin); fr_pin(h_dims_pin); fr_pin(h_norm_pin); fr_pin(h_out_pin);
         ws.release();
         prof.release();
     }
@@ -760,60 +786,45 @@ public:
         if (B == 0) return {};
         if (B > max_batch) throw std::runtime_error("g6embed: batch size exceeds max_batch");
 
-        std::vector<int> h_toks;
-        std::vector<int3> h_mrope;
-        std::vector<int> h_cu(static_cast<size_t>(B + 1), 0);
-        std::vector<int> h_seq;
-        std::vector<int> h_dims(static_cast<size_t>(B), 0);
-        std::vector<int> h_norm(static_cast<size_t>(B), 0);
-
         int total_M = 0;
         for (int b = 0; b < B; ++b) {
             const int len = static_cast<int>(batch[size_t(b)].prompt.size());
-            h_cu[size_t(b)] = total_M;
+            h_cu_pin[b] = total_M;
             total_M += len;
-            h_dims[size_t(b)] = batch[size_t(b)].dimensions > 0 ? batch[size_t(b)].dimensions : c.embedding_dim;
-            h_norm[size_t(b)] = batch[size_t(b)].normalize ? 1 : 0;
+            h_dims_pin[b] = batch[size_t(b)].dimensions > 0 ? batch[size_t(b)].dimensions : c.embedding_dim;
+            h_norm_pin[b] = batch[size_t(b)].normalize ? 1 : 0;
         }
-        h_cu[size_t(B)] = total_M;
+        h_cu_pin[B] = total_M;
         if (total_M > max_tokens) {
             throw std::runtime_error("g6embed: packed batch tokens (" + std::to_string(total_M) +
                                      ") exceed max_batched_tokens (" + std::to_string(max_tokens) + ")");
         }
 
-        h_toks.reserve(size_t(total_M));
-        h_mrope.reserve(size_t(total_M));
-        h_seq.reserve(size_t(total_M));
-        std::vector<MropePos> tmp_pos;
+        int row_idx = 0;
+        int num_q_tiles = 0;
         for (int b = 0; b < B; ++b) {
             const auto& req = batch[size_t(b)];
             const int len = static_cast<int>(req.prompt.size());
             tmp_pos.resize(size_t(len));
             build_qwen3vl_mrope_positions(len, req.images, tmp_pos.data());
             for (int p = 0; p < len; ++p) {
-                h_toks.push_back(req.prompt[size_t(p)]);
-                h_mrope.push_back(make_int3(tmp_pos[size_t(p)].t, tmp_pos[size_t(p)].h, tmp_pos[size_t(p)].w));
-                h_seq.push_back(b);
+                h_toks_pin[row_idx] = req.prompt[size_t(p)];
+                h_mrope_pin[row_idx] = make_int3(tmp_pos[size_t(p)].t, tmp_pos[size_t(p)].h, tmp_pos[size_t(p)].w);
+                h_seq_pin[row_idx] = b;
+                ++row_idx;
             }
-        }
-
-        std::vector<int2> h_qtiles;
-        h_qtiles.reserve(size_t(total_M / TEXT_TC_BQ + B + 4));
-        for (int b = 0; b < B; ++b) {
-            const int len = static_cast<int>(batch[size_t(b)].prompt.size());
             for (int ql = 0; ql < len; ql += TEXT_TC_BQ) {
-                h_qtiles.push_back(make_int2(b, ql));
+                h_qtiles_pin[num_q_tiles++] = make_int2(b, ql);
             }
         }
-        const int num_q_tiles = static_cast<int>(h_qtiles.size());
 
-        EMB_CK(cudaMemcpyAsync(d_toks, h_toks.data(), size_t(total_M) * sizeof(int), cudaMemcpyHostToDevice, st));
-        EMB_CK(cudaMemcpyAsync(d_mrope, h_mrope.data(), size_t(total_M) * sizeof(int3), cudaMemcpyHostToDevice, st));
-        EMB_CK(cudaMemcpyAsync(d_cu_seqlens, h_cu.data(), size_t(B + 1) * sizeof(int), cudaMemcpyHostToDevice, st));
-        EMB_CK(cudaMemcpyAsync(d_seq_of_row, h_seq.data(), size_t(total_M) * sizeof(int), cudaMemcpyHostToDevice, st));
-        EMB_CK(cudaMemcpyAsync(d_q_tiles, h_qtiles.data(), size_t(num_q_tiles) * sizeof(int2), cudaMemcpyHostToDevice, st));
-        EMB_CK(cudaMemcpyAsync(d_req_dims, h_dims.data(), size_t(B) * sizeof(int), cudaMemcpyHostToDevice, st));
-        EMB_CK(cudaMemcpyAsync(d_req_norm, h_norm.data(), size_t(B) * sizeof(int), cudaMemcpyHostToDevice, st));
+        EMB_CK(cudaMemcpyAsync(d_toks, h_toks_pin, size_t(total_M) * sizeof(int), cudaMemcpyHostToDevice, st));
+        EMB_CK(cudaMemcpyAsync(d_mrope, h_mrope_pin, size_t(total_M) * sizeof(int3), cudaMemcpyHostToDevice, st));
+        EMB_CK(cudaMemcpyAsync(d_cu_seqlens, h_cu_pin, size_t(B + 1) * sizeof(int), cudaMemcpyHostToDevice, st));
+        EMB_CK(cudaMemcpyAsync(d_seq_of_row, h_seq_pin, size_t(total_M) * sizeof(int), cudaMemcpyHostToDevice, st));
+        EMB_CK(cudaMemcpyAsync(d_q_tiles, h_qtiles_pin, size_t(num_q_tiles) * sizeof(int2), cudaMemcpyHostToDevice, st));
+        EMB_CK(cudaMemcpyAsync(d_req_dims, h_dims_pin, size_t(B) * sizeof(int), cudaMemcpyHostToDevice, st));
+        EMB_CK(cudaMemcpyAsync(d_req_norm, h_norm_pin, size_t(B) * sizeof(int), cudaMemcpyHostToDevice, st));
 
         const bool has_vis = (vis && vis->n_img_tokens > 0 && vis->main_vis != nullptr);
         if (has_vis) {
@@ -937,8 +948,7 @@ public:
                 B, c.hidden_size, c.embedding_dim, c.last_token_pool ? 1 : 0);
         });
 
-        std::vector<float> h_out(size_t(B) * c.embedding_dim);
-        EMB_CK(cudaMemcpyAsync(h_out.data(), d_out_emb, h_out.size() * sizeof(float), cudaMemcpyDeviceToHost, st));
+        EMB_CK(cudaMemcpyAsync(h_out_pin, d_out_emb, size_t(B) * c.embedding_dim * sizeof(float), cudaMemcpyDeviceToHost, st));
         EMB_CK(cudaStreamSynchronize(st));
 
         const double prefill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -948,9 +958,9 @@ public:
             EmbedOutput o;
             o.id = batch[size_t(b)].id;
             o.prompt_tokens = static_cast<int>(batch[size_t(b)].prompt.size());
-            const int dim = h_dims[size_t(b)];
-            o.embedding.assign(h_out.data() + size_t(b) * c.embedding_dim,
-                               h_out.data() + size_t(b) * c.embedding_dim + dim);
+            const int dim = h_dims_pin[b];
+            o.embedding.assign(h_out_pin + size_t(b) * c.embedding_dim,
+                               h_out_pin + size_t(b) * c.embedding_dim + dim);
             o.prefill_s = prefill_s;
             outs.push_back(std::move(o));
         }

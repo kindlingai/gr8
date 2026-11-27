@@ -220,7 +220,7 @@ __device__ __forceinline__ void store_bf16x4(bf16* dst, const bf16* bias, bool a
 // Grid: (ceil(M/16), K/128), Block: 256 (8 warps; each warp handles 2 rows of the 16-row tile).
 __global__ void __launch_bounds__(256) k_emb_rot_h16(
     const bf16* __restrict__ x, const __half* __restrict__ suh, uint8_t* __restrict__ dst, int M, int K) {
-    __shared__ __half sh[16][128];
+    __shared__ __half sh[16][136];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int mb = blockIdx.x, kb = blockIdx.y;
     const int k0 = kb * 128 + lane * 4;
@@ -395,7 +395,7 @@ __global__ void __launch_bounds__(256) k_emb_rot_h16_multi(
     const __half* suh0, const __half* suh1, const __half* suh2,
     uint8_t* dst0, uint8_t* dst1, uint8_t* dst2,
     int M, int K) {
-    __shared__ __half sh[16][128];
+    __shared__ __half sh[16][136];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int mb = blockIdx.x, kb = blockIdx.y;
     const int k0 = kb * 128 + lane * 4;
@@ -460,7 +460,7 @@ __global__ void __launch_bounds__(256) k_emb_swiglu_rot_h16(
     const __half* __restrict__ suh,
     uint8_t* __restrict__ dst,
     int M, int K) {
-    __shared__ __half sh[16][128];
+    __shared__ __half sh[16][136];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int mb = blockIdx.x, kb = blockIdx.y;
     const int k0 = kb * 128 + lane * 4;
