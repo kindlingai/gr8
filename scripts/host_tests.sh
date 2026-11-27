@@ -699,6 +699,12 @@ run_job ptab_compact_test '
   g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined "$REPO/engine/kernels/tests/ptab_compact_test.cpp" -o "$D/ptab_compact_test"
   "$D/ptab_compact_test"
 '
+# Native dense embedding engine (g6embed): protocol framing, M-RoPE geometry, base64 RGB decode, token-budget batching
+run_job embed_proto_test '
+  g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined -pthread -I "$REPO/engine/embed" \
+    "$REPO/engine/embed/tests/embed_proto_test.cpp" -o "$D/embed_proto_test"
+  "$D/embed_proto_test"
+'
 
 wait
 for name in "${ORDER[@]}"; do
