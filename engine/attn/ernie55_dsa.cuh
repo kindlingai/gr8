@@ -246,36 +246,48 @@ __global__ void __launch_bounds__(128) k_ernie55_dsa_q_absorb_rope_mx8(
     const int h = blockIdx.x;
     const int hwarp = threadIdx.x >> 4;
     const int hlane = threadIdx.x & 15;
-    const int c = blockIdx.y * 8 + hwarp;
-    if (h >= nh || c >= geom::KV_LORA) return;
+    const int c0 = blockIdx.y * 16 + hwarp * 2;
+    if (h >= nh || c0 >= geom::KV_LORA) return;
 
-    float acc[MAX_M];
+    float acc0[MAX_M], acc1[MAX_M];
     #pragma unroll
-    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+    for (int m = 0; m < MAX_M; ++m) { acc0[m] = 0.0f; acc1[m] = 0.0f; }
 
     if (hlane < 12) {
-        const size_t row_id = static_cast<size_t>(h) * geom::KV_LORA + c;
-        const uint4 wv = __ldg(reinterpret_cast<const uint4*>(wq + row_id * geom::QK_NOPE) + hlane);
-        const float sc = __uint_as_float(static_cast<uint32_t>(__ldg(wsc + row_id * 6 + (hlane >> 1))) << 23);
-        float2 wf[8];
-        mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
-        mx8::fp8x4_unpack(wv.y, wf[2], wf[3]);
-        mx8::fp8x4_unpack(wv.z, wf[4], wf[5]);
-        mx8::fp8x4_unpack(wv.w, wf[6], wf[7]);
+        const size_t r0 = static_cast<size_t>(h) * geom::KV_LORA + c0;
+        const size_t r1 = r0 + 1;
+        // Issue 2x concurrent uint4 weight loads + scales per lane, read q_raw ONCE for both rows!
+        const uint4 wv0 = __ldg(reinterpret_cast<const uint4*>(wq + r0 * geom::QK_NOPE) + hlane);
+        const uint4 wv1 = __ldg(reinterpret_cast<const uint4*>(wq + r1 * geom::QK_NOPE) + hlane);
+        const float sc0 = __uint_as_float(static_cast<uint32_t>(__ldg(wsc + r0 * 6 + (hlane >> 1))) << 23);
+        const float sc1 = __uint_as_float(static_cast<uint32_t>(__ldg(wsc + r1 * 6 + (hlane >> 1))) << 23);
+        float2 wf0[8], wf1[8];
+        mx8::fp8x4_unpack(wv0.x, wf0[0], wf0[1]); mx8::fp8x4_unpack(wv0.y, wf0[2], wf0[3]);
+        mx8::fp8x4_unpack(wv0.z, wf0[4], wf0[5]); mx8::fp8x4_unpack(wv0.w, wf0[6], wf0[7]);
+        mx8::fp8x4_unpack(wv1.x, wf1[0], wf1[1]); mx8::fp8x4_unpack(wv1.y, wf1[2], wf1[3]);
+        mx8::fp8x4_unpack(wv1.z, wf1[4], wf1[5]); mx8::fp8x4_unpack(wv1.w, wf1[6], wf1[7]);
         #pragma unroll
         for (int m = 0; m < MAX_M; ++m) {
             if (m < M) {
                 const uint4* qm = reinterpret_cast<const uint4*>(
                     q_raw + (static_cast<size_t>(m) * nh + h) * geom::QK_HEAD);
-                acc[m] = sc * mx8::dot_bf16x16(__ldg(qm + 2 * hlane), __ldg(qm + 2 * hlane + 1), wf);
+                const uint4 q0 = __ldg(qm + 2 * hlane);
+                const uint4 q1 = __ldg(qm + 2 * hlane + 1);
+                acc0[m] = sc0 * mx8::dot_bf16x16(q0, q1, wf0);
+                acc1[m] = sc1 * mx8::dot_bf16x16(q0, q1, wf1);
             }
         }
     }
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
         if (m < M) {
-            const float s = mx8::h16_sum(acc[m]);
-            if (hlane == 0) q_full[(static_cast<size_t>(m) * nh + h) * geom::KVA + c] = __float2bfloat16(s);
+            const float s0 = mx8::h16_sum(acc0[m]);
+            const float s1 = mx8::h16_sum(acc1[m]);
+            if (hlane == 0) {
+                __nv_bfloat16* dst = q_full + (static_cast<size_t>(m) * nh + h) * geom::KVA + c0;
+                dst[0] = __float2bfloat16(s0);
+                dst[1] = __float2bfloat16(s1);
+            }
         }
     }
     if (blockIdx.y == 0 && threadIdx.x < 32) {
@@ -285,8 +297,8 @@ __global__ void __launch_bounds__(128) k_ernie55_dsa_q_absorb_rope_mx8(
         for (int m = 0; m < M; ++m) {
             const size_t q_off = (static_cast<size_t>(m) * nh + h) * geom::QK_HEAD + geom::QK_NOPE;
             const size_t d_off = (static_cast<size_t>(m) * nh + h) * geom::KVA + geom::KV_LORA;
-            const float x0 = __bfloat162float(q_raw[q_off + 2 * p]);
-            const float x1 = __bfloat162float(q_raw[q_off + 2 * p + 1]);
+            const float x0 = __bfloat162float(__ldg(q_raw + q_off + 2 * p));
+            const float x1 = __bfloat162float(__ldg(q_raw + q_off + 2 * p + 1));
             float s, cv;
             sincosf(static_cast<float>(d_pos[m]) * inv_freq, &s, &cv);
             q_full[d_off + 2 * p]     = __float2bfloat16(x0 * cv - x1 * s);
@@ -550,13 +562,13 @@ __global__ void __launch_bounds__(128) k_ernie55_idx_score_tc(
         if (valid_k) {
             if constexpr (!IDX_FP8) {
                 const __nv_bfloat16* kp = idx_bf16 + to * geom::IDX_DIM + kbase;
-                kb0[ks] = *reinterpret_cast<const uint32_t*>(kp + 2 * tc);
-                kb1[ks] = *reinterpret_cast<const uint32_t*>(kp + 2 * tc + 8);
+                kb0[ks] = __ldg(reinterpret_cast<const uint32_t*>(kp + 2 * tc));
+                kb1[ks] = __ldg(reinterpret_cast<const uint32_t*>(kp + 2 * tc + 8));
             } else {
-                const float sc = __half2float(idx_pool_sc[to * 4 + (ks >> 1)]);
+                const float sc = __half2float(__ldg(idx_pool_sc + to * 4 + (ks >> 1)));
                 const uint8_t* qp = idx_pool_q + to * geom::IDX_DIM + kbase;
-                const uint16_t raw0 = *reinterpret_cast<const uint16_t*>(qp + 2 * tc);
-                const uint16_t raw1 = *reinterpret_cast<const uint16_t*>(qp + 2 * tc + 8);
+                const uint16_t raw0 = __ldg(reinterpret_cast<const uint16_t*>(qp + 2 * tc));
+                const uint16_t raw1 = __ldg(reinterpret_cast<const uint16_t*>(qp + 2 * tc + 8));
                 uint32_t h0, h1;
                 asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h0) : "h"(raw0));
                 asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h1) : "h"(raw1));
@@ -810,20 +822,20 @@ __device__ __forceinline__ void dsa_load_kv_tile(
             const int tk = idx4 / 72;
             const int u4 = idx4 - tk * 72;
             const int tpos = tok_pos(k0 + tk);
-            const int ppage = d_page_table[static_cast<size_t>(slot) * max_pps + (tpos / geom::KV_PAGE)];
+            const int ppage = __ldg(d_page_table + static_cast<size_t>(slot) * max_pps + (tpos / geom::KV_PAGE));
             const __nv_bfloat16* src = reinterpret_cast<const __nv_bfloat16*>(kv_mem) +
                                        (static_cast<size_t>(ppage) * geom::KV_PAGE + (tpos % geom::KV_PAGE)) * geom::KVA;
-            *reinterpret_cast<uint4*>(sKV[tk] + u4 * 8) = reinterpret_cast<const uint4*>(src)[u4];
+            *reinterpret_cast<uint4*>(sKV[tk] + u4 * 8) = __ldg(reinterpret_cast<const uint4*>(src) + u4);
         }
     } else if constexpr (FMT == KvFmt::FP8) {
         const int warp = tid >> 5, lane = tid & 31;
         for (int tk = warp; tk < nk; tk += 8) {
             const int tpos = tok_pos(k0 + tk);
-            const int ppage = d_page_table[static_cast<size_t>(slot) * max_pps + (tpos / geom::KV_PAGE)];
+            const int ppage = __ldg(d_page_table + static_cast<size_t>(slot) * max_pps + (tpos / geom::KV_PAGE));
             const uint8_t* src = kv_mem + (static_cast<size_t>(ppage) * geom::KV_PAGE + (tpos % geom::KV_PAGE)) * KV_FP8_STRIDE;
             const __half* scs = reinterpret_cast<const __half*>(src + 512);
-            const uint4 qv = reinterpret_cast<const uint4*>(src)[lane];
-            const float sc = __half2float(scs[lane >> 1]);
+            const uint4 qv = __ldg(reinterpret_cast<const uint4*>(src) + lane);
+            const float sc = __half2float(__ldg(scs + (lane >> 1)));
             float2 f[8];
             mx8::fp8x4_unpack(qv.x, f[0], f[1]);
             mx8::fp8x4_unpack(qv.y, f[2], f[3]);
@@ -836,17 +848,17 @@ __device__ __forceinline__ void dsa_load_kv_tile(
             o1.z = pack_bf2(f[6].x * sc, f[6].y * sc); o1.w = pack_bf2(f[7].x * sc, f[7].y * sc);
             *reinterpret_cast<uint4*>(sKV[tk] + lane * 16)     = o0;
             *reinterpret_cast<uint4*>(sKV[tk] + lane * 16 + 8) = o1;
-            *reinterpret_cast<uint32_t*>(sKV[tk] + 512 + lane * 2) = reinterpret_cast<const uint32_t*>(src + 544)[lane];
+            *reinterpret_cast<uint32_t*>(sKV[tk] + 512 + lane * 2) = __ldg(reinterpret_cast<const uint32_t*>(src + 544) + lane);
         }
     } else { // KvFmt::INT4
         const int warp = tid >> 5, lane = tid & 31;
         for (int tk = warp; tk < nk; tk += 8) {
             const int tpos = tok_pos(k0 + tk);
-            const int ppage = d_page_table[static_cast<size_t>(slot) * max_pps + (tpos / geom::KV_PAGE)];
+            const int ppage = __ldg(d_page_table + static_cast<size_t>(slot) * max_pps + (tpos / geom::KV_PAGE));
             const uint8_t* src = kv_mem + (static_cast<size_t>(ppage) * geom::KV_PAGE + (tpos % geom::KV_PAGE)) * KV_INT4_STRIDE;
             const __half* scs = reinterpret_cast<const __half*>(src + 256);
-            const uint2 raw = reinterpret_cast<const uint2*>(src)[lane];
-            const float sc = __half2float(scs[lane >> 1]);
+            const uint2 raw = __ldg(reinterpret_cast<const uint2*>(src) + lane);
+            const float sc = __half2float(__ldg(scs + (lane >> 1)));
             auto unpack_u32 = [&](uint32_t w, uint4& dst) {
                 uint32_t out[4];
                 #pragma unroll
@@ -1292,10 +1304,127 @@ __global__ void __launch_bounds__(256) k_ernie55_dsa_split_reduce(
     dst[tid + 256] = __float2bfloat16(o1 * inv_l);
 }
 
+// Fused Small-M MXFP8 q_a [1024, 4096] + kv_a [576, 4096] + idx_wk [128, 4096] = 1728 rows = 432 CTAs (exact 9.00 waves on 48 SMs)!
+template <int MAX_M, bool EXACT_M>
+__global__ void __launch_bounds__(128) k_ernie55_dsa_qkv_idx_mx8(
+    const __nv_bfloat16* __restrict__ X,
+    const uint8_t* __restrict__ qa_q,  const uint8_t* __restrict__ qa_sc,
+    const uint8_t* __restrict__ kva_q, const uint8_t* __restrict__ kva_sc,
+    const uint8_t* __restrict__ ik_q,  const uint8_t* __restrict__ ik_sc,
+    __nv_bfloat16* __restrict__ q_c,
+    __nv_bfloat16* __restrict__ kv_raw,
+    __nv_bfloat16* __restrict__ idx_k,
+    int M, int m_off) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int o = blockIdx.x * 4 + warp;
+    constexpr int N0 = geom::QA;              // 1024
+    constexpr int N1 = N0 + geom::KVA;        // 1600
+    constexpr int N2 = N1 + geom::IDX_DIM;    // 1728
+    if (o >= N2) return;
+
+    const int kind = (o < N0) ? 0 : ((o < N1) ? 1 : 2);
+    const int row  = (kind == 0) ? o : ((kind == 1) ? (o - N0) : (o - N1));
+    const uint8_t* Bq  = (kind == 0) ? qa_q  : ((kind == 1) ? kva_q  : ik_q);
+    const uint8_t* Bsc = (kind == 0) ? qa_sc : ((kind == 1) ? kva_sc : ik_sc);
+
+    constexpr int K = geom::HID; // 4096
+    constexpr int K16 = K >> 4;  // 256
+    constexpr int NB  = K >> 5;  // 128
+    const uint4* qrow = reinterpret_cast<const uint4*>(Bq + static_cast<size_t>(row) * K);
+    const uint8_t* srow = Bsc + static_cast<size_t>(row) * NB;
+    const __nv_bfloat16* Xm0 = X + static_cast<size_t>(m_off) * K;
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+
+    #pragma unroll
+    for (int i = lane; i < K16; i += 128) {
+        const uint4 w0 = __ldg(qrow + i);
+        const uint4 w1 = __ldg(qrow + i + 32);
+        const uint4 w2 = __ldg(qrow + i + 64);
+        const uint4 w3 = __ldg(qrow + i + 96);
+        const uint8_t s0 = __ldg(srow + (i >> 1));
+        const uint8_t s1 = __ldg(srow + ((i + 32) >> 1));
+        const uint8_t s2 = __ldg(srow + ((i + 64) >> 1));
+        const uint8_t s3 = __ldg(srow + ((i + 96) >> 1));
+        mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w0, s0, i,      M, K, acc);
+        mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w1, s1, i + 32, M, K, acc);
+        mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w2, s2, i + 64, M, K, acc);
+        mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w3, s3, i + 96, M, K, acc);
+    }
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (EXACT_M || m < M) {
+            const float tot = warp_sum(acc[m]);
+            if (lane == 0) {
+                const size_t gm = static_cast<size_t>(m_off + m);
+                if (kind == 0)      q_c[gm * geom::QA + row]        = __float2bfloat16(tot);
+                else if (kind == 1) kv_raw[gm * geom::KVA + row]    = __float2bfloat16(tot);
+                else                idx_k[gm * geom::IDX_DIM + row] = __float2bfloat16(tot);
+            }
+        }
+    }
+}
+
+// Fused Small-M MXFP8 q_b [nh_loc*256, 1024] + gate [nh_loc*256, 1024] + optional idx_wq_b [8192, 1024] on shared q_c!
+// 32-lane/row, 2x-unrolled (K=1024 -> K16=64 -> single unrolled step, zero loop overhead).
+template <int MAX_M, bool EXACT_M>
+__global__ void __launch_bounds__(128) k_ernie55_dsa_qbg_mx8(
+    const __nv_bfloat16* __restrict__ q_c,
+    const uint8_t* __restrict__ qb_q,   const uint8_t* __restrict__ qb_sc,
+    const uint8_t* __restrict__ gate_q, const uint8_t* __restrict__ gate_sc,
+    const uint8_t* __restrict__ iq_q,   const uint8_t* __restrict__ iq_sc,
+    __nv_bfloat16* __restrict__ q_raw,
+    __nv_bfloat16* __restrict__ gate,
+    __nv_bfloat16* __restrict__ idx_q,
+    int M, int m_off, int N_q, int N_g, int N_iq) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int o = blockIdx.x * 4 + warp;
+    if (o >= N_q + N_g + N_iq) return;
+
+    const int kind = (o < N_q) ? 0 : ((o < N_q + N_g) ? 1 : 2);
+    const int row  = (kind == 0) ? o : ((kind == 1) ? (o - N_q) : (o - N_q - N_g));
+    const uint8_t* Bq  = (kind == 0) ? qb_q  : ((kind == 1) ? gate_q  : iq_q);
+    const uint8_t* Bsc = (kind == 0) ? qb_sc : ((kind == 1) ? gate_sc : iq_sc);
+
+    constexpr int K = geom::QA; // 1024
+    constexpr int NB = K >> 5;  // 32
+    const uint4* qrow = reinterpret_cast<const uint4*>(Bq + static_cast<size_t>(row) * K);
+    const uint8_t* srow = Bsc + static_cast<size_t>(row) * NB;
+    const __nv_bfloat16* Qm0 = q_c + static_cast<size_t>(m_off) * K;
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+
+    const uint4 w0 = __ldg(qrow + lane);
+    const uint4 w1 = __ldg(qrow + lane + 32);
+    const uint8_t s0 = __ldg(srow + (lane >> 1));
+    const uint8_t s1 = __ldg(srow + ((lane + 32) >> 1));
+    mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Qm0, w0, s0, lane,      M, K, acc);
+    mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Qm0, w1, s1, lane + 32, M, K, acc);
+
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (EXACT_M || m < M) {
+            const float tot = warp_sum(acc[m]);
+            if (lane == 0) {
+                const size_t gm = static_cast<size_t>(m_off + m);
+                if (kind == 0)      q_raw[gm * N_q + row]  = __float2bfloat16(tot);
+                else if (kind == 1) gate[gm * N_g + row]   = __float2bfloat16(tot);
+                else                idx_q[gm * N_iq + row] = __float2bfloat16(tot);
+            }
+        }
+    }
+}
+
 // Direct Small-M MXFP8 V-expand: v_h[h, m, 256] = u_h[h, m, 512] @ w_uv[h, 256, 512]^T.
-// Eliminates on-the-fly BF16 GMEM dequant (16 MB write+read) and cuBLAS strided batched launch on decode!
-// Grid: dim3(nh_loc, V_HEAD / 4), Block: 128 (4 warps = 4 output dims, 32 lanes cover K=512 in 1 uint4!).
-template <int MAX_M>
+// 4 rows/warp (4x DRAM MLP, reads u_h ONCE per 4 output rows!):
+// Grid: dim3(nh_loc, V_HEAD / 16) = 1024 CTAs, Block: 128 (4 warps x 4 rows = 16 rows/CTA).
+template <int MAX_M, bool EXACT_M>
 __global__ void __launch_bounds__(128) k_ernie55_dsa_v_expand_mx8(
     const __nv_bfloat16* __restrict__ u_h, // [nh_loc, M, 512]
     const uint8_t* __restrict__ wq,        // [nh_loc * 256, 512]
@@ -1305,26 +1434,53 @@ __global__ void __launch_bounds__(128) k_ernie55_dsa_v_expand_mx8(
     const int h = blockIdx.x;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int v = blockIdx.y * 4 + warp;
-    if (h >= nh || v >= geom::V_HEAD) return;
+    const int v0 = (blockIdx.y * 4 + warp) * 4;
+    if (h >= nh || v0 >= geom::V_HEAD) return;
 
-    const size_t row_id = static_cast<size_t>(h) * geom::V_HEAD + v;
-    const uint4 wv = __ldg(reinterpret_cast<const uint4*>(wq + row_id * geom::KV_LORA) + lane);
-    const float sc = __uint_as_float(static_cast<uint32_t>(__ldg(wsc + row_id * (geom::KV_LORA >> 5) + (lane >> 1))) << 23);
-    float2 wf[8];
-    mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
-    mx8::fp8x4_unpack(wv.y, wf[2], wf[3]);
-    mx8::fp8x4_unpack(wv.z, wf[4], wf[5]);
-    mx8::fp8x4_unpack(wv.w, wf[6], wf[7]);
-
+    const size_t base_row = static_cast<size_t>(h) * geom::V_HEAD + v0;
+    // Issue 4 concurrent uint4 weight loads + 4 scale loads per lane for 4x DRAM MLP!
+    uint4 wv[4];
+    float sc[4];
     #pragma unroll
-    for (int m = 0; m < MAX_M; ++m) {
-        if (m < M) {
-            const uint4* um = reinterpret_cast<const uint4*>(
-                u_h + (static_cast<size_t>(h) * M + m) * geom::KV_LORA);
-            const float partial = sc * mx8::dot_bf16x16(__ldg(um + 2 * lane), __ldg(um + 2 * lane + 1), wf);
-            const float s = warp_sum(partial);
-            if (lane == 0) v_h[(static_cast<size_t>(h) * M + m) * geom::V_HEAD + v] = __float2bfloat16(s);
+    for (int r = 0; r < 4; ++r) {
+        const size_t rid = base_row + r;
+        wv[r] = __ldg(reinterpret_cast<const uint4*>(wq + rid * geom::KV_LORA) + lane);
+        sc[r] = __uint_as_float(static_cast<uint32_t>(__ldg(wsc + rid * (geom::KV_LORA >> 5) + (lane >> 1))) << 23);
+    }
+
+    if constexpr (MAX_M == 1) {
+        const uint4* um = reinterpret_cast<const uint4*>(
+            u_h + static_cast<size_t>(h) * geom::KV_LORA);
+        const uint4 u0 = __ldg(um + 2 * lane);
+        const uint4 u1 = __ldg(um + 2 * lane + 1);
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            float2 wf[8];
+            mx8::fp8x4_unpack(wv[r].x, wf[0], wf[1]);
+            mx8::fp8x4_unpack(wv[r].y, wf[2], wf[3]);
+            mx8::fp8x4_unpack(wv[r].z, wf[4], wf[5]);
+            mx8::fp8x4_unpack(wv[r].w, wf[6], wf[7]);
+            const float s = warp_sum(sc[r] * mx8::dot_bf16x16(u0, u1, wf));
+            if (lane == 0) v_h[static_cast<size_t>(h) * geom::V_HEAD + v0 + r] = __float2bfloat16(s);
+        }
+    } else {
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            float2 wf[8];
+            mx8::fp8x4_unpack(wv[r].x, wf[0], wf[1]);
+            mx8::fp8x4_unpack(wv[r].y, wf[2], wf[3]);
+            mx8::fp8x4_unpack(wv[r].z, wf[4], wf[5]);
+            mx8::fp8x4_unpack(wv[r].w, wf[6], wf[7]);
+            #pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (EXACT_M || m < M) {
+                    const uint4* um = reinterpret_cast<const uint4*>(
+                        u_h + (static_cast<size_t>(h) * M + m) * geom::KV_LORA);
+                    const float partial = sc[r] * mx8::dot_bf16x16(__ldg(um + 2 * lane), __ldg(um + 2 * lane + 1), wf);
+                    const float s = warp_sum(partial);
+                    if (lane == 0) v_h[(static_cast<size_t>(h) * M + m) * geom::V_HEAD + v0 + r] = __float2bfloat16(s);
+                }
+            }
         }
     }
 }
@@ -1345,12 +1501,26 @@ __global__ void __launch_bounds__(256) k_ernie55_dsa_vha_gate(
     const float* mrow = vha_mix + static_cast<size_t>(h_off + h) * geom::HEADS + h_off;
     float s = 0.0f;
     for (int g = 0; g < nh; ++g) {
-        s = fmaf(mrow[g], __bfloat162float(v_h[(static_cast<size_t>(g) * M + m) * geom::V_HEAD + d]), s);
+        s = fmaf(__ldg(mrow + g), __bfloat162float(__ldg(v_h + (static_cast<size_t>(g) * M + m) * geom::V_HEAD + d)), s);
     }
     const float vbf = __bfloat162float(__float2bfloat16(s));
-    const float gv  = sigmoid_f(__bfloat162float(gate[static_cast<size_t>(idx) * geom::V_HEAD + d]));
+    const float gv  = sigmoid_f(__bfloat162float(__ldg(gate + static_cast<size_t>(idx) * geom::V_HEAD + d)));
     attn_out[static_cast<size_t>(idx) * geom::V_HEAD + d] = __float2bfloat16(vbf * gv);
 }
+
+struct DsaProfDetail {
+    double qkv_idx_ms = 0, prep_ms = 0, qbg_ms = 0, q_abs_ms = 0;
+    double idx_score_ms = 0, mla_tc_ms = 0, v_exp_ms = 0, vha_gate_ms = 0, o_proj_ms = 0;
+    cudaEvent_t ev_a = nullptr, ev_b = nullptr;
+    void mark(double& acc, cudaStream_t st) {
+        cudaEventRecord(ev_b, st);
+        cudaEventSynchronize(ev_b);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, ev_a, ev_b);
+        acc += ms;
+        cudaEventRecord(ev_a, st);
+    }
+};
 
 // Full MLA-DSA Forward -> out_part [M, 4096] BF16.
 inline void dsa_forward(
@@ -1360,24 +1530,42 @@ inline void dsa_forward(
     const int* d_slot, const int* d_pos, const int* d_page_table,
     int M, int max_pps, int max_cap, int max_pos,
     uint8_t* x8_scratch, cudaStream_t st,
-    int graph_idx_cap = 0, int graph_ns = 0) {
-    // 1. Pre-quantize x_norm once for M >= 16 MXFP8 reuse across q_a, kv_a, idx_wk!
-    const uint8_t* x_x8 = nullptr;
-    if (M >= 16 && w.q_a_proj.is_mx8() && x8_scratch != nullptr) {
-        mx8::bf16_to_mx8_a(x_norm, x8_scratch, M, geom::HID, st);
-        x_x8 = x8_scratch;
+    int graph_idx_cap = 0, int graph_ns = 0,
+    DsaProfDetail* pd = nullptr) {
+    if (pd) cudaEventRecord(pd->ev_a, st);
+    const bool need_sparse = (max_pos + 1 - geom::SLIDING_WIN > geom::IDX_TOPK) || (graph_idx_cap > 0);
+    const bool small_mx8   = (M <= 15 && w.q_a_proj.is_mx8());
+
+    // 1. Q_a + KV_a + Indexer K projections (fused 432 CTAs = exact 9.00 waves on small-M MXFP8!)
+    if (small_mx8) {
+        auto launch_qkv_idx = [&](int cnt, int m_off) {
+            constexpr unsigned G = (geom::QA + geom::KVA + geom::IDX_DIM) / 4; // 432
+            if (cnt == 1)      k_ernie55_dsa_qkv_idx_mx8<1, true> <<<G, 128, 0, st>>>(x_norm, w.q_a_proj.mx8.q, w.q_a_proj.mx8.sc, w.kv_a_proj.mx8.q, w.kv_a_proj.mx8.sc, w.idx_wk.mx8.q, w.idx_wk.mx8.sc, sc.q_c, sc.kv_raw, sc.idx_k, 1, m_off);
+            else if (cnt == 2) k_ernie55_dsa_qkv_idx_mx8<2, true> <<<G, 128, 0, st>>>(x_norm, w.q_a_proj.mx8.q, w.q_a_proj.mx8.sc, w.kv_a_proj.mx8.q, w.kv_a_proj.mx8.sc, w.idx_wk.mx8.q, w.idx_wk.mx8.sc, sc.q_c, sc.kv_raw, sc.idx_k, 2, m_off);
+            else if (cnt == 4) k_ernie55_dsa_qkv_idx_mx8<4, true> <<<G, 128, 0, st>>>(x_norm, w.q_a_proj.mx8.q, w.q_a_proj.mx8.sc, w.kv_a_proj.mx8.q, w.kv_a_proj.mx8.sc, w.idx_wk.mx8.q, w.idx_wk.mx8.sc, sc.q_c, sc.kv_raw, sc.idx_k, 4, m_off);
+            else if (cnt == 6) k_ernie55_dsa_qkv_idx_mx8<6, true> <<<G, 128, 0, st>>>(x_norm, w.q_a_proj.mx8.q, w.q_a_proj.mx8.sc, w.kv_a_proj.mx8.q, w.kv_a_proj.mx8.sc, w.idx_wk.mx8.q, w.idx_wk.mx8.sc, sc.q_c, sc.kv_raw, sc.idx_k, 6, m_off);
+            else if (cnt == 8) k_ernie55_dsa_qkv_idx_mx8<8, true> <<<G, 128, 0, st>>>(x_norm, w.q_a_proj.mx8.q, w.q_a_proj.mx8.sc, w.kv_a_proj.mx8.q, w.kv_a_proj.mx8.sc, w.idx_wk.mx8.q, w.idx_wk.mx8.sc, sc.q_c, sc.kv_raw, sc.idx_k, 8, m_off);
+            else               k_ernie55_dsa_qkv_idx_mx8<8, false><<<G, 128, 0, st>>>(x_norm, w.q_a_proj.mx8.q, w.q_a_proj.mx8.sc, w.kv_a_proj.mx8.q, w.kv_a_proj.mx8.sc, w.idx_wk.mx8.q, w.idx_wk.mx8.sc, sc.q_c, sc.kv_raw, sc.idx_k, cnt, m_off);
+        };
+        if (M <= 8) launch_qkv_idx(M, 0);
+        else { launch_qkv_idx(8, 0); launch_qkv_idx(M - 8, 8); }
+    } else {
+        const uint8_t* x_x8 = nullptr;
+        if (M >= 16 && w.q_a_proj.is_mx8() && x8_scratch != nullptr) {
+            mx8::bf16_to_mx8_a(x_norm, x8_scratch, M, geom::HID, st);
+            x_x8 = x8_scratch;
+        }
+        mx8::linear_w(blas, x_norm, w.q_a_proj,  sc.q_c,    M, geom::QA,      geom::HID, x8_scratch, x_x8, st);
+        mx8::linear_w(blas, x_norm, w.kv_a_proj, sc.kv_raw, M, geom::KVA,     geom::HID, x8_scratch, x_x8, st);
+        mx8::linear_w(blas, x_norm, w.idx_wk,    sc.idx_k,  M, geom::IDX_DIM, geom::HID, x8_scratch, x_x8, st);
     }
+    if (pd) pd->mark(pd->qkv_idx_ms, st);
 
-    // 2. Q_c + RMSNorm, KV_a + paged write, Indexer K + paged write
-    mx8::linear_w(blas, x_norm, w.q_a_proj,  sc.q_c,    M, geom::QA,      geom::HID, x8_scratch, x_x8, st);
+    // 2. Q_c RMSNorm, KV paged write, Indexer K paged write
     k_ernie55_rmsnorm<<<M, 256, 0, st>>>(sc.q_c, w.q_a_ln, sc.q_c, M, geom::QA, geom::RMS_EPS);
-
-    mx8::linear_w(blas, x_norm, w.kv_a_proj, sc.kv_raw, M, geom::KVA,     geom::HID, x8_scratch, x_x8, st);
     if (kv.fmt == KvFmt::FP8)       k_ernie55_dsa_kv_write<KvFmt::FP8> <<<M, 256, 0, st>>>(sc.kv_raw, w.kv_a_ln, d_slot, d_pos, d_page_table, kv.kv_pool, M, max_pps);
     else if (kv.fmt == KvFmt::INT4) k_ernie55_dsa_kv_write<KvFmt::INT4><<<M, 256, 0, st>>>(sc.kv_raw, w.kv_a_ln, d_slot, d_pos, d_page_table, kv.kv_pool, M, max_pps);
     else                            k_ernie55_dsa_kv_write<KvFmt::BF16><<<M, 256, 0, st>>>(sc.kv_raw, w.kv_a_ln, d_slot, d_pos, d_page_table, kv.kv_pool, M, max_pps);
-
-    mx8::linear_w(blas, x_norm, w.idx_wk, sc.idx_k, M, geom::IDX_DIM, geom::HID, x8_scratch, x_x8, st);
     if (kv.fmt == KvFmt::BF16) {
         k_ernie55_idx_k_write<false><<<M, 32, 0, st>>>(
             sc.idx_k, w.idx_k_norm_w, w.idx_k_norm_b, d_slot, d_pos, d_page_table,
@@ -1387,20 +1575,42 @@ inline void dsa_forward(
             sc.idx_k, w.idx_k_norm_w, w.idx_k_norm_b, d_slot, d_pos, d_page_table,
             nullptr, kv.idx_q, kv.idx_sc, M, max_pps);
     }
+    if (pd) pd->mark(pd->prep_ms, st);
 
-    // 3. Q_b, gate_proj(q_c), and (when sparse needed) Indexer Q + Weights
+    // 3. Q_b, gate_proj(q_c), and (when sparse & small_mx8) fused Indexer Q on shared q_c!
+    const int N_q  = w.nh_loc * geom::QK_HEAD;
+    const int N_g  = w.nh_loc * geom::V_HEAD;
+    const int N_iq = geom::IDX_HEADS * geom::IDX_DIM;
     const uint8_t* qc_x8 = nullptr;
-    if (M >= 16 && w.q_b_proj.is_mx8() && x8_scratch != nullptr) {
-        mx8::bf16_to_mx8_a(sc.q_c, x8_scratch, M, geom::QA, st);
-        qc_x8 = x8_scratch;
+    bool idx_q_done = false;
+    if (small_mx8) {
+        const int niq = need_sparse ? N_iq : 0;
+        const unsigned G = static_cast<unsigned>((N_q + N_g + niq + 3) / 4);
+        auto launch_qbg = [&](int cnt, int m_off) {
+            if (cnt == 1)      k_ernie55_dsa_qbg_mx8<1, true> <<<G, 128, 0, st>>>(sc.q_c, w.q_b_proj.mx8.q, w.q_b_proj.mx8.sc, w.gate_proj.mx8.q, w.gate_proj.mx8.sc, w.idx_wq_b.mx8.q, w.idx_wq_b.mx8.sc, sc.q_raw, sc.gate, sc.idx_q, 1, m_off, N_q, N_g, niq);
+            else if (cnt == 2) k_ernie55_dsa_qbg_mx8<2, true> <<<G, 128, 0, st>>>(sc.q_c, w.q_b_proj.mx8.q, w.q_b_proj.mx8.sc, w.gate_proj.mx8.q, w.gate_proj.mx8.sc, w.idx_wq_b.mx8.q, w.idx_wq_b.mx8.sc, sc.q_raw, sc.gate, sc.idx_q, 2, m_off, N_q, N_g, niq);
+            else if (cnt == 4) k_ernie55_dsa_qbg_mx8<4, true> <<<G, 128, 0, st>>>(sc.q_c, w.q_b_proj.mx8.q, w.q_b_proj.mx8.sc, w.gate_proj.mx8.q, w.gate_proj.mx8.sc, w.idx_wq_b.mx8.q, w.idx_wq_b.mx8.sc, sc.q_raw, sc.gate, sc.idx_q, 4, m_off, N_q, N_g, niq);
+            else if (cnt == 6) k_ernie55_dsa_qbg_mx8<6, true> <<<G, 128, 0, st>>>(sc.q_c, w.q_b_proj.mx8.q, w.q_b_proj.mx8.sc, w.gate_proj.mx8.q, w.gate_proj.mx8.sc, w.idx_wq_b.mx8.q, w.idx_wq_b.mx8.sc, sc.q_raw, sc.gate, sc.idx_q, 6, m_off, N_q, N_g, niq);
+            else if (cnt == 8) k_ernie55_dsa_qbg_mx8<8, true> <<<G, 128, 0, st>>>(sc.q_c, w.q_b_proj.mx8.q, w.q_b_proj.mx8.sc, w.gate_proj.mx8.q, w.gate_proj.mx8.sc, w.idx_wq_b.mx8.q, w.idx_wq_b.mx8.sc, sc.q_raw, sc.gate, sc.idx_q, 8, m_off, N_q, N_g, niq);
+            else               k_ernie55_dsa_qbg_mx8<8, false><<<G, 128, 0, st>>>(sc.q_c, w.q_b_proj.mx8.q, w.q_b_proj.mx8.sc, w.gate_proj.mx8.q, w.gate_proj.mx8.sc, w.idx_wq_b.mx8.q, w.idx_wq_b.mx8.sc, sc.q_raw, sc.gate, sc.idx_q, cnt, m_off, N_q, N_g, niq);
+        };
+        if (M <= 8) launch_qbg(M, 0);
+        else { launch_qbg(8, 0); launch_qbg(M - 8, 8); }
+        idx_q_done = need_sparse;
+    } else {
+        if (M >= 16 && w.q_b_proj.is_mx8() && x8_scratch != nullptr) {
+            mx8::bf16_to_mx8_a(sc.q_c, x8_scratch, M, geom::QA, st);
+            qc_x8 = x8_scratch;
+        }
+        mx8::linear_w(blas, sc.q_c, w.q_b_proj,  sc.q_raw, M, N_q, geom::QA, x8_scratch, qc_x8, st);
+        mx8::linear_w(blas, sc.q_c, w.gate_proj, sc.gate,  M, N_g, geom::QA, x8_scratch, qc_x8, st);
     }
-    mx8::linear_w(blas, sc.q_c, w.q_b_proj,  sc.q_raw, M, w.nh_loc * geom::QK_HEAD, geom::QA, x8_scratch, qc_x8, st);
-    mx8::linear_w(blas, sc.q_c, w.gate_proj, sc.gate,  M, w.nh_loc * geom::V_HEAD,  geom::QA, x8_scratch, qc_x8, st);
+    if (pd) pd->mark(pd->qbg_ms, st);
 
     // 4. Q absorption + RoPE
     if (M <= 12) {
         if (w.w_uk_t.is_mx8()) {
-            const dim3 g(w.nh_loc, geom::KV_LORA / 8);
+            const dim3 g(w.nh_loc, geom::KV_LORA / 16);
             if (M <= 1)      k_ernie55_dsa_q_absorb_rope_mx8<1> <<<g, 128, 0, st>>>(sc.q_raw, w.w_uk_t.mx8.q, w.w_uk_t.mx8.sc, d_pos, sc.q_full, M, w.nh_loc);
             else if (M <= 2) k_ernie55_dsa_q_absorb_rope_mx8<2> <<<g, 128, 0, st>>>(sc.q_raw, w.w_uk_t.mx8.q, w.w_uk_t.mx8.sc, d_pos, sc.q_full, M, w.nh_loc);
             else if (M <= 4) k_ernie55_dsa_q_absorb_rope_mx8<4> <<<g, 128, 0, st>>>(sc.q_raw, w.w_uk_t.mx8.q, w.w_uk_t.mx8.sc, d_pos, sc.q_full, M, w.nh_loc);
@@ -1432,11 +1642,13 @@ inline void dsa_forward(
             w.nh_loc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         k_ernie55_dsa_q_abs_scatter<<<M * w.nh_loc, 256, 0, st>>>(sc.q_abs_h, sc.q_full, M, w.nh_loc);
     }
+    if (pd) pd->mark(pd->q_abs_ms, st);
 
     // 5. Sparse Lightning Indexer scoring & top-2048 selection (only when pos + 1 - 128 > 2048!)
-    const bool need_sparse = (max_pos + 1 - geom::SLIDING_WIN > geom::IDX_TOPK) || (graph_idx_cap > 0);
     if (need_sparse) {
-        mx8::linear_w(blas, sc.q_c, w.idx_wq_b, sc.idx_q, M, geom::IDX_HEADS * geom::IDX_DIM, geom::QA, x8_scratch, qc_x8, st);
+        if (!idx_q_done) {
+            mx8::linear_w(blas, sc.q_c, w.idx_wq_b, sc.idx_q, M, N_iq, geom::QA, x8_scratch, qc_x8, st);
+        }
         k_ernie55_idx_q_rope_had<<<M * geom::IDX_HEADS, 32, 0, st>>>(sc.idx_q, d_pos, M);
         linear_bf16_f32(blas, x_norm, w.idx_w_proj, sc.idx_w, M, geom::IDX_HEADS, geom::HID, st);
 
@@ -1457,6 +1669,7 @@ inline void dsa_forward(
                 sc.idx_sc, d_pos, sc.sel_tok, sc.sel_cnt, m0, nm, max_cap);
         }
     }
+    if (pd) pd->mark(pd->idx_score_ms, st);
 
     // 6. Tensor-Core Absorbed MLA Attention
     ensure_dsa_tc_smem();
@@ -1488,15 +1701,17 @@ inline void dsa_forward(
             k_ernie55_dsa_split_reduce<<<M * w.nh_loc, 256, 0, st>>>(sc.split_m, sc.split_l, sc.split_o, sc.u_h, M, w.nh_loc, NS);
         }
     }
+    if (pd) pd->mark(pd->mla_tc_ms, st);
 
-    // 7. V expand: v_h[h, m, 256] = u_h[h, m, 512] @ w_uv[h, 256, 512]^T
+    // 7. V expand: v_h[h, m, 256] = u_h[h, m, 512] @ w_uv[h, 256, 512]^T (4 rows/warp -> 1024 CTAs)
     if (M <= 12 && w.w_uv.is_mx8()) {
-        const dim3 gv(w.nh_loc, geom::V_HEAD / 4);
-        if (M <= 1)      k_ernie55_dsa_v_expand_mx8<1> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
-        else if (M <= 2) k_ernie55_dsa_v_expand_mx8<2> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
-        else if (M <= 4) k_ernie55_dsa_v_expand_mx8<4> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
-        else if (M <= 8) k_ernie55_dsa_v_expand_mx8<8> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
-        else             k_ernie55_dsa_v_expand_mx8<12><<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
+        const dim3 gv(w.nh_loc, geom::V_HEAD / 16);
+        if (M == 1)      k_ernie55_dsa_v_expand_mx8<1,  true> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, 1, w.nh_loc);
+        else if (M == 2) k_ernie55_dsa_v_expand_mx8<2,  true> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, 2, w.nh_loc);
+        else if (M == 4) k_ernie55_dsa_v_expand_mx8<4,  true> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, 4, w.nh_loc);
+        else if (M == 8) k_ernie55_dsa_v_expand_mx8<8,  true> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, 8, w.nh_loc);
+        else if (M <  8) k_ernie55_dsa_v_expand_mx8<8,  false><<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
+        else             k_ernie55_dsa_v_expand_mx8<12, false><<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
     } else {
         const __nv_bfloat16* wuv_bf16 = w.w_uv.bf16;
         if (w.w_uv.is_mx8()) {
@@ -1513,10 +1728,13 @@ inline void dsa_forward(
             &beta, sc.v_h, CUDA_R_16BF, geom::V_HEAD, static_cast<long long>(M) * geom::V_HEAD,
             w.nh_loc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     }
+    if (pd) pd->mark(pd->v_exp_ms, st);
 
     // 8. VHAPostMix + * sigmoid(gate) -> o_proj -> out_part [M, 4096]
     k_ernie55_dsa_vha_gate<<<M * w.nh_loc, 256, 0, st>>>(sc.v_h, w.vha_mix, sc.gate, sc.attn_out, M, w.nh_loc, w.h_off);
+    if (pd) pd->mark(pd->vha_gate_ms, st);
     mx8::linear_w(blas, sc.attn_out, w.o_proj, out_part, M, geom::HID, w.nh_loc * geom::V_HEAD, x8_scratch, nullptr, st);
+    if (pd) pd->mark(pd->o_proj_ms, st);
 }
 
 } // namespace ernie55

@@ -19,6 +19,14 @@ knobs:
       Quantize ERNIE 5.5 Flash dense BF16 linear projections to Blackwell MXFP8 (E4M3 + UE8M0 1x32 scales) at boot
       and free the ~11.34 GiB BF16 dense staging slab before KV and hot-expert allocation, saving ~5.4 GiB VRAM and
       halving decode dense bandwidth. Set 0 to keep all dense weights in BF16.
+  GR8_ERNIE55_MX8_HEAD:
+    scope: agree
+    kind: flag
+    default: "0"
+    legacy: []
+    doc: >-
+      Quantize ERNIE 5.5 Flash lm_head.weight [201216, 4096] to Blackwell MXFP8 (E4M3 + UE8M0 1x32 scales) at boot,
+      halving LM-head decode bandwidth (~7.1 ms -> ~3.6 ms on Spark). Default 0 keeps lm_head in lossless BF16.
   GR8_ERNIE55_GRAPHS:
     scope: local
     kind: flag

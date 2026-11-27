@@ -180,6 +180,7 @@ int main(int argc, char** argv) {
     uint32_t seed = 42;
     bool profile = false, dump_logits = false, eval_dump_full = false;
     bool mx8_set = false, mx8_val = true;
+    bool mx8_head_set = false, mx8_head_val = false;
     bool graphs_set = false, graphs_val = true;
     bool hybrid_set = false, hybrid_val = false;
 
@@ -191,6 +192,8 @@ int main(int argc, char** argv) {
         else if (a == "--kv-format")      kv_fmt_str = need("--kv-format");
         else if (a == "--mx8")            { mx8_set = true; mx8_val = true; }
         else if (a == "--no-mx8")         { mx8_set = true; mx8_val = false; }
+        else if (a == "--mx8-head")       { mx8_head_set = true; mx8_head_val = true; }
+        else if (a == "--no-mx8-head")    { mx8_head_set = true; mx8_head_val = false; }
         else if (a == "--graph")          { graphs_set = true; graphs_val = true; }
         else if (a == "--no-graph")       { graphs_set = true; graphs_val = false; }
         else if (a == "--hybrid")         { hybrid_set = true; hybrid_val = true; }
@@ -237,6 +240,7 @@ int main(int argc, char** argv) {
     o.dump_dir = dump_dir;
     if (!kv_fmt_str.empty()) { o.kv_fmt = ernie55rt::parse_kv_fmt(kv_fmt_str); o.kv_fmt_set = true; }
     if (mx8_set)             { o.mx8_dense = mx8_val; o.mx8_set = true; }
+    if (mx8_head_set)        { o.mx8_head = mx8_head_val; o.mx8_head_set = true; }
     if (graphs_set)          { o.use_graphs = graphs_val; o.graphs_set = true; }
     if (hybrid_set)          { o.use_hybrid = hybrid_val; o.hybrid_set = true; }
 

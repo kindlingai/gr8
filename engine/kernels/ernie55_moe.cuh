@@ -620,6 +620,104 @@ struct MoeScratch {
     float*  sh_fc2_part = nullptr; // [16, HB, 2, 128] FP32 (shared FC2 K-split=2 scratch)
 };
 
+// Fused FP32 Router (W0[512,4096] + W1[512,4096], 256 heavy CTAs FIRST) + MXFP8 fc1_lat ([2048,4096], 512 light CTAs)
+// on shared x_norm [M, 4096]! Total 768 CTAs = exact 16.00 waves on 48 SMs (eliminates 11.1% router wave tail + 42 launches).
+template <int MAX_M, bool EXACT_M>
+__global__ void __launch_bounds__(128) k_ernie55_moe_router_fc1lat_mx8(
+    const __nv_bfloat16* __restrict__ X,
+    const float* __restrict__ W0,
+    const float* __restrict__ W1,
+    const uint8_t* __restrict__ lat_q,
+    const uint8_t* __restrict__ lat_sc,
+    float* __restrict__ L0,
+    float* __restrict__ L1,
+    __nv_bfloat16* __restrict__ routed_in,
+    int M, int m_off) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int bx = blockIdx.x;
+    const __nv_bfloat16* Xm0 = X + static_cast<size_t>(m_off) * geom::HID;
+
+    if (bx < 256) {
+        const int e_ext = bx * 4 + warp;
+        if (e_ext >= 2 * geom::NEXP) return;
+        const bool is_w1 = (e_ext >= geom::NEXP);
+        const int e = is_w1 ? (e_ext - geom::NEXP) : e_ext;
+        const float4* wr = reinterpret_cast<const float4*>((is_w1 ? W1 : W0) + static_cast<size_t>(e) * geom::HID);
+        float a[MAX_M];
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) a[m] = 0.0f;
+
+        for (int i = lane; i < (geom::HID >> 2); i += 128) {
+            const float4 f0 = __ldg(wr + i);
+            const float4 f1 = __ldg(wr + i + 32);
+            const float4 f2 = __ldg(wr + i + 64);
+            const float4 f3 = __ldg(wr + i + 96);
+            #pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (EXACT_M || m < M) {
+                    const uint2* xm = reinterpret_cast<const uint2*>(Xm0 + static_cast<size_t>(m) * geom::HID);
+                    const uint2 r0 = __ldg(xm + i);
+                    const uint2 r1 = __ldg(xm + i + 32);
+                    const uint2 r2 = __ldg(xm + i + 64);
+                    const uint2 r3 = __ldg(xm + i + 96);
+                    auto dot4 = [](uint2 raw, float4 f, float acc) -> float {
+                        const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+                        const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+                        return fmaf(x01.x, f.x, fmaf(x01.y, f.y, fmaf(x23.x, f.z, fmaf(x23.y, f.w, acc))));
+                    };
+                    a[m] = dot4(r0, f0, a[m]);
+                    a[m] = dot4(r1, f1, a[m]);
+                    a[m] = dot4(r2, f2, a[m]);
+                    a[m] = dot4(r3, f3, a[m]);
+                }
+            }
+        }
+        float* L = is_w1 ? L1 : L0;
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (EXACT_M || m < M) {
+                const float s = warp_sum(a[m]);
+                if (lane == 0) L[static_cast<size_t>(m_off + m) * geom::NEXP + e] = s;
+            }
+        }
+    } else {
+        const int row = (bx - 256) * 4 + warp;
+        if (row >= geom::EH) return;
+        constexpr int K = geom::HID;
+        constexpr int K16 = K >> 4;
+        constexpr int NB  = K >> 5;
+        const uint4* qrow = reinterpret_cast<const uint4*>(lat_q + static_cast<size_t>(row) * K);
+        const uint8_t* srow = lat_sc + static_cast<size_t>(row) * NB;
+        float acc[MAX_M];
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+
+        #pragma unroll
+        for (int i = lane; i < K16; i += 128) {
+            const uint4 w0 = __ldg(qrow + i);
+            const uint4 w1 = __ldg(qrow + i + 32);
+            const uint4 w2 = __ldg(qrow + i + 64);
+            const uint4 w3 = __ldg(qrow + i + 96);
+            const uint8_t s0 = __ldg(srow + (i >> 1));
+            const uint8_t s1 = __ldg(srow + ((i + 32) >> 1));
+            const uint8_t s2 = __ldg(srow + ((i + 64) >> 1));
+            const uint8_t s3 = __ldg(srow + ((i + 96) >> 1));
+            mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w0, s0, i,      M, K, acc);
+            mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w1, s1, i + 32, M, K, acc);
+            mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w2, s2, i + 64, M, K, acc);
+            mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w3, s3, i + 96, M, K, acc);
+        }
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (EXACT_M || m < M) {
+                const float tot = warp_sum(acc[m]);
+                if (lane == 0) routed_in[static_cast<size_t>(m_off + m) * geom::EH + row] = __float2bfloat16(tot);
+            }
+        }
+    }
+}
+
 // Fast coalesced F32 GEMV for small-M router (M <= 12): splits W0 (0..511) & W1 (512..1023) across
 // Grid: (256), Block: 128 (4 warps/CTA, 5.33 waves on 48 SMs) with 4x-unrolled float4 loads (64 B/lane in flight).
 template <int MAX_M>
@@ -1206,7 +1304,7 @@ __global__ void __launch_bounds__(256) k_ernie55_routed_fc2_grp16(
 }
 
 // Deterministic sum over all 10 routes + fused latent_norm -> routed_normed [M, 2048] BF16!
-// Grid: (M), Block: 256 (8 elements per thread for EH=2048 exact).
+// Grid: (M), Block: 256 (2 x float4 = 8 elements per thread for EH=2048 exact, coalesced float4 __ldg).
 __global__ void __launch_bounds__(256) k_ernie55_routed_reduce_and_norm(
     const float* __restrict__ fc2_part,
     const __nv_bfloat16* __restrict__ lat_norm_w,
@@ -1215,21 +1313,26 @@ __global__ void __launch_bounds__(256) k_ernie55_routed_reduce_and_norm(
     if (m >= M) return;
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
+    constexpr int EH4 = geom::EH >> 2; // 512
 
-    float vals[8];
+    float4 vals[2];
     float ss = 0.0f;
     #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int d = tid + j * 256;
-        float acc = 0.0f;
+    for (int j = 0; j < 2; ++j) {
+        const int d4 = tid + j * 256;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         #pragma unroll
         for (int k = 0; k < geom::TOPK; ++k) {
             const int r = m * geom::TOPK + k;
-            acc += fc2_part[static_cast<size_t>(r) * geom::EH + d];
+            const float4 v = __ldg(reinterpret_cast<const float4*>(fc2_part) + static_cast<size_t>(r) * EH4 + d4);
+            a0 += v.x; a1 += v.y; a2 += v.z; a3 += v.w;
         }
-        const float vbf = __bfloat162float(__float2bfloat16(acc));
-        vals[j] = vbf;
-        ss = fmaf(vbf, vbf, ss);
+        const float b0 = __bfloat162float(__float2bfloat16(a0));
+        const float b1 = __bfloat162float(__float2bfloat16(a1));
+        const float b2 = __bfloat162float(__float2bfloat16(a2));
+        const float b3 = __bfloat162float(__float2bfloat16(a3));
+        vals[j] = make_float4(b0, b1, b2, b3);
+        ss = fmaf(b0, b0, fmaf(b1, b1, fmaf(b2, b2, fmaf(b3, b3, ss))));
     }
     __shared__ float sm[8];
     ss = warp_sum(ss);
@@ -1243,11 +1346,18 @@ __global__ void __launch_bounds__(256) k_ernie55_routed_reduce_and_norm(
     }
     __syncthreads();
     const float inv = sm[0];
-    __nv_bfloat16* dst = routed_normed + static_cast<size_t>(m) * geom::EH;
+    uint2* dst2 = reinterpret_cast<uint2*>(routed_normed + static_cast<size_t>(m) * geom::EH);
+    const uint2* nw2 = reinterpret_cast<const uint2*>(lat_norm_w);
     #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int d = tid + j * 256;
-        dst[d] = __float2bfloat16(vals[j] * inv * __bfloat162float(lat_norm_w[d]));
+    for (int j = 0; j < 2; ++j) {
+        const int d4 = tid + j * 256;
+        const uint2 raw = __ldg(nw2 + d4);
+        const float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+        const float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+        uint2 out;
+        *reinterpret_cast<__nv_bfloat162*>(&out.x) = __floats2bfloat162_rn(vals[j].x * inv * w01.x, vals[j].y * inv * w01.y);
+        *reinterpret_cast<__nv_bfloat162*>(&out.y) = __floats2bfloat162_rn(vals[j].z * inv * w23.x, vals[j].w * inv * w23.y);
+        dst2[d4] = out;
     }
 }
 
@@ -1896,10 +2006,27 @@ inline void moe_forward_resident(cublasHandle_t blas, const MoeWeights& w, MoeSc
         cudaEventRecord(ev_join, stream_sh);
     }
     if (pd) cudaEventRecord(pd->ev_a, st);
-    moe_route(blas, w, sc, x_norm, M, nullptr, st);
-    if (pd) pd->mark(pd->router_ms, st);
-    mx8::linear_w(blas, x_norm, w.fc1_lat, sc.routed_in, M, geom::EH, geom::HID, x8_scratch, nullptr, st);
-    if (pd) pd->mark(pd->fc1_lat_ms, st);
+    if (M <= 15 && w.fc1_lat.is_mx8()) {
+        auto launch_rf = [&](int cnt, int m_off) {
+            constexpr unsigned G = (2 * geom::NEXP + geom::EH) / 4; // 768 = exact 16.00 waves on 48 SMs
+            if (cnt == 1)      k_ernie55_moe_router_fc1lat_mx8<1, true> <<<G, 128, 0, st>>>(x_norm, w.router_w0, w.router_w1, w.fc1_lat.mx8.q, w.fc1_lat.mx8.sc, sc.router_l0, sc.router_l1, sc.routed_in, 1, m_off);
+            else if (cnt == 2) k_ernie55_moe_router_fc1lat_mx8<2, true> <<<G, 128, 0, st>>>(x_norm, w.router_w0, w.router_w1, w.fc1_lat.mx8.q, w.fc1_lat.mx8.sc, sc.router_l0, sc.router_l1, sc.routed_in, 2, m_off);
+            else if (cnt == 4) k_ernie55_moe_router_fc1lat_mx8<4, true> <<<G, 128, 0, st>>>(x_norm, w.router_w0, w.router_w1, w.fc1_lat.mx8.q, w.fc1_lat.mx8.sc, sc.router_l0, sc.router_l1, sc.routed_in, 4, m_off);
+            else if (cnt == 6) k_ernie55_moe_router_fc1lat_mx8<6, true> <<<G, 128, 0, st>>>(x_norm, w.router_w0, w.router_w1, w.fc1_lat.mx8.q, w.fc1_lat.mx8.sc, sc.router_l0, sc.router_l1, sc.routed_in, 6, m_off);
+            else if (cnt == 8) k_ernie55_moe_router_fc1lat_mx8<8, true> <<<G, 128, 0, st>>>(x_norm, w.router_w0, w.router_w1, w.fc1_lat.mx8.q, w.fc1_lat.mx8.sc, sc.router_l0, sc.router_l1, sc.routed_in, 8, m_off);
+            else               k_ernie55_moe_router_fc1lat_mx8<8, false><<<G, 128, 0, st>>>(x_norm, w.router_w0, w.router_w1, w.fc1_lat.mx8.q, w.fc1_lat.mx8.sc, sc.router_l0, sc.router_l1, sc.routed_in, cnt, m_off);
+        };
+        if (M <= 8) launch_rf(M, 0);
+        else { launch_rf(8, 0); launch_rf(M - 8, 8); }
+        k_ernie55_router_topk10<<<M, 256, 0, st>>>(
+            sc.router_l0, sc.router_l1, w.router_bias, w.router_sc, sc.topk_idx, sc.topk_w, nullptr, M);
+        if (pd) pd->mark(pd->router_ms, st);
+    } else {
+        moe_route(blas, w, sc, x_norm, M, nullptr, st);
+        if (pd) pd->mark(pd->router_ms, st);
+        mx8::linear_w(blas, x_norm, w.fc1_lat, sc.routed_in, M, geom::EH, geom::HID, x8_scratch, nullptr, st);
+        if (pd) pd->mark(pd->fc1_lat_ms, st);
+    }
     const int n_routes = M * geom::TOPK;
     k_ernie55_prerot_x<geom::EHB><<<M * geom::EHB, 32, 0, st>>>(sc.routed_in, w.routed.sg, sc.x_had_r, M);
     if (pd) pd->mark(pd->prerot_r_ms, st);

@@ -660,6 +660,102 @@ inline void linear_w_f32(cublasHandle_t blas, const __nv_bfloat16* A, const LinW
     }
 }
 
+// Fused MXFP8 LM-head GEMV + multimax transform for small-M decode (M <= 15).
+// 32-lane/row, 4x-unrolled uint4 __ldg loads (halves LM-head weight BW vs BF16: 1.65 GiB -> 0.85 GiB).
+template <int MAX_M, bool EXACT_M>
+__global__ void __launch_bounds__(128) k_ernie55_lm_head_mx8_multimax(
+    const __nv_bfloat16* __restrict__ X,
+    const uint8_t* __restrict__ Bq,
+    const uint8_t* __restrict__ Bsc,
+    const __nv_bfloat16* __restrict__ ranges,
+    const __nv_bfloat16* __restrict__ ts,
+    float* __restrict__ C,
+    int M, int N, int K) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int o = blockIdx.x * 4 + warp;
+    if (o >= N) return;
+
+    const int K16 = K >> 4;
+    const int NB = K >> 5;
+    const uint4* qrow = reinterpret_cast<const uint4*>(Bq + static_cast<size_t>(o) * K);
+    const uint8_t* srow = Bsc + static_cast<size_t>(o) * NB;
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+
+    int i = lane;
+    for (; i + 96 < K16; i += 128) {
+        const uint4 w0 = __ldg(qrow + i);
+        const uint4 w1 = __ldg(qrow + i + 32);
+        const uint4 w2 = __ldg(qrow + i + 64);
+        const uint4 w3 = __ldg(qrow + i + 96);
+        const uint8_t s0 = __ldg(srow + (i >> 1));
+        const uint8_t s1 = __ldg(srow + ((i + 32) >> 1));
+        const uint8_t s2 = __ldg(srow + ((i + 64) >> 1));
+        const uint8_t s3 = __ldg(srow + ((i + 96) >> 1));
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w0, s0, i,      M, K, acc);
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w1, s1, i + 32, M, K, acc);
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w2, s2, i + 64, M, K, acc);
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w3, s3, i + 96, M, K, acc);
+    }
+    for (; i < K16; i += 32) {
+        const uint4 w0 = __ldg(qrow + i);
+        const uint8_t s0 = __ldg(srow + (i >> 1));
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w0, s0, i, M, K, acc);
+    }
+
+    const bool has_mm = (ranges != nullptr && ts != nullptr);
+    const float r0 = has_mm ? __bfloat162float(__ldg(ranges + 0)) : 0.0f;
+    const float r1 = has_mm ? __bfloat162float(__ldg(ranges + 1)) : 0.0f;
+    const float r2 = has_mm ? __bfloat162float(__ldg(ranges + 2)) : 0.0f;
+    const float r3 = has_mm ? __bfloat162float(__ldg(ranges + 3)) : 0.0f;
+    const float t0 = has_mm ? __bfloat162float(__ldg(ts + 0)) : 0.0f;
+    const float t1 = has_mm ? __bfloat162float(__ldg(ts + 1)) : 0.0f;
+    const float t2 = has_mm ? __bfloat162float(__ldg(ts + 2)) : 0.0f;
+    const float t3 = has_mm ? __bfloat162float(__ldg(ts + 3)) : 0.0f;
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (EXACT_M || m < M) {
+            float x = warp_sum(acc[m]);
+            if (lane == 0) {
+                if (has_mm) {
+                    const float a = fmaxf(0.0f, r0 - x);
+                    const float b = fmaxf(0.0f, x - r1);
+                    const float c = fmaxf(0.0f, r2 - x);
+                    const float d = fmaxf(0.0f, x - r3);
+                    x = x + t0 * a + t1 * b + t2 * (c * c) + t3 * (d * d);
+                }
+                C[static_cast<size_t>(m) * N + o] = x;
+            }
+        }
+    }
+}
+
+inline void linear_mx8_f32_multimax(cublasHandle_t blas, const __nv_bfloat16* A, const Mx8Mat& B,
+                                    const __nv_bfloat16* ranges, const __nv_bfloat16* ts,
+                                    float* C, int M, uint8_t* x8_scratch, cudaStream_t st) {
+    if (M <= 15) {
+        const unsigned g = static_cast<unsigned>((B.N + 3) / 4);
+        if (M == 1)      k_ernie55_lm_head_mx8_multimax<1, true> <<<g, 128, 0, st>>>(A, B.q, B.sc, ranges, ts, C, 1, B.N, B.K);
+        else if (M == 2) k_ernie55_lm_head_mx8_multimax<2, true> <<<g, 128, 0, st>>>(A, B.q, B.sc, ranges, ts, C, 2, B.N, B.K);
+        else if (M == 4) k_ernie55_lm_head_mx8_multimax<4, true> <<<g, 128, 0, st>>>(A, B.q, B.sc, ranges, ts, C, 4, B.N, B.K);
+        else if (M == 6) k_ernie55_lm_head_mx8_multimax<6, true> <<<g, 128, 0, st>>>(A, B.q, B.sc, ranges, ts, C, 6, B.N, B.K);
+        else if (M == 8) k_ernie55_lm_head_mx8_multimax<8, true> <<<g, 128, 0, st>>>(A, B.q, B.sc, ranges, ts, C, 8, B.N, B.K);
+        else if (M <  8) k_ernie55_lm_head_mx8_multimax<8, false><<<g, 128, 0, st>>>(A, B.q, B.sc, ranges, ts, C, M, B.N, B.K);
+        else {
+            k_ernie55_lm_head_mx8_multimax<8, true> <<<g, 128, 0, st>>>(A, B.q, B.sc, ranges, ts, C, 8, B.N, B.K);
+            k_ernie55_lm_head_mx8_multimax<8, false><<<g, 128, 0, st>>>(
+                A + static_cast<size_t>(8) * B.K, B.q, B.sc, ranges, ts,
+                C + static_cast<size_t>(8) * B.N, M - 8, B.N, B.K);
+        }
+    } else {
+        linear_w_f32(blas, A, LinW::from_mx8(B), C, M, B.N, B.K, x8_scratch, nullptr, st);
+        apply_multimax(C, ranges, ts, M, B.N, st);
+    }
+}
+
 __global__ void __launch_bounds__(256) k_ernie55_mx8_dequant_bf16(
     const uint8_t* __restrict__ q,
     const uint8_t* __restrict__ sc,

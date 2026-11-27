@@ -295,6 +295,8 @@ struct Options {
     bool kv_fmt_set = false;
     bool mx8_dense = true;
     bool mx8_set = false;
+    bool mx8_head = false;
+    bool mx8_head_set = false;
     bool use_graphs = true;
     bool graphs_set = false;
     bool use_hybrid = false;
@@ -305,6 +307,7 @@ struct ProfileAccum {
     double mhc_ms = 0, hca_ms = 0, dsa_ms = 0, moe_ms = 0, ar_ms = 0, head_ms = 0;
     double head_gemv_ms = 0, head_pack_ms = 0;
     ernie55::HcaProfDetail hca_d{};
+    ernie55::DsaProfDetail dsa_d{};
     ernie55::MoeProfDetail moe_d{};
     int steps = 0, tokens = 0;
     void reset() {
@@ -312,6 +315,8 @@ struct ProfileAccum {
         head_gemv_ms = head_pack_ms = 0;
         hca_d.qkv_comp_ms = hca_d.prep_ms = hca_d.qup_gate_ms = hca_d.q_norm_rope_ms = 0;
         hca_d.attn_tc_ms = hca_d.vha_invrope_ms = hca_d.woa_gate_ms = hca_d.o_proj_ms = 0;
+        dsa_d.qkv_idx_ms = dsa_d.prep_ms = dsa_d.qbg_ms = dsa_d.q_abs_ms = 0;
+        dsa_d.idx_score_ms = dsa_d.mla_tc_ms = dsa_d.v_exp_ms = dsa_d.vha_gate_ms = dsa_d.o_proj_ms = 0;
         moe_d.router_ms = moe_d.fc1_lat_ms = moe_d.prerot_r_ms = moe_d.routed_fc1_ms = 0;
         moe_d.routed_fc2_ms = moe_d.shared_ms = moe_d.finish_ms = 0;
         steps = tokens = 0;
@@ -332,6 +337,12 @@ struct ProfileAccum {
                      hca_d.qkv_comp_ms / steps, hca_d.prep_ms / steps, hca_d.qup_gate_ms / steps,
                      hca_d.q_norm_rope_ms / steps, hca_d.attn_tc_ms / steps, hca_d.vha_invrope_ms / steps,
                      hca_d.woa_gate_ms / steps, hca_d.o_proj_ms / steps);
+        std::fprintf(stderr,
+                     "# ernie55 dsa_detail (ms/step, 6L): qkv_idx=%.2f prep=%.2f qbg=%.2f q_abs=%.2f "
+                     "idx=%.2f mla_tc=%.2f v_exp=%.2f vha=%.2f o_proj=%.2f\n",
+                     dsa_d.qkv_idx_ms / steps, dsa_d.prep_ms / steps, dsa_d.qbg_ms / steps,
+                     dsa_d.q_abs_ms / steps, dsa_d.idx_score_ms / steps, dsa_d.mla_tc_ms / steps,
+                     dsa_d.v_exp_ms / steps, dsa_d.vha_gate_ms / steps, dsa_d.o_proj_ms / steps);
         std::fprintf(stderr,
                      "# ernie55 moe_detail (ms/step, 42L): router=%.2f fc1_lat=%.2f prerot=%.2f r_fc1=%.2f "
                      "r_fc2=%.2f shared=%.2f finish=%.2f\n",
@@ -368,6 +379,8 @@ struct Engine {
     const __nv_bfloat16* multimax_ranges = nullptr;
     const __nv_bfloat16* multimax_ts = nullptr;
     std::vector<const __nv_bfloat16*> lm_head;
+    std::vector<ernie55::mx8::Mx8Arena> mx8_head_arena;
+    std::vector<ernie55::mx8::Mx8Mat> lm_head_mx8;
     std::vector<int> v_lo, v_rows;
 
     float* d_yarn_inv_freq = nullptr; // [32] FP32
@@ -458,6 +471,8 @@ struct Engine {
         if (ev_moe_join) cudaEventDestroy(ev_moe_join);
         if (prof.hca_d.ev_a) cudaEventDestroy(prof.hca_d.ev_a);
         if (prof.hca_d.ev_b) cudaEventDestroy(prof.hca_d.ev_b);
+        if (prof.dsa_d.ev_a) cudaEventDestroy(prof.dsa_d.ev_a);
+        if (prof.dsa_d.ev_b) cudaEventDestroy(prof.dsa_d.ev_b);
         if (prof.moe_d.ev_a) cudaEventDestroy(prof.moe_d.ev_a);
         if (prof.moe_d.ev_b) cudaEventDestroy(prof.moe_d.ev_b);
         if (blas) cublasDestroy(blas);
@@ -558,9 +573,10 @@ struct Engine {
         if (o.widths_path.empty()) o.widths_path = default_widths_path(release_dir);
 
         // Apply typed knobs (CLI overrides when explicitly set!)
-        if (!o.kv_fmt_set) o.kv_fmt = parse_kv_fmt(knob::ernie55_kv_format());
-        if (!o.mx8_set)    o.mx8_dense = knob::ernie55_mx8_dense();
-        if (!o.graphs_set) o.use_graphs = knob::ernie55_graphs();
+        if (!o.kv_fmt_set)   o.kv_fmt = parse_kv_fmt(knob::ernie55_kv_format());
+        if (!o.mx8_set)      o.mx8_dense = knob::ernie55_mx8_dense();
+        if (!o.mx8_head_set) o.mx8_head = knob::ernie55_mx8_head();
+        if (!o.graphs_set)   o.use_graphs = knob::ernie55_graphs();
         HybridConfig hcfg = load_hybrid_config();
         if (o.hybrid_set) hcfg.enabled = o.use_hybrid;
         else              o.use_hybrid = hcfg.enabled;
@@ -583,6 +599,8 @@ struct Engine {
         ERNIE55_CK(cudaEventCreateWithFlags(&ev_moe_join, cudaEventDisableTiming));
         ERNIE55_CK(cudaEventCreate(&prof.hca_d.ev_a));
         ERNIE55_CK(cudaEventCreate(&prof.hca_d.ev_b));
+        ERNIE55_CK(cudaEventCreate(&prof.dsa_d.ev_a));
+        ERNIE55_CK(cudaEventCreate(&prof.dsa_d.ev_b));
         ERNIE55_CK(cudaEventCreate(&prof.moe_d.ev_a));
         ERNIE55_CK(cudaEventCreate(&prof.moe_d.ev_b));
 
@@ -620,6 +638,8 @@ struct Engine {
         multimax_ts     = im0.get<__nv_bfloat16>("lm_head.multimax_ts");
 
         lm_head.resize(size_t(o.nloc));
+        mx8_head_arena.resize(size_t(o.nloc));
+        lm_head_mx8.resize(size_t(o.nloc));
         v_lo.resize(size_t(o.nloc));
         v_rows.resize(size_t(o.nloc));
         int max_vr = 0;
@@ -629,6 +649,12 @@ struct Engine {
             v_lo[size_t(i)]    = geom::vocab_row0(o.nr, r);
             v_rows[size_t(i)]  = static_cast<int>(img[size_t(i)]->entry("lm_head.weight").shape[0]);
             max_vr = std::max(max_vr, v_rows[size_t(i)]);
+            if (o.mx8_head) {
+                auto& ha = mx8_head_arena[size_t(i)];
+                ha.reserve(v_rows[size_t(i)], geom::HID);
+                if (!ha.alloc()) die("mx8_head_arena cudaMalloc failed");
+                lm_head_mx8[size_t(i)] = ha.add(lm_head[size_t(i)], v_rows[size_t(i)], geom::HID, stream);
+            }
         }
 
         // 3. Bind permanent layer structures, boot-transpose mHC weights, precompute VHA I+V@U^T,
@@ -1016,8 +1042,8 @@ struct Engine {
 
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        std::fprintf(stderr, "# ernie55 ready: TP=%d rank0=%d kv=%s mx8=%d hybrid=%d graphs=%d VRAM used=%.2f / %.2f GiB (free=%.2f GiB)\n",
-                     o.nr, o.rank0, kv_fmt_name(o.kv_fmt), o.mx8_dense ? 1 : 0, o.use_hybrid ? 1 : 0,
+        std::fprintf(stderr, "# ernie55 ready: TP=%d rank0=%d kv=%s mx8=%d mx8_head=%d hybrid=%d graphs=%d VRAM used=%.2f / %.2f GiB (free=%.2f GiB)\n",
+                     o.nr, o.rank0, kv_fmt_name(o.kv_fmt), o.mx8_dense ? 1 : 0, o.mx8_head ? 1 : 0, o.use_hybrid ? 1 : 0,
                      o.use_graphs ? 1 : 0, (total_b - free_b) / double(1ull << 30),
                      total_b / double(1ull << 30), free_b / double(1ull << 30));
     }
@@ -1063,7 +1089,8 @@ struct Engine {
             if (y.is_dsa) {
                 ernie55::dsa_forward(blas, rl.dsa_w, dsa_sc, rl.dsa_kv, mixed_ln, p_dst,
                                      segs, nsegs, d_slot, d_pos, d_page_table,
-                                     M, max_pps, o.cap, max_pos, mx8_x8, stream, graph_idx_cap, dsa_g_ns);
+                                     M, max_pps, o.cap, max_pos, mx8_x8, stream, graph_idx_cap, dsa_g_ns,
+                                     (!capture_mode && o.profile) ? &prof.dsa_d : nullptr);
             } else {
                 ernie55::hca_forward(blas, rl.hca_w, hca_sc, rl.hca_kv, mixed_ln, p_dst,
                                      segs, nsegs, d_slot, d_pos, d_yarn_inv_freq,
@@ -1196,8 +1223,13 @@ struct Engine {
                 }
                 ernie55::k_ernie55_hc_head_and_norm<<<M, 256, 0, stream>>>(
                     hyper, hc_head.fn, hc_head.base, hc_head.scale, final_norm, mixed_ln, M);
-                ernie55::linear_bf16_f32_multimax(blas, mixed_ln, lm_head[0], multimax_ranges, multimax_ts,
-                                                  head_logits, M, v_rows[0], geom::HID, stream);
+                if (o.mx8_head && lm_head_mx8[0].ready()) {
+                    ernie55::mx8::linear_mx8_f32_multimax(blas, mixed_ln, lm_head_mx8[0], multimax_ranges, multimax_ts,
+                                                          head_logits, M, mx8_x8, stream);
+                } else {
+                    ernie55::linear_bf16_f32_multimax(blas, mixed_ln, lm_head[0], multimax_ranges, multimax_ts,
+                                                      head_logits, M, v_rows[0], geom::HID, stream);
+                }
                 if (greedy_fast) {
                     ink2::head_argmax_dev(head_logits, M, v_rows[0], v_lo[0],
                                           head_argmax_val, head_argmax_id, head_dev_pkt, rb, stream);
@@ -1264,8 +1296,13 @@ struct Engine {
             const int r = o.rank0 + i;
             const int vr = v_rows[size_t(i)];
             const int v0 = v_lo[size_t(i)];
-            ernie55::linear_bf16_f32_multimax(blas, mixed_ln, lm_head[size_t(i)], multimax_ranges, multimax_ts,
-                                              head_logits, M, vr, geom::HID, stream);
+            if (o.mx8_head && lm_head_mx8[size_t(i)].ready()) {
+                ernie55::mx8::linear_mx8_f32_multimax(blas, mixed_ln, lm_head_mx8[size_t(i)], multimax_ranges, multimax_ts,
+                                                      head_logits, M, mx8_x8, stream);
+            } else {
+                ernie55::linear_bf16_f32_multimax(blas, mixed_ln, lm_head[size_t(i)], multimax_ranges, multimax_ts,
+                                                  head_logits, M, vr, geom::HID, stream);
+            }
             if (o.profile) {
                 const double before = prof.head_gemv_ms;
                 prof_mark(prof.head_gemv_ms);
