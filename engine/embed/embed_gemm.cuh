@@ -258,6 +258,135 @@ __global__ void __launch_bounds__(256) k_emb_rot_h16(
     out_blk[lane] = make_uint4(a0, a1, a2, a3);
 }
 
+// Direct FP16 A-fragment scatter helper (matches k_emb_rot_h16 layout bit-for-bit, zero staging SMEM).
+__device__ __forceinline__ void emb_store_h16_row(
+    const float (&v)[4], int lane, int lr, bool valid, int mb, int K16, int ks_base, uint8_t* dst) {
+    const u32 p0 = valid ? emb_pack_h2(v[0], v[1]) : 0u;
+    const u32 p1 = valid ? emb_pack_h2(v[2], v[3]) : 0u;
+    const int ks = ks_base + (lane >> 2);
+    const int fl = (lr & 7) * 4 + ((lane & 1) << 1);
+    const int reg = (((lane >> 1) & 1) << 1) | (lr >> 3);
+    u32* out = reinterpret_cast<u32*>(dst + (size_t(mb) * K16 + ks) * 512);
+    out[fl * 4 + reg] = p0;
+    out[(fl + 1) * 4 + reg] = p1;
+}
+
+// Fused RMSNorm + Multi-Output H128 Rotation (for H = 2048 or H = 4096):
+// Reads d_hidden[16, H] ONCE into shared memory (normalized by ln_w), then rotates into N_OUT (2 or 3)
+// FP16 A-fragment buffers without ever writing or re-reading an intermediate d_normed tensor in DRAM!
+// Grid: (ceil(M / 16)), Block: 256, Dynamic SMEM: 16 * H * 2 bytes (64 KiB for H=2048).
+template <int N_OUT>
+__global__ void __launch_bounds__(256, 1) k_emb_rmsnorm_rot_h16_multi(
+    const bf16* __restrict__ hidden,
+    const bf16* __restrict__ ln_w,
+    const __half* suh0, const __half* suh1, const __half* suh2,
+    uint8_t* dst0, uint8_t* dst1, uint8_t* dst2,
+    int M, int H, float eps) {
+    extern __shared__ __align__(16) bf16 s_norm[]; // [16][H]
+    __shared__ float red[8];
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int mb = blockIdx.x;
+    const int K16 = H >> 4;
+    const int nbk = H >> 7;
+    const __half* suhs[3] = {suh0, suh1, suh2};
+    uint8_t* dsts[3] = {dst0, dst1, dst2};
+
+    // Pass 1: Normalize all 16 rows from d_hidden -> s_norm (single DRAM read of d_hidden, 0 DRAM writes of d_normed!).
+    for (int lr = 0; lr < 16; ++lr) {
+        const int row = mb * 16 + lr;
+        bf16* sn_row = s_norm + size_t(lr) * H;
+        if (row >= M) continue;
+        const bf16* xr = hidden + size_t(row) * H;
+        uint4 xr_buf[2];
+        int nvec = 0;
+        float ss = 0.f;
+        #pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            const int d = (tid + pass * 256) * 8;
+            if (d < H) {
+                const uint4 r = *reinterpret_cast<const uint4*>(xr + d);
+                xr_buf[pass] = r;
+                nvec = pass + 1;
+                const float2 a0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.x));
+                const float2 a1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.y));
+                const float2 a2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.z));
+                const float2 a3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.w));
+                ss += (a0.x * a0.x + a0.y * a0.y) + (a1.x * a1.x + a1.y * a1.y) +
+                      (a2.x * a2.x + a2.y * a2.y) + (a3.x * a3.x + a3.y * a3.y);
+            }
+        }
+        // Warp-sum then block-sum across 8 warps
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+        if (lane == 0) red[warp] = ss;
+        __syncthreads();
+        float tot = 0.f;
+        if (tid < 32) {
+            tot = (tid < 8) ? red[tid] : 0.f;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) tot += __shfl_xor_sync(0xffffffffu, tot, off);
+            if (tid == 0) red[0] = tot;
+        }
+        __syncthreads();
+        const float rs = rsqrtf(red[0] / float(H) + eps);
+        #pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass < nvec) {
+                const int d = (tid + pass * 256) * 8;
+                const uint4 r = xr_buf[pass];
+                const uint4 wr = *reinterpret_cast<const uint4*>(ln_w + d);
+                const float2 a0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.x));
+                const float2 a1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.y));
+                const float2 a2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.z));
+                const float2 a3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.w));
+                const float2 w0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.x));
+                const float2 w1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.y));
+                const float2 w2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.z));
+                const float2 w3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.w));
+                auto nm = [&](float v, float wt) { return __bfloat162float(__float2bfloat16_rn(v * rs)) * wt; };
+                *reinterpret_cast<uint4*>(sn_row + d) = make_uint4(
+                    emb_pack_bf2(nm(a0.x, w0.x), nm(a0.y, w0.y)),
+                    emb_pack_bf2(nm(a1.x, w1.x), nm(a1.y, w1.y)),
+                    emb_pack_bf2(nm(a2.x, w2.x), nm(a2.y, w2.y)),
+                    emb_pack_bf2(nm(a3.x, w3.x), nm(a3.y, w3.y)));
+            }
+        }
+    }
+    __syncthreads();
+
+    // Pass 2: Each warp sweeps 128-col blocks (blk = warp, warp+8, ...) reading s_norm from SMEM and writing dst[0..N_OUT-1].
+    for (int blk = warp; blk < nbk; blk += 8) {
+        const int k0 = blk * 128 + lane * 4;
+        float2 s01[N_OUT], s23[N_OUT];
+        #pragma unroll
+        for (int m = 0; m < N_OUT; ++m) {
+            const uint2 sr = *reinterpret_cast<const uint2*>(suhs[m] + k0);
+            s01[m] = __half22float2(emb_as_h2(sr.x));
+            s23[m] = __half22float2(emb_as_h2(sr.y));
+        }
+        for (int lr = 0; lr < 16; ++lr) {
+            const bool valid = (mb * 16 + lr < M);
+            float2 x01 = make_float2(0.f, 0.f), x23 = make_float2(0.f, 0.f);
+            if (valid) {
+                const uint2 xr = *reinterpret_cast<const uint2*>(s_norm + size_t(lr) * H + k0);
+                x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xr.x));
+                x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xr.y));
+            }
+            #pragma unroll
+            for (int m = 0; m < N_OUT; ++m) {
+                float v[4] = {0.f, 0.f, 0.f, 0.f};
+                if (valid) {
+                    v[0] = x01.x * s01[m].x; v[1] = x01.y * s01[m].y;
+                    v[2] = x23.x * s23[m].x; v[3] = x23.y * s23[m].y;
+                    emb_had128(v, lane);
+                }
+                emb_store_h16_row(v, lane, lr, valid, mb, K16, blk * 8, dsts[m]);
+            }
+        }
+    }
+}
+
 // Multi-output H16 activation rotation: reads X[M, K] ONCE from DRAM and produces N_OUT rotated A-fragment buffers
 // (N_OUT = 2 for Gate+Up, N_OUT = 3 for Q+K+V) using distinct suh[i] vectors.
 template <int N_OUT>
@@ -1265,6 +1394,8 @@ struct GemmWorkspace {
         EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_multi<4, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<4>::SMEM));
         EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_multi<8, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<8>::SMEM));
         EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_splitk, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<4>::SMEM));
+        EMB_CK(cudaFuncSetAttribute(k_emb_rmsnorm_rot_h16_multi<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+        EMB_CK(cudaFuncSetAttribute(k_emb_rmsnorm_rot_h16_multi<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
     }
 
     void ensure_rot(int M, int K) {
@@ -1463,6 +1594,83 @@ inline void linear_forward_triple(const bf16* X, const DevMatrix& W0, const DevM
     linear_forward(X, W0, nullptr, Y0, M, false, ws, st);
     linear_forward(X, W1, nullptr, Y1, M, false, ws, st);
     linear_forward(X, W2, nullptr, Y2, M, false, ws, st);
+}
+
+// Fused RMSNorm + Dual Trellis linear (Gate + Up): for M >= 512 (saturates SMs) and H == 2048, skips d_normed completely!
+inline bool rmsnorm_linear_forward_dual(const bf16* hidden, const bf16* ln_w, float eps,
+                                        const DevMatrix& W0, const DevMatrix& W1,
+                                        bf16* Y0, bf16* Y1, int M, GemmWorkspace& ws, cudaStream_t st) {
+    if (M <= 0) return true;
+    if (M >= 512 && W0.fmt == FMT_TRELLIS && W1.fmt == FMT_TRELLIS && W0.inp == W1.inp && W0.inp == 2048) {
+        const size_t rb = (size_t(M) + 15) / 16;
+        const size_t k16 = size_t(W0.inp) / 16;
+        const size_t one_bytes = rb * k16 * 512;
+        if (one_bytes * 2 <= ws.x_rot_bytes) {
+            uint8_t* x0 = ws.x_rot;
+            uint8_t* x1 = ws.x_rot + one_bytes;
+            const size_t smem = size_t(16) * size_t(W0.inp) * sizeof(bf16);
+            k_emb_rmsnorm_rot_h16_multi<2><<<static_cast<unsigned>(rb), 256, smem, st>>>(
+                hidden, ln_w, W0.suh, W1.suh, nullptr, x0, x1, nullptr, M, W0.inp, eps);
+            MultiTrDesc d;
+            d.x_h16[0] = x0; d.x_h16[1] = x1;
+            d.tw[0] = W0.data; d.tw[1] = W1.data;
+            d.svh[0] = W0.svh; d.svh[1] = W1.svh;
+            d.y[0] = Y0; d.y[1] = Y1;
+            d.N[0] = W0.out; d.N[1] = W1.out;
+            d.nb_end[0] = W0.out / 128;
+            d.nb_end[1] = d.nb_end[0] + W1.out / 128;
+            d.sB[0] = W0.sB; d.sB[1] = W1.sB;
+            d.sG[0] = W0.sG; d.sG[1] = W1.sG;
+            const int RB = static_cast<int>(rb);
+            if (M >= 128) {
+                k_emb_tr_h16_multi<8, 2><<<dim3(d.nb_end[1], (RB + 7) / 8), EmbTrH16Cfg<8>::NTH, EmbTrH16Cfg<8>::SMEM, st>>>(d, M, W0.inp);
+            } else {
+                k_emb_tr_h16_multi<4, 2><<<dim3(d.nb_end[1], (RB + 3) / 4), EmbTrH16Cfg<4>::NTH, EmbTrH16Cfg<4>::SMEM, st>>>(d, M, W0.inp);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// Fused RMSNorm + Triple Trellis linear (Q + K + V): for M >= 512 (saturates SMs) and H == 2048, skips d_normed completely!
+inline bool rmsnorm_linear_forward_triple(const bf16* hidden, const bf16* ln_w, float eps,
+                                          const DevMatrix& W0, const DevMatrix& W1, const DevMatrix& W2,
+                                          bf16* Y0, bf16* Y1, bf16* Y2, int M, GemmWorkspace& ws, cudaStream_t st) {
+    if (M <= 0) return true;
+    if (M >= 512 && W0.fmt == FMT_TRELLIS && W1.fmt == FMT_TRELLIS && W2.fmt == FMT_TRELLIS &&
+        W0.inp == W1.inp && W0.inp == W2.inp && W0.inp == 2048) {
+        const size_t rb = (size_t(M) + 15) / 16;
+        const size_t k16 = size_t(W0.inp) / 16;
+        const size_t one_bytes = rb * k16 * 512;
+        if (one_bytes * 3 <= ws.x_rot_bytes) {
+            uint8_t* x0 = ws.x_rot;
+            uint8_t* x1 = ws.x_rot + one_bytes;
+            uint8_t* x2 = ws.x_rot + one_bytes * 2;
+            const size_t smem = size_t(16) * size_t(W0.inp) * sizeof(bf16);
+            k_emb_rmsnorm_rot_h16_multi<3><<<static_cast<unsigned>(rb), 256, smem, st>>>(
+                hidden, ln_w, W0.suh, W1.suh, W2.suh, x0, x1, x2, M, W0.inp, eps);
+            MultiTrDesc d;
+            d.x_h16[0] = x0; d.x_h16[1] = x1; d.x_h16[2] = x2;
+            d.tw[0] = W0.data; d.tw[1] = W1.data; d.tw[2] = W2.data;
+            d.svh[0] = W0.svh; d.svh[1] = W1.svh; d.svh[2] = W2.svh;
+            d.y[0] = Y0; d.y[1] = Y1; d.y[2] = Y2;
+            d.N[0] = W0.out; d.N[1] = W1.out; d.N[2] = W2.out;
+            d.nb_end[0] = W0.out / 128;
+            d.nb_end[1] = d.nb_end[0] + W1.out / 128;
+            d.nb_end[2] = d.nb_end[1] + W2.out / 128;
+            d.sB[0] = W0.sB; d.sB[1] = W1.sB; d.sB[2] = W2.sB;
+            d.sG[0] = W0.sG; d.sG[1] = W1.sG; d.sG[2] = W2.sG;
+            const int RB = static_cast<int>(rb);
+            if (M >= 128) {
+                k_emb_tr_h16_multi<8, 3><<<dim3(d.nb_end[2], (RB + 7) / 8), EmbTrH16Cfg<8>::NTH, EmbTrH16Cfg<8>::SMEM, st>>>(d, M, W0.inp);
+            } else {
+                k_emb_tr_h16_multi<4, 3><<<dim3(d.nb_end[2], (RB + 3) / 4), EmbTrH16Cfg<4>::NTH, EmbTrH16Cfg<4>::SMEM, st>>>(d, M, W0.inp);
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 // Raw BF16 weight matrix GEMM (e.g. 5D patch_embed.proj flattened to [out, inp]).

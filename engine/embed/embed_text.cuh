@@ -847,13 +847,20 @@ public:
         for (int l = 0; l < c.num_text_layers; ++l) {
             const TextLayerW& L = W->text_layers[size_t(l)];
 
-            prof.record(prof.rmsnorm_ms, st, [&] {
-                k_q3_rmsnorm<<<total_M, 256, 0, st>>>(d_hidden, L.input_ln, d_normed, total_M, c.hidden_size, c.rms_norm_eps);
-            });
-
+            bool fused_qkv = false;
             prof.record(prof.qkv_ms, st, [&] {
-                linear_forward_triple(d_normed, L.q_proj, L.k_proj, L.v_proj, d_q, d_k, d_v, total_M, ws, st);
+                fused_qkv = rmsnorm_linear_forward_triple(
+                    d_hidden, L.input_ln, c.rms_norm_eps,
+                    L.q_proj, L.k_proj, L.v_proj, d_q, d_k, d_v, total_M, ws, st);
             });
+            if (!fused_qkv) {
+                prof.record(prof.rmsnorm_ms, st, [&] {
+                    k_q3_rmsnorm<<<total_M, 256, 0, st>>>(d_hidden, L.input_ln, d_normed, total_M, c.hidden_size, c.rms_norm_eps);
+                });
+                prof.record(prof.qkv_ms, st, [&] {
+                    linear_forward_triple(d_normed, L.q_proj, L.k_proj, L.v_proj, d_q, d_k, d_v, total_M, ws, st);
+                });
+            }
 
             prof.record(prof.qknorm_mrope_ms, st, [&] {
                 const dim3 qk_grid(total_M, (c.num_q_heads + c.num_kv_heads + 3) / 4);
@@ -881,13 +888,20 @@ public:
                 linear_forward(d_attn, L.o_proj, nullptr, d_hidden, total_M, true, ws, st);
             });
 
-            prof.record(prof.rmsnorm_ms, st, [&] {
-                k_q3_rmsnorm<<<total_M, 256, 0, st>>>(d_hidden, L.post_attn_ln, d_normed, total_M, c.hidden_size, c.rms_norm_eps);
-            });
-
+            bool fused_gu = false;
             prof.record(prof.mlp_gate_up_ms, st, [&] {
-                linear_forward_dual(d_normed, L.gate_proj, L.up_proj, d_gate, d_up, total_M, ws, st);
+                fused_gu = rmsnorm_linear_forward_dual(
+                    d_hidden, L.post_attn_ln, c.rms_norm_eps,
+                    L.gate_proj, L.up_proj, d_gate, d_up, total_M, ws, st);
             });
+            if (!fused_gu) {
+                prof.record(prof.rmsnorm_ms, st, [&] {
+                    k_q3_rmsnorm<<<total_M, 256, 0, st>>>(d_hidden, L.post_attn_ln, d_normed, total_M, c.hidden_size, c.rms_norm_eps);
+                });
+                prof.record(prof.mlp_gate_up_ms, st, [&] {
+                    linear_forward_dual(d_normed, L.gate_proj, L.up_proj, d_gate, d_up, total_M, ws, st);
+                });
+            }
 
             if (L.down_proj.fmt == FMT_TRELLIS) {
                 prof.record(prof.swiglu_ms, st, [&] {
