@@ -1,0 +1,43 @@
+# gr8 with spark-attic (github.com/bertholomus/spark-attic) on stock DGX OS: add this file to compose.yaml so each
+# rank leases its ~2 GiB display carveout into the KV pool via DISPRAM_KEY_FILE (#614).
+#
+#   docker compose -f docker/compose.yaml -f docker/compose.spark-attic.yaml up -d
+#
+# On stock DGX OS, atticd's socket (/run/spark-attic/attic.sock) is 0660 root:root and its key
+# (/etc/spark-attic/key) is 0600 root:root. Both stay untouched on the host: gr8 (uid 1000) joins group 0 to
+# connect to the read-only socket mount, and a least-privilege one-shot init container copies the key into a
+# private named volume readable only by uid 1000 (mode 0400).
+#
+# Adapted from bertholomus/glm-5.3-exlr8-4x-spark (compose.attic.yaml, MIT).
+services:
+  attic-key:
+    image: ${GR8_IMAGE:-ghcr.io/kindlingai/gr8:latest}
+    user: "0:0"
+    entrypoint: ["/usr/bin/install", "-m", "0400", "-o", "1000", "-g", "1000", "/k/key", "/v/key"]
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    volumes:
+      - /etc/spark-attic/key:/k/key:ro
+      - attic:/v
+    restart: "no"
+
+  gr8:
+    group_add:
+      - "0"
+    environment:
+      - DISPRAM=1
+      - DISPRAM_SOCKET=/run/spark-attic/attic.sock
+      - DISPRAM_KEY_FILE=/run/gr8-attic/key
+    depends_on:
+      attic-key:
+        condition: service_completed_successfully
+    volumes:
+      - /run/spark-attic:/run/spark-attic:ro
+      - attic:/run/gr8-attic:ro
+
+volumes:
+  attic:

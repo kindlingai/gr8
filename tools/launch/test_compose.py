@@ -14,9 +14,12 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
+import knobs  # noqa: E402
 import options as opt  # noqa: E402
+import supervisor  # noqa: E402
 
 OVERRIDE = os.path.join(REPO, 'docker', 'model-loader.yaml')
+SPARK_ATTIC = os.path.join(REPO, 'docker', 'compose.spark-attic.yaml')
 COMPOSE = os.path.join(REPO, 'docker', 'compose.yaml')
 
 
@@ -179,6 +182,54 @@ class DispramMountTests(unittest.TestCase):
     def test_writable_socket_mount(self):
         self.assertIn(('/run/dispram', '/run/dispram', False),
                       [mount(v) for v in services(COMPOSE)['gr8']['volumes']])
+
+
+class SparkAtticComposeTests(unittest.TestCase):
+    def setUp(self):
+        self.a = services(SPARK_ATTIC)
+
+    def test_environment_and_mounts(self):
+        gr8 = self.a['gr8']
+        env = dict(e.split('=', 1) for e in gr8['environment'])
+        self.assertEqual(env, {
+            'DISPRAM': '1',
+            'DISPRAM_SOCKET': '/run/spark-attic/attic.sock',
+            'DISPRAM_KEY_FILE': '/run/gr8-attic/key',
+        })
+        self.assertIn('DISPRAM', opt.KEYS)
+        for k in ('DISPRAM_SOCKET', 'DISPRAM_KEY_FILE'):
+            self.assertIn(k, supervisor.ENGINE_ENV_KEEP)
+            self.assertIsNotNone(knobs.knob_of(k))
+        self.assertEqual(gr8['group_add'], ['"0"'])
+        self.assertEqual(
+            [mount(v) for v in gr8['volumes']],
+            [('/run/spark-attic', '/run/spark-attic', True), ('attic', '/run/gr8-attic', True)],
+        )
+        self.assertIn('attic-key', gr8['depends_on'])
+        with open(SPARK_ATTIC) as f:
+            self.assertIn('condition: service_completed_successfully', f.read())
+
+    def test_init_container_least_privilege(self):
+        init = self.a['attic-key']
+        self.assertEqual(init['network_mode'], 'none')
+        self.assertEqual(init['read_only'], 'true')
+        self.assertEqual(init['cap_drop'], '[ALL]')
+        self.assertEqual(init['cap_add'], '[CHOWN, FOWNER]')
+        self.assertIn('no-new-privileges:true', init['security_opt'])
+        self.assertIn('0400', init['entrypoint'])
+        self.assertIn('1000', init['entrypoint'])
+        self.assertEqual(
+            [mount(v) for v in init['volumes']],
+            [('/etc/spark-attic/key', '/k/key', True), ('attic', '/v', False)],
+        )
+
+    def test_overlay_parses_as_options(self):
+        env = dict(e.split('=', 1) for e in self.a['gr8']['environment'])
+        o = opt.parse(['--no-config', '--peers', '192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4',
+                       '--model', 'https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4'],
+                      {**env, 'GR8_MODEL': 'glm53'})
+        opt.validate(o)
+        self.assertEqual((o.get('DISPRAM'), o.origin['DISPRAM']), ('1', 'environment'))
 
 
 if __name__ == '__main__':
