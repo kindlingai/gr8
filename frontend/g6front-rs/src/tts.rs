@@ -799,8 +799,8 @@ pub struct VoiceRecord {
 }
 
 pub fn default_voices_dir() -> PathBuf {
-    match std::env::var("GR8_WORK_DIR") {
-        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir).join("voices"),
+    match gr8knobs::WORK_DIR.get() {
+        Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir).join("voices"),
         _ => std::env::temp_dir().join("g6front-voices"),
     }
 }
@@ -913,12 +913,13 @@ mod tests {
         let cases: Vec<Value> = serde_json::from_str(include_str!("tts_golden.json")).unwrap();
         assert_eq!(cases.len(), 50, "expected 50 golden cases");
 
-        // Optional real Drama 3 tokenizer cross-check if available locally or via env.
-        let real_tok = std::env::var("GR8_DRAMA3_TOKENIZER")
-            .ok()
-            .map(PathBuf::from)
+        // Optional real Drama 3 tokenizer cross-check when GR8_TEST_TOKENIZER_DIR points at Drama 3.
+        let real_tok = gr8knobs::TEST_TOKENIZER_DIR
+            .get()
+            .map(|d| PathBuf::from(d).join("tokenizer.json"))
             .filter(|p| p.exists())
-            .and_then(|p| tokenizers::Tokenizer::from_file(p).ok());
+            .and_then(|p| tokenizers::Tokenizer::from_file(p).ok())
+            .filter(|t| t.token_to_id("<|semantic:0|>").is_some());
 
         for case in &cases {
             let name = case["name"].as_str().unwrap();
