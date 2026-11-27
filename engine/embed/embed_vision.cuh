@@ -384,7 +384,7 @@ struct VisionRunner {
         if (!W || !W->cfg.has_vision) return out;
 
         struct ImgRef {
-            const ImageSpan* span = nullptr;
+            const EmbedImage* span = nullptr;
             int patch_off = 0;
             size_t rgb_off = 0;
         };
@@ -428,7 +428,7 @@ struct VisionRunner {
         std::vector<int> h_cu(imgs.size() + 1, 0);
         std::vector<int> h_iof(size_t(total_patches), 0);
         for (size_t i = 0; i < imgs.size(); ++i) {
-            const ImageSpan& im = *imgs[i].span;
+            const EmbedImage& im = *imgs[i].span;
             std::memcpy(h_rgb.data() + imgs[i].rgb_off, im.rgb.data(), im.rgb.size());
             h_cu[i] = imgs[i].patch_off;
             const int n_p = im.vit_h * im.vit_w;
@@ -454,7 +454,7 @@ struct VisionRunner {
                 const int n_p = ir.span->vit_h * ir.span->vit_w;
                 k_q3v_pos_add<<<n_p, 256, 0, st>>>(
                     d_x + size_t(ir.patch_off) * H_v, W->pos_embed,
-                    ir.span->vit_h, ir.span->vit_w, c.vit_pos_grid, H_v);
+                    ir.span->vit_h, ir.span->vit_w, c.vit_grid_size, H_v);
             }
             // 4. ViT transformer blocks + DeepStack hooks
             for (int l = 0; l < c.vit_layers; ++l) {

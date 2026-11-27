@@ -158,10 +158,11 @@ std::vector<g6emb::EmbedRequest> make_mm_batch(int B, int vit_h, int vit_w, int 
         const int suffix = std::max(4, text_pad);
         r.prompt.reserve(size_t(prefix + n_vis_toks + suffix));
         for (int i = 0; i < prefix; ++i) r.prompt.push_back(1000 + ((b * 13 + i * 7) % (vmax - 1000)));
-        g6emb::ImageSpan im;
+        g6emb::EmbedImage im;
         im.pos = prefix;
         im.vit_h = vit_h;
         im.vit_w = vit_w;
+        im.span = n_vis_toks;
         im.rgb = make_synthetic_rgb(vit_h, vit_w, b + 1);
         r.images.push_back(std::move(im));
         for (int i = 0; i < n_vis_toks; ++i) r.prompt.push_back(img_tok_id);

@@ -462,10 +462,10 @@ public:
 
         std::vector<int> h_toks;
         std::vector<int3> h_mrope;
-        std::vector<int> h_cu(size_t(B + 1), 0);
+        std::vector<int> h_cu(static_cast<size_t>(B + 1), 0);
         std::vector<int> h_seq;
-        std::vector<int> h_dims(size_t(B));
-        std::vector<int> h_norm(size_t(B));
+        std::vector<int> h_dims(static_cast<size_t>(B), 0);
+        std::vector<int> h_norm(static_cast<size_t>(B), 0);
 
         int total_M = 0;
         for (int b = 0; b < B; ++b) {

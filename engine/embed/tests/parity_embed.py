@@ -53,17 +53,21 @@ class SocketClient:
         self.sock.close()
 
     def send_frame(self, obj: dict[str, Any]) -> None:
-        data = (json.dumps(obj) + "\n").encode("utf-8")
-        self.sock.sendall(data)
+        data = json.dumps(obj).encode("utf-8")
+        self.sock.sendall(struct.pack(">I", len(data)) + data)
 
-    def recv_frame(self) -> dict[str, Any]:
-        while b"\n" not in self.buf:
-            chunk = self.sock.recv(65536)
+    def _recv_exact(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            chunk = self.sock.recv(max(65536, n - len(self.buf)))
             if not chunk:
                 raise RuntimeError("EOF on engine socket")
             self.buf += chunk
-        line, self.buf = self.buf.split(b"\n", 1)
-        return json.loads(line.decode("utf-8"))
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def recv_frame(self) -> dict[str, Any]:
+        (n,) = struct.unpack(">I", self._recv_exact(4))
+        return json.loads(self._recv_exact(n).decode("utf-8"))
 
     def embed_batch(self, reqs: list[dict[str, Any]]) -> dict[int, np.ndarray]:
         for r in reqs:
