@@ -289,11 +289,14 @@ knobs:
     scope: agree
     kind: int
     default: "2"
-    values: "0..2"
+    values: "0..4"
     legacy: []
     doc: >-
-      Blackwell (sm_120+) cached physical-layer grouped MXFP8 MoE prefill for exlr8 tr3 layers on TP=1 when
-      M >= GR8_INK2_PF_MX8_MIN_M: 2 (the default) = all physical layers, 1 = looped core layers only, 0 = off.
+      Blackwell (sm_120+) grouped MXFP8 MoE prefill for exlr8 tr3 layers on TP=1 when M >= GR8_INK2_PF_MX8_MIN_M:
+      4 = layer-wise 2-slot double-buffered MXFP8 scratch (~2.0 GiB, overlapped with MoE GEMM and attention),
+      3 = layer-wise 1-slot streaming MXFP8 scratch (~1.0 GiB, overlapped with attention; ideal for 32 GB GPUs),
+      2 (the default) = cached MXFP8 on all physical layers (~23.5 GiB; ideal for 128 GB systems),
+      1 = cached MXFP8 on looped core layers only, 0 = off.
       Automatically disabled on pre-Blackwell GPUs. Decode/verify stays W*A16 exlr8 trellis. Every rank must agree.
   GR8_INK2_PF_MX8_MIN_M:
     scope: agree

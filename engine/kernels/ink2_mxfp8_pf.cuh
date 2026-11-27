@@ -1401,6 +1401,352 @@ __global__ void __launch_bounds__(256) k_ink2_tr3_decode_fc2_mx8(
     }
 }
 
+// Runtime Post-Widened Trellis -> MXFP8 MoE Decoders (for layer-wise streaming scratch GR8_INK2_PF_MX8_MOE=3|4).
+// Uses 32 KiB XOR-swizzled __half[128][128] SMEM (3 CTAs/SM on sm_120a, 0 SMEM bank conflicts across all 4 phases),
+// dual-column Hadamard, and 128B coalesced uint32_t FP8 + uint32_t scale stores.
+__device__ __forceinline__ int tr3_sw_u32(int r) {
+    const int b = (r >> 2) & 31;
+    const int rot = (b >> 1) | ((b & 1) << 4);
+    return rot ^ ((r & 3) << 2);
+}
+
+__device__ __forceinline__ void tr3_quant_row_128(
+    const uint32_t* __restrict__ sW_row, int sw_r,
+    uint8_t* __restrict__ qdst, uint8_t* __restrict__ sdst, int lane) {
+    const uint32_t u01 = sW_row[lane ^ sw_r];
+    const uint32_t u23 = sW_row[(lane + 32) ^ sw_r];
+    const float2 f01 = __half22float2(*reinterpret_cast<const __half2*>(&u01));
+    const float2 f23 = __half22float2(*reinterpret_cast<const __half2*>(&u23));
+    // Lanes 0..15 hold blk 0 (in f01) & blk 2 (in f23); lanes 16..31 hold blk 1 (in f01) & blk 3 (in f23).
+    float amax01 = fmaxf(fabsf(f01.x), fabsf(f01.y));
+    float amax23 = fmaxf(fabsf(f23.x), fabsf(f23.y));
+    #pragma unroll
+    for (int o = 8; o > 0; o >>= 1) {
+        amax01 = fmaxf(amax01, __shfl_xor_sync(0xffffffffu, amax01, o));
+        amax23 = fmaxf(amax23, __shfl_xor_sync(0xffffffffu, amax23, o));
+    }
+    float inv01, inv23;
+    const uint32_t code01 = mx8_scale_ue8m0(amax01, inv01);
+    const uint32_t code23 = mx8_scale_ue8m0(amax23, inv23);
+    const uint32_t q01 = mx8_f2_e4m3x2(f01.x * inv01, f01.y * inv01);
+    const uint32_t q23 = mx8_f2_e4m3x2(f23.x * inv23, f23.y * inv23);
+    const int src_lo = (lane & 15) * 2;
+    const uint32_t a_lo = __shfl_sync(0xffffffffu, q01, src_lo);
+    const uint32_t a_hi = __shfl_sync(0xffffffffu, q01, src_lo + 1);
+    const uint32_t b_lo = __shfl_sync(0xffffffffu, q23, src_lo);
+    const uint32_t b_hi = __shfl_sync(0xffffffffu, q23, src_lo + 1);
+    reinterpret_cast<uint32_t*>(qdst)[lane] = (lane < 16) ? (a_lo | (a_hi << 16)) : (b_lo | (b_hi << 16));
+    const uint32_t c1 = __shfl_sync(0xffffffffu, code01, 16);
+    const uint32_t c3 = __shfl_sync(0xffffffffu, code23, 16);
+    if (lane == 0) {
+        *reinterpret_cast<uint32_t*>(sdst) = code01 | (c1 << 8) | (code23 << 16) | (c3 << 24);
+    }
+}
+
+__global__ void __launch_bounds__(256, 3) k_ink2_tr3_wide_decode_fc1_mx8(
+    const uint8_t* __restrict__ fc1,
+    const __half* __restrict__ v1,      // [nblk][2][H] suh
+    const __half* __restrict__ v2,      // [nblk][3][128] svh gate(0), up(1)
+    const long long* __restrict__ tab,  // [NE][6]
+    const long long* __restrict__ kmix,
+    uint8_t* __restrict__ gu_q,         // [NE][2*I][H]
+    uint8_t* __restrict__ gu_sc,        // [NE][2*I][H/32]
+    int eb, int H) {
+    extern __shared__ uint32_t sW_h2[]; // [128][64] of __half2 (32 KiB, XOR-swizzled)
+    const int HB = H / 128;
+    const int I = eb * 128;
+    const int hb = blockIdx.x % HB;
+    const int bm = (blockIdx.x / HB) % (2 * eb);
+    const int e = blockIdx.x / (HB * 2 * eb);
+    const int b = bm >> 1;
+    const int mat = bm & 1;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const long long* tr = tab + static_cast<size_t>(e) * 6;
+    const int S = H >> 5;
+    if (b >= static_cast<int>(tr[3])) {
+        for (int r = warp; r < 128; r += 8) {
+            const size_t grow = (static_cast<size_t>(e) * (2 * I) + mat * I + b * 128 + r);
+            reinterpret_cast<uint32_t*>(gu_q + grow * H + hb * 128)[lane] = 0u;
+            if (lane == 0) *reinterpret_cast<uint32_t*>(gu_sc + grow * S + hb * 4) = 0x7f7f7f7fu;
+        }
+        return;
+    }
+    const size_t brow = static_cast<size_t>(tr[2]) + b;
+    const uint8_t* mw = nullptr;
+    const int bits = tr3::fc1_unit(fc1, kmix, e, tr, bm, H, mw);
+    const int row0 = lane >> 2, col = lane & 3;
+    const int prev_lane = (lane + 31) & 31;
+    const int rA = warp * 16 + row0;
+    const int rB = rA + 8;
+    const int swA = tr3_sw_u32(rA);
+    const int swB = tr3_sw_u32(rB);
+
+    auto store_pair = [&](int kp, const uint32_t (&f0)[2], const uint32_t (&f1)[2]) {
+        const int c2_lo = kp * 8 + col;
+        const int c2_hi = c2_lo + 4;
+        sW_h2[rA * 64 + (c2_lo ^ swA)] = f0[0];
+        sW_h2[rB * 64 + (c2_lo ^ swB)] = f1[0];
+        sW_h2[rA * 64 + (c2_hi ^ swA)] = f0[1];
+        sW_h2[rB * 64 + (c2_hi ^ swB)] = f1[1];
+    };
+
+    if (bits == 4) {
+        const uint8_t* wg = mw + static_cast<size_t>(hb) * 8192 + warp * 1024 + lane * 16;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint4 wh = tr3::ld_nc128_tr3(wg + h * 512);
+            const uint32_t w[4] = {wh.x, wh.y, wh.z, wh.w};
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const uint32_t ch = w[p];
+                const uint32_t pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+                uint32_t f0[2], f1[2];
+                tr3::decode_pmcgx_m<4>((static_cast<uint64_t>(pc) << 32) | ch, 28, f0, f1);
+                store_pair(h * 4 + p, f0, f1);
+            }
+        }
+    } else if (bits == 3) {
+        const uint8_t* wg = mw + static_cast<size_t>(hb) * 6144 + warp * 256 + lane * 8;
+        uint64_t w[3] = {tr3::ld_nc64_tr3(wg), tr3::ld_nc64_tr3(wg + 2048), tr3::ld_nc64_tr3(wg + 4096)};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const uint32_t ch = tr3::trw_chunk_rt<3>(w, p);
+            const uint32_t pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            uint32_t f0[2], f1[2];
+            tr3::decode_pmcgx_m<3>((static_cast<uint64_t>(pc) << 24) | ch, 21, f0, f1);
+            store_pair(p, f0, f1);
+        }
+    } else {
+        const uint8_t* wg = mw + static_cast<size_t>(hb) * 4096 + warp * 256 + lane * 8;
+        uint64_t w[3] = {tr3::ld_nc64_tr3(wg), tr3::ld_nc64_tr3(wg + 2048), 0ull};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const uint32_t ch = tr3::trw_chunk_rt<2>(w, p);
+            const uint32_t pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            uint32_t f0[2], f1[2];
+            tr3::decode_pmcgx_m<2>((static_cast<uint64_t>(pc) << 16) | ch, 14, f0, f1);
+            store_pair(p, f0, f1);
+        }
+    }
+    __syncthreads();
+
+    // 1. Row-wise H128 * suh (strided-64 mapping: lane holds {2*lane, 2*lane+1, 64+2*lane, 64+2*lane+1}, 0 bank conflicts)
+    const __half2* suh2 = reinterpret_cast<const __half2*>(v1 + (brow * 2 + mat) * H + hb * 128);
+    const float2 si0 = __half22float2(suh2[lane]);
+    const float2 si1 = __half22float2(suh2[lane + 32]);
+    for (int r = warp; r < 128; r += 8) {
+        const int sw_r = tr3_sw_u32(r);
+        const int i0 = r * 64 + (lane ^ sw_r);
+        const int i1 = r * 64 + ((lane + 32) ^ sw_r);
+        const uint32_t u0 = sW_h2[i0], u1 = sW_h2[i1];
+        const float2 a0 = __half22float2(*reinterpret_cast<const __half2*>(&u0));
+        const float2 a1 = __half22float2(*reinterpret_cast<const __half2*>(&u1));
+        float v[4] = {a0.x, a0.y, a1.x, a1.y};
+        tr3::had128(v, lane);
+        const __half2 h0 = __floats2half2_rn(v[0] * si0.x, v[1] * si0.y);
+        const __half2 h1 = __floats2half2_rn(v[2] * si1.x, v[3] * si1.y);
+        sW_h2[i0] = *reinterpret_cast<const uint32_t*>(&h0);
+        sW_h2[i1] = *reinterpret_cast<const uint32_t*>(&h1);
+    }
+    __syncthreads();
+
+    // 2. Dual-column H128 * svh (2 adjacent cols per __half2, 0 bank conflicts)
+    const __half* svh = v2 + (brow * 3 + mat) * 128 + lane * 4;
+    float s_out[4];
+    int sw_row[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        s_out[i] = __half2float(svh[i]);
+        sw_row[i] = tr3_sw_u32(lane * 4 + i);
+    }
+    for (int k2 = warp; k2 < 64; k2 += 8) {
+        float v0[4], v1[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t u = sW_h2[(lane * 4 + i) * 64 + (k2 ^ sw_row[i])];
+            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&u));
+            v0[i] = f.x;
+            v1[i] = f.y;
+        }
+        tr3::had128(v0, lane);
+        tr3::had128(v1, lane);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const __half2 h = __floats2half2_rn(v0[i] * s_out[i], v1[i] * s_out[i]);
+            sW_h2[(lane * 4 + i) * 64 + (k2 ^ sw_row[i])] = *reinterpret_cast<const uint32_t*>(&h);
+        }
+    }
+    __syncthreads();
+
+    // 3. Quantize each row r=0..127 to MXFP8 with 128B coalesced uint32_t stores + 4B scale store
+    for (int r = warp; r < 128; r += 8) {
+        const size_t grow = (static_cast<size_t>(e) * (2 * I) + mat * I + b * 128 + r);
+        tr3_quant_row_128(sW_h2 + r * 64, tr3_sw_u32(r), gu_q + grow * H + hb * 128, gu_sc + grow * S + hb * 4, lane);
+    }
+}
+
+__global__ void __launch_bounds__(256, 3) k_ink2_tr3_wide_decode_fc2_mx8(
+    const uint8_t* __restrict__ fc2,
+    const __half* __restrict__ v2,      // [nblk][3][128] suh_down(2)
+    const __half* __restrict__ v3,      // [nblk][H] svh_down
+    const long long* __restrict__ tab,
+    uint8_t* __restrict__ dn_q,         // [NE][H][I]
+    uint8_t* __restrict__ dn_sc,        // [NE][H][I/32]
+    int eb, int H) {
+    extern __shared__ uint32_t sW_h2[]; // [128][64] of __half2 (32 KiB, XOR-swizzled)
+    const int HB = H / 128;
+    const int I = eb * 128;
+    const int hb = blockIdx.x % HB;
+    const int b = (blockIdx.x / HB) % eb;
+    const int e = blockIdx.x / (HB * eb);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const long long* tr = tab + static_cast<size_t>(e) * 6;
+    const int S = I >> 5;
+    if (b >= static_cast<int>(tr[3])) {
+        for (int r = warp; r < 128; r += 8) {
+            const size_t grow = static_cast<size_t>(e) * H + hb * 128 + r;
+            reinterpret_cast<uint32_t*>(dn_q + grow * I + b * 128)[lane] = 0u;
+            if (lane == 0) *reinterpret_cast<uint32_t*>(dn_sc + grow * S + b * 4) = 0x7f7f7f7fu;
+        }
+        return;
+    }
+    const size_t brow = static_cast<size_t>(tr[2]) + b;
+    const int bits = static_cast<int>(tr[4]);
+    const uint8_t* mw = tr3::fc2_block(fc2, tr, b, bits, H);
+    const int row0 = lane >> 2, col = lane & 3;
+    const int prev_lane = (lane + 31) & 31;
+    const int n_tile = hb * 8 + warp;
+    const int rA = warp * 16 + row0;
+    const int rB = rA + 8;
+    const int swA = tr3_sw_u32(rA);
+    const int swB = tr3_sw_u32(rB);
+
+    auto store_pair = [&](int ks, const uint32_t (&f0)[2], const uint32_t (&f1)[2]) {
+        const int c2_lo = ks * 8 + col;
+        const int c2_hi = c2_lo + 4;
+        sW_h2[rA * 64 + (c2_lo ^ swA)] = f0[0];
+        sW_h2[rB * 64 + (c2_lo ^ swB)] = f1[0];
+        sW_h2[rA * 64 + (c2_hi ^ swA)] = f0[1];
+        sW_h2[rB * 64 + (c2_hi ^ swB)] = f1[1];
+    };
+
+    if (bits == 4) {
+        const uint8_t* wg = mw + static_cast<size_t>(n_tile) * 1024 + lane * 16;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint4 wh = tr3::ld_nc128_tr3(wg + h * 512);
+            const uint32_t w[4] = {wh.x, wh.y, wh.z, wh.w};
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const uint32_t ch = w[p];
+                const uint32_t pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+                uint32_t f0[2], f1[2];
+                tr3::decode_pmcgx_m<4>((static_cast<uint64_t>(pc) << 32) | ch, 28, f0, f1);
+                store_pair(h * 4 + p, f0, f1);
+            }
+        }
+    } else if (bits == 3) {
+        const uint8_t* wg = mw + static_cast<size_t>(n_tile) * 768 + lane * 8;
+        uint64_t w[3] = {tr3::ld_nc64_tr3(wg), tr3::ld_nc64_tr3(wg + 256), tr3::ld_nc64_tr3(wg + 512)};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const uint32_t ch = tr3::trw_chunk_rt<3>(w, p);
+            const uint32_t pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            uint32_t f0[2], f1[2];
+            tr3::decode_pmcgx_m<3>((static_cast<uint64_t>(pc) << 24) | ch, 21, f0, f1);
+            store_pair(p, f0, f1);
+        }
+    } else {
+        const uint8_t* wg = mw + static_cast<size_t>(n_tile) * 512 + lane * 8;
+        uint64_t w[3] = {tr3::ld_nc64_tr3(wg), tr3::ld_nc64_tr3(wg + 256), 0ull};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const uint32_t ch = tr3::trw_chunk_rt<2>(w, p);
+            const uint32_t pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            uint32_t f0[2], f1[2];
+            tr3::decode_pmcgx_m<2>((static_cast<uint64_t>(pc) << 16) | ch, 14, f0, f1);
+            store_pair(p, f0, f1);
+        }
+    }
+    __syncthreads();
+
+    // 1. Row-wise H128 * suh_down (strided-64 mapping, 0 bank conflicts)
+    const __half2* suh2 = reinterpret_cast<const __half2*>(v2 + (brow * 3 + 2) * 128);
+    const float2 si0 = __half22float2(suh2[lane]);
+    const float2 si1 = __half22float2(suh2[lane + 32]);
+    for (int r = warp; r < 128; r += 8) {
+        const int sw_r = tr3_sw_u32(r);
+        const int i0 = r * 64 + (lane ^ sw_r);
+        const int i1 = r * 64 + ((lane + 32) ^ sw_r);
+        const uint32_t u0 = sW_h2[i0], u1 = sW_h2[i1];
+        const float2 a0 = __half22float2(*reinterpret_cast<const __half2*>(&u0));
+        const float2 a1 = __half22float2(*reinterpret_cast<const __half2*>(&u1));
+        float v[4] = {a0.x, a0.y, a1.x, a1.y};
+        tr3::had128(v, lane);
+        const __half2 h0 = __floats2half2_rn(v[0] * si0.x, v[1] * si0.y);
+        const __half2 h1 = __floats2half2_rn(v[2] * si1.x, v[3] * si1.y);
+        sW_h2[i0] = *reinterpret_cast<const uint32_t*>(&h0);
+        sW_h2[i1] = *reinterpret_cast<const uint32_t*>(&h1);
+    }
+    __syncthreads();
+
+    // 2. Dual-column H128 * svh_down (2 adjacent cols per __half2, 0 bank conflicts)
+    const __half* svh = v3 + brow * H + hb * 128 + lane * 4;
+    float s_out[4];
+    int sw_row[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        s_out[i] = __half2float(svh[i]);
+        sw_row[i] = tr3_sw_u32(lane * 4 + i);
+    }
+    for (int k2 = warp; k2 < 64; k2 += 8) {
+        float v0[4], v1[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t u = sW_h2[(lane * 4 + i) * 64 + (k2 ^ sw_row[i])];
+            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&u));
+            v0[i] = f.x;
+            v1[i] = f.y;
+        }
+        tr3::had128(v0, lane);
+        tr3::had128(v1, lane);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const __half2 h = __floats2half2_rn(v0[i] * s_out[i], v1[i] * s_out[i]);
+            sW_h2[(lane * 4 + i) * 64 + (k2 ^ sw_row[i])] = *reinterpret_cast<const uint32_t*>(&h);
+        }
+    }
+    __syncthreads();
+
+    // 3. Quantize to MXFP8 dn_q[e][hb*128 + r][b*128 + k] with 128B coalesced uint32_t stores + 4B scale store
+    for (int r = warp; r < 128; r += 8) {
+        const size_t grow = static_cast<size_t>(e) * H + hb * 128 + r;
+        tr3_quant_row_128(sW_h2 + r * 64, tr3_sw_u32(r), dn_q + grow * I + b * 128, dn_sc + grow * S + b * 4, lane);
+    }
+}
+
+inline void launch_tr3_decode_mx8(
+    const uint8_t* tr3_fc1, const uint8_t* tr3_fc2,
+    const __half* tr3_v1, const __half* tr3_v2, const __half* tr3_v3,
+    const long long* tr3_tab, const long long* tr3_kmix, bool wide,
+    const MoeMx8Layer& dst, int NE, int H, int I, cudaStream_t st) {
+    const int HB = H / 128;
+    const int eb = I / 128;
+    if (wide) {
+        constexpr int DEC_WIDE_SMEM = 128 * 64 * sizeof(uint32_t); // 32 KiB -> 3 CTAs/SM on sm_120a
+        k_ink2_tr3_wide_decode_fc1_mx8<<<static_cast<unsigned>(NE * 2 * eb * HB), 256, DEC_WIDE_SMEM, st>>>(
+            tr3_fc1, tr3_v1, tr3_v2, tr3_tab, tr3_kmix, dst.gu_q, dst.gu_sc, eb, H);
+        k_ink2_tr3_wide_decode_fc2_mx8<<<static_cast<unsigned>(NE * eb * HB), 256, DEC_WIDE_SMEM, st>>>(
+            tr3_fc2, tr3_v2, tr3_v3, tr3_tab, dst.dn_q, dst.dn_sc, eb, H);
+    } else {
+        constexpr int DEC_SMEM = 128 * 132 * sizeof(float);
+        k_ink2_tr3_decode_fc1_mx8<tr3::CB_PMCGX><<<static_cast<unsigned>(NE * 2 * eb * HB), 256, DEC_SMEM, st>>>(
+            tr3_fc1, tr3_v1, tr3_v2, tr3_tab, tr3_kmix, dst.gu_q, dst.gu_sc, eb, H);
+        k_ink2_tr3_decode_fc2_mx8<tr3::CB_PMCGX><<<static_cast<unsigned>(NE * eb * HB), 256, DEC_SMEM, st>>>(
+            tr3_fc2, tr3_v2, tr3_v3, tr3_tab, dst.dn_q, dst.dn_sc, eb, H);
+    }
+}
+
 // ------------------------------------------------------------------------------------------- Grouped Blackwell MXFP8 MoE Prefill
 // Step 1: Parallel TileMap4 + flat tok_list/rw_list builder from ink2::Plan (1 CTA, 128 threads, ~5 us!).
 __global__ void __launch_bounds__(128) k_ink2_moe_mx8_build_map(
@@ -1930,6 +2276,9 @@ inline void init_mx8_attrs() {
     constexpr int DEC_SMEM = 128 * 132 * sizeof(float);
     cudaFuncSetAttribute(k_ink2_tr3_decode_fc1_mx8<tr3::CB_PMCGX>, cudaFuncAttributeMaxDynamicSharedMemorySize, DEC_SMEM);
     cudaFuncSetAttribute(k_ink2_tr3_decode_fc2_mx8<tr3::CB_PMCGX>, cudaFuncAttributeMaxDynamicSharedMemorySize, DEC_SMEM);
+    constexpr int DEC_WIDE_SMEM = 128 * 64 * sizeof(uint32_t);
+    cudaFuncSetAttribute(k_ink2_tr3_wide_decode_fc1_mx8,           cudaFuncAttributeMaxDynamicSharedMemorySize, DEC_WIDE_SMEM);
+    cudaFuncSetAttribute(k_ink2_tr3_wide_decode_fc2_mx8,           cudaFuncAttributeMaxDynamicSharedMemorySize, DEC_WIDE_SMEM);
 }
 
 inline void launch_moe_mx8_prefill(

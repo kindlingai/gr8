@@ -662,6 +662,7 @@ struct Options
     std::string variant; // exlr8 width-manifest variant (empty = auto / GR8_INK2_VARIANT)
     bool whole_image = false;
     bool vision = false; // run the vision tower when the checkpoint has one (image input)
+    bool need_full_logits = false; // true only when copy_logits_valid() reads >64 rows (e.g. --eval-inkl)
     // the speed paths: -1 = what the knob says (GR8_INK2_*), 0 = off, 1 = on
     int fast_allreduce = -1, gpu_head_pack = -1, cublas_prefill = -1, tc_prefill_attn = -1;
     int use_graph = -1;  // -1 = knob GR8_INK2_GRAPH (default 1 on TP=1), 0 = off, 1 = on
@@ -756,6 +757,29 @@ public:
         ink2::msg_bf16_enabled() = knob::ink2_msg_bf16();
         ink2::mx8::mx8_tc_min_m_ref() = static_cast<int>(knob::ink2_mx8_tc_min_m());
         const size_t mh = static_cast<size_t>(o.max_rows) * c.H;
+        keep_rows = std::min(o.max_rows, std::max(64, o.slots * (o.mtp + 1)));
+        kv_keep_rows = std::min(o.max_rows, std::max(keep_rows, c.window));
+        head_cap_rows = o.need_full_logits ? o.max_rows : keep_rows;
+        shared_att = dalloc<uint16_t>(mh);
+        shared_mo = dalloc<uint16_t>(mh);
+        shared_aw.resize(static_cast<size_t>(o.nloc));
+        bool any_glob_layer = false;
+        for (int lid : layer_ids)
+            if (a.find(lname(lid, "q_input_norm")) != nullptr) any_glob_layer = true;
+        for (int i = 0; i < o.nloc; ++i)
+        {
+            const ink2::AttnGeom g = rank_geom(o.rank0 + i, any_glob_layer);
+            const size_t loc_spans = static_cast<size_t>(g.window + ink2::ATTN_SPAN - 1) / ink2::ATTN_SPAN + 1;
+            const size_t loc_pf = static_cast<size_t>(keep_rows) * g.nh_q * loc_spans * (g.hd + 2);
+            size_t pf = loc_pf;
+            if (any_glob_layer)
+            {
+                const size_t glob_spans = static_cast<size_t>(o.cap + ink2::ATTN_SPAN - 1) / ink2::ATTN_SPAN + 1;
+                const size_t glob_pf = std::min<size_t>(16, static_cast<size_t>(o.max_rows)) * g.nh_q * glob_spans * (g.hd + 2);
+                if (glob_pf > pf) pf = glob_pf;
+            }
+            shared_aw[static_cast<size_t>(i)].alloc(g, o.max_rows, pf);
+        }
         embed = a.get<uint16_t>("G.embed");
         embed_norm = a.get<uint16_t>("G.embed_norm");
         final_norm = a.get<uint16_t>("G.final_norm");
@@ -778,21 +802,48 @@ public:
             for (size_t j = 0; j < L.size(); ++j) bind_layer(L[j], layer_ids[j], static_cast<int>(j), 0, -1);
         }
         int max_tr3_eb = 0;
-        for (const Layer& y : L)
+        bool all_tr3 = !L.empty();
+        bool all_pmcgx = !L.empty();
+        first_tr3_layer = -1;
+        next_tr3_layer.assign(L.size(), -1);
+        int last_tr3 = -1;
+        for (size_t ji = 0; ji < L.size(); ++ji)
+        {
+            const Layer& y = L[ji];
             if (y.exp_fmt >= 1 && y.exp_fmt <= 3)
+            {
                 for (const RankPart& x : y.rk) max_tr3_eb = std::max(max_tr3_eb, x.tr3_eb);
+                if (y.exp_fmt != 3) all_pmcgx = false;
+                if (y.exp_fmt == 3)
+                {
+                    if (first_tr3_layer < 0) first_tr3_layer = static_cast<int>(ji);
+                    if (last_tr3 >= 0) next_tr3_layer[static_cast<size_t>(last_tr3)] = static_cast<int>(ji);
+                    last_tr3 = static_cast<int>(ji);
+                }
+            }
+            else
+            {
+                all_tr3 = false;
+                all_pmcgx = false;
+            }
+        }
+        const int pf_mx8_mode_cfg = (o.nr == 1 && o.nloc == 1 && max_tr3_eb > 0 && ink2::mx8::mx8_supported() && c.H % 128 == 0 && c.I % 128 == 0)
+                                        ? static_cast<int>(knob::ink2_pf_mx8_moe())
+                                        : 0;
+        const int pf_mx8_min_m_cfg = static_cast<int>(knob::ink2_pf_mx8_min_m());
+        const int tr3_fallback_m = (pf_mx8_mode_cfg >= 2 && all_pmcgx) ? std::min(o.max_rows, std::max(pf_mx8_min_m_cfg - 1, keep_rows)) : o.max_rows;
         mw.resize(static_cast<size_t>(o.nloc));
         const int i_work = std::max(64, (c.I / o.nr + 31) / 32 * 32);
         for (int i = 0; i < o.nloc; ++i)
         {
-            mw[i].alloc(o.max_rows, c.H, i_work, c.NE, c.TK, false);
+            mw[i].alloc(o.max_rows, c.H, i_work, c.NE, c.TK, false, all_tr3, tr3_fallback_m);
             lm.push_back(img[i]->get<uint16_t>("G.lm_head"));
-            logits.push_back(dalloc<float>(static_cast<size_t>(o.max_rows) * vr));
+            logits.push_back(dalloc<float>(static_cast<size_t>(head_cap_rows) * vr));
             if (max_tr3_eb > 0)
             {
-                const size_t mt = static_cast<size_t>(ink2::plan_max_tiles(o.max_rows, c.TK, c.NE));
+                const size_t mt = static_cast<size_t>(ink2::plan_max_tiles(tr3_fallback_m, c.TK, c.NE));
                 tr3_a_rot.push_back(dalloc<__half>(mt * 8 * static_cast<size_t>(max_tr3_eb) * 128));
-                tr3_x_had.push_back(dalloc<__half>(static_cast<size_t>(o.max_rows) * c.H));
+                tr3_x_had.push_back(dalloc<__half>(static_cast<size_t>(tr3_fallback_m) * c.H));
             }
         }
         if (o.nr == 1 && o.nloc == 1)
@@ -827,8 +878,8 @@ public:
             gate_sm = dalloc<float>(mh);
         }
         part_stride = static_cast<size_t>(o.max_rows) * c.TK * c.H;
-        parts = dalloc<float>(static_cast<size_t>(o.nr) * part_stride);
-        host_logits.resize(static_cast<size_t>(o.max_rows) * vr);
+        parts = o.nr > 1 ? dalloc<float>(static_cast<size_t>(o.nr) * part_stride) : nullptr;
+        host_logits.resize(static_cast<size_t>(head_cap_rows) * vr);
         head_parts.resize(static_cast<size_t>(o.nr) * head_bytes(o.max_rows));
         if ((use_blas || !df2_path.empty()) && cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) die("cublasCreate failed");
         if (use_ghp) head_dev = dalloc<uint8_t>(head_bytes(std::max(o.max_rows, o.slots)));
@@ -842,7 +893,9 @@ public:
         }
         if (o.nr == 1 && o.nloc == 1)
         {
-            INK2RT_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+            int prio_lo = 0, prio_hi = 0;
+            INK2RT_CK(cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi));
+            INK2RT_CK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, prio_hi));
             INK2RT_CK(cudaHostAlloc(&h_meta_pin, sizeof(int) * static_cast<size_t>(4) * o.max_rows, cudaHostAllocDefault));
             INK2RT_CK(cudaHostAlloc(&h_head_pin, head_bytes(std::max(o.max_rows, o.slots)), cudaHostAllocDefault));
             INK2RT_CK(cudaHostAlloc(&h_acc_pin, static_cast<size_t>(o.max_rows), cudaHostAllocDefault));
@@ -1023,7 +1076,29 @@ public:
         const int head_mode = (T == 1 && o.nloc == 1 && use_ghp && fast_greedy_head && !exact_head && all_greedy) ? 1 : 0;
         const size_t hb = head_bytes(M), rb = head_row_bytes(o.nc);
 
+        const bool graph_ok = use_graph && !prof.enabled && T == 1 && o.nloc == 1 && st != nullptr && h_head_pin != nullptr &&
+                              samples != nullptr && !vis_rows && M <= 64 && !tc && !want_blas && use_ghp;
+        const bool compact_commit = (M > keep_rows);
+        if (compact_commit && !chunk) die("step with M > keep_rows must be a single contiguous run");
+        last_compact_commit = compact_commit;
+        const int pf_mx8_min_m = static_cast<int>(knob::ink2_pf_mx8_min_m());
+        const bool use_stream_mx8 = (T == 1 && o.nloc == 1 && mx8_moe_slots > 0 && M >= pf_mx8_min_m && first_tr3_layer >= 0 && !graph_ok);
+
+        auto enqueue_mx8_unpack = [&](int slot, int vj) {
+            const Layer& tl = L[static_cast<size_t>(vj)];
+            if (mx8_stream_phys[slot] == tl.l) return;
+            const RankPart& tx = tl.rk[0];
+            INK2RT_CK(cudaStreamWaitEvent(mx8_unpack_stream, mx8_done_ev[slot], 0));
+            ink2::mx8::launch_tr3_decode_mx8(tx.tr3_fc1, tx.tr3_fc2, tx.tr3_v1, tx.tr3_v2, tx.tr3_v3,
+                                             tx.tr3_tab, tx.tr3_kmix, tx.tr3_wide != 0,
+                                             mx8_stream_buf[slot], c.NE, c.H, c.I, mx8_unpack_stream);
+            INK2RT_CK(cudaEventRecord(mx8_ready_ev[slot], mx8_unpack_stream));
+            mx8_stream_phys[slot] = tl.l;
+        };
+
         auto run_body_and_head = [&](bool async_head_d2h) {
+            int mx8_stream_idx = 0;
+            if (use_stream_mx8) enqueue_mx8_unpack(0, first_tr3_layer);
             {
                 ink2::ProfScope _ps(pf, ink2::PS_EMBED, st);
                 ink2::embed_norm(toks, embed, embed_norm, vis_rows, c.image_token, h, M, c.H, st);
@@ -1143,20 +1218,30 @@ public:
                     ink2::attn_res(ar, M, st);
                 }
                 const bool split_kv = s.glob || gated;
+                uint16_t* att_dst = compact_commit ? shared_att : s.att;
+                uint16_t* mo_dst = compact_commit ? shared_mo : s.mo;
                 for (int i = 0; i < o.nloc; ++i)
                 {
                     RankPart& x = s.rk[i];
-                    ink2::attn_forward(x.g, x.aw, x.as, x.wk, rw, rh.max_pos, qi, split_kv ? ki : qi, split_kv ? vi : qi, M, T == 1 ? s.att : nullptr,
-                                       parts + static_cast<size_t>(o.rank0 + i) * n, st, tc, pf, T == 1 ? &x.mx8_aw : nullptr);
+                    ink2::AttnWork wk_run = x.wk;
+                    if (compact_commit)
+                    {
+                        wk_run.kp = shared_aw[static_cast<size_t>(i)].kp;
+                        wk_run.vp = shared_aw[static_cast<size_t>(i)].vp;
+                        wk_run.kv_new = shared_aw[static_cast<size_t>(i)].kv_new;
+                    }
+                    float* part_out = (T == 1) ? nullptr : (parts + static_cast<size_t>(o.rank0 + i) * n);
+                    ink2::attn_forward(x.g, x.aw, x.as, wk_run, rw, rh.max_pos, qi, split_kv ? ki : qi, split_kv ? vi : qi, M, T == 1 ? att_dst : nullptr,
+                                       part_out, st, tc, pf, T == 1 ? &x.mx8_aw : nullptr);
                 }
                 if (T > 1)
                 {
                     if (gather) gather(2 * ji, parts, n * 4);
-                    ink2::sum_ranks(parts, T, n, s.att, st);
+                    ink2::sum_ranks(parts, T, n, att_dst, st);
                 }
                 {
                     ink2::ProfScope _ps(pf, ink2::PS_POST_ATTN_SCONV_RES, st);
-                    ink2::sconv_static(s.att, s.hist_a, rw, s.attn_sconv, M, c.H, a_, st);
+                    ink2::sconv_static(att_dst, s.hist_a, rw, s.attn_sconv, M, c.H, a_, st);
                     const bool bstart = (c.is_looped() ? s.l : ji) % c.block == 0;
                     ink2::attn_block_step(h, a_, bstart, states[static_cast<size_t>(cur_nb)], mid, n, st);
                     if (bstart) ++cur_nb;
@@ -1195,13 +1280,71 @@ public:
                     ar.out[0] = xm;
                     ink2::attn_res(ar, M, st);
                 }
-                if (s.exp_fmt >= 1 && s.exp_fmt <= 3) moe_tr3(s, ji, st);
-                else if (s.mx8) moe<ink2::Mx8Frag>(s, ji, st);
-                else moe<nv4::Frag>(s, ji, st);
+                if (s.exp_fmt >= 1 && s.exp_fmt <= 3)
+                {
+                    if (use_stream_mx8 && s.exp_fmt == 3)
+                    {
+                        const int slot = (mx8_moe_slots == 2) ? (mx8_stream_idx & 1) : 0;
+                        const int nxt = next_tr3_layer[static_cast<size_t>(ji)];
+                        if (mx8_moe_slots == 2 && nxt >= 0) enqueue_mx8_unpack(slot ^ 1, nxt);
+                        {
+                            ink2::ProfScope _ps(pf, ink2::PS_ROUTER, st);
+                            ink2::route(xm, s.router_w, s.router_bias, M, c.H, c.NE, c.TK, c.route_scale, mw[0].score, mw[0].idx, mw[0].wt, mw[0].plan, st);
+                        }
+                        INK2RT_CK(cudaStreamWaitEvent(st, mx8_ready_ev[slot], 0));
+                        ink2::mx8::launch_moe_mx8_prefill(mx8_stream_buf[slot], mx8_moe_sc, xm, mw[0].plan, M, c.TK, mo_dst, st, pf);
+                        INK2RT_CK(cudaEventRecord(mx8_done_ev[slot], st));
+                        if (mx8_moe_slots == 1 && nxt >= 0) enqueue_mx8_unpack(0, nxt);
+                        ++mx8_stream_idx;
+                    }
+                    else moe_tr3(s, ji, mo_dst, st);
+                }
+                else if (s.mx8) moe<ink2::Mx8Frag>(s, ji, mo_dst, st);
+                else moe<nv4::Frag>(s, ji, mo_dst, st);
                 {
                     ink2::ProfScope _ps(pf, ink2::PS_POST_MLP_SCONV_RES, st);
-                    ink2::sconv_static(s.mo, s.hist_m, rw, s.mlp_sconv, M, c.H, ms, st);
+                    ink2::sconv_static(mo_dst, s.hist_m, rw, s.mlp_sconv, M, c.H, ms, st);
                     ink2::add_bf16(mid, ms, h, n, st);
+                }
+                if (compact_commit)
+                {
+                    const int n_tail = std::min(M, ink2::SCONV_HIST);
+                    const int row0_tail = M - n_tail;
+                    if (o.nloc == 1)
+                    {
+                        const RankPart& x0 = s.rk[0];
+                        const int nk0 = x0.g.nh_kv * x0.g.hd;
+                        ink2::save_sconv_tail(shared_att, shared_mo, shared_aw[0].kp, shared_aw[0].vp,
+                                              s.att, s.mo, x0.wk.kp, x0.wk.vp, row0_tail, n_tail, c.H, nk0, st);
+                        if (!s.glob)
+                        {
+                            const int n_kv = std::min(M, kv_keep_rows);
+                            const int row0_kv = M - n_kv;
+                            INK2RT_CK(cudaMemcpyAsync(x0.wk.kv_new, shared_aw[0].kv_new + static_cast<size_t>(row0_kv) * 2 * nk0,
+                                                      static_cast<size_t>(n_kv) * 2 * nk0 * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st));
+                        }
+                    }
+                    else
+                    {
+                        INK2RT_CK(cudaMemcpyAsync(s.att, shared_att + static_cast<size_t>(row0_tail) * c.H,
+                                                  static_cast<size_t>(n_tail) * c.H * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st));
+                        INK2RT_CK(cudaMemcpyAsync(s.mo, shared_mo + static_cast<size_t>(row0_tail) * c.H,
+                                                  static_cast<size_t>(n_tail) * c.H * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st));
+                        const int n_kv = std::min(M, kv_keep_rows);
+                        const int row0_kv = M - n_kv;
+                        for (int i = 0; i < o.nloc; ++i)
+                        {
+                            const RankPart& xi = s.rk[static_cast<size_t>(i)];
+                            const size_t nki = static_cast<size_t>(xi.g.nh_kv) * xi.g.hd;
+                            INK2RT_CK(cudaMemcpyAsync(xi.wk.kp, shared_aw[static_cast<size_t>(i)].kp + static_cast<size_t>(row0_tail) * nki,
+                                                      static_cast<size_t>(n_tail) * nki * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st));
+                            INK2RT_CK(cudaMemcpyAsync(xi.wk.vp, shared_aw[static_cast<size_t>(i)].vp + static_cast<size_t>(row0_tail) * nki,
+                                                      static_cast<size_t>(n_tail) * nki * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st));
+                            if (!s.glob)
+                                INK2RT_CK(cudaMemcpyAsync(xi.wk.kv_new, shared_aw[static_cast<size_t>(i)].kv_new + static_cast<size_t>(row0_kv) * 2 * nki,
+                                                          static_cast<size_t>(n_kv) * 2 * nki * sizeof(uint16_t), cudaMemcpyDeviceToDevice, st));
+                        }
+                    }
                 }
             }
             if (!samples && ntaps == 0) return;
@@ -1224,48 +1367,52 @@ public:
             for (int i = 0; i < o.nloc; ++i)
             {
                 const int r = o.rank0 + i;
+                for (int m0 = 0; m0 < M; m0 += head_cap_rows)
                 {
-                    ink2::ProfScope _ps(pf, ink2::PS_TRUNK_LM_HEAD, st);
-                    const bool use_lm_mx8 = (T == 1 && lm_mx8.ready() && (lm_mx8_mode == 1 || (lm_mx8_mode == 2 && M >= 64)));
-                    if (use_lm_mx8) ink2::mx8::lm_head_mx8(hf, mx8_x8, lm_mx8, M, r * vr, c.valid, logits[i], st);
-                    else ink2::lm_head(hf, lm[i], M, c.H, vr, r * vr, c.valid, logits[i], st);
+                    const int nm = std::min(head_cap_rows, M - m0);
+                    const uint16_t* hf_sl = hf + static_cast<size_t>(m0) * c.H;
+                    const size_t hb_sl = static_cast<size_t>(nm) * rb;
+                    {
+                        ink2::ProfScope _ps(pf, ink2::PS_TRUNK_LM_HEAD, st);
+                        const bool use_lm_mx8 = (T == 1 && lm_mx8.ready() && (lm_mx8_mode == 1 || (lm_mx8_mode == 2 && nm >= 64)));
+                        if (use_lm_mx8) ink2::mx8::lm_head_mx8(hf_sl, mx8_x8, lm_mx8, nm, r * vr, c.valid, logits[i], st);
+                        else ink2::lm_head(hf_sl, lm[i], nm, c.H, vr, r * vr, c.valid, logits[i], st);
+                    }
+                    if (head_mode == 1)
+                    {
+                        {
+                            ink2::ProfScope _ps(pf, ink2::PS_TRUNK_HEAD_PACK, st);
+                            ink2::head_argmax_dev(logits[i], nm, vr, r * vr, h_arg_val, h_arg_id, head_dev + static_cast<size_t>(m0) * rb, rb, st);
+                        }
+                        if (async_head_d2h) INK2RT_CK(cudaMemcpyAsync(h_head_pin + static_cast<size_t>(m0) * rb, head_dev + static_cast<size_t>(m0) * rb, hb_sl, cudaMemcpyDeviceToHost, st));
+                        else
+                        {
+                            INK2RT_CK(cudaMemcpyAsync(&head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(m0) * rb], head_dev + static_cast<size_t>(m0) * rb, hb_sl, cudaMemcpyDeviceToHost, st));
+                            INK2RT_CK(cudaStreamSynchronize(st));
+                        }
+                        continue;
+                    }
+                    if (use_ghp)
+                    {
+                        {
+                            ink2::ProfScope _ps(pf, ink2::PS_TRUNK_HEAD_PACK, st);
+                            ink2::head_pack_dev(logits[i], nm, vr, r * vr, o.nc, head_dev + static_cast<size_t>(m0) * rb, rb, st);
+                        }
+                        if (async_head_d2h) INK2RT_CK(cudaMemcpyAsync(h_head_pin + static_cast<size_t>(m0) * rb, head_dev + static_cast<size_t>(m0) * rb, hb_sl, cudaMemcpyDeviceToHost, st));
+                        else
+                        {
+                            INK2RT_CK(cudaMemcpyAsync(&head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(m0) * rb], head_dev + static_cast<size_t>(m0) * rb, hb_sl, cudaMemcpyDeviceToHost, st));
+                            INK2RT_CK(cudaStreamSynchronize(st));
+                        }
+                        continue;
+                    }
+                    INK2RT_CK(cudaMemcpyAsync(host_logits.data(), logits[i], sizeof(float) * static_cast<size_t>(nm) * vr, cudaMemcpyDeviceToHost, st));
+                    INK2RT_CK(cudaStreamSynchronize(st));
+                    for (int m = 0; m < nm; ++m) head_pack(&host_logits[static_cast<size_t>(m) * vr], vr, r * vr, o.nc, &head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(m0 + m) * rb]);
                 }
-                if (head_mode == 1)
-                {
-                    {
-                        ink2::ProfScope _ps(pf, ink2::PS_TRUNK_HEAD_PACK, st);
-                        ink2::head_argmax_dev(logits[i], M, vr, r * vr, h_arg_val, h_arg_id, head_dev, rb, st);
-                    }
-                    if (async_head_d2h) INK2RT_CK(cudaMemcpyAsync(h_head_pin, head_dev, hb, cudaMemcpyDeviceToHost, st));
-                    else
-                    {
-                        INK2RT_CK(cudaMemcpyAsync(&head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost, st));
-                        INK2RT_CK(cudaStreamSynchronize(st));
-                    }
-                    continue;
-                }
-                if (use_ghp)
-                {
-                    {
-                        ink2::ProfScope _ps(pf, ink2::PS_TRUNK_HEAD_PACK, st);
-                        ink2::head_pack_dev(logits[i], M, vr, r * vr, o.nc, head_dev, rb, st);
-                    }
-                    if (async_head_d2h) INK2RT_CK(cudaMemcpyAsync(h_head_pin, head_dev, hb, cudaMemcpyDeviceToHost, st));
-                    else
-                    {
-                        INK2RT_CK(cudaMemcpyAsync(&head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost, st));
-                        INK2RT_CK(cudaStreamSynchronize(st));
-                    }
-                    continue;
-                }
-                INK2RT_CK(cudaMemcpyAsync(host_logits.data(), logits[i], sizeof(float) * static_cast<size_t>(M) * vr, cudaMemcpyDeviceToHost, st));
-                INK2RT_CK(cudaStreamSynchronize(st));
-                for (int m = 0; m < M; ++m) head_pack(&host_logits[static_cast<size_t>(m) * vr], vr, r * vr, o.nc, &head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(m) * rb]);
             }
         };
 
-        const bool graph_ok = use_graph && !prof.enabled && T == 1 && o.nloc == 1 && st != nullptr && h_head_pin != nullptr &&
-                              samples != nullptr && !vis_rows && M <= 64 && !tc && !want_blas && use_ghp;
         if (graph_ok)
         {
             const int sm_loc = ink2::attn_splits(false, c.window, rh.max_pos);
@@ -1338,20 +1485,23 @@ public:
             else INK2RT_CK(cudaMemcpy(acc_dev, acc->data(), static_cast<size_t>(M), cudaMemcpyHostToDevice));
         }
         const uint8_t* am = acc ? acc_dev : nullptr;
+        if (last_compact_commit && acc != nullptr) die("commit: partial acc mask after compact prefill step");
+        const int sconv_base = last_compact_commit ? (M - std::min(M, ink2::SCONV_HIST)) : 0;
+        const int kv_base = last_compact_commit ? (M - std::min(M, kv_keep_rows)) : 0;
         {
             ink2::ProfScope _ps(pf, ink2::PS_COMMIT_TRUNK, st);
             const bool batch_commit_on = knob::ink2_batch_commit();
             if (batch_commit_on && commit_descs != nullptr && o.nloc == 1)
             {
-                ink2::commit_all(commit_descs, static_cast<int>(L.size()), rw, am, M, c.H, st);
+                ink2::commit_all(commit_descs, static_cast<int>(L.size()), rw, am, M, c.H, st, sconv_base, kv_base);
             }
             else
             {
                 for (Layer& s : L)
                 {
-                    ink2::sconv_advance(s.att, s.hist_a, rw, am, M, c.H, st);
-                    ink2::sconv_advance(s.mo, s.hist_m, rw, am, M, c.H, st);
-                    for (RankPart& x : s.rk) ink2::attn_commit(x.g, x.as, x.wk, rw, am, M, st);
+                    ink2::sconv_advance(s.att, s.hist_a, rw, am, M, c.H, st, sconv_base);
+                    ink2::sconv_advance(s.mo, s.hist_m, rw, am, M, c.H, st, sconv_base);
+                    for (RankPart& x : s.rk) ink2::attn_commit(x.g, x.as, x.wk, rw, am, M, st, sconv_base, kv_base);
                 }
             }
         }
@@ -1779,6 +1929,7 @@ public:
     void copy_logits_valid(int rows, float* dst_host) const
     {
         if (logits.empty() || !logits[0]) die("copy_logits_valid: no logits buffer");
+        if (rows > head_cap_rows) die("copy_logits_valid: rows > head_cap_rows (set Options::need_full_logits)");
         if (stream) INK2RT_CK(cudaStreamSynchronize(stream));
         INK2RT_CK(cudaMemcpy2D(dst_host, static_cast<size_t>(c.valid) * sizeof(float),
                                logits[0], static_cast<size_t>(vr) * sizeof(float),
@@ -1862,11 +2013,11 @@ private:
             bind_ctrl(s.ctrl_v, "v");
             bind_ctrl(s.ctrl_mlp, "mlp");
         }
-        const size_t mh = static_cast<size_t>(o.max_rows) * c.H, sl = static_cast<size_t>(o.slots);
+        const size_t kh = static_cast<size_t>(keep_rows) * c.H, sl = static_cast<size_t>(o.slots);
         s.hist_a = dalloc<uint16_t>(sl * 3 * c.H);
         s.hist_m = dalloc<uint16_t>(sl * 3 * c.H);
-        s.att = dalloc<uint16_t>(mh);
-        s.mo = dalloc<uint16_t>(mh);
+        s.att = dalloc<uint16_t>(kh);
+        s.mo = dalloc<uint16_t>(kh);
         s.rk.resize(static_cast<size_t>(o.nloc));
         for (int i = 0; i < o.nloc; ++i)
         {
@@ -1899,7 +2050,6 @@ private:
             }
             x.as.hist_k = dalloc<uint16_t>(sl * 3 * nk);
             x.as.hist_v = dalloc<uint16_t>(sl * 3 * nk);
-            int keys = x.g.window;
             if (!s.glob) x.as.ring = dalloc<uint16_t>(sl * 2 * x.g.window * nk);
             else
             {
@@ -1913,12 +2063,14 @@ private:
                 x.staging = dalloc<uint16_t>(sl * 2 * ink2::KV_PAGE_TOKENS * nk);
                 x.as.page_table = t;
                 x.as.max_pps = max_pps;
-                keys = o.cap;
             }
-            // the split partials over every span of keys; 16 global rows fill 32-query GQA CTAs on both TP=6 and TP=4
-            const size_t spans = static_cast<size_t>(keys + ink2::ATTN_SPAN - 1) / ink2::ATTN_SPAN + 1;
-            const size_t rows = s.glob ? std::min<size_t>(16, static_cast<size_t>(o.max_rows)) : static_cast<size_t>(o.max_rows);
-            x.wk.alloc(x.g, o.max_rows, rows * x.g.nh_q * spans * (x.g.hd + 2));
+            // Alias ephemeral attention work buffers & split-partials to per-rank shared_aw[i]; keep only compact per-layer commit buffers.
+            x.wk = shared_aw[static_cast<size_t>(i)];
+            x.wk.owned.clear();
+            x.wk.kp = dalloc<uint16_t>(static_cast<size_t>(keep_rows) * nk);
+            x.wk.vp = dalloc<uint16_t>(static_cast<size_t>(keep_rows) * nk);
+            if (!s.glob) x.wk.kv_new = dalloc<uint16_t>(static_cast<size_t>(kv_keep_rows) * 2 * nk);
+            else x.wk.kv_new = shared_aw[static_cast<size_t>(i)].kv_new;
             if (is_tr3)
             {
                 x.tr3_fc1 = im.get<uint8_t>(N("tr3.fc1"));
@@ -2282,18 +2434,49 @@ private:
         const int I = c.I;
         if (I % 128 != 0) return;
         const int eb = I / 128;
+        mx8_moe_mode = mode;
 
         mx8_moe_sc.max_M = o.max_rows;
         mx8_moe_sc.max_rb = (o.max_rows * c.TK + 15) / 16 + c.NE;
         mx8_moe_sc.max_cta_y = (mx8_moe_sc.max_rb + 3) / 4 + c.NE;
         mx8_moe_sc.x8 = dalloc<uint8_t>(static_cast<size_t>(mx8_moe_sc.max_rb) * (c.H >> 5) * ink2::mx8::MX8_REC);
-        mx8_moe_sc.act_bf16 = dalloc<uint16_t>(static_cast<size_t>(mx8_moe_sc.max_rb) * 16 * I);
+        mx8_moe_sc.act_bf16 = nullptr; // fused SwiGLU writes directly to a8 in SMEM
         mx8_moe_sc.a8 = dalloc<uint8_t>(static_cast<size_t>(mx8_moe_sc.max_rb) * (I >> 5) * ink2::mx8::MX8_REC);
         mx8_moe_sc.out_f32 = dalloc<float>(static_cast<size_t>(o.max_rows) * c.H);
         mx8_moe_sc.tok_list = dalloc<int>(static_cast<size_t>(mx8_moe_sc.max_rb) * 16);
         mx8_moe_sc.rw_list = dalloc<float>(static_cast<size_t>(mx8_moe_sc.max_rb) * 16);
         mx8_moe_sc.map4 = dalloc<ink2::mx8::MoeTileMap4>(static_cast<size_t>(mx8_moe_sc.max_cta_y));
         mx8_moe_sc.d_counts = dalloc<int>(2);
+
+        if (mode == 3 || mode == 4)
+        {
+            mx8_moe_slots = (mode == 4) ? 2 : 1;
+            const size_t gu_el = static_cast<size_t>(c.NE) * 2 * I * c.H;
+            const size_t dn_el = static_cast<size_t>(c.NE) * c.H * I;
+            int prio_lo = 0, prio_hi = 0;
+            INK2RT_CK(cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi));
+            INK2RT_CK(cudaStreamCreateWithPriority(&mx8_unpack_stream, cudaStreamNonBlocking, prio_lo));
+            for (int k = 0; k < mx8_moe_slots; ++k)
+            {
+                ink2::mx8::MoeMx8Layer ly{};
+                ly.NE = c.NE; ly.H = c.H; ly.I = I;
+                ly.gu_q = dalloc<uint8_t>(gu_el);
+                ly.gu_sc = dalloc<uint8_t>(gu_el >> 5);
+                ly.dn_q = dalloc<uint8_t>(dn_el);
+                ly.dn_sc = dalloc<uint8_t>(dn_el >> 5);
+                mx8_stream_buf[k] = ly;
+                mx8_stream_phys[k] = -1;
+                INK2RT_CK(cudaEventCreateWithFlags(&mx8_ready_ev[k], cudaEventDisableTiming));
+                INK2RT_CK(cudaEventCreateWithFlags(&mx8_done_ev[k], cudaEventDisableTiming));
+                INK2RT_CK(cudaEventRecord(mx8_done_ev[k], 0));
+            }
+            INK2RT_CK(cudaDeviceSynchronize());
+            fprintf(stderr, "# ink2: layer-wise MXFP8 prefill MoE enabled (mode=%d, %d scratch slot(s), %.2f GiB, min_m=%d)\n",
+                    mode, mx8_moe_slots,
+                    (double)mx8_moe_slots * c.NE * 3.0 * I * c.H * 1.03125 / (1024.0 * 1024.0 * 1024.0),
+                    static_cast<int>(knob::ink2_pf_mx8_min_m()));
+            return;
+        }
 
         std::vector<ink2::mx8::MoeMx8Layer> phys(static_cast<size_t>(c.n_layers));
         std::vector<bool> done(static_cast<size_t>(c.n_layers), false);
@@ -2398,7 +2581,7 @@ private:
         INK2RT_CK(cudaDeviceSynchronize());
     }
 
-    void moe_tr3(Layer& s, int j, cudaStream_t st = 0)
+    void moe_tr3(Layer& s, int j, uint16_t* mo_dst, cudaStream_t st = 0)
     {
         ink2::Work& w0 = mw[0];
         const int T = o.nr;
@@ -2410,7 +2593,7 @@ private:
         const int pf_mx8_min_m = static_cast<int>(knob::ink2_pf_mx8_min_m());
         if (T == 1 && M >= pf_mx8_min_m && s.rk[0].mx8_moe.ready())
         {
-            ink2::mx8::launch_moe_mx8_prefill(s.rk[0].mx8_moe, mx8_moe_sc, xm, w0.plan, M, c.TK, s.mo, st, pf);
+            ink2::mx8::launch_moe_mx8_prefill(s.rk[0].mx8_moe, mx8_moe_sc, xm, w0.plan, M, c.TK, mo_dst, st, pf);
             return;
         }
         const int cb = s.exp_fmt == 3 ? ink2::tr3::CB_PMCGX : s.exp_fmt == 2 ? ink2::tr3::CB_MUL1 : ink2::tr3::CB_MCG;
@@ -2430,7 +2613,7 @@ private:
             ta.plan = w0.plan;
             ta.a_rot = tr3_a_rot[static_cast<size_t>(i)];
             ta.ypart = mw[i].ypart;
-            ta.out = T == 1 ? s.mo : nullptr;
+            ta.out = T == 1 ? mo_dst : nullptr;
             ta.H = c.H;
             ta.eb = x.tr3_eb;
             ta.M = M;
@@ -2447,9 +2630,9 @@ private:
             k_ink2rt_picks<<<ink2::cells_grid(picks), 256, 0, st>>>(pa);
         }
         if (gather) gather(2 * j + 1, parts, picks * 4);
-        k_ink2rt_pick_sum<<<ink2::cells_grid(static_cast<size_t>(M) * c.H), 256, 0, st>>>(parts, T, picks, M, c.H, c.TK, s.mo);
+        k_ink2rt_pick_sum<<<ink2::cells_grid(static_cast<size_t>(M) * c.H), 256, 0, st>>>(parts, T, picks, M, c.H, c.TK, mo_dst);
     }
-    template <class F> void moe(Layer& s, int j, cudaStream_t st = 0)
+    template <class F> void moe(Layer& s, int j, uint16_t* mo_dst, cudaStream_t st = 0)
     {
         ink2::Work& w0 = mw[0];
         const int T = o.nr;
@@ -2458,7 +2641,7 @@ private:
         for (int i = 0; i < o.nloc; ++i)
         {
             const RankPart& x = s.rk[i];
-            ink2::MoeArgs ma = mw[i].args(x.fc1, x.fc2, x.s1, x.s2, M, T == 1 ? s.mo : scratch);
+            ink2::MoeArgs ma = mw[i].args(x.fc1, x.fc2, x.s1, x.s2, M, T == 1 ? mo_dst : scratch);
             ma.plan = w0.plan;   // one routing for every rank
             if (M <= 8) ink2::moe_decode<F>(ma, xm, c.NE, st);
             else ink2::moe_prefill<F>(ma, xm, c.NE, st);
@@ -2467,7 +2650,7 @@ private:
             k_ink2rt_picks<<<ink2::cells_grid(picks), 256, 0, st>>>(pa);
         }
         if (gather) gather(2 * j + 1, parts, picks * 4);
-        k_ink2rt_pick_sum<<<ink2::cells_grid(static_cast<size_t>(M) * c.H), 256, 0, st>>>(parts, T, picks, M, c.H, c.TK, s.mo);
+        k_ink2rt_pick_sum<<<ink2::cells_grid(static_cast<size_t>(M) * c.H), 256, 0, st>>>(parts, T, picks, M, c.H, c.TK, mo_dst);
     }
 
     std::vector<std::unique_ptr<Image>> img;
@@ -2575,6 +2758,19 @@ private:
     ink2::Prof prof;
     ink2::df2::Ink2DFlash2 df2;
     ink2::mx8::MoeMx8Scratch mx8_moe_sc;
+    int mx8_moe_mode = 0;
+    int mx8_moe_slots = 0;
+    ink2::mx8::MoeMx8Layer mx8_stream_buf[2];
+    int mx8_stream_phys[2] = {-1, -1};
+    cudaStream_t mx8_unpack_stream = nullptr;
+    cudaEvent_t mx8_ready_ev[2] = {};
+    cudaEvent_t mx8_done_ev[2] = {};
+    int first_tr3_layer = -1;
+    std::vector<int> next_tr3_layer;
+    int keep_rows = 0, kv_keep_rows = 0, head_cap_rows = 0;
+    bool last_compact_commit = false;
+    std::vector<ink2::AttnWork> shared_aw;
+    uint16_t *shared_att = nullptr, *shared_mo = nullptr;
     uint8_t* mx8_x8 = nullptr;
     ink2::mx8::Mx8Mat lm_mx8;
     int lm_mx8_mode = 0;

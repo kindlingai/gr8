@@ -367,7 +367,8 @@ struct Work
         return static_cast<T*>(p);
     }
     // KG = the smaller k group of the two formats (32), so one Work serves both.
-    void alloc(int M_, int H_, int I_, int NE_, int TK_, bool y_bf16_)
+    // tr3_only: skip non-tr3 nv4/mx8 scratch; ypart_M >= 0: cap ypart allocation to ypart_M rows (e.g. when MXFP8 handles M >= min_m).
+    void alloc(int M_, int H_, int I_, int NE_, int TK_, bool y_bf16_, bool tr3_only = false, int ypart_M = -1)
     {
         M = M_; H = H_; I = I_; NE = NE_; TK = TK_; y_bf16 = y_bf16_ ? 1 : 0;
         const size_t ms = static_cast<size_t>(plan_max_slots(M, TK, NE)), mt = static_cast<size_t>(plan_max_tiles(M, TK, NE)), m = static_cast<size_t>(M);
@@ -384,14 +385,19 @@ struct Work
         plan.tok_slot = get<int>(m * TK);
         plan.tok_col = get<int>(m * TK);
         plan.counts = get<int>(2);
-        xq = get<uint8_t>(m * (H / 32) * 32);
-        xs = get<u32>(m * (H / 32));
-        x_outer = get<float>(m);
-        act = get<uint16_t>(mt * 8 * I);
-        aq = get<uint8_t>(mt * 8 * (I / 32) * 32);
-        as = get<u32>(mt * 8 * (I / 32));
-        a_outer = get<float>(mt * 8);
-        ypart = get<uint8_t>(mt * 8 * H * (y_bf16 ? 2 : 4));
+        if (!tr3_only)
+        {
+            xq = get<uint8_t>(m * (H / 32) * 32);
+            xs = get<u32>(m * (H / 32));
+            x_outer = get<float>(m);
+            act = get<uint16_t>(mt * 8 * I);
+            aq = get<uint8_t>(mt * 8 * (I / 32) * 32);
+            as = get<u32>(mt * 8 * (I / 32));
+            a_outer = get<float>(mt * 8);
+        }
+        const int ym = (ypart_M >= 0 && ypart_M < M) ? ypart_M : M;
+        const size_t mt_y = ym > 0 ? static_cast<size_t>(plan_max_tiles(ym, TK, NE)) : 1u;
+        ypart = get<uint8_t>(mt_y * 8 * H * (y_bf16 ? 2 : 4));
     }
     void release()
     {

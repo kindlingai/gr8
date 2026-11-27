@@ -794,13 +794,13 @@ __global__ void __launch_bounds__(ACT) k_ink2_attn_merge(AttnCoreArgs a)
 }
 
 // The staged K / V of the accepted rows into the ring. A thread per (row, cell of nk).
-__global__ void __launch_bounds__(256) k_ink2_attn_commit(const uint16_t* kv_new, uint16_t* ring, Rows rw, const uint8_t* acc, int M, int nk, int win)
+__global__ void __launch_bounds__(256) k_ink2_attn_commit(const uint16_t* kv_new, uint16_t* ring, Rows rw, const uint8_t* acc, int M, int nk, int win, int kv_base)
 {
     const size_t i = static_cast<size_t>(blockIdx.x) * 256 + threadIdx.x;
     if (i >= static_cast<size_t>(M) * nk) return;
     const int m = static_cast<int>(i / nk), c = static_cast<int>(i % nk);
     if (!ring_writer(rw, acc, m, M, win)) return;
-    const uint16_t* src = kv_new + static_cast<size_t>(m) * 2 * nk + c;
+    const uint16_t* src = kv_new + static_cast<size_t>(m - kv_base) * 2 * nk + c;
     uint16_t* dst = ring + (static_cast<size_t>(rw.slot[m]) * 2 * win + rw.pos[m] % win) * nk + c;
     dst[0] = src[0];
     dst[static_cast<size_t>(win) * nk] = src[nk];
@@ -1052,12 +1052,12 @@ inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnStat
 }
 
 // The rows a forward of this layer ran on, and the accepted ones (acc [M] bytes on the device; nullptr = all).
-inline void attn_commit(const AttnGeom& g, const AttnState& s, const AttnWork& wk, const Rows& rw, const uint8_t* acc, int M, cudaStream_t st)
+inline void attn_commit(const AttnGeom& g, const AttnState& s, const AttnWork& wk, const Rows& rw, const uint8_t* acc, int M, cudaStream_t st, int sconv_base = 0, int kv_base = 0)
 {
     const int nk = g.nh_kv * g.hd;
-    if (!g.global) k_ink2_attn_commit<<<cells_grid(static_cast<size_t>(M) * nk), 256, 0, st>>>(wk.kv_new, s.ring, rw, acc, M, nk, g.window);
-    sconv_advance(wk.kp, s.hist_k, rw, acc, M, nk, st);
-    sconv_advance(wk.vp, s.hist_v, rw, acc, M, nk, st);
+    if (!g.global) k_ink2_attn_commit<<<cells_grid(static_cast<size_t>(M) * nk), 256, 0, st>>>(wk.kv_new, s.ring, rw, acc, M, nk, g.window, kv_base);
+    sconv_advance(wk.kp, s.hist_k, rw, acc, M, nk, st, sconv_base);
+    sconv_advance(wk.vp, s.hist_v, rw, acc, M, nk, st, sconv_base);
 }
 #endif   // __CUDACC__
 }   // namespace ink2

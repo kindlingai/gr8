@@ -2012,7 +2012,7 @@ struct Ink2DFlash2 {
     bool init(const std::string& st_path, int slots, int max_rows, int valid_v,
               const uint16_t* target_lm_bf16, const InitOpts& opts, cudaStream_t st = 0) {
         max_slots = slots;
-        max_commit_rows = std::max(max_rows, B);
+        max_commit_rows = std::min(std::max(max_rows, B), 512);
         valid_vocab = valid_v;
         slot_ctx_lo.assign(static_cast<size_t>(slots), 0);
 
@@ -2268,51 +2268,70 @@ struct Ink2DFlash2 {
     }
 
     // Ingest accepted committed rows from step_taps [NT][max_rows][HID] into each session's FP16 ring.
+    // Tiles large prefill commits in slices of max_commit_rows (<=512) to bound scratch VRAM.
     void commit(const uint16_t* step_taps, size_t tap_stride, const ink2::Rows& rw,
                 const std::vector<uint8_t>* acc_host, int M, cublasHandle_t blas, cudaStream_t st) {
         if (!loaded || M <= 0) return;
-        int n_acc = M;
-        const int* d_idx = nullptr;
-        if (acc_host != nullptr) {
-            n_acc = 0;
-            for (int m = 0; m < M; ++m) {
-                if ((*acc_host)[static_cast<size_t>(m)]) h_acc_idx_pin[n_acc++] = m;
-            }
-            if (n_acc == 0) return;
-            cudaMemcpyAsync(d_acc_idx, h_acc_idx_pin, static_cast<size_t>(n_acc) * sizeof(int), cudaMemcpyHostToDevice, st);
-            d_idx = d_acc_idx;
-        }
-        const size_t tot = static_cast<size_t>(n_acc) * NT * HID;
-        k_df2_gather_taps<<<static_cast<unsigned>((tot + 255) / 256), 256, 0, st>>>(step_taps, tap_stride, d_idx, ctx_taps_bf16, n_acc);
+        auto run_slice = [&](const uint16_t* taps_ptr, const int* slot_ptr, const int* pos_ptr, const int* d_idx, int n_acc) {
+            const size_t tot = static_cast<size_t>(n_acc) * NT * HID;
+            k_df2_gather_taps<<<static_cast<unsigned>((tot + 255) / 256), 256, 0, st>>>(taps_ptr, tap_stride, d_idx, ctx_taps_bf16, n_acc);
 
-        if (n_acc <= B) {
-            // Fast Q4_0 __dp4a path for small decode commits (~0.15 ms)
-            quant_q8_bf16(ctx_taps_bf16, qa, n_acc, NT * HID, st);
-            launch_q4_gemv(qa, fc, ctx_fc_f32, n_acc, st);
-            k_df2_rmsnorm_q8<false, false, false><<<n_acc, 256, 0, st>>>(ctx_fc_f32, hidden_norm, nullptr, nullptr, qa.q, qa.sc, qa.isum, RMS_EPS);
-            for (int l = 0; l < L; ++l) {
-                launch_q4_gemv(qa, ly[l].k, ctx_k_f32, n_acc, st);
-                launch_q4_gemv(qa, ly[l].v, ctx_v_f32, n_acc, st);
-                k_df2_ctx_kv_scatter<false><<<n_acc * NKV, 128, 0, st>>>(
-                    ctx_k_f32, ctx_v_f32, ly[l].k_norm, rw.slot, rw.pos, d_idx, kring, vring, l, RMS_EPS);
+            if (n_acc <= B) {
+                // Fast Q4_0 __dp4a path for small decode commits (~0.15 ms)
+                quant_q8_bf16(ctx_taps_bf16, qa, n_acc, NT * HID, st);
+                launch_q4_gemv(qa, fc, ctx_fc_f32, n_acc, st);
+                k_df2_rmsnorm_q8<false, false, false><<<n_acc, 256, 0, st>>>(ctx_fc_f32, hidden_norm, nullptr, nullptr, qa.q, qa.sc, qa.isum, RMS_EPS);
+                for (int l = 0; l < L; ++l) {
+                    launch_q4_gemv(qa, ly[l].k, ctx_k_f32, n_acc, st);
+                    launch_q4_gemv(qa, ly[l].v, ctx_v_f32, n_acc, st);
+                    k_df2_ctx_kv_scatter<false><<<n_acc * NKV, 128, 0, st>>>(
+                        ctx_k_f32, ctx_v_f32, ly[l].k_norm, slot_ptr, pos_ptr, d_idx, kring, vring, l, RMS_EPS);
+                }
+            } else {
+                // Fast cuBLAS BF16 path for prefill chunks (M = 9..4096, tiled in slices of <=512)
+                const float one = 1.0f, zero = 0.0f;
+                cublasSetStream(blas, st);
+                cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, HID, n_acc, NT * HID, &one,
+                             fc_bf16, CUDA_R_16BF, NT * HID, ctx_taps_bf16, CUDA_R_16BF, NT * HID,
+                             &zero, ctx_fc_bf16, CUDA_R_16BF, HID, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                k_df2_rmsnorm_q8<false, true, true><<<n_acc, 256, 0, st>>>(ctx_fc_bf16, hidden_norm, nullptr, ctx_norm_bf16, nullptr, nullptr, nullptr, RMS_EPS);
+                for (int l = 0; l < L; ++l) {
+                    cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, NKV * HD, n_acc, HID, &one,
+                                 ly[l].k_bf16, CUDA_R_16BF, HID, ctx_norm_bf16, CUDA_R_16BF, HID,
+                                 &zero, ctx_k_bf16, CUDA_R_16BF, NKV * HD, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, NKV * HD, n_acc, HID, &one,
+                                 ly[l].v_bf16, CUDA_R_16BF, HID, ctx_norm_bf16, CUDA_R_16BF, HID,
+                                 &zero, ctx_v_bf16, CUDA_R_16BF, NKV * HD, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    k_df2_ctx_kv_scatter<true><<<n_acc * NKV, 128, 0, st>>>(
+                        ctx_k_bf16, ctx_v_bf16, ly[l].k_norm, slot_ptr, pos_ptr, d_idx, kring, vring, l, RMS_EPS);
+                }
+            }
+        };
+
+        if (acc_host != nullptr) {
+            std::vector<int> acc_all;
+            acc_all.reserve(static_cast<size_t>(M));
+            for (int m = 0; m < M; ++m) {
+                if ((*acc_host)[static_cast<size_t>(m)]) acc_all.push_back(m);
+            }
+            const int total_acc = static_cast<int>(acc_all.size());
+            if (total_acc == 0) return;
+            if (total_acc <= max_commit_rows) {
+                memcpy(h_acc_idx_pin, acc_all.data(), static_cast<size_t>(total_acc) * sizeof(int));
+                cudaMemcpyAsync(d_acc_idx, h_acc_idx_pin, static_cast<size_t>(total_acc) * sizeof(int), cudaMemcpyHostToDevice, st);
+                run_slice(step_taps, rw.slot, rw.pos, d_acc_idx, total_acc);
+            } else {
+                for (int off = 0; off < total_acc; off += max_commit_rows) {
+                    const int nm = std::min(total_acc - off, max_commit_rows);
+                    cudaMemcpyAsync(d_acc_idx, acc_all.data() + off, static_cast<size_t>(nm) * sizeof(int), cudaMemcpyHostToDevice, st);
+                    run_slice(step_taps, rw.slot, rw.pos, d_acc_idx, nm);
+                    cudaStreamSynchronize(st);
+                }
             }
         } else {
-            // Fast cuBLAS BF16 path for prefill chunks (M = 9..2048, ~0.5 ms per 1024 tokens!)
-            const float one = 1.0f, zero = 0.0f;
-            cublasSetStream(blas, st);
-            cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, HID, n_acc, NT * HID, &one,
-                         fc_bf16, CUDA_R_16BF, NT * HID, ctx_taps_bf16, CUDA_R_16BF, NT * HID,
-                         &zero, ctx_fc_bf16, CUDA_R_16BF, HID, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            k_df2_rmsnorm_q8<false, true, true><<<n_acc, 256, 0, st>>>(ctx_fc_bf16, hidden_norm, nullptr, ctx_norm_bf16, nullptr, nullptr, nullptr, RMS_EPS);
-            for (int l = 0; l < L; ++l) {
-                cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, NKV * HD, n_acc, HID, &one,
-                             ly[l].k_bf16, CUDA_R_16BF, HID, ctx_norm_bf16, CUDA_R_16BF, HID,
-                             &zero, ctx_k_bf16, CUDA_R_16BF, NKV * HD, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-                cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, NKV * HD, n_acc, HID, &one,
-                             ly[l].v_bf16, CUDA_R_16BF, HID, ctx_norm_bf16, CUDA_R_16BF, HID,
-                             &zero, ctx_v_bf16, CUDA_R_16BF, NKV * HD, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-                k_df2_ctx_kv_scatter<true><<<n_acc * NKV, 128, 0, st>>>(
-                    ctx_k_bf16, ctx_v_bf16, ly[l].k_norm, rw.slot, rw.pos, d_idx, kring, vring, l, RMS_EPS);
+            for (int off = 0; off < M; off += max_commit_rows) {
+                const int nm = std::min(M - off, max_commit_rows);
+                run_slice(step_taps + static_cast<size_t>(off) * HID, rw.slot + off, rw.pos + off, nullptr, nm);
             }
         }
     }
