@@ -70,6 +70,20 @@ static void test_batch_queue_packing() {
     q.mark_done("c");
     q.close();
     assert(q.pop_batch().empty());
+
+    // Enforce max_batch cap even when total tokens easily fit within max_batched_tokens.
+    g6emb::EmbedBatchQueue qcap(16384, 3);
+    for (int i = 0; i < 5; ++i) {
+        assert(qcap.push(g6emb::EmbedRequest{"req-" + std::to_string(i), {1, 2}, 0, true, {}}));
+    }
+    auto c1 = qcap.pop_batch();
+    assert(c1.size() == 3 && c1[0].id == "req-0" && c1[2].id == "req-2");
+    auto c2 = qcap.pop_batch();
+    assert(c2.size() == 2 && c2[0].id == "req-3" && c2[1].id == "req-4");
+    for (const auto& r : c1) qcap.mark_done(r.id);
+    for (const auto& r : c2) qcap.mark_done(r.id);
+    qcap.close();
+    assert(qcap.pop_batch().empty());
 }
 
 static void test_protocol_roundtrip() {

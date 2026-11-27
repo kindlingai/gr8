@@ -708,7 +708,9 @@ pub mod qwen3vl {
     pub const FACTOR: usize = PATCH * MERGE; // 32
     pub const MIN_PIXELS: usize = 4_096;     // 4 tokens
     pub const MAX_PIXELS: usize = 1_310_720; // 1280 tokens
+    #[allow(dead_code)]
     pub const MIN_TOKENS: usize = MIN_PIXELS / (FACTOR * FACTOR); // 4
+    #[allow(dead_code)]
     pub const MAX_TOKENS: usize = MAX_PIXELS / (FACTOR * FACTOR); // 1280
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

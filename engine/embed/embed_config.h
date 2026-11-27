@@ -259,8 +259,9 @@ struct EmbedConfig {
             cfg.embedding_dim = cfg.hidden_size;
             cfg.vit_out_hidden = cfg.hidden_size;
             if (cfg.vit_layers > 0) {
-                cfg.vit_heads = 16;
-                if (cfg.vit_hidden % cfg.vit_heads != 0) cfg.vit_heads = std::max(1, cfg.vit_hidden / 64);
+                if (cfg.vit_heads <= 0 || cfg.vit_hidden % cfg.vit_heads != 0) {
+                    cfg.vit_heads = (cfg.vit_hidden % 16 == 0) ? 16 : std::max(1, cfg.vit_hidden / 64);
+                }
                 cfg.vit_head_dim = cfg.vit_hidden / cfg.vit_heads;
             }
             if (cfg.deepstack_indexes.empty() && max_ds_k >= 0) {

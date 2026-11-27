@@ -314,7 +314,8 @@ inline std::string parse_embed_request(const g6v::Json& obj, const EmbedConfig& 
 // Token-budgeted dynamic batch queue shared between socket ingress thread and GPU worker thread.
 class EmbedBatchQueue {
 public:
-    explicit EmbedBatchQueue(int max_batched_tokens) : max_tokens_(std::max(1, max_batched_tokens)) {}
+    explicit EmbedBatchQueue(int max_batched_tokens, int max_batch = 256)
+        : max_tokens_(std::max(1, max_batched_tokens)), max_batch_(std::max(1, max_batch)) {}
 
     bool push(EmbedRequest req) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -349,7 +350,7 @@ public:
     }
 
     // Blocks until at least one request is available (or closed), then packs as many queued requests
-    // as fit within max_batched_tokens (always admitting at least the head request).
+    // as fit within max_batched_tokens and max_batch (always admitting at least the head request).
     std::vector<EmbedRequest> pop_batch() {
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [&] { return closed_ || !q_.empty(); });
@@ -358,7 +359,7 @@ public:
         int tokens = 0;
         while (!q_.empty()) {
             const int n = static_cast<int>(q_.front().prompt.size());
-            if (!batch.empty() && tokens + n > max_tokens_) break;
+            if (!batch.empty() && (static_cast<int>(batch.size()) >= max_batch_ || tokens + n > max_tokens_)) break;
             tokens += n;
             batch.push_back(std::move(q_.front()));
             q_.pop_front();
@@ -374,6 +375,7 @@ public:
 
 private:
     int max_tokens_;
+    int max_batch_;
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::deque<EmbedRequest> q_;
@@ -384,10 +386,11 @@ private:
 // Serves one accepted Unix domain socket connection speaking PROTOCOL.md v1.
 // `run_batch` executes a packed batch of EmbedRequests and returns one EmbedOutput per request in order.
 inline void serve_connection(int fd, const EmbedConfig& cfg, int max_batched_tokens, EmbedMetrics& metrics,
-                             const std::function<std::vector<EmbedOutput>(const std::vector<EmbedRequest>&)>& run_batch) {
+                             const std::function<std::vector<EmbedOutput>(const std::vector<EmbedRequest>&)>& run_batch,
+                             int max_batch = 256) {
     if (!send_frame(fd, make_hello_json(cfg))) return;
 
-    EmbedBatchQueue queue(max_batched_tokens);
+    EmbedBatchQueue queue(max_batched_tokens, max_batch);
     std::mutex write_mu;
     std::atomic<bool> write_failed{false};
 

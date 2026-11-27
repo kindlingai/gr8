@@ -134,7 +134,7 @@ std::vector<g6emb::EmbedRequest> make_text_batch(int B, int L, int vocab_size) {
     const int vmax = std::max(1024, std::min(vocab_size - 16, 120000));
     for (int b = 0; b < B; ++b) {
         g6emb::EmbedRequest r;
-        r.id = b + 1;
+        r.id = std::to_string(b + 1);
         r.prompt.resize(size_t(L));
         uint32_t s = 0x9e3779b9u ^ static_cast<uint32_t>(b * 2654435761u + L);
         for (int i = 0; i < L; ++i) {
@@ -153,7 +153,7 @@ std::vector<g6emb::EmbedRequest> make_mm_batch(int B, int vit_h, int vit_w, int 
     const int vmax = std::max(1024, std::min(vocab_size - 16, 120000));
     for (int b = 0; b < B; ++b) {
         g6emb::EmbedRequest r;
-        r.id = b + 1;
+        r.id = std::to_string(b + 1);
         const int prefix = 8;
         const int suffix = std::max(4, text_pad);
         r.prompt.reserve(size_t(prefix + n_vis_toks + suffix));

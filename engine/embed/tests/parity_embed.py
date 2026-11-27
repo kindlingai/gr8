@@ -201,7 +201,7 @@ def main() -> int:
 
         # Build multimodal prompt via transformers AutoProcessor so pixel grid & tokens match exactly
         mm_messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Describe the color gradient in this image."}]}]
-        mm_text = proc.apply_chat_template(mm_messages, tokenize=False, add_generation_prompt=False)
+        mm_text = proc.apply_chat_template(mm_messages, tokenize=False, add_generation_prompt=True)
         mm_inputs = proc(text=[mm_text], images=[img], return_tensors="pt")
         mm_ids = mm_inputs["input_ids"][0].tolist()
         mm_grid = mm_inputs["image_grid_thw"]  # [[1, vit_h, vit_w]]

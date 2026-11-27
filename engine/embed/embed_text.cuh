@@ -184,24 +184,27 @@ __global__ void __launch_bounds__(256) k_q3_qk_norm_mrope_fused(
     int M, int nq, int nkv, int hd, float eps, int s1_lim, int s2_lim) {
     __shared__ float sm[8]; // 2 warps per head * 4 heads per CTA
     const int m = blockIdx.x;
+    if (m >= M) return; // uniform across CTA
     const int h_sub = threadIdx.x >> 6; // 0..3
     const int j = threadIdx.x & 63;     // 0..63
     const int h_glob = blockIdx.y * 4 + h_sub;
     const int half = hd >> 1;
-    if (m >= M || h_glob >= nq + nkv || j >= half) return;
+    const bool active = (h_glob < nq + nkv && j < half);
 
     const bool is_k = (h_glob >= nq);
     const int h = is_k ? (h_glob - nq) : h_glob;
-    bf16* row = is_k ? (k + (size_t(m) * nkv + h) * hd) : (q + (size_t(m) * nq + h) * hd);
+    bf16* row = active ? (is_k ? (k + (size_t(m) * nkv + h) * hd) : (q + (size_t(m) * nq + h) * hd)) : nullptr;
     const bf16* nw = is_k ? k_norm_w : q_norm_w;
 
-    float a = __bfloat162float(row[j]);
-    float b = __bfloat162float(row[j + half]);
+    float a = active ? __bfloat162float(row[j]) : 0.f;
+    float b = active ? __bfloat162float(row[j + half]) : 0.f;
     float ss = a * a + b * b;
     ss = emb_warp_sum(ss);
     const int warp_id = threadIdx.x >> 5;
     if ((threadIdx.x & 31) == 0) sm[warp_id] = ss;
     __syncthreads();
+    if (!active) return;
+
     const float tot = sm[h_sub * 2] + (half > 32 ? sm[h_sub * 2 + 1] : 0.f);
     const float rs = rsqrtf(tot / float(hd) + eps);
 

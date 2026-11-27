@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
 
     try {
         g6emb::EmbedWeights weights = g6emb::load_embed_weights(opts.model_dir, opts.verify_checksums, opts.weight_mode);
-        weights.cfg.max_model_len = opts.max_model_len;
+        weights.cfg.max_model_len = std::min(opts.max_model_len, opts.max_batched_tokens);
         if (!opts.model_name_override.empty()) {
             weights.cfg.model_name = opts.model_name_override;
         }
@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
                 if (errno == EINTR) continue;
                 break;
             }
-            g6emb::serve_connection(cfd, weights.cfg, opts.max_batched_tokens, metrics, runner);
+            g6emb::serve_connection(cfd, weights.cfg, opts.max_batched_tokens, metrics, runner, text_runner.max_batch);
             ::close(cfd);
         }
         cudaStreamDestroy(stream);

@@ -1,7 +1,6 @@
 // Standalone mixed-format dense linear GEMM dispatch for g6embed (Blackwell sm_121a / sm_120a).
 // Supports all exlr8 v2 dense formats natively on GPU with zero persistent dequantized copies:
 //   - FMT_TRELLIS (K4 mcg, side=OUT or side=IN): exact FP16-activation on-the-fly Trellis K4 MMA (m16n8k16)
-//     and high-throughput MXFP8-activation on-the-fly Trellis K4 MMA (m16n8k32, block_scale)
 //   - FMT_INT4    (g32 row-major q4 + s4): fused nibble unpack + FP32 accumulate
 //   - FMT_FP8_ROW (side=OUT/REPLICATED, arbitrary N & K incl. 8B ViT 4304): native cvt.rn.f16x2.e4m3x2 GEMM
 //   - FMT_BF16    (copied BF16 or --weight-mode bf16 debug path): cuBLAS BF16 GEMM + fused bias/residual epilogue
@@ -75,42 +74,10 @@ __device__ __forceinline__ void emb_mma16816_bf16(float (&c)[4], u32 a0, u32 a1,
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void emb_mma_mx8(float (&d)[4], const uint4& a, u32 b0, u32 b1, u32 sa, u32 sb) {
-    const uint16_t z = 0;
-    asm volatile(
-        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1),
-          "r"(sa), "h"(z), "h"(z), "r"(sb), "h"(z), "h"(z));
-}
-
 __device__ __forceinline__ void emb_ldsm_x4(const void* p, u32& r0, u32& r1, u32& r2, u32& r3) {
     const u32 addr = static_cast<u32>(__cvta_generic_to_shared(p));
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
-}
-
-__device__ __forceinline__ u32 emb_h2_e4m3x2(u32 h2) {
-    u32 r;
-    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.u32.u16 %0, t; }" : "=r"(r) : "r"(h2));
-    return r;
-}
-
-__device__ __forceinline__ u32 emb_f2_e4m3x2(float a, float b) {
-    u32 r;
-    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, %2, %1; cvt.u32.u16 %0, t; }" : "=r"(r) : "f"(a), "f"(b));
-    return r;
-}
-
-__device__ __forceinline__ u32 emb_mx_scale(float amax, float& inv) {
-    const u32 u = __float_as_uint(__fmul_rn(amax, 0.002232142857f)); // amax / 448
-    int e = static_cast<int>(u >> 23) - 127 + ((u & 0x7fffffu) != 0u ? 1 : 0);
-    if (amax == 0.f) e = 0;
-    if (e < -126) e = -126;
-    if (e > 127) e = 127;
-    inv = __uint_as_float(static_cast<u32>(127 - e) << 23);
-    return static_cast<u32>(e + 127);
 }
 
 // 128-point Sylvester Hadamard scaled by 1/sqrt(128) across one warp (4 floats per lane).
@@ -1471,6 +1438,9 @@ inline void launch_trellis_with_rot(const DevMatrix& W, const bf16* bias, bf16* 
 inline void linear_forward(const bf16* X, const DevMatrix& W, const bf16* bias, bf16* Y, int M,
                            bool add_res, GemmWorkspace& ws, cudaStream_t st, int act_mode = ACT_NONE) {
     if (M <= 0) return;
+    if (W.fmt != FMT_TRELLIS && act_mode != ACT_NONE) {
+        throw std::runtime_error("g6embed linear_forward: fused activation only supported for TRELLIS");
+    }
     switch (W.fmt) {
         case FMT_TRELLIS: {
             launch_rot_h16(X, W.suh, M, W.inp, ws, st);
