@@ -790,14 +790,22 @@ public:
                 linear_forward(d_normed, L.up_proj, nullptr, d_up, total_M, false, ws, st);
             });
 
-            prof.record(prof.swiglu_ms, st, [&] {
-                const size_t n = size_t(total_M) * c.intermediate_size;
-                k_q3_swiglu<<<static_cast<unsigned>((n + 255) / 256), 256, 0, st>>>(d_gate, d_up, d_act, n);
-            });
-
-            prof.record(prof.mlp_down_ms, st, [&] {
-                linear_forward(d_act, L.down_proj, nullptr, d_hidden, total_M, true, ws, st);
-            });
+            if (L.down_proj.fmt == FMT_TRELLIS) {
+                prof.record(prof.swiglu_ms, st, [&] {
+                    launch_swiglu_rot_h16(d_gate, d_up, L.down_proj.suh, total_M, c.intermediate_size, ws, st);
+                });
+                prof.record(prof.mlp_down_ms, st, [&] {
+                    launch_trellis_with_rot(L.down_proj, nullptr, d_hidden, total_M, true, ws, st);
+                });
+            } else {
+                prof.record(prof.swiglu_ms, st, [&] {
+                    const size_t n = size_t(total_M) * c.intermediate_size;
+                    k_q3_swiglu<<<static_cast<unsigned>((n + 255) / 256), 256, 0, st>>>(d_gate, d_up, d_act, n);
+                });
+                prof.record(prof.mlp_down_ms, st, [&] {
+                    linear_forward(d_act, L.down_proj, nullptr, d_hidden, total_M, true, ws, st);
+                });
+            }
 
             // DeepStack injection after LLM layers 0, 1, 2
             if (has_vis && size_t(l) < vis->deepstack_vis.size() && vis->deepstack_vis[size_t(l)] != nullptr) {

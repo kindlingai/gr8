@@ -234,6 +234,63 @@ __global__ void __launch_bounds__(256) k_emb_rot_h16(
     out_blk[lane] = make_uint4(a0, a1, a2, a3);
 }
 
+// Stage 1b (Fused SwiGLU + H16 rotation): reads gate[M, K] and up[M, K] (BF16), computes bf16(silu(gate)) * up,
+// multiplies by suh[K] (FP16), applies H128, and packs directly into FP16 m16n8k16 A-fragments dst[ceil(M/16)][K/16][512B].
+// Eliminates the intermediate [M, K] d_act DRAM write+read before down_proj.
+// Grid: (ceil(M/16), K/128), Block: 256.
+__global__ void __launch_bounds__(256) k_emb_swiglu_rot_h16(
+    const bf16* __restrict__ gate,
+    const bf16* __restrict__ up,
+    const __half* __restrict__ suh,
+    uint8_t* __restrict__ dst,
+    int M, int K) {
+    __shared__ __half sh[16][128];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int mb = blockIdx.x, kb = blockIdx.y;
+    const int k0 = kb * 128 + lane * 4;
+    const int K16 = K >> 4;
+
+    const uint2 sr = *reinterpret_cast<const uint2*>(suh + k0);
+    const float2 s01 = __half22float2(emb_as_h2(sr.x)), s23 = __half22float2(emb_as_h2(sr.y));
+
+    auto silu_mul = [](float g, float u) -> float {
+        const float sg = __bfloat162float(__float2bfloat16_rn(g / (1.0f + __expf(-g))));
+        return __bfloat162float(__float2bfloat16_rn(sg * u));
+    };
+
+    #pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        const int lr = warp + pass * 8;
+        const int row = mb * 16 + lr;
+        float v[4] = {0.f, 0.f, 0.f, 0.f};
+        if (row < M) {
+            const uint2 gr = *reinterpret_cast<const uint2*>(gate + size_t(row) * K + k0);
+            const uint2 ur = *reinterpret_cast<const uint2*>(up + size_t(row) * K + k0);
+            const float2 g01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gr.x));
+            const float2 g23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gr.y));
+            const float2 u01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur.x));
+            const float2 u23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur.y));
+            v[0] = silu_mul(g01.x, u01.x) * s01.x;
+            v[1] = silu_mul(g01.y, u01.y) * s01.y;
+            v[2] = silu_mul(g23.x, u23.x) * s23.x;
+            v[3] = silu_mul(g23.y, u23.y) * s23.y;
+            emb_had128(v, lane);
+        }
+        *reinterpret_cast<uint2*>(&sh[lr][lane * 4]) = make_uint2(emb_pack_h2(v[0], v[1]), emb_pack_h2(v[2], v[3]));
+    }
+    __syncthreads();
+
+    const int j = warp;
+    const int r = lane >> 2, c = (lane & 3) * 2;
+    const int c0 = j * 16 + c;
+    const u32 a0 = *reinterpret_cast<const u32*>(&sh[r][c0]);
+    const u32 a1 = *reinterpret_cast<const u32*>(&sh[r + 8][c0]);
+    const u32 a2 = *reinterpret_cast<const u32*>(&sh[r][c0 + 8]);
+    const u32 a3 = *reinterpret_cast<const u32*>(&sh[r + 8][c0 + 8]);
+    uint4* out_blk = reinterpret_cast<uint4*>(dst + (size_t(mb) * K16 + kb * 8 + j) * 512);
+    out_blk[lane] = make_uint4(a0, a1, a2, a3);
+}
+
 // Stage 2 (H16 exact path v2): Cooperative-decode on-the-fly Trellis K4 -> E4M3 FP16 -> ldmatrix.x4 -> mma.m16n8k16
 // + RGRP=4 L2-swizzled CTA rasterization + 3-stage cp.async + pure-FP32 H128*svh (+ bias/residual) epilogue.
 // Each tile is decoded ONCE across all NW warps into double-buffered XOR-swizzled FP16 sdec (eliminating 4x redundant decode).
@@ -738,6 +795,13 @@ inline void launch_rot_h16(const bf16* X, const __half* suh, int M, int K, GemmW
     const unsigned rb = static_cast<unsigned>((M + 15) / 16);
     const unsigned kb = static_cast<unsigned>(K / 128);
     k_emb_rot_h16<<<dim3(rb, kb), 256, 0, st>>>(X, suh, ws.x_rot, M, K);
+}
+
+inline void launch_swiglu_rot_h16(const bf16* gate, const bf16* up, const __half* suh, int M, int K,
+                                  GemmWorkspace& ws, cudaStream_t st) {
+    const unsigned rb = static_cast<unsigned>((M + 15) / 16);
+    const unsigned kb = static_cast<unsigned>(K / 128);
+    k_emb_swiglu_rot_h16<<<dim3(rb, kb), 256, 0, st>>>(gate, up, suh, ws.x_rot, M, K);
 }
 
 inline void launch_trellis_with_rot(const DevMatrix& W, const bf16* bias, bf16* Y, int M, bool add_res,
