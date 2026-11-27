@@ -1906,6 +1906,44 @@ async fn embed_inputs(
     Err(ApiError::bad("`input` or `messages` is required", Some("input")))
 }
 
+async fn collect_embed_stream(
+    mut stream: crate::engine::Stream,
+    prompt_len: usize,
+) -> Result<(Vec<f32>, usize), ApiError> {
+    let mut got: Option<crate::wire::EmbeddingFrame> = None;
+    loop {
+        match stream.next().await {
+            Some(crate::engine::Msg::Frame(crate::engine::Kind::Embedding, bytes)) => {
+                let ef: crate::wire::EmbeddingFrame = serde_json::from_slice(&bytes)
+                    .map_err(|e| ApiError::new(500, &format!("bad embedding frame: {e}"), None))?;
+                got = Some(ef);
+            }
+            Some(crate::engine::Msg::Frame(crate::engine::Kind::Finish, bytes)) => {
+                let fin: crate::wire::Finish = serde_json::from_slice(&bytes)
+                    .map_err(|e| ApiError::new(500, &format!("bad finish frame: {e}"), None))?;
+                if fin.reason == "error" {
+                    let msg = fin.message.unwrap_or_else(|| "engine error".into());
+                    return Err(ApiError {
+                        status: fin.status.unwrap_or(500),
+                        message: msg,
+                        param: None,
+                        retry_after: fin.retry_after,
+                    });
+                }
+                if fin.reason != "stop" {
+                    return Err(ApiError::new(500, &format!("embedding finished with reason {}", fin.reason), None));
+                }
+                break;
+            }
+            Some(crate::engine::Msg::Frame(_, _)) => {}
+            Some(crate::engine::Msg::Lost(msg)) => return Err(ApiError::new(500, msg, None)),
+            None => return Err(ApiError::new(500, "engine stream closed before finish", None)),
+        }
+    }
+    let ef = got.ok_or_else(|| ApiError::new(500, "engine finished without an embedding frame", None))?;
+    Ok((ef.embedding, ef.prompt_tokens.unwrap_or(prompt_len)))
+}
+
 async fn embeddings(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {
     let r = async {
         let body = read_json(req).await?;
@@ -1962,45 +2000,38 @@ async fn embeddings(st: &'static State, req: Request<Incoming>) -> Response<Http
                 ));
             }
         }
-        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(items.len());
-        let mut total_prompt_tokens = 0usize;
-        for (prompt, images) in items {
+        let n = items.len();
+        let (vectors, total_prompt_tokens) = if n == 1 {
+            let (prompt, images) = items.into_iter().next().unwrap();
+            let prompt_len = prompt.len();
             let p = crate::wire::EmbedParams { dimensions, normalize, images };
-            let mut stream = st.engine.embed(new_id("emb"), &prompt, &p).map_err(|e| ApiError::new(503, &e.0, None))?;
-            let mut got: Option<crate::wire::EmbeddingFrame> = None;
-            loop {
-                match stream.next().await {
-                    Some(crate::engine::Msg::Frame(crate::engine::Kind::Embedding, bytes)) => {
-                        let ef: crate::wire::EmbeddingFrame = serde_json::from_slice(&bytes)
-                            .map_err(|e| ApiError::new(500, &format!("bad embedding frame: {e}"), None))?;
-                        got = Some(ef);
-                    }
-                    Some(crate::engine::Msg::Frame(crate::engine::Kind::Finish, bytes)) => {
-                        let fin: crate::wire::Finish = serde_json::from_slice(&bytes)
-                            .map_err(|e| ApiError::new(500, &format!("bad finish frame: {e}"), None))?;
-                        if fin.reason == "error" {
-                            let msg = fin.message.unwrap_or_else(|| "engine error".into());
-                            return Err(ApiError {
-                                status: fin.status.unwrap_or(500),
-                                message: msg,
-                                param: None,
-                                retry_after: fin.retry_after,
-                            });
-                        }
-                        if fin.reason != "stop" {
-                            return Err(ApiError::new(500, &format!("embedding finished with reason {}", fin.reason), None));
-                        }
-                        break;
-                    }
-                    Some(crate::engine::Msg::Frame(_, _)) => {}
-                    Some(crate::engine::Msg::Lost(msg)) => return Err(ApiError::new(500, msg, None)),
-                    None => return Err(ApiError::new(500, "engine stream closed before finish", None)),
-                }
+            let stream = st.engine.embed(new_id("emb"), &prompt, &p).map_err(|e| ApiError::new(503, &e.0, None))?;
+            let (vec, toks) = collect_embed_stream(stream, prompt_len).await?;
+            (vec![vec], toks)
+        } else {
+            // Enqueue all embed frames before awaiting any response so the engine's dynamic batcher receives the
+            // full array burst together over one vectored socket write.
+            let mut dispatched: Vec<(crate::engine::Stream, usize)> = Vec::with_capacity(n);
+            for (prompt, images) in items {
+                let prompt_len = prompt.len();
+                let p = crate::wire::EmbedParams { dimensions, normalize, images };
+                let stream = st.engine.embed(new_id("emb"), &prompt, &p).map_err(|e| ApiError::new(503, &e.0, None))?;
+                dispatched.push((stream, prompt_len));
             }
-            let ef = got.ok_or_else(|| ApiError::new(500, "engine finished without an embedding frame", None))?;
-            total_prompt_tokens += ef.prompt_tokens.unwrap_or(prompt.len());
-            vectors.push(ef.embedding);
-        }
+            let mut set = tokio::task::JoinSet::new();
+            for (idx, (stream, prompt_len)) in dispatched.into_iter().enumerate() {
+                set.spawn(async move { (idx, collect_embed_stream(stream, prompt_len).await) });
+            }
+            let mut ordered: Vec<Option<Vec<f32>>> = vec![None; n];
+            let mut total_prompt_tokens = 0usize;
+            while let Some(joined) = set.join_next().await {
+                let (idx, res) = joined.map_err(|e| ApiError::new(500, &format!("embed task failed: {e}"), None))?;
+                let (vec, toks) = res?;
+                total_prompt_tokens += toks;
+                ordered[idx] = Some(vec);
+            }
+            (ordered.into_iter().map(|v| v.unwrap()).collect(), total_prompt_tokens)
+        };
         Ok((vectors, total_prompt_tokens, as_base64))
     };
     let (vectors, total_prompt_tokens, as_base64) = match r.await {
@@ -3177,6 +3208,150 @@ mod http_tokenize_chat_tests {
         assert_eq!(post(addr, "/v1/embeddings", &json!({"model": "qwen3-vl-embedding-2b", "input": []})).await.0, 400);
         assert_eq!(reqs.lock().unwrap().len(), 6);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embeddings_array_inputs_are_pipelined_concurrently_and_preserve_order() {
+        let tok = crate::tok::prefix_tests::fixture(true);
+        let dir = std::env::temp_dir().join(format!("g6front-emb-pipe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tok.tk.save(dir.join("tokenizer.json"), false).unwrap();
+        let grammars = crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap();
+
+        let sock_path = std::path::PathBuf::from(format!("/tmp/g6f-emb-pipe-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Barrier mock engine: refuses to reply until ALL 4 embed frames have arrived concurrently,
+        // then replies in REVERSE order so the test proves both pipelined dispatch and index-order preservation.
+        const BATCH: usize = 4;
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            wr.write_all(&frame(json!({
+                "type": "hello",
+                "version": 1,
+                "max_model_len": 1024,
+                "embeddings": true,
+                "embedding_dim": 4,
+                "matryoshka": true
+            })))
+            .await
+            .unwrap();
+            let mut r = FrameReader::new(rd);
+            let mut pending: Vec<(Value, Vec<u64>)> = Vec::with_capacity(BATCH);
+            while pending.len() < BATCH {
+                let f = tokio::time::timeout(Duration::from_secs(3), r.next())
+                    .await
+                    .expect("expected all array embed frames to arrive concurrently before any reply")
+                    .unwrap()
+                    .unwrap();
+                let v: Value = serde_json::from_slice(&f).unwrap();
+                if v["type"] == "embed" {
+                    let ids: Vec<u64> = v["prompt"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect();
+                    pending.push((v["id"].clone(), ids));
+                }
+            }
+            for (id, prompt) in pending.into_iter().rev() {
+                let tag = prompt[0] as f32;
+                let vec = vec![tag, tag + 1.0, tag + 2.0, tag + 3.0];
+                wr.write_all(&frame(json!({
+                    "type": "embedding",
+                    "id": id,
+                    "embedding": vec,
+                    "prompt_tokens": prompt.len()
+                })))
+                .await
+                .unwrap();
+                wr.write_all(&frame(json!({
+                    "type": "finish",
+                    "id": id,
+                    "reason": "stop",
+                    "stop_id": null,
+                    "prompt_tokens": prompt.len(),
+                    "cached_tokens": 0,
+                    "completion_tokens": 0
+                })))
+                .await
+                .unwrap();
+            }
+        });
+
+        let eng = Engine::new(sock_path.to_string_lossy().into_owned());
+        eng.start();
+        for _ in 0..500 {
+            if eng.ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(eng.ready(), "barrier embed engine did not connect");
+
+        let st: &'static State = Box::leak(Box::new(State {
+            tok,
+            template: None,
+            dialect: Dialect::Ds41,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine: eng,
+            served: vec!["qwen3-vl-embedding-2b".into()],
+            model_name: "qwen3-vl-embedding-2b".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: false,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars,
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+            sessions: None,
+        }));
+        let l = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = l.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+
+        let (code, v) = post(
+            addr,
+            "/v1/embeddings",
+            &json!({
+                "model": "qwen3-vl-embedding-2b",
+                "input": [[10, 11], [20, 21, 22], [30], [40, 41, 42, 43]],
+                "normalize": false
+            }),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        let data = v["data"].as_array().unwrap();
+        assert_eq!(data.len(), BATCH);
+        let expected_tags = [10.0, 20.0, 30.0, 40.0];
+        for (i, &tag) in expected_tags.iter().enumerate() {
+            assert_eq!(data[i]["index"], i);
+            assert_eq!(data[i]["embedding"][0].as_f64().unwrap(), tag);
+            assert_eq!(data[i]["embedding"][3].as_f64().unwrap(), tag + 3.0);
+        }
+        assert_eq!(v["usage"]["prompt_tokens"], 2 + 3 + 1 + 4);
+        assert_eq!(v["usage"]["total_tokens"], 10);
+
+        let _ = std::fs::remove_file(&sock_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
