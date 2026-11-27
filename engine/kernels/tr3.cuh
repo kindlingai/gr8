@@ -295,6 +295,12 @@ __device__ __forceinline__ uint2 tr3_hid4(const __half* vec, const __half* sg, c
     return r;
 }
 
+// t_wide4 / t_wide42: 0 = stock K4 order, 1 = all experts wide-K4, 2 = routed experts only (e < geom::NEXP).
+__device__ __forceinline__ bool tr3_is_wide4(int flag, int e)
+{
+    return flag == 1 || (flag == 2 && e < geom::NEXP);
+}
+
 // mask = the slot's columns (A.slot_mask, or the rows of a trellis shared-expert tile, k1.cuh k1_slot). CB = the
 // layer's codebook (TR3_*).
 template <int BITS, bool E4 = false, bool BS = false, int CB = TR3_MCG>
@@ -320,6 +326,8 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     const uint8_t* base = mw + (static_cast<size_t>(ks0 + ksq) * 8 + j) * TB;
 #if !defined(TR3_PROBE)
     // wide order: the first group is requested here, before the prologue, so its DRAM latency overlaps the prologue's
+    const int e = static_cast<int>((tr - A.t_tab) / 6);
+    const bool wide4 = BS && BITS == 4 && tr3_is_wide4(A.t_wide4, e);
     const bool wide = trw_ok<BITS>() && A.t_wide;                 // K3, and K2
     const uint8_t* g0 = base - static_cast<size_t>(j) * TB + j * 256 + lane * 8;
     u64 nw[3] = {0, 0, 0};
@@ -336,7 +344,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     }
     else if constexpr (!trw_ok<BITS>() && TR3_EARLY)
     {
-        if (!(BS && BITS == 4 && A.t_wide4))
+        if (!wide4)
         {
             #pragma unroll
             for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(base + static_cast<size_t>(p) * 8 * TB, lane);
@@ -430,7 +438,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     }
 #else
 #if !defined(TR3_PROBE)
-    if (BS && BITS == 4 && A.t_wide4)
+    if (wide4)
     {
         if constexpr (BS && BITS == 4)
         {
@@ -562,6 +570,7 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     const uint8_t* base = tr3_fc2_block(A.t_fc2, A.t_ptab, e, tr, b, BITS);
     // wide order (tr3_wide.cuh, k_tr3_widen2): the 8 k-tiles of an n-tile in three 64-bit loads. The first n-tile is
     // requested here, before the prologue, so its DRAM latency overlaps the prologue's.
+    const bool wide4 = BS && BITS == 4 && tr3_is_wide4(A.t_wide42, e);
     const bool wide = trw_ok<BITS>() && A.t_wide2;                // K3, and K2
     const uint8_t* wg = base + static_cast<size_t>(nt0) * 8 * TB + lane * 8;
     u64 nw[3] = {0, 0, 0};
@@ -580,7 +589,7 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     }
     else if constexpr (!trw_ok<BITS>() && TR3_EARLY)
     {
-        if (!(BS && BITS == 4 && A.t_wide42) && Q > 0)
+        if (!wide4 && Q > 0)
         {
             #pragma unroll
             for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(tile_ptr(p), lane);
@@ -659,7 +668,7 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     if constexpr (BS && BITS == 4)
     {
-        if (A.t_wide42)
+        if (wide4)
         {
             const uint8_t* wg4 = base + static_cast<size_t>(nt0) * TR4W_NT + lane * 16;
             const int prev_lane = (lane + 31) & 31;
@@ -781,7 +790,8 @@ __device__ __forceinline__ void tr3_fc1_body_nt(const K1Args& A, int plan, int s
     const int ksq = q * steps;
     const int csteps = (A.WG == 4) ? 8 : (A.WG == 2 ? (steps < 24 ? steps : 24) : (steps < 48 ? steps : 48));
     const __half* suh = A.t_v1 + (row * 2 + mat) * HID;
-    const bool wide4 = BS && BITS == 4 && A.t_wide4;
+    const int e = static_cast<int>((tr - A.t_tab) / 6);
+    const bool wide4 = BS && BITS == 4 && tr3_is_wide4(A.t_wide4, e);
     const bool wide = !wide4 && trw_ok<BITS>() && A.t_wide;
     const int prev_lane = (lane + 31) & 31;
 
@@ -967,7 +977,7 @@ __device__ __forceinline__ void tr3_fc2_body_nt(const K1Args& A, int ss0, int b,
     const int ntiles = (NTU - warp + nwarps - 1) >> s_nw;
     const int e = static_cast<int>((tr - A.t_tab) / 6);
     const uint8_t* base = tr3_fc2_block(A.t_fc2, A.t_ptab, e, tr, b, BITS);
-    const bool wide4 = BS && BITS == 4 && A.t_wide42;
+    const bool wide4 = BS && BITS == 4 && tr3_is_wide4(A.t_wide42, e);
     const bool wide = !wide4 && trw_ok<BITS>() && A.t_wide2;
     const uint8_t* wg4 = base + static_cast<size_t>(nt0) * TR4W_NT + lane * 16;
     const uint8_t* wg = base + static_cast<size_t>(nt0) * 8 * TB + lane * 8;

@@ -988,13 +988,14 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
             bind::widen_fc1(y.T, st);
             if (!knob::nowide2()) bind::widen_fc2(y.T, st);
 #if !G6_MODEL_FLASH && !G6_MODEL_DS41
-            // GR8_TR3_WIDE4=1: in-place K4 wide order (0 extra bytes), only on block-scale expert-tile layers
-            // where prefill uses FP8 shared expert (not GR8_V2_SHARED=trellis segment pass) and fc2 is widened.
-            if (knob::tr3_wide4() && knob::pf_wt() && knob::v2_shared() != "trellis" && !knob::nowide2() &&
-                y.T.t[bind::T_TR3_SG].p)
+            // GR8_TR3_WIDE4=1: in-place K4 wide order (0 extra bytes) on block-scale expert-tile layers when fc2 is widened.
+            // Under GR8_V2_SHARED=trellis, widen routed experts only (0..NEXP-1) so row NEXP stays in stock K4 order for
+            // the trellis shared-expert prefill segment pass.
+            if (knob::tr3_wide4() && knob::pf_wt() && !knob::nowide2() && y.T.t[bind::T_TR3_SG].p)
             {
-                bind::widen_k4_fc1(y.T, st);
-                bind::widen_k4_fc2(y.T, st);
+                const bool routed_only = y.T.sh_trellis && knob::v2_shared() == "trellis";
+                bind::widen_k4_fc1(y.T, st, routed_only);
+                bind::widen_k4_fc2(y.T, st, routed_only);
             }
 #endif
             G6RT_CK(cudaStreamSynchronize(st));

@@ -170,20 +170,24 @@ inline void widen_fc2(LayerTensors& T, cudaStream_t st)
 }
 // Optional (GR8_TR3_WIDE4=1), once per layer after make_shared_fp8: reorder K4 records of tr3.fc1 / tr3.fc2 in place
 // into 128-bit coalesced wide-K4 order (tr3_wide.cuh, 0 extra bytes). Same results bit for bit.
-inline void widen_k4_fc1(LayerTensors& T, cudaStream_t st)
+// routed_only: under GR8_V2_SHARED=trellis, widen routed experts 0..NEXP-1 only (fc*_wide4 = 2) so row NEXP stays in
+// stock K4 order for the trellis shared-expert prefill segment pass.
+inline void widen_k4_fc1(LayerTensors& T, cudaStream_t st, bool routed_only = false)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc1 = T.t[T_TR3_FC1];
     if (!tab.p || (!fc1.p && !T.ptab) || T.fc1_wide4) return;
+    const int n = (routed_only && tab.shape[0] > geom::NEXP) ? geom::NEXP : static_cast<int>(tab.shape[0]);
     launch_tr4_widen(const_cast<void*>(fc1.p), static_cast<const long long*>(tab.p), static_cast<const long long*>(T.t[T_TR3_KMIX].p),
-                     static_cast<int>(tab.shape[0]), g6nr::EB, st, T.ptab);
-    T.fc1_wide4 = 1;
+                     n, g6nr::EB, st, T.ptab);
+    T.fc1_wide4 = (n < tab.shape[0]) ? 2 : 1;
 }
-inline void widen_k4_fc2(LayerTensors& T, cudaStream_t st)
+inline void widen_k4_fc2(LayerTensors& T, cudaStream_t st, bool routed_only = false)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc2 = T.t[T_TR3_FC2];
     if (!tab.p || (!fc2.p && !T.ptab) || T.fc2_wide4) return;
-    launch_tr4_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st, T.ptab);
-    T.fc2_wide4 = 1;
+    const int n = (routed_only && tab.shape[0] > geom::NEXP) ? geom::NEXP : static_cast<int>(tab.shape[0]);
+    launch_tr4_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), n, g6nr::EB, st, T.ptab);
+    T.fc2_wide4 = (n < tab.shape[0]) ? 2 : 1;
 }
 
 // Host twin of tr3_unit for tr3.table row 256 (LayerTensors::sh_tr, sh_kmix): byte offset of its fc1 unit u in tr3.fc1
@@ -1167,7 +1171,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     // GR8_TR3_WIDE4=1 per-M fused dispatch (bit-exact KS1*WG partial count; works with GR8_TR3_W2ALL=1
     // because fuse_w4 already runs WG=1 with identical KS1*WG partial counts to w2all).
     int fuse_w4 = 0;
-    if (fuse == 1 && moe && sh && T.e4m3 && !T.k2 && T.fc1_wide4 && T.fc2_wide4 &&
+    if (fuse == 1 && moe && sh && T.e4m3 && !T.k2 && T.fc1_wide4 == 1 && T.fc2_wide4 == 1 &&
         (!T.k3 || (T.fc1_wide && T.fc2_wide)) && !v.split && !v.m1 && !v.m2 && !v.m4)
     {
         if constexpr (g6nr::EB == 4)

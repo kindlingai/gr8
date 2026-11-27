@@ -6214,7 +6214,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         A.cb = T.cb;
         A.t_fc1 = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p); A.t_wide = T.fc1_wide; A.t_fc2 = static_cast<const uint8_t*>(T.t[T_TR3_FC2].p); A.t_wide2 = T.fc2_wide;
         A.t_ptab = T.ptab;
-        A.t_wide4 = T.fc1_wide4; A.t_wide42 = T.fc2_wide4; A.k3 = T.k3;
+        A.t_wide4 = T.fc1_wide4 != 0; A.t_wide42 = T.fc2_wide4 != 0; A.k3 = T.k3;
         A.t_v1 = static_cast<const __half*>(v1.p); A.t_v2 = static_cast<const __half*>(v2.p); A.t_v3 = static_cast<const __half*>(v3.p);
         A.bs = bsf;
         A.t_sg = static_cast<const __half*>(sgn.p); A.t_v1b = static_cast<const __half*>(v1b.p); A.t_v3b = static_cast<const __half*>(v3b.p);
@@ -6252,7 +6252,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         }
         if ((T.fc1_wide4 || T.fc2_wide4) && !A.wtk)
             return "wide-K4 tr3.fc1/fc2 requires expert-tile prefill (GR8_PF_WT=1, block-scale)";
-        if ((T.fc1_wide4 || T.fc2_wide4) && T.sh_trellis && !T.sh_fp8)
+        if ((T.fc1_wide4 == 1 || T.fc2_wide4 == 1) && T.sh_trellis && !T.sh_fp8)
             return "wide-K4 tr3.fc1/fc2 requires FP8 shared expert in prefill (not GR8_V2_SHARED=trellis)";
         if (T.sh_trellis && T.sh_fp8)
         {
@@ -6299,6 +6299,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             S.rr_row = sc.sh_rr_row; S.rr_e = sc.sh_rr_e; S.rr_sp = sc.sh_rr_sp; S.rr_w = sc.sh_rr_w;
             S.segs = sc.sh_segs; S.n_seg = sc.sh_n_seg; S.pos = nullptr;
             S.wtk = 0; S.wtc = 0; S.wtiles = nullptr; S.n_wtiles = nullptr; S.rr_wp = nullptr;   // the trellis shared pass keeps the segment kernels
+            S.t_wide4 = 0; S.t_wide42 = 0;
 #if G6_MODEL_FLASH
             S.wm = 0; S.wm2 = 0; S.wt = nullptr; S.n_wt = nullptr;
 #endif
