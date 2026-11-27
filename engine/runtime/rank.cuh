@@ -482,6 +482,8 @@ struct Model
     void *dio_ids = nullptr, *dio_out = nullptr;
     int dio_rows = 0;
     bool dscratch_lent = false;       // the MTP draft: dscratch and dio_* are the main model's (build_draft)
+    int scratch_rows = MX;            // row limit for bind::scratch_bytes / scratch_at (<= MX); default MX
+    bool scratch_lent = false;        // the MTP draft: scratch is the main model's (build_draft)
     // The main model checks GR8_MEM_MIN as its KV pool is allocated. The MTP draft is built after the prefill lanes, and
     // both are part of the rest of the boot that floor reserves, so the draft does not check it again.
     bool headroom = true;
@@ -910,8 +912,17 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.lp = dmalloc<float>(MX);
     m.lpt = dmalloc<float>(MX);
     m.tgt = dmalloc<int>(MX);
-    m.scratch = dmalloc<char>(bind::scratch_bytes());
-    m.sc = bind::scratch_at(m.scratch);
+    const int sc_rows = m.scratch_rows < 1 ? 1 : (m.scratch_rows > MX ? MX : m.scratch_rows);
+    if (m.scratch_lent)
+    {
+        if (!(m.nl == 1 && ids[0] == geom::MTP_LAYER)) die("scratch_lent: only the MTP draft borrows the main model's decode scratch");
+        if (!m.scratch || m.sc.rows < sc_rows) die("scratch_lent: the main model's decode scratch is smaller than the draft's");
+    }
+    else
+    {
+        m.scratch = dmalloc<char>(bind::scratch_bytes(sc_rows));
+        m.sc = bind::scratch_at(m.scratch, sc_rows);
+    }
     m.layers = std::vector<Layer>(m.nl);      // sized once: the attention bindings must not move
     // GR8_DEC_SHARED_SCRATCH=1 (PLAN-600K L1): ONE decode attention scratch, and one set of selected ids and attention
     // output, for every layer of the main model and the MTP draft. Their attention calls never overlap: decode runs the
@@ -2653,6 +2664,12 @@ inline void build_draft(Draft& D, const Model& main, const Find& find, int capac
         D.d.dscratch = main.dscratch; D.d.dscratch_bytes = main.dscratch_bytes;
         D.d.dio_ids = main.dio_ids; D.d.dio_out = main.dio_out; D.d.dio_rows = main.dio_rows;
         D.d.dscratch_lent = true;
+    }
+    if (main.scratch && main.sc.rows >= D.d.scratch_rows)   // main and MTP draft steps never run concurrently on the GPU
+    {
+        D.d.scratch = main.scratch;
+        D.d.sc = main.sc;
+        D.d.scratch_lent = true;
     }
     build(D.d, main.rank, std::vector<int>{geom::MTP_LAYER}, find, capacity, f, stepp, st, max_rows);
     // The draft has no CP binding, but its graph indices must use the target context buckets.

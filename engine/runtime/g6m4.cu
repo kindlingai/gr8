@@ -718,6 +718,24 @@ int main(int argc, char** argv)
     }
     host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
+    // Right-size the decode MoE/GEMV scratch to the widest decode step this run can execute (<= MX).
+    // bind::make_k1 checks M <= sc.rows, so any overshoot fails closed at boot.
+    int max_step_rows = 1;
+    for (int M : row_counts) max_step_rows = std::max(max_step_rows, M);
+    for (int M : draft_rows) max_step_rows = std::max(max_step_rows, M);
+    if (s2mode)
+    {
+        max_step_rows = std::max({max_step_rows, s2sess * (shared_depth + 1), plan.chunk, dfl ? dfl_k + 1 : 0});
+#if !G6_MODEL_DS41
+        if (kstop.solo) max_step_rows = std::max(max_step_rows, kstop.kmax + 1);
+        for (int M : s2::kstopb_widths(kstop.b, s2sess, mtp)) max_step_rows = std::max(max_step_rows, M);
+#endif
+    }
+#if G6_MODEL_FLASH
+    if (MP) max_step_rows = MX;
+#endif
+    max_step_rows = std::max(1, std::min(MX, max_step_rows));
+    m.scratch_rows = max_step_rows;
 #if G6_MODEL_FLASH
     if (mtp || dfl) m.kda_ring = std::max(mtp + 1, dfl ? dfl::B : 0);   // KDA state slots for the verify ring (DFlash2: B rows)
     if (s2mode) m.kda_sessions = s2sess;   // each S2 session its own ring (s2/flash_ring.h FlashSlots)
@@ -951,6 +969,7 @@ int main(int argc, char** argv)
         fd = fabd.dev();
         G6RT_CK(cudaHostAlloc((void**)&in_d, sizeof(StepIn), cudaHostAllocMapped));
         G6RT_CK(cudaHostAlloc((void**)&out_d, sizeof(StepOut), cudaHostAllocMapped));
+        D.d.scratch_rows = max_step_rows;
 #if G6_MODEL_FLASH
         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MX);   // Flash draft prefill: decode draft steps (flash_prefill.cuh)
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
