@@ -682,7 +682,7 @@ class RequiredTests(unittest.TestCase):
             o = opt.parse(['--no-config', '--peers', PEERS], env)            # down, status and logs need none
             with self.assertRaises(opt.OptionError) as e:
                 opt.validate(o)                                              # up, check, prepare, show-config
-            self.assertIn('no model: set GR8_MODEL to glm53 (GLM-5.3), glm53f (GLM-5.3-Flash), ds41 (DeepSeek-V4.1-Flash), ink2 (Inkling-2-Small), qw38 (Qwen3.8-Flash-Next) or hy4 (Hy4-flash)', str(e.exception))
+            self.assertIn('no model: set GR8_MODEL to glm53 (GLM-5.3), glm53f (GLM-5.3-Flash), ds41 (DeepSeek-V4.1-Flash), ink2 (Inkling-2-Small), qw38 (Qwen3.8-Flash-Next), hy4 (Hy4-flash) or embed (Qwen3-VL-Embedding)', str(e.exception))
             self.assertNotIn('pseudo', str(e.exception))
 
     def test_an_unknown_name(self):
@@ -690,7 +690,7 @@ class RequiredTests(unittest.TestCase):
                                ([], {'GR8_MODEL': 'glm53x'}, 'environment')):
             with self.assertRaises(opt.OptionError) as e:
                 opt.parse(['--no-config', *argv], env)
-            self.assertIn(f'from the {src}: not a model gr8 serves. Want glm53 (GLM-5.3), glm53f (GLM-5.3-Flash), ds41 (DeepSeek-V4.1-Flash), ink2 (Inkling-2-Small), qw38 (Qwen3.8-Flash-Next) or hy4 (Hy4-flash)',
+            self.assertIn(f'from the {src}: not a model gr8 serves. Want glm53 (GLM-5.3), glm53f (GLM-5.3-Flash), ds41 (DeepSeek-V4.1-Flash), ink2 (Inkling-2-Small), qw38 (Qwen3.8-Flash-Next), hy4 (Hy4-flash) or embed (Qwen3-VL-Embedding)',
                           str(e.exception))
             self.assertNotIn('pseudo', str(e.exception))
         self.assertIs(models.of(opt.parse(['--no-config'], {'GR8_MODEL': 'pseudo'})), models.PSEUDO)   # asked for
@@ -721,7 +721,7 @@ class RequiredTests(unittest.TestCase):
         self.assertIn('--tp       4, 3, 2 or 1', flash)
         self.assertIn('TP=1 k2', flash)
         self.assertIn('--drafter URL (DFlash2), --kv-format int4', flash)
-        self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F, models.DS41, models.INK2, models.QW38, models.HY4))
+        self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F, models.DS41, models.INK2, models.QW38, models.HY4, models.EMBED))
         ds = models.describe(models.DS41)
         self.assertIn('a local copy of an exlr8 release of DeepseekV41ForCausalLM', ds)
         self.assertIn('--variant  none: the release is read in place', ds)
@@ -769,6 +769,186 @@ class PseudoTests(unittest.TestCase):
         self.assertNotEqual(M.pseudo_set(self.rel, 1).id, first)
         os.unlink(os.path.join(self.rel, 'responses.toml'))
         self.assertIn('want a pseudo engine release', S.resolve_model(self.pseudo())[2])
+
+
+class EmbedTests(unittest.TestCase):
+    """GR8_MODEL=embed: g6embed TP=1 dense embedding engine (local dir and Hugging Face DenseRelease)."""
+
+    def setUp(self):
+        self.t = tempfile.mkdtemp()
+        self.rel = os.path.join(self.t, 'rel-8b')
+        os.makedirs(os.path.join(self.rel, 'hashes'))
+        cfg = {
+            'architectures': ['Qwen3VLForConditionalGeneration'],
+            'text_config': {'hidden_size': 4096, 'num_hidden_layers': 36, 'vocab_size': 151936},
+        }
+        with open(os.path.join(self.rel, 'config.json'), 'w') as f:
+            json.dump(cfg, f)
+        for n in models.TOKENIZER_EMBED:
+            with open(os.path.join(self.rel, n), 'w') as f:
+                f.write(n)
+        for wf in ('exlr8-vocab.safetensors', 'exlr8-dense-text-000.safetensors', 'exlr8-dense-global-000.safetensors'):
+            p = os.path.join(self.rel, wf)
+            hdr = json.dumps({'__metadata__': {'format': 'exlr8-v2'}}).encode()
+            with open(p, 'wb') as f:
+                f.write(len(hdr).to_bytes(8, 'little') + hdr)
+            with open(os.path.join(self.rel, 'hashes', wf + '.sha256'), 'w') as f:
+                f.write(f'{M.sha256_file(p)} {os.path.getsize(p)}\n')
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.t)
+
+    def embed(self, *argv):
+        o = opt.parse(['--no-config', '--peers', '127.0.0.1', '--model', self.rel, *argv], {'GR8_MODEL': 'embed'})
+        opt.validate(o)
+        return o
+
+    def test_engine_plan_and_served_names(self):
+        o = self.embed()
+        self.assertEqual((o.get('TP'), o.get('GROUP'), S.engine_bin(o)), ('1', 'gr8-embed', 'g6embed'))
+        self.assertFalse(S.fabric_needed(o))
+        ms, variant, err = S.resolve_model(o)
+        self.assertEqual((err, variant.name, ms.set['source']['kind']), ('', 'home', 'exlr8-dense-embed'))
+        plan = opt.engine_plan(o, rank=0, home='/h', epoch=3, set_id=ms.id)
+        self.assertEqual(plan['env'], [])
+        self.assertEqual(plan['args'], ['--model-dir', self.rel, '--socket', '/h/run/engine.sock',
+                                        '--max-batched-tokens', '16384', '--max-model-len', '16384'])
+        self.assertEqual(models.embed_served_names(self.rel, 'kindlingai/Qwen3-VL-Embedding-8B-exlr8-k4'),
+                         ('qwen3-vl-embedding-8b', 'Qwen/Qwen3-VL-Embedding-8B', 'embed',
+                          'kindlingai/Qwen3-VL-Embedding-8B-exlr8-k4'))
+
+        # NOHASH=1 and CAP/MAX_MODEL_LEN overrides propagate to g6embed args.
+        o2 = self.embed('--cap', '8192', '--max-model-len', '4096', '--nohash', '1', '--extra-args', '--weight-mode bf16')
+        S.resolve_model(o2)
+        plan2 = opt.engine_plan(o2, rank=0, home='/h', epoch=3, set_id=ms.id)
+        self.assertEqual(plan2['args'], ['--model-dir', self.rel, '--socket', '/h/run/engine.sock',
+                                         '--max-batched-tokens', '8192', '--max-model-len', '4096',
+                                         '--no-hash', '--weight-mode', 'bf16'])
+
+    def test_tp2_and_wrong_arch_refused(self):
+        o = opt.parse(['--no-config', '--tp', '2', '--peers', '192.0.2.1,192.0.2.2', '--model', self.rel],
+                      {'GR8_MODEL': 'embed'})
+        with self.assertRaisesRegex(opt.OptionError, 'want 1'):
+            opt.validate(o)
+        with open(os.path.join(self.rel, 'config.json'), 'w') as f:
+            json.dump({'architectures': ['GlmMoeDsaForCausalLM']}, f)
+        _, _, err = S.resolve_model(self.embed())
+        self.assertIn('GlmMoeDsaForCausalLM', err)
+
+    def test_hf_dense_release_fetch_verify_and_reuse(self):
+        import hashlib
+        import http.server
+        import socketserver
+        import threading
+
+        commit1 = 'a' * 40
+        commit2 = 'b' * 40
+        files = {}
+        for root, _, names in os.walk(self.rel):
+            for name in names:
+                full = os.path.join(root, name)
+                relp = os.path.relpath(full, self.rel).replace(os.sep, '/')
+                with open(full, 'rb') as f:
+                    files[relp] = f.read()
+
+        def git_oid(b):
+            return hashlib.sha1(f'blob {len(b)}\0'.encode() + b).hexdigest()
+
+        class FakeHub(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_HEAD(self):
+                if '/resolve/' in self.path:
+                    p = self.path.split('/resolve/', 1)[1].split('/', 1)[1]
+                    if p in files:
+                        self.send_response(200)
+                        self.send_header('Content-Length', str(len(files[p])))
+                        self.end_headers()
+                        return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_GET(self):
+                if self.path.startswith('/api/models/kindlingai/q3vl/revision/'):
+                    body = json.dumps({'sha': commit1}).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path.startswith('/api/models/kindlingai/q3vl/tree/'):
+                    tree = []
+                    for p, b in sorted(files.items()):
+                        entry = {'type': 'file', 'path': p, 'size': len(b), 'oid': git_oid(b)}
+                        if p.endswith('.safetensors'):
+                            entry['lfs'] = {'oid': hashlib.sha256(b).hexdigest(), 'size': len(b)}
+                        tree.append(entry)
+                    body = json.dumps(tree).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif '/resolve/' in self.path:
+                    p = self.path.split('/resolve/', 1)[1].split('/', 1)[1]
+                    b = files[p]
+                    rng = self.headers.get('Range')
+                    if rng and rng.startswith('bytes='):
+                        lo, hi = (int(x) for x in rng[6:].split('-'))
+                        b = b[lo:hi + 1]
+                        self.send_response(206)
+                    else:
+                        self.send_response(200)
+                    self.send_header('Content-Length', str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        srv = socketserver.ThreadingTCPServer(('127.0.0.1', 0), FakeHub)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        cache = os.path.join(self.t, 'cache')
+        old_ep = os.environ.get('GR8_HF_ENDPOINT')
+        try:
+            os.environ['GR8_HF_ENDPOINT'] = f'http://127.0.0.1:{srv.server_address[1]}'
+            o = opt.parse(['--no-config', '--peers', '127.0.0.1', '--model-cache', cache,
+                           '--model', f'https://huggingface.co/kindlingai/q3vl@{commit1}'], {'GR8_MODEL': 'embed'})
+            opt.validate(o)
+            ms, variant, err = S.resolve_model(o)
+            self.assertEqual((err, variant.name), ('', 'home'))
+            self.assertTrue(ms.release.check())
+            ms.release.fetch_rank()
+            self.assertEqual(ms.release.check(), [])
+            self.assertTrue(M.is_embed_release(ms.dir))
+
+            # Second commit with identical files hard-links from commit1 instead of re-downloading.
+            o2 = opt.parse(['--no-config', '--peers', '127.0.0.1', '--model-cache', cache,
+                            '--model', f'https://huggingface.co/kindlingai/q3vl@{commit2}'], {'GR8_MODEL': 'embed'})
+            opt.validate(o2)
+            ms2, _, err2 = S.resolve_model(o2)
+            self.assertEqual(err2, '')
+            ms2.release.fetch_rank()
+            self.assertEqual(ms2.release.check(), [])
+            p1 = os.path.join(ms.dir, 'exlr8-vocab.safetensors')
+            p2 = os.path.join(ms2.dir, 'exlr8-vocab.safetensors')
+            self.assertEqual(os.stat(p1).st_ino, os.stat(p2).st_ino)
+        finally:
+            if old_ep is None:
+                os.environ.pop('GR8_HF_ENDPOINT', None)
+            else:
+                os.environ['GR8_HF_ENDPOINT'] = old_ep
+            srv.shutdown()
+            srv.server_close()
+
+    def test_running_engines_detects_g6embed(self):
+        proc = os.path.join(self.t, 'proc')
+        os.makedirs(os.path.join(proc, '4242'))
+        with open(os.path.join(proc, '4242', 'cmdline'), 'wb') as f:
+            f.write(b'./bin/g6embed\0--model-dir\0/m\0--socket\0/h/run/engine.sock\0')
+        os.symlink(self.t, os.path.join(proc, '4242', 'cwd'))
+        self.assertEqual(S.running_engines(proc), [(4242, self.t)])
 
 
 if __name__ == '__main__':

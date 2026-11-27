@@ -139,6 +139,9 @@ flash ckpt share: now' ;;
       BUILD_ENGINE=g6m4_hy4 BUILD_SIM=m4sim_hy4 BUILD_WIDTHS='1 2'
       BUILD_DEFINE=G6_MODEL_HY4 BUILD_FC2GL=4 BUILD_INT4=0
       BUILD_WHAT_ENV=HY4_WHAT ;;
+    embed)
+      BUILD_ENGINE=g6embed BUILD_SIM= BUILD_WIDTHS=1
+      BUILD_DEFINE= BUILD_FC2GL=6 BUILD_INT4=0 ;;
     *)
       if command -v python3 >/dev/null 2>&1 && [ -f "$REPO/tools/launch/models.py" ]; then
         local metadata

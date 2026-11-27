@@ -208,8 +208,11 @@ def cmd_status(argv):
         if s.get('last_line'):
             line += f'\n        last log line: {s["last_line"]}'
         if r == 0:
-            line += f'\n        shim {"running" if s.get("shim") else "stopped"}, ' \
-                    f'front end {"running" if s.get("front") else "stopped"}'
+            if s.get('direct_socket'):
+                line += f'\n        front end {"running" if s.get("front") else "stopped"}'
+            else:
+                line += f'\n        shim {"running" if s.get("shim") else "stopped"}, ' \
+                        f'front end {"running" if s.get("front") else "stopped"}'
         print(line)
     url = f'http://{members[0]}:{(read_handshake(out) or {}).get("port") or o.get("PORT")}'
     try:
