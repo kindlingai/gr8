@@ -79,7 +79,11 @@ __device__ __forceinline__ void ld4h(const __half* p, float (&v)[4])
 }
 
 template <int NT, int SUB, bool ROT, int EPI>
+#ifdef GR8_SM70
+__global__ void __launch_bounds__(256 * SUB, 2 / SUB) k_dtr(Args a)
+#else
 __global__ void __launch_bounds__(256 * SUB, NT <= 2 ? (4 / SUB) : (2 / SUB)) k_dtr(Args a)
+#endif
 {
     constexpr int TB = 32 * BITS, NM = EPI == EPI_GLU ? 2 : 1, NW = 8 * SUB, DTR_UNR = 8;
     extern __shared__ __align__(16) u32 sm[];
@@ -149,6 +153,24 @@ __global__ void __launch_bounds__(256 * SUB, NT <= 2 ? (4 / SUB) : (2 / SUB)) k_
     float acc[NT][4];
     #pragma unroll
     for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    gr8_sm70::Mma16816Acc vacc[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) vacc[t].zero();
+    auto dtr_mma = [&](const u32 (&f0)[2], const u32 (&f1)[2], const u32* xb_u) {
+        u32 qa0_0, qa0_1, qa1_0, qa1_1;
+        gr8_sm70::Mma16816Acc::prep_a(f0[0], f1[0], f0[1], f1[1], qa0_0, qa0_1, qa1_0, qa1_1);
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            const u32* xg = xb_u + t * xts;
+            const uint2 b = ROT ? *reinterpret_cast<const uint2*>(xg) : __ldg(reinterpret_cast<const uint2*>(xg));
+            u32 qb0, qb1;
+            gr8_sm70::Mma16816Acc::prep_b(b.x, b.y, qb0, qb1);
+            vacc[t].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1);
+        }
+    };
+#endif
     if (ng == 1)
     {
         #pragma unroll
@@ -156,6 +178,9 @@ __global__ void __launch_bounds__(256 * SUB, NT <= 2 ? (4 / SUB) : (2 / SUB)) k_
         {
             u32 f0[2], f1[2];
             ld.decodew(na[u], f0, f1);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            dtr_mma(f0, f1, xb + u * 64);
+#else
             #pragma unroll
             for (int t = 0; t < NT; ++t)
             {
@@ -163,6 +188,7 @@ __global__ void __launch_bounds__(256 * SUB, NT <= 2 ? (4 / SUB) : (2 / SUB)) k_
                 const uint2 b = ROT ? *reinterpret_cast<const uint2*>(xg) : __ldg(reinterpret_cast<const uint2*>(xg));
                 mma16816(acc[t], f0[0], f1[0], f0[1], f1[1], b.x, b.y);
             }
+#endif
         }
     }
     else
@@ -183,6 +209,9 @@ __global__ void __launch_bounds__(256 * SUB, NT <= 2 ? (4 / SUB) : (2 / SUB)) k_
             {
                 u32 f0[2], f1[2];
                 ld.decodew(wa[u], f0, f1);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+                dtr_mma(f0, f1, xb + u * 64);
+#else
                 #pragma unroll
                 for (int t = 0; t < NT; ++t)
                 {
@@ -190,10 +219,15 @@ __global__ void __launch_bounds__(256 * SUB, NT <= 2 ? (4 / SUB) : (2 / SUB)) k_
                     const uint2 b = ROT ? *reinterpret_cast<const uint2*>(xg) : __ldg(reinterpret_cast<const uint2*>(xg));
                     mma16816(acc[t], f0[0], f1[0], f0[1], f1[1], b.x, b.y);
                 }
+#endif
             }
             xb += DTR_UNR * 64;
         }
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) vacc[t].flush_store(acc[t]);
+#endif
 
     // sub-parts 1 .. SUB-1 -> sub-part 0, in order
     if constexpr (SUB > 1)
@@ -574,8 +608,7 @@ __global__ void __launch_bounds__(256) k_dtr_fp8(const uint8_t* w, long long sB,
         st = (st << 1) | ((word >> (31 - (bit & 31))) & 1u);
     }
     const u32 h2 = tr3_cb2<true>(st, 0u);
-    unsigned short e;
-    asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(e) : "r"(h2));
+    const unsigned short e = gr8_sm70::f16x2_to_e4m3x2(h2);
     codes[i] = static_cast<uint8_t>(e & 0xff);
 }
 

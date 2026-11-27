@@ -45,8 +45,7 @@ template <class F> inline void tr3_cb_dispatch(int cb, F&& f)
 template <bool E4>
 __device__ __forceinline__ u32 tr3_e4(u32 r)
 {
-    if constexpr (E4)
-        asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.rn.f16x2.e4m3x2 %0, t; }" : "=r"(r) : "r"(r));
+    if constexpr (E4) r = gr8_sm70::round_f16x2_e4m3_bounded(r);
     return r;
 }
 
@@ -62,9 +61,7 @@ __device__ __forceinline__ u32 tr3_cb2(u32 w0, u32 w1)
     const u32 lo = __byte_perm(x0, x1, 0x5410);
     const u32 hi = __byte_perm(x0, x1, 0x7632);
     u32 r = as_u32(__hadd2(as_h2(lo), as_h2(hi)));
-    if constexpr (E4)
-        asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.rn.f16x2.e4m3x2 %0, t; }" : "=r"(r) : "r"(r));
-    return r;
+    return tr3_e4<E4>(r);
 }
 
 // two 16-bit states -> half2 (mul1). The byte sum is __dp4a against 0x01010101 (one native instruction; vabsdiff4 gives
@@ -406,6 +403,10 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     // One mma per tile: the tile is the A operand (16 output cols x 16 k, exactly the trellis lane order),
     // the tokens are the B operand (8 cols).  acc: c0,c1 = (col l/4, tokens 2c, 2c+1), c2,c3 = (col l/4+8, same).
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#if !defined(TR3_PROBE) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    gr8_sm70::Mma16816Acc vacc;
+    vacc.zero();
+#endif
 #if defined(TR3_PROBE) && TR3_PROBE == 3
     // cost probe: loads only, wide. The group's 8 warps read the same bytes as the tile loads (8 k-steps = 64 tiles =
     // 2048*BITS bytes) with BITS 64-bit loads per warp (256 B per instruction) instead of 8 32-bit ones (4*8*BITS B).
@@ -451,7 +452,11 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
                         const u32 pc = __shfl_sync(0xffffffffu, c, prev_lane);
                         u32 f0[2], f1[2];
                         Tr3Lane<4, E4, CB>::decode_m((static_cast<u64>(pc) << 32) | c, 28, f0, f1);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+                        vacc.mma(f0[0], f1[0], f0[1], f1[1], XA0(s + h * 4 + p), XA1(s + h * 4 + p));
+#else
                         mma16816(acc, f0[0], f1[0], f0[1], f1[1], XA0(s + h * 4 + p), XA1(s + h * 4 + p));
+#endif
                     }
                 }
             }
@@ -481,7 +486,11 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
                 const u32 pc = __shfl_sync(0xffffffffu, c, (lane + 31) & 31);
                 u32 f0[2], f1[2];
                 Tr3Lane<BITS, E4, CB>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | c, 7 * BITS, f0, f1);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+                vacc.mma(f0[0], f1[0], f0[1], f1[1], XA0(s + p), XA1(s + p));
+#else
                 mma16816(acc, f0[0], f1[0], f0[1], f1[1], XA0(s + p), XA1(s + p));
+#endif
             }
         }
     }
@@ -515,7 +524,11 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
 #endif
             const u32 x0 = XA0(s + p), x1 = XA1(s + p);
 #if !defined(TR3_PROBE)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            vacc.mma(f0[0], f1[0], f0[1], f1[1], x0, x1);
+#else
             mma16816(acc, f0[0], f1[0], f0[1], f1[1], x0, x1);
+#endif
 #elif TR3_PROBE == 1   // cost probe: decode, no mma
             acc[0] += __int_as_float((f0[0] ^ f1[0] ^ f0[1] ^ f1[1] ^ x0 ^ x1) & 0x3fffffff);
 #else                  // cost probe: loads only
@@ -530,6 +543,9 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
 
 #undef XA0
 #undef XA1
+#if !defined(TR3_PROBE) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    vacc.flush_store(acc);
+#endif
     // epilogue: cols j*16 + l/4 (+8), tokens 2c and 2c+1
     const int nl = lane >> 2, c = lane & 3;
     float* gp = A.gpart + (((static_cast<size_t>(slot) * A.B + b) * 2 + mat) * GPMAX + h * A.WG + q) * 8 * 128 + j * 16 + nl;
@@ -657,6 +673,10 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     const bool wr0 = (mask >> (2 * c)) & 1, wr1 = (mask >> (2 * c + 1)) & 1;
     __half* zb = A.z + ((static_cast<size_t>(slot) * A.B + b) * 8 + 2 * c) * HID + nl;   // token 2c; token 2c+1 is +HID
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    gr8_sm70::Mma16816Acc vacc;
+    vacc.zero();
+#endif
     if constexpr (BS && BITS == 4)
     {
         if (A.t_wide42)
@@ -678,9 +698,17 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
                         const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
                         u32 f0[2], f1[2];
                         Tr3Lane<4, E4, CB>::decode_m((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+                        vacc.mma(f0[0], f1[0], f0[1], f1[1], ha[(h * 4 + p) * 64], ha[(h * 4 + p) * 64 + 1]);
+#else
                         mma16816(acc, f0[0], f1[0], f0[1], f1[1], ha[(h * 4 + p) * 64], ha[(h * 4 + p) * 64 + 1]);
+#endif
                     }
                 }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+                vacc.flush_store(acc);
+                vacc.zero();
+#endif
                 __half* zp = zb + (nt0 + i * nwarps) * 16;
                 if (wr0) { zp[0] = __float2half_rn(acc[0]); zp[8] = __float2half_rn(acc[2]); }
                 if (wr1) { zp[HID] = __float2half_rn(acc[1]); zp[HID + 8] = __float2half_rn(acc[3]); }
@@ -713,8 +741,16 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
                 const u32 pc = __shfl_sync(0xffffffffu, ch, (lane + 31) & 31);
                 u32 f0[2], f1[2];
                 Tr3Lane<BITS, E4, CB>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+                vacc.mma(f0[0], f1[0], f0[1], f1[1], ha[p * 64], ha[p * 64 + 1]);
+#else
                 mma16816(acc, f0[0], f1[0], f0[1], f1[1], ha[p * 64], ha[p * 64 + 1]);
+#endif
             }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            vacc.flush_store(acc);
+            vacc.zero();
+#endif
             __half* zp = zb + (nt0 + i * nwarps) * 16;
             if (wr0) { zp[0] = __float2half_rn(acc[0]); zp[8] = __float2half_rn(acc[2]); }
             if (wr1) { zp[HID] = __float2half_rn(acc[1]); zp[HID + 8] = __float2half_rn(acc[3]); }
@@ -745,10 +781,18 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
             ld.decodew(wa[p], f0, f1);
             const int ks = (s + p) & 7;
             const u32 x0 = ha[ks * 64], x1 = ha[ks * 64 + 1];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            vacc.mma(f0[0], f1[0], f0[1], f1[1], x0, x1);
+#else
             mma16816(acc, f0[0], f1[0], f0[1], f1[1], x0, x1);
+#endif
         }
         if (((s + TR3_UNR) & 7) == 0)
         {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            vacc.flush_store(acc);
+            vacc.zero();
+#endif
             __half* zp = zb + (nt0 + (s >> 3) * nwarps) * 16;
             if (wr0) { zp[0] = __float2half_rn(acc[0]); zp[8] = __float2half_rn(acc[2]); }
             if (wr1) { zp[HID] = __float2half_rn(acc[1]); zp[HID + 8] = __float2half_rn(acc[3]); }
@@ -861,10 +905,21 @@ __device__ __forceinline__ void tr3_fc1_body_nt(const K1Args& A, int plan, int s
         const u32* xa3 = xa2 + wg_stride;
 
         auto mma_nt = [&](const u32 (&f0)[2], const u32 (&f1)[2], int idx) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            u32 qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1;
+            gr8_sm70::Mma16816Acc::prep_a(f0[0], f1[0], f0[1], f1[1], qa0_0, qa0_1, qa1_0, qa1_1);
+            gr8_sm70::Mma16816Acc::prep_b(xa0[idx], xa0[idx + 1], qb0, qb1);
+            gr8_sm70::Mma16816Acc::mma_prepared_add(acc[0], qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1);
+            gr8_sm70::Mma16816Acc::prep_b(xa1[idx], xa1[idx + 1], qb0, qb1);
+            gr8_sm70::Mma16816Acc::mma_prepared_add(acc[1], qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1);
+            if (nt > 2) { gr8_sm70::Mma16816Acc::prep_b(xa2[idx], xa2[idx + 1], qb0, qb1); gr8_sm70::Mma16816Acc::mma_prepared_add(acc[2], qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1); }
+            if (nt > 3) { gr8_sm70::Mma16816Acc::prep_b(xa3[idx], xa3[idx + 1], qb0, qb1); gr8_sm70::Mma16816Acc::mma_prepared_add(acc[3], qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1); }
+#else
             mma16816(acc[0], f0[0], f1[0], f0[1], f1[1], xa0[idx], xa0[idx + 1]);
             mma16816(acc[1], f0[0], f1[0], f0[1], f1[1], xa1[idx], xa1[idx + 1]);
             if (nt > 2) mma16816(acc[2], f0[0], f1[0], f0[1], f1[1], xa2[idx], xa2[idx + 1]);
             if (nt > 3) mma16816(acc[3], f0[0], f1[0], f0[1], f1[1], xa3[idx], xa3[idx + 1]);
+#endif
         };
 
         if constexpr (BS && BITS == 4)
@@ -1098,10 +1153,21 @@ __device__ __forceinline__ void tr3_fc2_body_nt(const K1Args& A, int ss0, int b,
     for (int ti = 0; ti < 4; ++ti) acc[ti][0] = acc[ti][1] = acc[ti][2] = acc[ti][3] = 0.f;
 
     auto mma_nt = [&](const u32 (&f0)[2], const u32 (&f1)[2], int p_off) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+        u32 qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1;
+        gr8_sm70::Mma16816Acc::prep_a(f0[0], f1[0], f0[1], f1[1], qa0_0, qa0_1, qa1_0, qa1_1);
+        gr8_sm70::Mma16816Acc::prep_b(ha[p_off], ha[p_off + 1], qb0, qb1);
+        gr8_sm70::Mma16816Acc::mma_prepared_add(acc[0], qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1);
+        gr8_sm70::Mma16816Acc::prep_b(ha[512 + p_off], ha[512 + p_off + 1], qb0, qb1);
+        gr8_sm70::Mma16816Acc::mma_prepared_add(acc[1], qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1);
+        if (nt > 2) { gr8_sm70::Mma16816Acc::prep_b(ha[1024 + p_off], ha[1024 + p_off + 1], qb0, qb1); gr8_sm70::Mma16816Acc::mma_prepared_add(acc[2], qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1); }
+        if (nt > 3) { gr8_sm70::Mma16816Acc::prep_b(ha[1536 + p_off], ha[1536 + p_off + 1], qb0, qb1); gr8_sm70::Mma16816Acc::mma_prepared_add(acc[3], qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1); }
+#else
         mma16816(acc[0], f0[0], f1[0], f0[1], f1[1], ha[p_off], ha[p_off + 1]);
         mma16816(acc[1], f0[0], f1[0], f0[1], f1[1], ha[512 + p_off], ha[512 + p_off + 1]);
         if (nt > 2) mma16816(acc[2], f0[0], f1[0], f0[1], f1[1], ha[1024 + p_off], ha[1024 + p_off + 1]);
         if (nt > 3) mma16816(acc[3], f0[0], f1[0], f0[1], f1[1], ha[1536 + p_off], ha[1536 + p_off + 1]);
+#endif
     };
 
     auto flush_z = [&](int nt_col) {

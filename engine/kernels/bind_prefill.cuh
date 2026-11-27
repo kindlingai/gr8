@@ -38,6 +38,7 @@
 // The same for tr3.fc2: bind::widen_fc2, Tensors::fc2_wide = bind::LayerTensors::fc2_wide.
 #pragma once
 #include <cublas_v2.h>
+#include "sm70_cublas.cuh"
 #include "bind.cuh"
 #include "gemm_x.cuh"
 #include "../knobs-rs/gr8_knobs.h"
@@ -185,11 +186,7 @@ template <class F> inline Tensors layer_tensors(int layer, F find)
 // sm_120a): sa = the scale byte of row lane/4 (even lanes) or lane/4 + 8 (odd lanes), sb = the scale byte of col lane/4.
 __device__ __forceinline__ void mma_mx8(float (&d)[4], const uint4& a, u32 b0, u32 b1, u32 sa, u32 sb)
 {
-    const uint16_t z = 0;
-    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "r"(sa), "h"(z), "h"(z), "r"(sb), "h"(z), "h"(z));
+    gr8_sm70::mma_mx8_m16n8k32(d, a.x, a.y, a.z, a.w, b0, b1, sa, sb);
 }
 
 // E8M0 scale code of a block of fp16 values with absolute max amax, and inv = 2^-(code-127):
@@ -202,12 +199,7 @@ __device__ __forceinline__ u32 mx_scale(float amax, float& inv)
     inv = __uint_as_float(static_cast<u32>(127 - e) << 23);
     return static_cast<u32>(e + 127);
 }
-__device__ __forceinline__ u32 f2_e4m3x2(float a, float b)   // two floats -> two E4M3 bytes (a = low byte), RN, saturating
-{
-    u32 r;
-    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, %2, %1; cvt.u32.u16 %0, t; }" : "=r"(r) : "f"(a), "f"(b));
-    return r;
-}
+__device__ __forceinline__ u32 f2_e4m3x2(float a, float b) { return gr8_sm70::f32x2_to_e4m3x2(a, b); }   // two floats -> two E4M3 bytes (a = low byte), RN, saturating
 // The same scale code plus the exponent itself (inv = 2^-e).
 __device__ __forceinline__ u32 mx_scale_e(float amax, int& e)
 {
@@ -218,12 +210,12 @@ __device__ __forceinline__ u32 mx_scale_e(float amax, int& e)
 }
 // f16x2 -> two E4M3 bytes (low half = low byte), RN, saturating, in one convert: the same bytes as gx::h2_e4m3x2
 // (fp16 -> fp32 is exact, so rounding the fp16 value directly is the same rounding).
-__device__ __forceinline__ u32 h2_e4m3x2_d(u32 h2)
-{
-    u32 r;
-    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.u32.u16 %0, t; }" : "=r"(r) : "r"(h2));
-    return r;
-}
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+static __device__ __noinline__ u32 h2_e4m3x2_d_sm70(u32 h2) { return static_cast<u32>(gr8_sm70::f16x2_to_e4m3x2(h2)); }
+__device__ __forceinline__ u32 h2_e4m3x2_d(u32 h2) { return h2_e4m3x2_d_sm70(h2); }
+#else
+__device__ __forceinline__ u32 h2_e4m3x2_d(u32 h2) { return static_cast<u32>(gr8_sm70::f16x2_to_e4m3x2(h2)); }
+#endif
 __device__ __forceinline__ u32 h2_pow2(int k) { return (static_cast<u32>(k + 15) << 10) | (static_cast<u32>(k + 15) << 26); }   // {2^k, 2^k} as f16x2, k in [-14, 15]
 __device__ __forceinline__ u32 hmul2_u(u32 a, u32 b) { return as_u32(__hmul2(as_h2(a), as_h2(b))); }
 
@@ -589,8 +581,7 @@ template <int BM> struct G2
 };
 __device__ __forceinline__ void ldsm_x4(const void* p, u32& r0, u32& r1, u32& r2, u32& r3)
 {
-    const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+    gr8_sm70::ldmatrix_x4(r0, r1, r2, r3, p);
 }
 // RS: rows go to the RS send slot (rs, GR8_PF_RSDIRECT); a separate instantiation so the default kernel is unchanged
 // F32: fp32 output (Gemm.bf16 == 2, GR8_PF_OWN=3 o_proj); F32 = false instantiations are the served code, unchanged
@@ -1289,7 +1280,11 @@ template <int BM> struct GT
 {
     static constexpr int WM = BM / 4, WN = BM >= 8 ? 4 : 8, NW = WM * WN, NTH = 32 * NW, WC = 128 / WN, NT = WC / 8;
     static constexpr int A = G2_KS * BM * REC, RAW = 32 * 128, STG = A + RAW, B = 128 * G2_KS * 32;
+#ifdef GR8_SM70
+    static constexpr int ST = 3, SMEM = ST * STG + 2 * B;                     // V100: <= 96 KiB opt-in smem (79.4 KB)
+#else
     static constexpr int ST = BM == 16 ? 4 : 3, SMEM = ST * STG + 2 * B;     // BM = 16: 98.3 KB, 1 CTA per SM
+#endif
 };
 #if G6_MODEL_FLASH
 template <int BM, bool RS, bool F32 = false> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm_tr(Gemm g, RsOut rs)
@@ -1548,6 +1543,17 @@ __global__ void __launch_bounds__(GTH16<BM>::NTH) k_gemm_tr_h16(Gemm g, RsOut rs
         for (int nt = 0; nt < NT; ++nt)
             #pragma unroll
             for (int i = 0; i < 4; ++i) acc[mb][nt][i] = 0.f;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    constexpr bool SM70_ACC = (BM == 4 && NT == 2);
+    gr8_sm70::Mma16816Acc vacc[4][SM70_ACC ? NT : 1];
+    if constexpr (SM70_ACC)
+    {
+        #pragma unroll
+        for (int mb = 0; mb < 4; ++mb)
+            #pragma unroll
+            for (int nt = 0; nt < NT; ++nt) vacc[mb][nt].zero();
+    }
+#endif
 
     for (int kb = 0; kb < KG; ++kb)
     {
@@ -1569,6 +1575,26 @@ __global__ void __launch_bounds__(GTH16<BM>::NTH) k_gemm_tr_h16(Gemm g, RsOut rs
                 const u32* tile = reinterpret_cast<const u32*>(raw + ti * 128);
                 tl.decode(tile[tl.i0], tile[tl.i1], bf[2 * pr], bf[2 * pr + 1]);
             }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            if constexpr (SM70_ACC)
+            {
+                u32 qb[NT][2];
+                #pragma unroll
+                for (int nt = 0; nt < NT; ++nt) gr8_sm70::Mma16816Acc::prep_b(bf[nt][0], bf[nt][1], qb[nt][0], qb[nt][1]);
+                #pragma unroll
+                for (int mb = 0; mb < 4; ++mb)
+                {
+                    const int m = wm * 4 + mb;
+                    if (!full && m >= nb) continue;
+                    const uint4 fa = *reinterpret_cast<const uint4*>(a + (j * BM + m) * 512 + lane * 16);
+                    u32 qa0_0, qa0_1, qa1_0, qa1_1;
+                    gr8_sm70::Mma16816Acc::prep_a(fa.x, fa.y, fa.z, fa.w, qa0_0, qa0_1, qa1_0, qa1_1);
+                    #pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) vacc[mb][nt].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qb[nt][0], qb[nt][1]);
+                }
+                continue;
+            }
+#endif
             #pragma unroll
             for (int mb = 0; mb < 4; ++mb)
             {
@@ -1581,6 +1607,15 @@ __global__ void __launch_bounds__(GTH16<BM>::NTH) k_gemm_tr_h16(Gemm g, RsOut rs
         }
     }
     pf::cp_wait<0>();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    if constexpr (SM70_ACC)
+    {
+        #pragma unroll
+        for (int mb = 0; mb < 4; ++mb)
+            #pragma unroll
+            for (int nt = 0; nt < NT; ++nt) vacc[mb][nt].flush_store(acc[mb][nt]);
+    }
+#endif
     if (g.osvh)
     {
         gemm_rot_store_f32<BM, NT, C::NW>(acc, sm, g.osvh, c0, rb0, nb, g.M, wm, colw, [&](int row, int col, const float (&v)[4]) {
@@ -1653,7 +1688,11 @@ template <int BM, bool RS> inline void launch_tr_bm(const Gemm& g, const RsOut& 
 // GR8_PF_TR_BM (default 16): the row blocks of a large launch's CTA (8 or 16); small launches take 4, as k_gemm_mx8b
 inline void launch_tr(const Gemm& g, const RsOut& rs, bool big, cudaStream_t st)
 {
+#if G6_MODEL_FLASH
+    const int bm = (!big || (g.h16 && gr8_sm70::current_cc_major() < 8)) ? 4 : knob::pf_tr_bm() == 8 ? 8 : 16;
+#else
     const int bm = !big ? 4 : knob::pf_tr_bm() == 8 ? 8 : 16;
+#endif
     if (rs.base) { if (bm == 16) launch_tr_bm<16, true>(g, rs, st); else if (bm == 8) launch_tr_bm<8, true>(g, rs, st); else launch_tr_bm<4, true>(g, rs, st); }
 #if G6_MODEL_FLASH
     else if (g.bf16 == 2) { if (bm == 16) launch_tr_bm<16, false, true>(g, rs, st); else if (bm == 8) launch_tr_bm<8, false, true>(g, rs, st); else launch_tr_bm<4, false, true>(g, rs, st); }
@@ -1947,11 +1986,11 @@ inline cublasStatus_t launch(const Blas& b, cudaStream_t st)
     // row-major Y = X W^T is column-major Y' = W'^T X' with W' (K x O), X' (K x M), Y' (O x M)
 #if G6_MODEL_FLASH
     const int ldc = b.ldy > 0 ? b.ldy : b.O;
-    s = cublasGemmEx(b.h, CUBLAS_OP_T, CUBLAS_OP_N, b.O, b.M, b.K, &one, b.w, CUDA_R_16BF, b.K, b.xb, CUDA_R_16BF, b.K, &zero,
-                     b.y32, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    s = gr8_sm70::cublas_gemm_bf16_tn(b.h, b.O, b.M, b.K, &one, b.w, b.K, b.xb, b.K, &zero,
+                                      b.y32, CUDA_R_32F, ldc, CUBLAS_GEMM_DEFAULT);
 #else
-    s = cublasGemmEx(b.h, CUBLAS_OP_T, CUBLAS_OP_N, b.O, b.M, b.K, &one, b.w, CUDA_R_16BF, b.K, b.xb, CUDA_R_16BF, b.K, &zero,
-                     b.y32, CUDA_R_32F, b.O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    s = gr8_sm70::cublas_gemm_bf16_tn(b.h, b.O, b.M, b.K, &one, b.w, b.K, b.xb, b.K, &zero,
+                                      b.y32, CUDA_R_32F, b.O, CUBLAS_GEMM_DEFAULT);
 #endif
     if (s != CUBLAS_STATUS_SUCCESS) return s;
     const long long n = static_cast<long long>(b.M) * b.O;
@@ -2359,11 +2398,12 @@ __device__ __forceinline__ void had128_l16(float (&v)[16], int lane)
 __device__ __forceinline__ int swz16(int c, int r) { return c ^ (r & 7) ^ ((c >> 3) << 1); }
 #if G6_MODEL_FLASH
 // fp16 trellis fragments of a k32 step -> the decode values of an exlr8-e4m3 layer (tr3_cb2<true>: E4M3 RN-even, satfinite)
-__device__ __forceinline__ u32 pf_e4r(u32 r)
-{
-    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.rn.f16x2.e4m3x2 %0, t; }" : "=r"(r) : "r"(r));
-    return r;
-}
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+static __device__ __noinline__ u32 pf_e4r_sm70(u32 r) { return gr8_sm70::round_f16x2_e4m3_bounded(r); }
+__device__ __forceinline__ u32 pf_e4r(u32 r) { return pf_e4r_sm70(r); }
+#else
+__device__ __forceinline__ u32 pf_e4r(u32 r) { return gr8_sm70::round_f16x2_e4m3(r); }
+#endif
 __device__ __forceinline__ void pf_e4r4(bool on, u32 (&p0)[2], u32 (&p1)[2], u32 (&q0)[2], u32 (&q1)[2])
 {
     if (!on) return;
@@ -2372,8 +2412,7 @@ __device__ __forceinline__ void pf_e4r4(bool on, u32 (&p0)[2], u32 (&p1)[2], u32
 }
 __device__ __forceinline__ void pf_ldsm4(u32 (&r)[4], const void* p)
 {
-    const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+    gr8_sm70::ldmatrix_x4(r[0], r[1], r[2], r[3], p);
 }
 #endif
 
@@ -2392,11 +2431,11 @@ __device__ __forceinline__ void store_mx8_l32(const float (&v)[32], int lane, in
     for (int j = 0; j < 16; ++j) h[j] = pack_h2(v[2 * j], v[2 * j + 1]);
     u32 am[8];
     #pragma unroll
-    for (int j = 0; j < 8; ++j) am[j] = as_u32(__hmax2(__habs2(as_h2(h[2 * j])), __habs2(as_h2(h[2 * j + 1]))));
+    for (int j = 0; j < 8; ++j) am[j] = as_u32(gr8_sm70::hmax2(gr8_sm70::habs2(as_h2(h[2 * j])), gr8_sm70::habs2(as_h2(h[2 * j + 1]))));
     #pragma unroll
     for (int w = 4; w > 0; w >>= 1)
         #pragma unroll
-        for (int j = 0; j < w; ++j) am[j] = as_u32(__hmax2(as_h2(am[j]), as_h2(am[j + w])));
+        for (int j = 0; j < w; ++j) am[j] = as_u32(gr8_sm70::hmax2(as_h2(am[j]), as_h2(am[j + w])));
     const float amax = fmaxf(__low2float(as_h2(am[0])), __high2float(as_h2(am[0])));
     int e;
     const u32 code = mx_scale_e(amax, e);
@@ -2564,6 +2603,17 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
         for (int h = 0; h < 2; ++h)
             #pragma unroll
             for (int i = 0; i < 4; ++i) acc[mb][h][i] = 0.f;
+#if G6_MODEL_FLASH && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    constexpr bool SM70_FC1 = (H16 && MB == 4);
+    gr8_sm70::Mma16816Acc vacc[SM70_FC1 ? MB : 1][SM70_FC1 ? 2 : 1];
+    if constexpr (SM70_FC1)
+    {
+        #pragma unroll
+        for (int mb = 0; mb < MB; ++mb)
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) vacc[mb][h].zero();
+    }
+#endif
     const bool wide = trw_ok<BITS>() && A.t_wide;                 // K3, and K2
     constexpr size_t WG = static_cast<size_t>(2048) * BITS;         // bytes of one wide group (TR3W_GROUP at K3)
     const uint8_t* wg = wb - static_cast<size_t>(warp) * TB + warp * 256 + lane * 8;      // the lane's first u64 of group 0
@@ -2777,6 +2827,33 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
                 }
                 pf_e4r4(A.e4, p0, p1, q0, q1);
                 const unsigned char* xsb = sX + (hg & 1) * FC1_XS;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+                if constexpr (SM70_FC1)
+                {
+                    u32 qp0_0, qp0_1, qp1_0, qp1_1, qq0_0, qq0_1, qq1_0, qq1_1;
+                    gr8_sm70::Mma16816Acc::prep_b(p0[0], p0[1], qp0_0, qp0_1);
+                    gr8_sm70::Mma16816Acc::prep_b(p1[0], p1[1], qp1_0, qp1_1);
+                    gr8_sm70::Mma16816Acc::prep_b(q0[0], q0[1], qq0_0, qq0_1);
+                    gr8_sm70::Mma16816Acc::prep_b(q1[0], q1[1], qq1_0, qq1_1);
+                    #pragma unroll
+                    for (int mb = 0; mb < MB; ++mb)
+                    {
+                        if (mb >= nmb) continue;
+                        const int Rl = (g << rsh) + mb * 16 + (lane & 15);
+                        #pragma unroll
+                        for (int hk = 0; hk < 2; ++hk)
+                        {
+                            const int t16 = 2 * s + hk;
+                            u32 a[4], qa0_0, qa0_1, qa1_0, qa1_1;
+                            pf_ldsm4(a, xsb + Rl * 256 + swz16(2 * t16 + (lane >> 4), Rl) * 16);
+                            gr8_sm70::Mma16816Acc::prep_a(a[0], a[1], a[2], a[3], qa0_0, qa0_1, qa1_0, qa1_1);
+                            vacc[mb][0].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, hk ? qq0_0 : qp0_0, hk ? qq0_1 : qp0_1);
+                            vacc[mb][1].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, hk ? qq1_0 : qp1_0, hk ? qq1_1 : qp1_1);
+                        }
+                    }
+                    continue;
+                }
+#endif
                 #pragma unroll
                 for (int mb = 0; mb < MB; ++mb)
                 {
@@ -2829,6 +2906,15 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
             for (int i = 0; i < 9; ++i) atomicAdd(&g_pf_clk[path][idle][i], static_cast<unsigned long long>(ck_[i]));
             atomicAdd(&g_pf_warps[path][idle], 1u);
         }
+    }
+#endif
+#if G6_MODEL_FLASH && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    if constexpr (SM70_FC1)
+    {
+        #pragma unroll
+        for (int mb = 0; mb < MB; ++mb)
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) vacc[mb][h].flush_store(acc[mb][h]);
     }
 #endif
     const int c = lane & 3, r = lane >> 2;
@@ -2997,7 +3083,11 @@ __global__ void __launch_bounds__(256, PF_AOP_MINB) k_pf_aop(Expert A)
 // grid (2 EB = block * 2 + matrix, maxseg), block 256. EB = blocks per expert the scratch and grid are laid out for
 // (g6nr::EB: 3 = the TP6 packs, 4 = TP4; every expert of the table must have tr[3] <= EB).
 template <int EB = g6nr::EB, bool K2 = false, bool BS = false, bool AOPK = false PF_H16P, int CB = TR3_MCG>
+#ifdef GR8_SM70
+__global__ void __launch_bounds__(256, 1) k_pf_fc1(Expert A)
+#else
 __global__ void __launch_bounds__(256, 2) k_pf_fc1(Expert A)
+#endif
 {
     __shared__ __align__(16) unsigned char sA[4 * MB * REC];
     __shared__ __align__(16) unsigned char sX[2 * FC1_XS];
@@ -3911,7 +4001,11 @@ __global__ void __launch_bounds__(512, 1) k_pf_fc1w(Expert A)
 #define PF_WS_NB 2
 #endif
 #ifndef PF_WS_NW
+#ifdef GR8_SM70
+#define PF_WS_NW 4                             // V100: <= 96 KiB opt-in smem (91.1 KB vs 99.3 KB)
+#else
 #define PF_WS_NW 8
+#endif
 #endif
 constexpr int WS_NA = PF_WS_NA;                // A stages
 constexpr int WS_NB = PF_WS_NB;                // decoded B stages (producers run up to WS_NB - 1 steps ahead)
@@ -4447,6 +4541,17 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
             for (int h = 0; h < 2; ++h)
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) acc[mb][h][i] = 0.f;
+#if G6_MODEL_FLASH && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+        constexpr bool SM70_FC2G = (H16 && MB == 4);
+        gr8_sm70::Mma16816Acc vacc[SM70_FC2G ? MB : 1][SM70_FC2G ? 2 : 1];
+        if constexpr (SM70_FC2G)
+        {
+            #pragma unroll
+            for (int mb = 0; mb < MB; ++mb)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) vacc[mb][h].zero();
+        }
+#endif
         #pragma unroll
         for (int s = 0; s < 4; ++s)
         {
@@ -4467,6 +4572,31 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
                     ld.decode(cv[2 * s + 1][0], cv[2 * s + 1][1], q0, q1);
                 }
                 pf_e4r4(A.e4, p0, p1, q0, q1);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+                if constexpr (SM70_FC2G)
+                {
+                    u32 qp0_0, qp0_1, qp1_0, qp1_1, qq0_0, qq0_1, qq1_0, qq1_1;
+                    gr8_sm70::Mma16816Acc::prep_b(p0[0], p0[1], qp0_0, qp0_1);
+                    gr8_sm70::Mma16816Acc::prep_b(p1[0], p1[1], qp1_0, qp1_1);
+                    gr8_sm70::Mma16816Acc::prep_b(q0[0], q0[1], qq0_0, qq0_1);
+                    gr8_sm70::Mma16816Acc::prep_b(q1[0], q1[1], qq1_0, qq1_1);
+                    #pragma unroll
+                    for (int mb = 0; mb < MB; ++mb)
+                    {
+                        if (mb >= nmb) continue;
+                        const uint4* xa = reinterpret_cast<const uint4*>(A.x2) + (((static_cast<size_t>(seg) * MB + mb) * EB + b) * 8 + 2 * s) * 32 + lane;
+                        const uint4 a0 = __ldg(xa), a1 = __ldg(xa + 32);
+                        u32 qa0_0, qa0_1, qa1_0, qa1_1;
+                        gr8_sm70::Mma16816Acc::prep_a(a0.x, a0.y, a0.z, a0.w, qa0_0, qa0_1, qa1_0, qa1_1);
+                        vacc[mb][0].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qp0_0, qp0_1);
+                        vacc[mb][1].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qp1_0, qp1_1);
+                        gr8_sm70::Mma16816Acc::prep_a(a1.x, a1.y, a1.z, a1.w, qa0_0, qa0_1, qa1_0, qa1_1);
+                        vacc[mb][0].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qq0_0, qq0_1);
+                        vacc[mb][1].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qq1_0, qq1_1);
+                    }
+                    continue;
+                }
+#endif
                 #pragma unroll
                 for (int mb = 0; mb < MB; ++mb)
                 {
@@ -4503,6 +4633,15 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
                 mma_mx8(acc[mb][1], fa, bf[2], bf[3], sa, 127u);
             }
         }
+#if G6_MODEL_FLASH && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+        if constexpr (SM70_FC2G)
+        {
+            #pragma unroll
+            for (int mb = 0; mb < MB; ++mb)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) vacc[mb][h].flush_store(acc[mb][h]);
+        }
+#endif
 #if G6_MODEL_FLASH
         if constexpr (ONE)        // H16 + BS: H(sum_b scl_b z_b) * sign = sum_b H(z_b) * sign * scl_b, one Hadamard per group
         {
@@ -4670,7 +4809,11 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
 
 // grid (48 / GL, maxseg), block 256
 template <int EB = g6nr::EB, bool K2 = false, bool BS = false, bool ONE = false PF_H16P, int CB = TR3_MCG>
+#ifdef GR8_SM70
+__global__ void __launch_bounds__(256, 1) k_pf_fc2g(Expert A)
+#else
 __global__ void __launch_bounds__(256, 2) k_pf_fc2g(Expert A)
+#endif
 {
     __shared__ __align__(16) unsigned char sA[2 * MB * 4 * REC];
     __shared__ __align__(16) __half sZ[RS * 128];
@@ -4753,6 +4896,17 @@ __device__ __forceinline__ void fc2_body_v2(const Expert& A, const long long* tr
             for (int h = 0; h < 2; ++h)
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) acc[mb][h][i] = 0.f;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+        constexpr bool SM70_FC2V = (NM <= 4);
+        gr8_sm70::Mma16816Acc vacc[SM70_FC2V ? NM : 1][SM70_FC2V ? 2 : 1];
+        if constexpr (SM70_FC2V)
+        {
+            #pragma unroll
+            for (int mb = 0; mb < NM; ++mb)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) vacc[mb][h].zero();
+        }
+#endif
         #pragma unroll
         for (int s = 0; s < 4; ++s)
         {
@@ -4772,6 +4926,30 @@ __device__ __forceinline__ void fc2_body_v2(const Expert& A, const long long* tr
                 ld.decode(w1[ld.i0], w1[ld.i1], q0, q1);
             }
             pf_e4r4(A.e4, p0, p1, q0, q1);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            if constexpr (SM70_FC2V)
+            {
+                u32 qp0_0, qp0_1, qp1_0, qp1_1, qq0_0, qq0_1, qq1_0, qq1_1;
+                gr8_sm70::Mma16816Acc::prep_b(p0[0], p0[1], qp0_0, qp0_1);
+                gr8_sm70::Mma16816Acc::prep_b(p1[0], p1[1], qp1_0, qp1_1);
+                gr8_sm70::Mma16816Acc::prep_b(q0[0], q0[1], qq0_0, qq0_1);
+                gr8_sm70::Mma16816Acc::prep_b(q1[0], q1[1], qq1_0, qq1_1);
+                #pragma unroll
+                for (int mb = 0; mb < NM; ++mb)
+                {
+                    const uint4* xa = reinterpret_cast<const uint4*>(sAb + mb * 4096) + 2 * s * 32 + lane;
+                    const uint4 a0 = xa[0], a1 = xa[32];
+                    u32 qa0_0, qa0_1, qa1_0, qa1_1;
+                    gr8_sm70::Mma16816Acc::prep_a(a0.x, a0.y, a0.z, a0.w, qa0_0, qa0_1, qa1_0, qa1_1);
+                    vacc[mb][0].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qp0_0, qp0_1);
+                    vacc[mb][1].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qp1_0, qp1_1);
+                    gr8_sm70::Mma16816Acc::prep_a(a1.x, a1.y, a1.z, a1.w, qa0_0, qa0_1, qa1_0, qa1_1);
+                    vacc[mb][0].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qq0_0, qq0_1);
+                    vacc[mb][1].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qq1_0, qq1_1);
+                }
+                continue;
+            }
+#endif
             #pragma unroll
             for (int mb = 0; mb < NM; ++mb)
             {
@@ -4783,6 +4961,15 @@ __device__ __forceinline__ void fc2_body_v2(const Expert& A, const long long* tr
                 mma16816(acc[mb][1], a1.x, a1.y, a1.z, a1.w, q1[0], q1[1]);
             }
         }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+        if constexpr (SM70_FC2V)
+        {
+            #pragma unroll
+            for (int mb = 0; mb < NM; ++mb)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) vacc[mb][h].flush_store(acc[mb][h]);
+        }
+#endif
         const float scl = __half2float(A.t_v3b[(static_cast<size_t>(tr[2]) + b) * (HID / 128) + G]);
         #pragma unroll
         for (int mb = 0; mb < NM; ++mb)
@@ -4878,7 +5065,11 @@ __device__ __forceinline__ void fc2_v2_nm(const Expert& A, const long long* tr, 
 }
 // grid (48 / GL, maxseg), block 256, dynamic smem F2V_SMEM
 template <int EB = g6nr::EB, bool K2 = false, int CB = TR3_MCG>
+#ifdef GR8_SM70
+__global__ void __launch_bounds__(256, 1) k_pf_fc2v(Expert A)
+#else
 __global__ void __launch_bounds__(256, 2) k_pf_fc2v(Expert A)
+#endif
 {
     extern __shared__ __align__(16) unsigned char smv[];
     const int seg = blockIdx.y;
@@ -6138,7 +6329,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             // (default 6144; slower than k_pf_fc1 below ~5000). Byte-equal to k_pf_fc1.
             // the WM kernels read K4 order only: the widened order (fc1_wide / fc2_wide) differs only for K2 and K3 units
             const bool k4 = !T.k2 && !T.k3;
-            A.wm = A.hx && knob::pf_wm() && M >= knob::pf_wm_min() && (!T.fc1_wide || k4) && !T.fc1_wide4;
+            A.wm = (gr8_sm70::current_cc_major() >= 8) && A.hx && knob::pf_wm() && M >= knob::pf_wm_min() && (!T.fc1_wide || k4) && !T.fc1_wide4;
             // GR8_PF_WM2, k_pf_fc2w: byte-equal, ~4% slower than k_pf_fc2v at M 8192 (bench): off
             A.wm2 = A.wm && A.fc2v2 && knob::pf_wm2() && (!T.fc2_wide || k4) && !T.fc2_wide4;
         }

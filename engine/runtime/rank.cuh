@@ -1385,7 +1385,7 @@ inline void launch_embed(Model& m, int M, cudaStream_t st)
     if(m.ds41) { ds41_unit(m,ds41::U_EMBED,0,M,st); return; }
 #endif
     glue::EmbedArgs a{m.tok, m.emb, m.layers[0].attn_norm, m.resid, m.x, glue::RMS_EPS, m.emb_i8, m.emb_scale};
-    glue::k_embed_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
+    glue::k_embed_norm<<<GR8_RN_GRID(M), GR8_RN_BLOCK, 0, st>>>(a);
 }
 
 #ifdef DEC_SLOT
@@ -1989,7 +1989,7 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
     {
         a.wait_code = glue::ERR_AR;
     }
-    glue::k_ar_add_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
+    glue::k_ar_add_norm<<<GR8_RN_GRID(M), GR8_RN_BLOCK, 0, st>>>(a);
     dmark(c % 2 == 0 ? DP_NORM_A : DP_NORM_M, st);
 }
 
@@ -2612,11 +2612,11 @@ __global__ void __launch_bounds__(256) k_mtp_in(MtpInArgs a)
     }
 }
 // eh_proj output rows (fp16) -> the residual (fp32) and layer 78's input norm. grid (RN_CL, M), block RN_T.
-__global__ void __cluster_dims__(glue::RN_CL, 1, 1) __launch_bounds__(glue::RN_T) k_mtp_resid_norm(const __half* in, const __nv_bfloat16* w,
-                                                                                                  float* resid, __half* out, float eps)
+__global__ void GR8_RN_ATTR k_mtp_resid_norm(const __half* in, const __nv_bfloat16* w,
+                                             float* resid, __half* out, float eps)
 {
     const int m = blockIdx.y;
-    const int col0 = blockIdx.x * glue::RN_COLS + threadIdx.x * 8;
+    const int col0 = GR8_RN_COL0;
     const __half* src = in + (size_t)m * HID + col0;
     float x[8];
     #pragma unroll
@@ -2819,7 +2819,7 @@ inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st, int
     if (d.qs.eh) P.next();
     if (!P.on()) return;
     if (d.qs.eh) qs_get(d, d.qs.ceh, M, st);
-    k_mtp_resid_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(d.eh_out, d.layers[0].attn_norm, d.resid, d.x, glue::RMS_EPS);
+    k_mtp_resid_norm<<<GR8_RN_GRID(M), GR8_RN_BLOCK, 0, st>>>(d.eh_out, d.layers[0].attn_norm, d.resid, d.x, glue::RMS_EPS);
 }
 inline void launch_draft_keep(Draft& D, int M, cudaStream_t st)
 {

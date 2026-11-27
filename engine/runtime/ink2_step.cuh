@@ -15,6 +15,7 @@
 // checkpoint runs through the same code.
 #pragma once
 #include "../kernels/nvfp4.cuh"
+#include "../kernels/sm70_cublas.cuh"
 #include "../kernels/ink2_moe.cuh"
 #include "../kernels/ink2_loop.cuh"
 #include "../kernels/ink2_tr3_moe.cuh"
@@ -616,8 +617,8 @@ inline bool blas_gemm(const uint16_t* x, const uint16_t* w, int M, int K, int N,
     const float one = 1.f, zero = 0.f;
     cublasStatus_t rc = cublasSetStream(hd, st);
     if (rc == CUBLAS_STATUS_SUCCESS)
-        rc = cublasGemmEx(hd, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &one, w, CUDA_R_16BF, K, x, CUDA_R_16BF, K, &zero, y, mode == ink2::GEMM_F32 ? CUDA_R_32F : CUDA_R_16BF, N,
-                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        rc = gr8_sm70::cublas_gemm_bf16_tn(hd, N, M, K, &one, w, K, x, K, &zero, y,
+                                           mode == ink2::GEMM_F32 ? CUDA_R_32F : CUDA_R_16BF, N, CUBLAS_GEMM_DEFAULT);
     if (rc == CUBLAS_STATUS_SUCCESS) return true;
     if (!warned) fprintf(stderr, "# ink2: cuBLAS GEMM failed (%d); the engine's own GEMM runs instead\n", static_cast<int>(rc));
     warned = true;

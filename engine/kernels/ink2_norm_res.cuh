@@ -465,6 +465,17 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_c128(const uint16_t* 
     const int r = lane >> 2, c = lane & 3;
     const int lg = lane >> 3, lc = lane & 7;
     float acc[NT][4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    const int vr = (lane & 3) | ((lane & 16) >> 2), vqp = (lane >> 2) & 3;
+    gr8_sm70::Mma16816Acc vacc[NT];
+    const uint16_t* vxr[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        vacc[t].zero();
+        vxr[t] = x + static_cast<size_t>(min(m0 + t * 8 + vr, M - 1)) * K + 4 * vqp;
+    }
+#else
     const uint16_t* xr[NT];
     #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -472,6 +483,7 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_c128(const uint16_t* 
         acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
         xr[t] = x + static_cast<size_t>(min(m0 + t * 8 + r, M - 1)) * K + 2 * c;
     }
+#endif
     const uint16_t* wr[4];
     #pragma unroll
     for (int rr = 0; rr < 4; ++rr)
@@ -482,13 +494,31 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_c128(const uint16_t* 
         for (int rr = 0; rr < 4; ++rr)
         {
             const uint4 v = __ldg(reinterpret_cast<const uint4*>(wr[rr] + k) + lc);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint4 fv = make_uint4(gr8_sm70::bf16x2_to_f16x2(v.x), gr8_sm70::bf16x2_to_f16x2(v.y),
+                                        gr8_sm70::bf16x2_to_f16x2(v.z), gr8_sm70::bf16x2_to_f16x2(v.w));
+            *reinterpret_cast<uint4*>(&sm_w[warp][rr * 4 + lg][lc * 4]) = fv;
+#else
             *reinterpret_cast<uint4*>(&sm_w[warp][rr * 4 + lg][lc * 4]) = v;
+#endif
         }
         __syncwarp();
         #pragma unroll
         for (int p = 0; p < 4; ++p)
         {
             const int kp = k + p * 16;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint2 qa0 = *reinterpret_cast<const uint2*>(&sm_w[warp][vr][p * 8 + 2 * vqp]);
+            const uint2 qa1 = *reinterpret_cast<const uint2*>(&sm_w[warp][vr + 8][p * 8 + 2 * vqp]);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+                if (m0 + t * 8 < M)
+                {
+                    const u32 xb0 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp));
+                    const u32 xb1 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp + 2));
+                    vacc[t].mma_prepared(qa0.x, qa0.y, qa1.x, qa1.y, xb0, xb1);
+                }
+#else
             const u32 a0 = sm_w[warp][r][p * 8 + c];
             const u32 a1 = sm_w[warp][r + 8][p * 8 + c];
             const u32 a2 = sm_w[warp][r][p * 8 + c + 4];
@@ -496,9 +526,14 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_c128(const uint16_t* 
             #pragma unroll
             for (int t = 0; t < NT; ++t)
                 if (m0 + t * 8 < M) mma_bf16(acc[t], a0, a1, a2, a3, ld32(xr[t] + kp), ld32(xr[t] + kp + 8));
+#endif
         }
         __syncwarp();
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) vacc[t].flush_store(acc[t]);
+#endif
     #pragma unroll
     for (int t = 0; t < NT; ++t)
         #pragma unroll
@@ -906,6 +941,17 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_c128_splitk(const uint16_t* __
     const int r = lane >> 2, c = lane & 3;
     const int lg = lane >> 3, lc = lane & 7;
     float acc[NT][4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    const int vr = (lane & 3) | ((lane & 16) >> 2), vqp = (lane >> 2) & 3;
+    gr8_sm70::Mma16816Acc vacc[NT];
+    const uint16_t* vxr[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        vacc[t].zero();
+        vxr[t] = x + static_cast<size_t>(min(m0 + t * 8 + vr, M - 1)) * K + 4 * vqp;
+    }
+#else
     const uint16_t* xr[NT];
     #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -913,6 +959,7 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_c128_splitk(const uint16_t* __
         acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
         xr[t] = x + static_cast<size_t>(min(m0 + t * 8 + r, M - 1)) * K + 2 * c;
     }
+#endif
     const uint16_t* wr[4];
     #pragma unroll
     for (int rr = 0; rr < 4; ++rr)
@@ -923,13 +970,31 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_c128_splitk(const uint16_t* __
         for (int rr = 0; rr < 4; ++rr)
         {
             const uint4 v = __ldg(reinterpret_cast<const uint4*>(wr[rr] + k) + lc);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint4 fv = make_uint4(gr8_sm70::bf16x2_to_f16x2(v.x), gr8_sm70::bf16x2_to_f16x2(v.y),
+                                        gr8_sm70::bf16x2_to_f16x2(v.z), gr8_sm70::bf16x2_to_f16x2(v.w));
+            *reinterpret_cast<uint4*>(&sm_w[rr * 4 + lg][lc * 4]) = fv;
+#else
             *reinterpret_cast<uint4*>(&sm_w[rr * 4 + lg][lc * 4]) = v;
+#endif
         }
         __syncwarp();
         #pragma unroll
         for (int p = 0; p < 4; ++p)
         {
             const int kp = k + p * 16;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint2 qa0 = *reinterpret_cast<const uint2*>(&sm_w[vr][p * 8 + 2 * vqp]);
+            const uint2 qa1 = *reinterpret_cast<const uint2*>(&sm_w[vr + 8][p * 8 + 2 * vqp]);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+                if (m0 + t * 8 < M)
+                {
+                    const u32 xb0 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp));
+                    const u32 xb1 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp + 2));
+                    vacc[t].mma_prepared(qa0.x, qa0.y, qa1.x, qa1.y, xb0, xb1);
+                }
+#else
             const u32 a0 = sm_w[r][p * 8 + c];
             const u32 a1 = sm_w[r + 8][p * 8 + c];
             const u32 a2 = sm_w[r][p * 8 + c + 4];
@@ -937,9 +1002,14 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_c128_splitk(const uint16_t* __
             #pragma unroll
             for (int t = 0; t < NT; ++t)
                 if (m0 + t * 8 < M) mma_bf16(acc[t], a0, a1, a2, a3, ld32(xr[t] + kp), ld32(xr[t] + kp + 8));
+#endif
         }
         __syncwarp();
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) vacc[t].flush_store(acc[t]);
+#endif
     float* pout = partial + static_cast<size_t>(sk_id) * M * N;
     #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -995,6 +1065,17 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_multi_c128_splitk(const uint16
     const int r = lane >> 2, c = lane & 3;
     const int lg = lane >> 3, lc = lane & 7;
     float acc[NT][4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    const int vr = (lane & 3) | ((lane & 16) >> 2), vqp = (lane >> 2) & 3;
+    gr8_sm70::Mma16816Acc vacc[NT];
+    const uint16_t* vxr[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        vacc[t].zero();
+        vxr[t] = x + static_cast<size_t>(min(m0 + t * 8 + vr, M - 1)) * K + 4 * vqp;
+    }
+#else
     const uint16_t* xr[NT];
     #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -1002,6 +1083,7 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_multi_c128_splitk(const uint16
         acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
         xr[t] = x + static_cast<size_t>(min(m0 + t * 8 + r, M - 1)) * K + 2 * c;
     }
+#endif
     const uint16_t* wr[4];
     #pragma unroll
     for (int rr = 0; rr < 4; ++rr)
@@ -1012,13 +1094,31 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_multi_c128_splitk(const uint16
         for (int rr = 0; rr < 4; ++rr)
         {
             const uint4 v = __ldg(reinterpret_cast<const uint4*>(wr[rr] + k) + lc);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint4 fv = make_uint4(gr8_sm70::bf16x2_to_f16x2(v.x), gr8_sm70::bf16x2_to_f16x2(v.y),
+                                        gr8_sm70::bf16x2_to_f16x2(v.z), gr8_sm70::bf16x2_to_f16x2(v.w));
+            *reinterpret_cast<uint4*>(&sm_w[rr * 4 + lg][lc * 4]) = fv;
+#else
             *reinterpret_cast<uint4*>(&sm_w[rr * 4 + lg][lc * 4]) = v;
+#endif
         }
         __syncwarp();
         #pragma unroll
         for (int p = 0; p < 4; ++p)
         {
             const int kp = k + p * 16;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint2 qa0 = *reinterpret_cast<const uint2*>(&sm_w[vr][p * 8 + 2 * vqp]);
+            const uint2 qa1 = *reinterpret_cast<const uint2*>(&sm_w[vr + 8][p * 8 + 2 * vqp]);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+                if (m0 + t * 8 < M)
+                {
+                    const u32 xb0 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp));
+                    const u32 xb1 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp + 2));
+                    vacc[t].mma_prepared(qa0.x, qa0.y, qa1.x, qa1.y, xb0, xb1);
+                }
+#else
             const u32 a0 = sm_w[r][p * 8 + c];
             const u32 a1 = sm_w[r + 8][p * 8 + c];
             const u32 a2 = sm_w[r][p * 8 + c + 4];
@@ -1026,9 +1126,14 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_multi_c128_splitk(const uint16
             #pragma unroll
             for (int t = 0; t < NT; ++t)
                 if (m0 + t * 8 < M) mma_bf16(acc[t], a0, a1, a2, a3, ld32(xr[t] + kp), ld32(xr[t] + kp + 8));
+#endif
         }
         __syncwarp();
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) vacc[t].flush_store(acc[t]);
+#endif
     float* pout = partial + static_cast<size_t>(sk_id) * M * a.total_n;
     #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -1107,7 +1212,11 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_c128_i8_k128(const ui
     __shared__ alignas(16) uint32_t sm_w[RW_CTA][16][68];
     __shared__ uint16_t s_lut[256];
     for (int i = threadIdx.x; i < 256; i += RW_CTA * 32)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        s_lut[i] = __half_as_ushort(__float2half_rn(static_cast<float>(static_cast<int8_t>(i))));
+#else
         s_lut[i] = bf16(static_cast<float>(static_cast<int8_t>(i)));
+#endif
     __syncthreads();
 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -1117,6 +1226,17 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_c128_i8_k128(const ui
     const int r = lane >> 2, c = lane & 3;
     const int lg = lane >> 3, lc = lane & 7;
     float acc[NT][4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    const int vr = (lane & 3) | ((lane & 16) >> 2), vqp = (lane >> 2) & 3;
+    gr8_sm70::Mma16816Acc vacc[NT];
+    const uint16_t* vxr[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        vacc[t].zero();
+        vxr[t] = x + static_cast<size_t>(min(m0 + t * 8 + vr, M - 1)) * K + 4 * vqp;
+    }
+#else
     const uint16_t* xr[NT];
     #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -1124,6 +1244,7 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_c128_i8_k128(const ui
         acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
         xr[t] = x + static_cast<size_t>(min(m0 + t * 8 + r, M - 1)) * K + 2 * c;
     }
+#endif
     const int8_t* wr[4];
     #pragma unroll
     for (int rr = 0; rr < 4; ++rr)
@@ -1154,6 +1275,18 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_c128_i8_k128(const ui
         for (int p = 0; p < 8; ++p)
         {
             const int kp = k + p * 16;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint2 qa0 = *reinterpret_cast<const uint2*>(&sm_w[warp][vr][p * 8 + 2 * vqp]);
+            const uint2 qa1 = *reinterpret_cast<const uint2*>(&sm_w[warp][vr + 8][p * 8 + 2 * vqp]);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+                if (m0 + t * 8 < M)
+                {
+                    const u32 xb0 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp));
+                    const u32 xb1 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp + 2));
+                    vacc[t].mma_prepared(qa0.x, qa0.y, qa1.x, qa1.y, xb0, xb1);
+                }
+#else
             const u32 a0 = sm_w[warp][r][p * 8 + c];
             const u32 a1 = sm_w[warp][r + 8][p * 8 + c];
             const u32 a2 = sm_w[warp][r][p * 8 + c + 4];
@@ -1161,9 +1294,14 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_c128_i8_k128(const ui
             #pragma unroll
             for (int t = 0; t < NT; ++t)
                 if (m0 + t * 8 < M) mma_bf16(acc[t], a0, a1, a2, a3, ld32(xr[t] + kp), ld32(xr[t] + kp + 8));
+#endif
         }
         __syncwarp();
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) vacc[t].flush_store(acc[t]);
+#endif
     const float sc0 = __ldg(scales + min(n0 + r, N - 1));
     const float sc1 = __ldg(scales + min(n0 + r + 8, N - 1));
     #pragma unroll
@@ -1188,7 +1326,11 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_c128_i8_splitk(const uint16_t*
     const int lane = threadIdx.x & 31;
     #pragma unroll
     for (int i = lane; i < 256; i += 32)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        s_lut[i] = __half_as_ushort(__float2half_rn(static_cast<float>(static_cast<int8_t>(i))));
+#else
         s_lut[i] = bf16(static_cast<float>(static_cast<int8_t>(i)));
+#endif
     __syncwarp();
 
     const int n0 = blockIdx.x * 16;
@@ -1201,6 +1343,17 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_c128_i8_splitk(const uint16_t*
     const int r = lane >> 2, c = lane & 3;
     const int lg = lane >> 3, lc = lane & 7;
     float acc[NT][4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    const int vr = (lane & 3) | ((lane & 16) >> 2), vqp = (lane >> 2) & 3;
+    gr8_sm70::Mma16816Acc vacc[NT];
+    const uint16_t* vxr[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        vacc[t].zero();
+        vxr[t] = x + static_cast<size_t>(min(m0 + t * 8 + vr, M - 1)) * K + 4 * vqp;
+    }
+#else
     const uint16_t* xr[NT];
     #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -1208,6 +1361,7 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_c128_i8_splitk(const uint16_t*
         acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
         xr[t] = x + static_cast<size_t>(min(m0 + t * 8 + r, M - 1)) * K + 2 * c;
     }
+#endif
     const int8_t* wr[4];
     #pragma unroll
     for (int rr = 0; rr < 4; ++rr)
@@ -1238,6 +1392,18 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_c128_i8_splitk(const uint16_t*
         for (int p = 0; p < 8; ++p)
         {
             const int kp = k + p * 16;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint2 qa0 = *reinterpret_cast<const uint2*>(&sm_w[vr][p * 8 + 2 * vqp]);
+            const uint2 qa1 = *reinterpret_cast<const uint2*>(&sm_w[vr + 8][p * 8 + 2 * vqp]);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+                if (m0 + t * 8 < M)
+                {
+                    const u32 xb0 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp));
+                    const u32 xb1 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp + 2));
+                    vacc[t].mma_prepared(qa0.x, qa0.y, qa1.x, qa1.y, xb0, xb1);
+                }
+#else
             const u32 a0 = sm_w[r][p * 8 + c];
             const u32 a1 = sm_w[r + 8][p * 8 + c];
             const u32 a2 = sm_w[r][p * 8 + c + 4];
@@ -1245,9 +1411,14 @@ __global__ void __launch_bounds__(32) k_ink2_gemm_c128_i8_splitk(const uint16_t*
             #pragma unroll
             for (int t = 0; t < NT; ++t)
                 if (m0 + t * 8 < M) mma_bf16(acc[t], a0, a1, a2, a3, ld32(xr[t] + kp), ld32(xr[t] + kp + 8));
+#endif
         }
         __syncwarp();
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) vacc[t].flush_store(acc[t]);
+#endif
     float* pout = partial + static_cast<size_t>(sk_id) * M * N;
     #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -1294,7 +1465,11 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_multi_c128_i8_k128(co
     __shared__ alignas(16) uint32_t sm_w[RW_CTA][16][68];
     __shared__ uint16_t s_lut[256];
     for (int i = threadIdx.x; i < 256; i += RW_CTA * 32)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+        s_lut[i] = __half_as_ushort(__float2half_rn(static_cast<float>(static_cast<int8_t>(i))));
+#else
         s_lut[i] = bf16(static_cast<float>(static_cast<int8_t>(i)));
+#endif
     __syncthreads();
 
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -1314,6 +1489,17 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_multi_c128_i8_k128(co
     const int r = lane >> 2, c = lane & 3;
     const int lg = lane >> 3, lc = lane & 7;
     float acc[NT][4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    const int vr = (lane & 3) | ((lane & 16) >> 2), vqp = (lane >> 2) & 3;
+    gr8_sm70::Mma16816Acc vacc[NT];
+    const uint16_t* vxr[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        vacc[t].zero();
+        vxr[t] = x + static_cast<size_t>(min(m0 + t * 8 + vr, M - 1)) * K + 4 * vqp;
+    }
+#else
     const uint16_t* xr[NT];
     #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -1321,6 +1507,7 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_multi_c128_i8_k128(co
         acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
         xr[t] = x + static_cast<size_t>(min(m0 + t * 8 + r, M - 1)) * K + 2 * c;
     }
+#endif
     const int8_t* wr[4];
     #pragma unroll
     for (int rr = 0; rr < 4; ++rr)
@@ -1351,6 +1538,18 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_multi_c128_i8_k128(co
         for (int p = 0; p < 8; ++p)
         {
             const int kp = k + p * 16;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint2 qa0 = *reinterpret_cast<const uint2*>(&sm_w[warp][vr][p * 8 + 2 * vqp]);
+            const uint2 qa1 = *reinterpret_cast<const uint2*>(&sm_w[warp][vr + 8][p * 8 + 2 * vqp]);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+                if (m0 + t * 8 < M)
+                {
+                    const u32 xb0 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp));
+                    const u32 xb1 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp + 2));
+                    vacc[t].mma_prepared(qa0.x, qa0.y, qa1.x, qa1.y, xb0, xb1);
+                }
+#else
             const u32 a0 = sm_w[warp][r][p * 8 + c];
             const u32 a1 = sm_w[warp][r + 8][p * 8 + c];
             const u32 a2 = sm_w[warp][r][p * 8 + c + 4];
@@ -1358,9 +1557,14 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_multi_c128_i8_k128(co
             #pragma unroll
             for (int t = 0; t < NT; ++t)
                 if (m0 + t * 8 < M) mma_bf16(acc[t], a0, a1, a2, a3, ld32(xr[t] + kp), ld32(xr[t] + kp + 8));
+#endif
         }
         __syncwarp();
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) vacc[t].flush_store(acc[t]);
+#endif
     const float sc0 = __ldg(tg.scales + min(n0 + r, N - 1));
     const float sc1 = __ldg(tg.scales + min(n0 + r + 8, N - 1));
     #pragma unroll
@@ -1579,6 +1783,17 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_multi_c128(const uint
     const int r = lane >> 2, c = lane & 3;
     const int lg = lane >> 3, lc = lane & 7;
     float acc[NT][4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    const int vr = (lane & 3) | ((lane & 16) >> 2), vqp = (lane >> 2) & 3;
+    gr8_sm70::Mma16816Acc vacc[NT];
+    const uint16_t* vxr[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        vacc[t].zero();
+        vxr[t] = x + static_cast<size_t>(min(m0 + t * 8 + vr, M - 1)) * K + 4 * vqp;
+    }
+#else
     const uint16_t* xr[NT];
     #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -1586,6 +1801,7 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_multi_c128(const uint
         acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
         xr[t] = x + static_cast<size_t>(min(m0 + t * 8 + r, M - 1)) * K + 2 * c;
     }
+#endif
     const uint16_t* wr[4];
     #pragma unroll
     for (int rr = 0; rr < 4; ++rr)
@@ -1596,13 +1812,31 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_multi_c128(const uint
         for (int rr = 0; rr < 4; ++rr)
         {
             const uint4 v = __ldg(reinterpret_cast<const uint4*>(wr[rr] + k) + lc);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint4 fv = make_uint4(gr8_sm70::bf16x2_to_f16x2(v.x), gr8_sm70::bf16x2_to_f16x2(v.y),
+                                        gr8_sm70::bf16x2_to_f16x2(v.z), gr8_sm70::bf16x2_to_f16x2(v.w));
+            *reinterpret_cast<uint4*>(&sm_w[warp][rr * 4 + lg][lc * 4]) = fv;
+#else
             *reinterpret_cast<uint4*>(&sm_w[warp][rr * 4 + lg][lc * 4]) = v;
+#endif
         }
         __syncwarp();
         #pragma unroll
         for (int p = 0; p < 4; ++p)
         {
             const int kp = k + p * 16;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+            const uint2 qa0 = *reinterpret_cast<const uint2*>(&sm_w[warp][vr][p * 8 + 2 * vqp]);
+            const uint2 qa1 = *reinterpret_cast<const uint2*>(&sm_w[warp][vr + 8][p * 8 + 2 * vqp]);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+                if (m0 + t * 8 < M)
+                {
+                    const u32 xb0 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp));
+                    const u32 xb1 = gr8_sm70::bf16x2_to_f16x2(ld32(vxr[t] + kp + 2));
+                    vacc[t].mma_prepared(qa0.x, qa0.y, qa1.x, qa1.y, xb0, xb1);
+                }
+#else
             const u32 a0 = sm_w[warp][r][p * 8 + c];
             const u32 a1 = sm_w[warp][r + 8][p * 8 + c];
             const u32 a2 = sm_w[warp][r][p * 8 + c + 4];
@@ -1610,9 +1844,14 @@ __global__ void __launch_bounds__(RW_CTA * 32) k_ink2_gemm_multi_c128(const uint
             #pragma unroll
             for (int t = 0; t < NT; ++t)
                 if (m0 + t * 8 < M) mma_bf16(acc[t], a0, a1, a2, a3, ld32(xr[t] + kp), ld32(xr[t] + kp + 8));
+#endif
         }
         __syncwarp();
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) vacc[t].flush_store(acc[t]);
+#endif
     #pragma unroll
     for (int t = 0; t < NT; ++t)
         #pragma unroll

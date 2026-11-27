@@ -169,7 +169,7 @@ __global__ void __launch_bounds__(64) k_l2pf(const __grid_constant__ Queue q, in
             int i = 0;
             while (c >= q.end[i]) ++i;
             const uint32_t off = (c - (i ? q.end[i - 1] : 0)) * CHUNK, left = q.n[i] - off;
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(q.p[i] + off), "r"(min(left, CHUNK)) : "memory");
+            gr8_sm70::prefetch_l2_bulk(q.p[i] + off, min(left, CHUNK));
         }
         if (due > done) done = due;
         else __nanosleep(64);

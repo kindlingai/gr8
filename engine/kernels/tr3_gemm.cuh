@@ -14,19 +14,10 @@ constexpr int A_STAGE = MB * 16 * KS16 * 32;        // 4096 B
 constexpr int B_STAGE_MAX = KS16 * 8 * 128;         // 2048 B (K4)
 constexpr int SMEM = STAGES * (A_STAGE + B_STAGE_MAX);
 
-__device__ __forceinline__ void cp16(void* smem, const void* gmem)
-{
-    const u32 s = static_cast<u32>(__cvta_generic_to_shared(smem));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
-}
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int n> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(n)); }
-__device__ __forceinline__ void ldsm4(u32 (&r)[4], const void* smem)
-{
-    const u32 s = static_cast<u32>(__cvta_generic_to_shared(smem));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
-}
+__device__ __forceinline__ void cp16(void* smem, const void* gmem) { gr8_sm70::cp_async_cg_16(smem, gmem); }
+__device__ __forceinline__ void cp_commit() { gr8_sm70::cp_async_commit(); }
+template <int n> __device__ __forceinline__ void cp_wait() { gr8_sm70::cp_async_wait<n>(); }
+__device__ __forceinline__ void ldsm4(u32 (&r)[4], const void* smem) { gr8_sm70::ldmatrix_x4(r[0], r[1], r[2], r[3], smem); }
 
 template <int BITS>
 __device__ __forceinline__ void body(const __half* __restrict__ X, const uint8_t* __restrict__ tr, __half* __restrict__ Y,

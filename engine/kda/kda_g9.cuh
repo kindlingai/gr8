@@ -9,6 +9,7 @@
 #pragma once
 #include "kda_prefill.cuh"
 #include "../knobs-rs/gr8_knobs.h"
+#include "../kernels/sm70_compat.cuh"
 
 namespace kda
 {
@@ -167,30 +168,52 @@ inline void launch_out16(const G9Args& g, cudaStream_t st)
 // ------------------------------------------------------------------------------------------------------ PTX helpers
 __device__ inline uint32_t pack_bf16(float lo, float hi)
 {
-    uint32_t r;
-    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
-    return r;
+    return gr8_sm70::pack_bf16x2_f32(lo, hi);
 }
-// D = A (16x16 bf16, row) * B (16x8 bf16, col) + D, fp32
+// D = A (16x16 bf16, row) * B (16x8 bf16, col) + D, fp32.
+// On SM70, KDA's chunked decay factors exp(gc[i] - pivot) span BF16's 8-bit exponent (1e-38..3e38),
+// which exceeds FP16 range, so compute the exact BF16-operand MMA in FP32 without narrowing through FP16.
 __device__ inline void mma16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1)
 {
-    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    gr8_sm70::mma16816_bf16(c, a[0], a[1], a[2], a[3], b0, b1);
+#else
+    constexpr unsigned FULL = 0xffffffffu;
+    const int lane = threadIdx.x & 31, g = lane >> 2, cc = lane & 3;
+    auto acc_half = [&](uint32_t au0, uint32_t au1, uint32_t bu) {
+        #pragma unroll
+        for (int kk = 0; kk < 4; ++kk)
+        {
+            const uint32_t a0 = __shfl_sync(FULL, au0, (g << 2) | kk);
+            const uint32_t a1 = __shfl_sync(FULL, au1, (g << 2) | kk);
+            const uint32_t b_0 = __shfl_sync(FULL, bu, ((2 * cc) << 2) | kk);
+            const uint32_t b_1 = __shfl_sync(FULL, bu, ((2 * cc + 1) << 2) | kk);
+            const float a0l = __uint_as_float((a0 & 0xffffu) << 16), a0h = __uint_as_float(a0 & 0xffff0000u);
+            const float a1l = __uint_as_float((a1 & 0xffffu) << 16), a1h = __uint_as_float(a1 & 0xffff0000u);
+            const float b0l = __uint_as_float((b_0 & 0xffffu) << 16), b0h = __uint_as_float(b_0 & 0xffff0000u);
+            const float b1l = __uint_as_float((b_1 & 0xffffu) << 16), b1h = __uint_as_float(b_1 & 0xffff0000u);
+            c[0] = fmaf(a0l, b0l, fmaf(a0h, b0h, c[0]));
+            c[1] = fmaf(a0l, b1l, fmaf(a0h, b1h, c[1]));
+            c[2] = fmaf(a1l, b0l, fmaf(a1h, b0h, c[2]));
+            c[3] = fmaf(a1l, b1l, fmaf(a1h, b1h, c[3]));
+        }
+    };
+    acc_half(a[0], a[1], b0);
+    acc_half(a[2], a[3], b1);
+#endif
 }
 __device__ inline uint32_t smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
 __device__ inline void cp_async16(uint32_t dst, const void* src, bool valid)   // valid == false: 16 zero bytes, src not read
 {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(valid ? 16 : 0) : "memory");
+    gr8_sm70::cp_async_cg_16_addr(dst, src, valid ? 16 : 0);
 }
-__device__ inline void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
-template <int N> __device__ inline void cp_async_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
+__device__ inline void cp_async_commit() { gr8_sm70::cp_async_commit(); }
+template <int N> __device__ inline void cp_async_wait() { gr8_sm70::cp_async_wait<N>(); }
 __device__ inline void bar_sync(int id, int n) { asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(n) : "memory"); }
 __device__ inline void bar_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(n) : "memory"); }
 __device__ inline void ldmatrix_x4_trans(uint32_t (&r)[4], uint32_t addr)
 {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr) : "memory");
+    gr8_sm70::ldmatrix_x4_trans_addr(r[0], r[1], r[2], r[3], addr);
 }
 __device__ inline uint32_t lds32(const uint8_t* p) { return *reinterpret_cast<const uint32_t*>(p); }
 

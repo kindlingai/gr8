@@ -41,15 +41,8 @@ constexpr int WT_NTH = 256 * WT_HALVES;               // threads
 constexpr int FC2T_SMEM = 2 * F2T_SA > WT_HALVES * F2T_SZ ? 2 * F2T_SA : WT_HALVES * F2T_SZ;   // the halves' output tiles alias the A stages
 static_assert(WT_R == 128 || WT_R == 256, "PF_WT_R is 128 or 256");
 
-__device__ __forceinline__ void wt_cp4(void* s, const void* g)
-{
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(static_cast<u32>(__cvta_generic_to_shared(s))), "l"(g));
-}
-__device__ __forceinline__ void wt_ldsm4(u32 (&r)[4], const void* p)
-{
-    const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
-}
+__device__ __forceinline__ void wt_cp4(void* s, const void* g) { gr8_sm70::cp_async_ca_4(s, g); }
+__device__ __forceinline__ void wt_ldsm4(u32 (&r)[4], const void* p) { gr8_sm70::ldmatrix_x4(r[0], r[1], r[2], r[3], p); }
 
 // The fc1 input records: grid ceil(M / 8) * (HID / 128) warps in blocks of 8, warp = (8 rows, 128-k block), lane = (row,
 // k32 step). The values are x * sg rotated (had128_l32) and rounded to fp16, as the segment prologue computes them before
@@ -460,7 +453,7 @@ __device__ __forceinline__ void fc2t_body(const Expert& A, const long long* tr, 
     }
 }
 
-__device__ __forceinline__ void wt_discard(const void* p) { asm volatile("discard.global.L2 [%0], 128;" :: "l"(p) : "memory"); }
+__device__ __forceinline__ void wt_discard(const void* p) { gr8_sm70::discard_l2_128(const_cast<void*>(p)); }
 __device__ __forceinline__ uint4 wt_ldcg(const void* p) { return __ldcg(reinterpret_cast<const uint4*>(p)); }   // from the L2: other SMs wrote the line
 
 // The fused combine of one 32-row epilogue pass: lanes 8 i .. 8 i + 7 hold row i (token tok, live when act); after their yw

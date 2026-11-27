@@ -9,6 +9,8 @@
 #ifdef M4SIM
 #include <sys/stat.h>
 #include <vector>
+#else
+#include <cuda_runtime.h>
 #endif
 
 extern "C" {
@@ -60,6 +62,33 @@ static int count(const std::string& s)   // the entries g6m4.cu's split(s, ',') 
     while ((b = s.find(',', a)) != std::string::npos) { ++n; a = b + 1; }
     return n + (a < s.size() ? 1 : 0);
 }
+static bool all_loopback_ipc(const std::string& s)
+{
+    if (s.empty()) return false;
+    size_t a = 0, b;
+    while ((b = s.find(',', a)) != std::string::npos) {
+        if (s.compare(a, b - a, "127.0.0.1") != 0) return false;
+        a = b + 1;
+    }
+    return s.compare(a, s.size() - a, "127.0.0.1") == 0;
+}
+static void maybe_select_local_gpu(int argc, char** argv)
+{
+    int rank = -1;
+    std::string ips;
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string a = argv[i];
+        if (a == "--check-args") return;
+        if (a == "--rank" && i + 1 < argc) rank = atoi(argv[++i]);
+        else if (a == "--ips" && i + 1 < argc) ips = argv[++i];
+    }
+    if (rank >= 0 && count(ips) > 1 && all_loopback_ipc(ips))
+    {
+        int ndev = 0;
+        if (cudaGetDeviceCount(&ndev) == cudaSuccess && rank < ndev) cudaSetDevice(rank);
+    }
+}
 #endif
 
 int main(int argc, char** argv)
@@ -96,6 +125,7 @@ int main(int argc, char** argv)
         while (stat((packs + "/rank" + std::to_string(nr) + ".manifest.json").c_str(), &sb) == 0) ++nr;
     const char* how = "--tp N, or --packs DIR with its rank<r>.manifest.json files,";
 #else
+    maybe_select_local_gpu(argc, argv);
     if (n == 1) return only(argc, argv);
     for (int i = 1; i + 1 < argc; ++i)
         if (std::string(argv[i]) == "--ips") nr = count(argv[i + 1]);

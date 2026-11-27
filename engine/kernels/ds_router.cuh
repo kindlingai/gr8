@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstring>
 #include <cuda_bf16.h>
+#include "sm70_compat.cuh"
 #include "ds_plan_mt.h"
 
 namespace dsr
@@ -71,8 +72,8 @@ __host__ __device__ __forceinline__ float sqrt_softplus(float x) { return sqrtf(
 // cudaLaunchAttributeProgrammaticStreamSerialization). The _p twins and the PDLM = 1 instances below follow the chain rules of
 // ds41_moe_ops.cuh: every PDL-launched kernel executes pdl_wait on every path, and a kernel triggers only after its own wait when its
 // dependents read data produced two kernels earlier.
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() { gr8_sm70::pdl_trigger(); }
+__device__ __forceinline__ void pdl_wait() { gr8_sm70::pdl_wait(); }
 
 __device__ __forceinline__ void bf16x8(const uint4& v, float (&f)[8])
 {
@@ -97,7 +98,7 @@ __global__ void __launch_bounds__(256) k_gate_logits(const __nv_bfloat16* __rest
     uint4 w[NV];
     #pragma unroll
     for (int i = 0; i < NV; ++i)
-        asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(w[i].x), "=r"(w[i].y), "=r"(w[i].z), "=r"(w[i].w) : "l"(wr + 32 * i));
+        w[i] = gr8_sm70::ld_nc_uint4(wr + 32 * i);
     #pragma unroll
     for (int i = 0; i < NV; ++i) asm volatile("" : "+r"(w[i].x), "+r"(w[i].y), "+r"(w[i].z), "+r"(w[i].w));   // all loads issued before any use
     float acc[MMAX];
@@ -303,7 +304,7 @@ __global__ void __launch_bounds__(256) k_gate_logits_mt(const __nv_bfloat16* __r
     uint4 w[NV];
     #pragma unroll
     for (int i = 0; i < NV; ++i)
-        asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(w[i].x), "=r"(w[i].y), "=r"(w[i].z), "=r"(w[i].w) : "l"(wr + 32 * i));
+        w[i] = gr8_sm70::ld_nc_uint4(wr + 32 * i);
     #pragma unroll
     for (int i = 0; i < NV; ++i) asm volatile("" : "+r"(w[i].x), "+r"(w[i].y), "+r"(w[i].z), "+r"(w[i].w));
     #pragma unroll 1

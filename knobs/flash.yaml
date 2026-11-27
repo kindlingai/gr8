@@ -160,8 +160,9 @@ knobs:
     values: "0|1"
     legacy: ["G6_KDA_MX", "GR8_KDA_MX"]
     doc: >-
-      KDA decode q / k / v read MXFP8 records built at bind with FP16 activations. 0 reads the BF16 weights. Not byte-
-      exact, and the records are an extra copy outside the loader's accounting.
+      KDA decode q / k / v read MXFP8 records with FP16 activations: the release's stored records, and the loader skips
+      the BF16 .gv generation that 0 needs (about 6.85 GB/rank less device image at TP=4). 0 reads the BF16 weights. Not
+      byte-exact, and the records are an extra copy outside the loader's accounting.
   GR8_GLM53F_KDA_OPROJ_SPLIT:
     scope: agree
     kind: ints

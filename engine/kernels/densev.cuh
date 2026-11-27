@@ -22,21 +22,12 @@ namespace gv
 {
 enum { O_F16 = 0, O_BF16 = 1, O_F32 = 2 };
 
-__device__ __forceinline__ void ld_nc_v2(const void* p, u32* v)
-{
-    asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(v[0]), "=r"(v[1]) : "l"(p));
-}
-__device__ __forceinline__ void ld_nc_v4(const void* p, u32* v)
-{
-    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]) : "l"(p));
-}
+__device__ __forceinline__ void ld_nc_v2(const void* p, u32* v) { gr8_sm70::ld_nc_v2_u32(p, v); }
+__device__ __forceinline__ void ld_nc_v4(const void* p, u32* v) { gr8_sm70::ld_nc_v4_u32(p, v); }
 
 __device__ __forceinline__ void mma_bf16(float (&c)[4], u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1)
 {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    gr8_sm70::mma16816_bf16(c, a0, a1, a2, a3, b0, b1);
 }
 
 using ::f2bf;
@@ -52,7 +43,7 @@ __device__ __forceinline__ void put(void* y, size_t i, float v, int odt)
 struct Mxfp8
 {
     static constexpr int G = 2, TW = 2, GR = 528, PFB = 2;
-    static constexpr bool SCALED = true, ROW_SCALED = false;
+    static constexpr bool SCALED = true, ROW_SCALED = false, IS_BF16 = false;
     static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { gv::ld_nc_v2(tile + lane * 8, w); }
     static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4]) { a[0] = e4m3x2(w[0]); a[1] = e4m3x2(w[0] >> 16); a[2] = e4m3x2(w[1]); a[3] = e4m3x2(w[1] >> 16); }
     static __device__ __forceinline__ void mma_a(float (&g)[4], const u32 (&a)[4], u32 b0, u32 b1) { mma16816(g, a[0], a[1], a[2], a[3], b0, b1); }
@@ -63,6 +54,12 @@ struct Mxfp8
         mma_a(g, a, b0, b1);
     }
     static __device__ __forceinline__ u32 ld_scale(const uint8_t* grp, int lane) { return ld_nc16(grp + 512 + (lane >> 2) * 2); }
+    static __device__ __forceinline__ void ld_scale_qp(const uint8_t* grp, int lane, u32& s0, u32& s2)
+    {
+        const int rlo = ((lane & 16) >> 2) | (lane & 1);
+        s0 = ld_nc16(grp + 512 + rlo * 2);
+        s2 = ld_nc16(grp + 512 + (rlo + 2) * 2);
+    }
     static __device__ __forceinline__ float e8m0(u32 code) { return __uint_as_float(code ? code << 23 : 0x00400000u); }   // 2^(code-127)
     static __device__ __forceinline__ float2 scale(u32 raw) { return make_float2(e8m0(raw & 0xffu), e8m0((raw >> 8) & 0xffu)); }
 };
@@ -70,24 +67,26 @@ struct Mxfp8
 struct Fp8r
 {
     static constexpr int G = 2, TW = 2, GR = 512, PFB = 2;
-    static constexpr bool SCALED = false, ROW_SCALED = true;
+    static constexpr bool SCALED = false, ROW_SCALED = true, IS_BF16 = false;
     static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { gv::ld_nc_v2(tile + lane * 8, w); }
     static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4]) { Mxfp8::dec(w, a); }
     static __device__ __forceinline__ void mma_a(float (&g)[4], const u32 (&a)[4], u32 b0, u32 b1) { mma16816(g, a[0], a[1], a[2], a[3], b0, b1); }
     static __device__ __forceinline__ void mma(float (&g)[4], const u32* w, u32 b0, u32 b1) { Mxfp8::mma(g, w, b0, b1); }
     static __device__ __forceinline__ u32 ld_scale(const uint8_t*, int) { return 0; }
+    static __device__ __forceinline__ void ld_scale_qp(const uint8_t*, int, u32& s0, u32& s2) { s0 = 0; s2 = 0; }
     static __device__ __forceinline__ float2 scale(u32) { return make_float2(1.f, 1.f); }
 };
 
 struct Bf16w
 {
     static constexpr int G = 1, TW = 4, GR = 512, PFB = 4;
-    static constexpr bool SCALED = false, ROW_SCALED = false;
+    static constexpr bool SCALED = false, ROW_SCALED = false, IS_BF16 = true;
     static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { gv::ld_nc_v4(tile + lane * 16, w); }
     static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4]) { a[0] = w[0]; a[1] = w[1]; a[2] = w[2]; a[3] = w[3]; }
     static __device__ __forceinline__ void mma_a(float (&g)[4], const u32 (&a)[4], u32 b0, u32 b1) { gv::mma_bf16(g, a[0], a[1], a[2], a[3], b0, b1); }
     static __device__ __forceinline__ void mma(float (&g)[4], const u32* w, u32 b0, u32 b1) { gv::mma_bf16(g, w[0], w[1], w[2], w[3], b0, b1); }
     static __device__ __forceinline__ u32 ld_scale(const uint8_t*, int) { return 0; }
+    static __device__ __forceinline__ void ld_scale_qp(const uint8_t*, int, u32& s0, u32& s2) { s0 = 0; s2 = 0; }
     static __device__ __forceinline__ float2 scale(u32) { return make_float2(1.f, 1.f); }
 };
 
@@ -96,7 +95,7 @@ struct Bf16w
 struct Int4v
 {
     static constexpr int G = 2, TW = 1, GR = 288, PFB = 2;
-    static constexpr bool SCALED = true, ROW_SCALED = false;
+    static constexpr bool SCALED = true, ROW_SCALED = false, IS_BF16 = false;
     static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { w[0] = ld_nc(tile + lane * 4); }
     static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4])
     {
@@ -110,6 +109,12 @@ struct Int4v
         mma_a(g, a, b0, b1);
     }
     static __device__ __forceinline__ u32 ld_scale(const uint8_t* grp, int lane) { return Int4::ld_scale(grp, lane); }
+    static __device__ __forceinline__ void ld_scale_qp(const uint8_t* grp, int lane, u32& s0, u32& s2)
+    {
+        const int rlo = ((lane & 16) >> 2) | (lane & 1);
+        s0 = ld_nc(grp + 256 + rlo * 4);
+        s2 = ld_nc(grp + 256 + (rlo + 2) * 4);
+    }
     static __device__ __forceinline__ float2 scale(u32 raw) { return Int4::scale(raw); }
 };
 
@@ -118,12 +123,124 @@ struct GvGroup
 {
     u32 c[C::G * C::TW];
     u32 s;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    u32 s2;
+#endif
     __device__ __forceinline__ void load(const uint8_t* grp, int lane)
     {
         #pragma unroll
         for (int i = 0; i < C::G; ++i) C::ld_tile(grp + i * C::TW * 128, lane, c + i * C::TW);
         s = C::ld_scale(grp, lane);
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    __device__ __forceinline__ void load_qp(const uint8_t* grp, int lane)
+    {
+        #pragma unroll
+        for (int i = 0; i < C::G; ++i) C::ld_tile(grp + i * C::TW * 128, lane, c + i * C::TW);
+        C::ld_scale_qp(grp, lane, s, s2);
+    }
+    template <int NT>
+    __device__ __forceinline__ void run_qp(const u32* bf, int ks, gr8_sm70::Mma16816Acc (&vacc)[NT], int ts) const
+    {
+        if constexpr (C::SCALED)
+        {
+            u32 qa[C::G][4];
+            #pragma unroll
+            for (int i = 0; i < C::G; ++i)
+            {
+                u32 a[4];
+                C::dec(c + i * C::TW, a);
+                gr8_sm70::Mma16816Acc::prep_a(a[0], a[1], a[2], a[3], qa[i][0], qa[i][1], qa[i][2], qa[i][3]);
+            }
+            const float2 sc0 = C::scale(s), sc2 = C::scale(s2);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                gr8_sm70::Mma16816Acc g;
+                g.zero();
+                #pragma unroll
+                for (int i = 0; i < C::G; ++i)
+                {
+                    u32 qb0, qb1;
+                    gr8_sm70::Mma16816Acc::prep_b(bf[t * ts + (ks + i) * 64], bf[t * ts + (ks + i) * 64 + 1], qb0, qb1);
+                    g.mma_prepared(qa[i][0], qa[i][1], qa[i][2], qa[i][3], qb0, qb1);
+                }
+                vacc[t].add_scaled(g, sc0.x, sc2.x, sc0.y, sc2.y);
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int i = 0; i < C::G; ++i)
+            {
+                u32 a[4];
+                C::dec(c + i * C::TW, a);
+                if constexpr (C::IS_BF16)
+                {
+                    a[0] = gr8_sm70::bf16x2_to_f16x2(a[0]); a[1] = gr8_sm70::bf16x2_to_f16x2(a[1]);
+                    a[2] = gr8_sm70::bf16x2_to_f16x2(a[2]); a[3] = gr8_sm70::bf16x2_to_f16x2(a[3]);
+                }
+                u32 qa0_0, qa0_1, qa1_0, qa1_1;
+                gr8_sm70::Mma16816Acc::prep_a(a[0], a[1], a[2], a[3], qa0_0, qa0_1, qa1_0, qa1_1);
+                #pragma unroll
+                for (int t = 0; t < NT; ++t)
+                {
+                    u32 b0 = bf[t * ts + (ks + i) * 64], b1 = bf[t * ts + (ks + i) * 64 + 1];
+                    if constexpr (C::IS_BF16)
+                    {
+                        b0 = gr8_sm70::bf16x2_to_f16x2(b0);
+                        b1 = gr8_sm70::bf16x2_to_f16x2(b1);
+                    }
+                    u32 qb0, qb1;
+                    gr8_sm70::Mma16816Acc::prep_b(b0, b1, qb0, qb1);
+                    vacc[t].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, qb0, qb1);
+                }
+            }
+        }
+    }
+    // Compact high-NT (NT > 2) SM70 path: reuses a single 16-reg Mma16816Acc per group/tile (zero spills at 1024 threads)
+    template <int NT>
+    __device__ __forceinline__ void run_sm70_hi(const u32* bf, int ks, float (&acc)[NT][4], int ts) const
+    {
+        u32 qa[C::G][4];
+        #pragma unroll
+        for (int i = 0; i < C::G; ++i)
+        {
+            u32 a[4];
+            C::dec(c + i * C::TW, a);
+            if constexpr (C::IS_BF16)
+            {
+                a[0] = gr8_sm70::bf16x2_to_f16x2(a[0]); a[1] = gr8_sm70::bf16x2_to_f16x2(a[1]);
+                a[2] = gr8_sm70::bf16x2_to_f16x2(a[2]); a[3] = gr8_sm70::bf16x2_to_f16x2(a[3]);
+            }
+            gr8_sm70::Mma16816Acc::prep_a(a[0], a[1], a[2], a[3], qa[i][0], qa[i][1], qa[i][2], qa[i][3]);
+        }
+        const float2 sc = C::SCALED ? C::scale(s) : make_float2(1.f, 1.f);
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            gr8_sm70::Mma16816Acc g;
+            g.zero();
+            #pragma unroll
+            for (int i = 0; i < C::G; ++i)
+            {
+                u32 b0 = bf[t * ts + (ks + i) * 64], b1 = bf[t * ts + (ks + i) * 64 + 1];
+                if constexpr (C::IS_BF16) { b0 = gr8_sm70::bf16x2_to_f16x2(b0); b1 = gr8_sm70::bf16x2_to_f16x2(b1); }
+                u32 qb0, qb1;
+                gr8_sm70::Mma16816Acc::prep_b(b0, b1, qb0, qb1);
+                g.mma_prepared(qa[i][0], qa[i][1], qa[i][2], qa[i][3], qb0, qb1);
+            }
+            if constexpr (C::SCALED)
+            {
+                float gv[4];
+                g.flush_store(gv);
+                acc[t][0] = fmaf(sc.x, gv[0], acc[t][0]); acc[t][1] = fmaf(sc.x, gv[1], acc[t][1]);
+                acc[t][2] = fmaf(sc.y, gv[2], acc[t][2]); acc[t][3] = fmaf(sc.y, gv[3], acc[t][3]);
+            }
+            else g.flush_add(acc[t]);
+        }
+    }
+#endif
     // acc += scale * (weights @ B fragments); bf = fragment table already offset to this lane, ks = first k16 step
     __device__ __forceinline__ void run(const u32* bf, int ks, float (&acc)[4]) const
     {
@@ -190,6 +307,51 @@ __device__ __forceinline__ void gv_tile_part(const uint8_t* tile, const u32* bf,
     constexpr int PFB = C::PFB;
     const int lane = threadIdx.x & 31;
     const int Q = g1 - g0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    if constexpr (NT <= 2)
+    {
+        gr8_sm70::Mma16816Acc vacc[NT];
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) vacc[t].zero();
+        GvGroup<C> nx[PFB];
+        #pragma unroll
+        for (int p = 0; p < PFB; ++p)
+            if (p < Q) nx[p].load_qp(tile + static_cast<size_t>(g0 + p) * C::GR, lane);
+        for (int q = 0; q < Q; q += PFB)
+        {
+            GvGroup<C> cur[PFB];
+            #pragma unroll
+            for (int p = 0; p < PFB; ++p) cur[p] = nx[p];
+            #pragma unroll
+            for (int p = 0; p < PFB; ++p)
+                if (q + PFB + p < Q) nx[p].load_qp(tile + static_cast<size_t>(g0 + q + PFB + p) * C::GR, lane);
+            #pragma unroll
+            for (int p = 0; p < PFB; ++p)
+                if (q + p < Q) cur[p].template run_qp<NT>(bf, (g0 + q + p) * C::G, vacc, ts);
+        }
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) vacc[t].flush_add(acc[t]);
+    }
+    else
+    {
+        GvGroup<C> nx[PFB];
+        #pragma unroll
+        for (int p = 0; p < PFB; ++p)
+            if (p < Q) nx[p].load(tile + static_cast<size_t>(g0 + p) * C::GR, lane);
+        for (int q = 0; q < Q; q += PFB)
+        {
+            GvGroup<C> cur[PFB];
+            #pragma unroll
+            for (int p = 0; p < PFB; ++p) cur[p] = nx[p];
+            #pragma unroll
+            for (int p = 0; p < PFB; ++p)
+                if (q + PFB + p < Q) nx[p].load(tile + static_cast<size_t>(g0 + q + PFB + p) * C::GR, lane);
+            #pragma unroll
+            for (int p = 0; p < PFB; ++p)
+                if (q + p < Q) cur[p].template run_sm70_hi<NT>(bf, (g0 + q + p) * C::G, acc, ts);
+        }
+    }
+#else
     GvGroup<C> nx[PFB];
     #pragma unroll
     for (int p = 0; p < PFB; ++p)
@@ -206,6 +368,7 @@ __device__ __forceinline__ void gv_tile_part(const uint8_t* tile, const u32* bf,
         for (int p = 0; p < PFB; ++p)
             if (q + p < Q) cur[p].template run<NT>(bf, (g0 + q + p) * C::G, acc, ts);
     }
+#endif
 }
 
 #if DEC_I4PAIR
@@ -221,6 +384,83 @@ __device__ __forceinline__ void gv_i4pair_part(const uint8_t* tile, const u32* b
     const int lane = threadIdx.x & 31;
     const int NP = (g1 - g0) / 2;
     const uint8_t* base = tile + static_cast<size_t>(g0) * Int4v::GR;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    if constexpr (NT <= 2)
+    {
+        const int rlo = gr8_sm70::Mma16816Acc::qp_row_lo(lane);
+        gr8_sm70::Mma16816Acc vacc[NT];
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) vacc[t].zero();
+        u32 nw[2][4], ns0[2][2], ns2[2][2];
+        #pragma unroll
+        for (int p = 0; p < 2; ++p)
+            if (p < NP)
+            {
+                gv::ld_nc_v4(base + p * 576 + lane * 16, nw[p]);
+                gv::ld_nc_v2(base + p * 576 + 512 + rlo * 8, ns0[p]);
+                gv::ld_nc_v2(base + p * 576 + 512 + (rlo + 2) * 8, ns2[p]);
+            }
+        for (int q = 0; q < NP; q += 2)
+        {
+            u32 cw[2][4], cs0[2][2], cs2[2][2];
+            #pragma unroll
+            for (int p = 0; p < 2; ++p)
+            {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) cw[p][j] = nw[p][j];
+                cs0[p][0] = ns0[p][0]; cs0[p][1] = ns0[p][1];
+                cs2[p][0] = ns2[p][0]; cs2[p][1] = ns2[p][1];
+            }
+            #pragma unroll
+            for (int p = 0; p < 2; ++p)
+                if (q + 2 + p < NP)
+                {
+                    const uint8_t* b = base + static_cast<size_t>(q + 2 + p) * 576;
+                    gv::ld_nc_v4(b + lane * 16, nw[p]);
+                    gv::ld_nc_v2(b + 512 + rlo * 8, ns0[p]);
+                    gv::ld_nc_v2(b + 512 + (rlo + 2) * 8, ns2[p]);
+                }
+            #pragma unroll
+            for (int p = 0; p < 2; ++p)
+                if (q + p < NP)
+                {
+                    #pragma unroll
+                    for (int h = 0; h < 2; ++h)
+                    {
+                        const int ks = (g0 + 2 * (q + p) + h) * Int4v::G;
+                        u32 qa[2][4];
+                        #pragma unroll
+                        for (int i = 0; i < Int4v::G; ++i)
+                        {
+                            u32 a[4];
+                            Int4v::dec(&cw[p][2 * h + i], a);
+                            gr8_sm70::Mma16816Acc::prep_a(a[0], a[1], a[2], a[3], qa[i][0], qa[i][1], qa[i][2], qa[i][3]);
+                        }
+                        const float2 sc0 = Int4v::scale(cs0[p][h]), sc2 = Int4v::scale(cs2[p][h]);
+                        #pragma unroll
+                        for (int t = 0; t < NT; ++t)
+                        {
+                            gr8_sm70::Mma16816Acc g;
+                            g.zero();
+                            #pragma unroll
+                            for (int i = 0; i < Int4v::G; ++i)
+                            {
+                                u32 qb0, qb1;
+                                gr8_sm70::Mma16816Acc::prep_b(bf[t * ts + (ks + i) * 64], bf[t * ts + (ks + i) * 64 + 1], qb0, qb1);
+                                g.mma_prepared(qa[i][0], qa[i][1], qa[i][2], qa[i][3], qb0, qb1);
+                            }
+                            vacc[t].add_scaled(g, sc0.x, sc2.x, sc0.y, sc2.y);
+                        }
+                    }
+                }
+        }
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) vacc[t].flush_add(acc[t]);
+        if ((g1 - g0) & 1) gv_tile_part<Int4v, NT>(tile, bf, ts, g1 - 1, g1, acc);
+    }
+    else
+#endif
+    {
     u32 nw[2][4], ns[2][2];
     #pragma unroll
     for (int p = 0; p < 2; ++p)
@@ -272,6 +512,7 @@ __device__ __forceinline__ void gv_i4pair_part(const uint8_t* tile, const u32* b
             }
     }
     if ((g1 - g0) & 1) gv_tile_part<Int4v, NT>(tile, bf, ts, g1 - 1, g1, acc);
+    }
 }
 
 // in-place repack of an Int4 record tensor [OT][NG2][288] for k-part count ks (must equal the launch's ks).
@@ -385,8 +626,13 @@ __device__ __forceinline__ void gv_gemv_body(const uint8_t* stream, const u32* x
     __shared__ float4 red[32][32];   // [warp][lane]
     gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, red, cta, rscale);
 }
+#ifdef GR8_SM70
+#define GR8_GV_LB1024 __launch_bounds__(1024)
+#else
+#define GR8_GV_LB1024
+#endif
 template <class C, int NT = 1>
-__global__ void gv_gemv(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
+__global__ void GR8_GV_LB1024 gv_gemv(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
                         int M, void* y, int ystride, int odt, const float* rscale = nullptr)
 {
     gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, blockIdx.x, rscale);
@@ -424,7 +670,11 @@ struct GvMulti
     int n = 0, M = 0, ctas = 0;
     GvPart p[MAXP];
 };
+#ifdef GR8_SM70
+__global__ void __launch_bounds__(512) gv_multi(GvMulti a)
+#else
 __global__ void __launch_bounds__(1024) gv_multi(GvMulti a)
+#endif
 {
     __shared__ float4 red[32][32];
     int i = 0;
@@ -481,7 +731,7 @@ __device__ __forceinline__ void gv_gemv_slot_body(const uint8_t* stream, const u
 #endif
 }
 template <class C, int NT = 1>
-__global__ void gv_gemv_slot(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
+__global__ void GR8_GV_LB1024 gv_gemv_slot(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
                              int M, int ystride, dslot::Slot s)
 {
     gv_gemv_slot_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, ystride, s);

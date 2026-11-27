@@ -35,10 +35,7 @@ __device__ __forceinline__ float rnd_h(float x) { return __half2float(__float2ha
 
 __device__ __forceinline__ void mma16816_f16(float (&c)[4], u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1)
 {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    gr8_sm70::mma16816_f16(c, a0, a1, a2, a3, b0, b1);
 }
 
 __device__ __forceinline__ void had128(float (&v)[4], int lane)
@@ -60,11 +57,7 @@ __device__ __forceinline__ void had128(float (&v)[4], int lane)
     for (int e = 0; e < 4; ++e) v[e] *= SQ128;
 }
 
-__device__ __forceinline__ u32 round_e4m3(u32 r)
-{
-    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.rn.f16x2.e4m3x2 %0, t; }" : "=r"(r) : "r"(r));
-    return r;
-}
+__device__ __forceinline__ u32 round_e4m3(u32 r) { return gr8_sm70::round_f16x2_e4m3_bounded(r); }
 
 __device__ __forceinline__ u32 cb_mcg2(u32 w0, u32 w1)
 {
@@ -194,12 +187,31 @@ template <int BITS, int CB>
 __device__ __forceinline__ void fc1_hb_mma(const uint8_t* mw, int hb, int warp, int lane,
                                            const __half (&x_rot)[8][136], int mask, float (&c)[4])
 {
-    const int row0 = lane >> 2, col = lane & 3;
-    const bool act = ((mask >> row0) & 1) != 0;
     const size_t tb = static_cast<size_t>(32 * BITS);
     LaneDec<BITS, CB> tl;
     tl.init(lane);
     const int ks0 = hb * 8;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    const int r = (lane & 3) | ((lane & 16) >> 2), qp = (lane >> 2) & 3;
+    const bool act = ((mask >> r) & 1) != 0;
+    gr8_sm70::Mma16816Acc acc;
+    acc.zero();
+    #pragma unroll
+    for (int p = 0; p < 8; ++p)
+    {
+        const uint8_t* tile = mw + (static_cast<size_t>(ks0 + p) * 8 + warp) * tb;
+        const u32 raw = tl.loadw(tile, lane);
+        u32 f0[2], f1[2];
+        tl.decodew(raw, f0, f1);
+        uint32_t qa0_0, qa0_1, qa1_0, qa1_1;
+        gr8_sm70::Mma16816Acc::prep_a(f0[0], f1[0], f0[1], f1[1], qa0_0, qa0_1, qa1_0, qa1_1);
+        const uint2 bv = act ? *reinterpret_cast<const uint2*>(x_rot[r] + p * 16 + 4 * qp) : make_uint2(0u, 0u);
+        acc.mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, bv.x, bv.y);
+    }
+    acc.flush_add(c);
+#else
+    const int row0 = lane >> 2, col = lane & 3;
+    const bool act = ((mask >> row0) & 1) != 0;
     #pragma unroll
     for (int p = 0; p < 8; ++p)
     {
@@ -211,17 +223,37 @@ __device__ __forceinline__ void fc1_hb_mma(const uint8_t* mw, int hb, int warp, 
         const u32 b1 = act ? *reinterpret_cast<const u32*>(x_rot[row0] + p * 16 + 2 * col + 8) : 0u;
         mma16816_f16(c, f0[0], f1[0], f0[1], f1[1], b0, b1);
     }
+#endif
 }
 
 template <int BITS, int CB>
 __device__ __forceinline__ void fc2_ntile_mma(const uint8_t* mw, int n_tile, int lane,
                                               const __half (&x2)[8][136], int mask, float (&c)[4])
 {
-    const int row0 = lane >> 2, col = lane & 3;
-    const bool act = ((mask >> row0) & 1) != 0;
     const size_t tb = static_cast<size_t>(32 * BITS);
     LaneDec<BITS, CB> tl;
     tl.init(lane);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    const int r = (lane & 3) | ((lane & 16) >> 2), qp = (lane >> 2) & 3;
+    const bool act = ((mask >> r) & 1) != 0;
+    gr8_sm70::Mma16816Acc acc;
+    acc.zero();
+    #pragma unroll
+    for (int ks = 0; ks < 8; ++ks)
+    {
+        const uint8_t* tile = mw + (static_cast<size_t>(n_tile) * 8 + ks) * tb;
+        const u32 raw = tl.loadw(tile, lane);
+        u32 f0[2], f1[2];
+        tl.decodew(raw, f0, f1);
+        uint32_t qa0_0, qa0_1, qa1_0, qa1_1;
+        gr8_sm70::Mma16816Acc::prep_a(f0[0], f1[0], f0[1], f1[1], qa0_0, qa0_1, qa1_0, qa1_1);
+        const uint2 bv = act ? *reinterpret_cast<const uint2*>(x2[r] + ks * 16 + 4 * qp) : make_uint2(0u, 0u);
+        acc.mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, bv.x, bv.y);
+    }
+    acc.flush_add(c);
+#else
+    const int row0 = lane >> 2, col = lane & 3;
+    const bool act = ((mask >> row0) & 1) != 0;
     #pragma unroll
     for (int ks = 0; ks < 8; ++ks)
     {
@@ -233,6 +265,7 @@ __device__ __forceinline__ void fc2_ntile_mma(const uint8_t* mw, int n_tile, int
         const u32 b1 = act ? *reinterpret_cast<const u32*>(x2[row0] + ks * 16 + 2 * col + 8) : 0u;
         mma16816_f16(c, f0[0], f1[0], f0[1], f1[1], b0, b1);
     }
+#endif
 }
 
 struct Tr3Args
@@ -265,13 +298,7 @@ __device__ __forceinline__ u64 ld_nc64_tr3(const void* p)
     asm volatile("ld.global.nc.u64 %0, [%1];" : "=l"(v) : "l"(p));
     return v;
 }
-__device__ __forceinline__ uint4 ld_nc128_tr3(const void* p)
-{
-    uint4 v;
-    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
-    return v;
-}
+__device__ __forceinline__ uint4 ld_nc128_tr3(const void* p) { return gr8_sm70::ld_nc_uint4(p); }
 
 template <int BITS>
 __device__ __forceinline__ u32 trw_chunk_rt(const u64 (&w)[3], int p)
@@ -492,8 +519,47 @@ __device__ __forceinline__ void pmcgx_fc1_hb_wide(const uint8_t* mw, int hb, int
                                                   const __half (&x_rot)[NT * 8][136], const int (&masks)[NT], int nt_here,
                                                   float (&c)[NT][4])
 {
-    const int row0 = lane >> 2, col = lane & 3;
     const int prev_lane = (lane + 31) & 31;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    const int r = (lane & 3) | ((lane & 16) >> 2), qp = (lane >> 2) & 3;
+    gr8_sm70::Mma16816Acc acc[NT <= 2 ? NT : 1];
+    if constexpr (NT <= 2)
+    {
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) acc[t].zero();
+    }
+    auto step = [&](const u32 (&f0)[2], const u32 (&f1)[2], int kp) {
+        uint32_t qa0_0, qa0_1, qa1_0, qa1_1;
+        gr8_sm70::Mma16816Acc::prep_a(f0[0], f1[0], f0[1], f1[1], qa0_0, qa0_1, qa1_0, qa1_1);
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            if (t < nt_here)
+            {
+                const bool act = ((masks[t] >> r) & 1) != 0;
+                const uint2 bv = act ? *reinterpret_cast<const uint2*>(x_rot[t * 8 + r] + kp * 16 + 4 * qp) : make_uint2(0u, 0u);
+                if constexpr (NT <= 2) acc[t].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, bv.x, bv.y);
+                else gr8_sm70::Mma16816Acc::mma_prepared_add(c[t], qa0_0, qa0_1, qa1_0, qa1_1, bv.x, bv.y);
+            }
+        }
+    };
+#else
+    const int row0 = lane >> 2, col = lane & 3;
+    auto step = [&](const u32 (&f0)[2], const u32 (&f1)[2], int kp) {
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            if (t < nt_here)
+            {
+                const bool act = ((masks[t] >> row0) & 1) != 0;
+                const __half* xr = x_rot[t * 8 + row0] + kp * 16 + 2 * col;
+                const u32 b0 = act ? *reinterpret_cast<const u32*>(xr) : 0u;
+                const u32 b1 = act ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
+                mma16816_f16(c[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
+            }
+        }
+    };
+#endif
     if constexpr (BITS == 4)
     {
         const uint8_t* wg = mw + static_cast<size_t>(hb) * 8192 + warp * 1024 + lane * 16;
@@ -509,19 +575,7 @@ __device__ __forceinline__ void pmcgx_fc1_hb_wide(const uint8_t* mw, int hb, int
                 const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
                 u32 f0[2], f1[2];
                 decode_pmcgx_m<4>((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
-                const int kp = h * 4 + p;
-                #pragma unroll
-                for (int t = 0; t < NT; ++t)
-                {
-                    if (t < nt_here)
-                    {
-                        const bool act = ((masks[t] >> row0) & 1) != 0;
-                        const __half* xr = x_rot[t * 8 + row0] + kp * 16 + 2 * col;
-                        const u32 b0 = act ? *reinterpret_cast<const u32*>(xr) : 0u;
-                        const u32 b1 = act ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
-                        mma16816_f16(c[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
-                    }
-                }
+                step(f0, f1, h * 4 + p);
             }
         }
     }
@@ -538,20 +592,16 @@ __device__ __forceinline__ void pmcgx_fc1_hb_wide(const uint8_t* mw, int hb, int
             const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
             u32 f0[2], f1[2];
             decode_pmcgx_m<BITS>((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
-            #pragma unroll
-            for (int t = 0; t < NT; ++t)
-            {
-                if (t < nt_here)
-                {
-                    const bool act = ((masks[t] >> row0) & 1) != 0;
-                    const __half* xr = x_rot[t * 8 + row0] + p * 16 + 2 * col;
-                    const u32 b0 = act ? *reinterpret_cast<const u32*>(xr) : 0u;
-                    const u32 b1 = act ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
-                    mma16816_f16(c[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
-                }
-            }
+            step(f0, f1, p);
         }
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    if constexpr (NT <= 2)
+    {
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) if (t < nt_here) acc[t].flush_add(c[t]);
+    }
+#endif
 }
 
 template <int BITS, int NT>
@@ -559,8 +609,47 @@ __device__ __forceinline__ void pmcgx_fc2_ntile_wide(const uint8_t* mw, int n_ti
                                                      const __half* x2_b_base, const int (&masks)[NT], int nt_here,
                                                      float (&c)[NT][4])
 {
-    const int row0 = lane >> 2, col = lane & 3;
     const int prev_lane = (lane + 31) & 31;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    const int r = (lane & 3) | ((lane & 16) >> 2), qp = (lane >> 2) & 3;
+    gr8_sm70::Mma16816Acc acc[NT <= 2 ? NT : 1];
+    if constexpr (NT <= 2)
+    {
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) acc[t].zero();
+    }
+    auto step = [&](const u32 (&f0)[2], const u32 (&f1)[2], int ks) {
+        uint32_t qa0_0, qa0_1, qa1_0, qa1_1;
+        gr8_sm70::Mma16816Acc::prep_a(f0[0], f1[0], f0[1], f1[1], qa0_0, qa0_1, qa1_0, qa1_1);
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            if (t < nt_here)
+            {
+                const bool act = ((masks[t] >> r) & 1) != 0;
+                const uint2 bv = act ? *reinterpret_cast<const uint2*>(x2_b_base + (t * 8 + r) * 136 + ks * 16 + 4 * qp) : make_uint2(0u, 0u);
+                if constexpr (NT <= 2) acc[t].mma_prepared(qa0_0, qa0_1, qa1_0, qa1_1, bv.x, bv.y);
+                else gr8_sm70::Mma16816Acc::mma_prepared_add(c[t], qa0_0, qa0_1, qa1_0, qa1_1, bv.x, bv.y);
+            }
+        }
+    };
+#else
+    const int row0 = lane >> 2, col = lane & 3;
+    auto step = [&](const u32 (&f0)[2], const u32 (&f1)[2], int ks) {
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            if (t < nt_here)
+            {
+                const bool act = ((masks[t] >> row0) & 1) != 0;
+                const __half* xr = x2_b_base + (t * 8 + row0) * 136 + ks * 16 + 2 * col;
+                const u32 b0 = act ? *reinterpret_cast<const u32*>(xr) : 0u;
+                const u32 b1 = act ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
+                mma16816_f16(c[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
+            }
+        }
+    };
+#endif
     if constexpr (BITS == 4)
     {
         const uint8_t* wg = mw + static_cast<size_t>(n_tile) * 1024 + lane * 16;
@@ -576,19 +665,7 @@ __device__ __forceinline__ void pmcgx_fc2_ntile_wide(const uint8_t* mw, int n_ti
                 const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
                 u32 f0[2], f1[2];
                 decode_pmcgx_m<4>((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
-                const int ks = h * 4 + p;
-                #pragma unroll
-                for (int t = 0; t < NT; ++t)
-                {
-                    if (t < nt_here)
-                    {
-                        const bool act = ((masks[t] >> row0) & 1) != 0;
-                        const __half* xr = x2_b_base + (t * 8 + row0) * 136 + ks * 16 + 2 * col;
-                        const u32 b0 = act ? *reinterpret_cast<const u32*>(xr) : 0u;
-                        const u32 b1 = act ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
-                        mma16816_f16(c[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
-                    }
-                }
+                step(f0, f1, h * 4 + p);
             }
         }
     }
@@ -605,20 +682,16 @@ __device__ __forceinline__ void pmcgx_fc2_ntile_wide(const uint8_t* mw, int n_ti
             const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
             u32 f0[2], f1[2];
             decode_pmcgx_m<BITS>((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
-            #pragma unroll
-            for (int t = 0; t < NT; ++t)
-            {
-                if (t < nt_here)
-                {
-                    const bool act = ((masks[t] >> row0) & 1) != 0;
-                    const __half* xr = x2_b_base + (t * 8 + row0) * 136 + p * 16 + 2 * col;
-                    const u32 b0 = act ? *reinterpret_cast<const u32*>(xr) : 0u;
-                    const u32 b1 = act ? *reinterpret_cast<const u32*>(xr + 8) : 0u;
-                    mma16816_f16(c[t], f0[0], f1[0], f0[1], f1[1], b0, b1);
-                }
-            }
+            step(f0, f1, p);
         }
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    if constexpr (NT <= 2)
+    {
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) if (t < nt_here) acc[t].flush_add(c[t]);
+    }
+#endif
 }
 
 // Wide-load multi-tile PMCGX FC1 using pre-rotated x_had and block scales v1b.

@@ -195,7 +195,9 @@ if [ "${GR8_TESTS:-1}" != only ] && [ "${GR8_TESTS:-1}" != ship ]; then
   WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
   if [ "${BUNDLE_LIBS:-0}" = 1 ]; then
     mkdir -p "$OUT/lib"
-    cp -L /usr/local/cuda/lib64/libcublas.so.13 /usr/local/cuda/lib64/libcublasLt.so.13 "$OUT/lib/"
+    for f in /usr/local/cuda/lib64/libcublas.so.1[23] /usr/local/cuda/lib64/libcublasLt.so.1[23]; do
+      [ -e "$f" ] && cp -L "$f" "$OUT/lib/"
+    done
   fi
   strings "$OUT/g6m4" | grep -q "G6_CP_PF_HASH2 build" && echo "HASH2 build marker: present"
   md5sum "$OUT/g6m4" "$OUT/m4sim"
@@ -210,6 +212,7 @@ mkdir -p "$OUT/obj"
 export GR8_NVCC_CACHE_LOG="$OUT/obj/nvcc_cache.tests.calls"
 rm -f "$GR8_NVCC_CACHE_LOG"
 GEN="-gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a}"
+case "${ARCH:-121a}" in 7*) GEN="-DGR8_SM70=1 $GEN" ;; esac
 S2="$GEN $K1H2_FLAGS -DG6_NR=4 -DDEC_S2"
 TL="$OUT/obj/tests"
 rm -rf "$TL" && mkdir -p "$TL"

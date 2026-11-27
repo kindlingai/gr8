@@ -23,6 +23,7 @@
 #include "../knobs-rs/gr8_knobs.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include "../kernels/sm70_compat.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cub/block/block_scan.cuh>
@@ -861,7 +862,12 @@ __global__ void __launch_bounds__(256) kp_scores_pf(Input input,int start,int n,
     if(p0>=max_nvis)return;
     const int npools=min(32,max_nvis-p0);
     __shared__ __align__(16) float ks[32][IDIM+4];
+#ifdef GR8_SM70
+    extern __shared__ __align__(16) half qs_dyn[];
+    auto qs = reinterpret_cast<half (*)[IHEADS][IDIM+8]>(qs_dyn);
+#else
     __shared__ __align__(16) half qs[4][IHEADS][IDIM+8];
+#endif
     __shared__ float ws[4][IHEADS];
     __shared__ int nvis_s[4];
     for(int i=t;i<npools*IDIM;i+=256){
@@ -1594,8 +1600,7 @@ __global__ void __launch_bounds__(128) value_project_tc(Input input,int start,in
 template<bool VPROJ> struct MlaProjB { using T=nvcuda::wmma::row_major; };
 template<> struct MlaProjB<true> { using T=nvcuda::wmma::col_major; };
 __device__ __forceinline__ void mla_cp16(void* s,const void* g,bool v){
-    const unsigned sa=(unsigned)__cvta_generic_to_shared(s);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"::"r"(sa),"l"(g),"r"(v?16:0));
+    gr8_sm70::cp_async_cg_16_pred(s, g, v ? 16 : 0);
 }
 template<bool VPROJ,class Input>
 __global__ void __launch_bounds__(128) mla_proj2(Input input,int start,int n,const half* ctxh,half* qh){
@@ -1616,7 +1621,7 @@ __global__ void __launch_bounds__(128) mla_proj2(Input input,int start,int n,con
             const bool v=r0+rr<n;
             mla_cp16(A+rr*BK+kk,xb+((int64_t)(xrow0+r0+(v?rr:0))*a.heads+h)*K+st*BK+kk,v);
         }
-        asm volatile("cp.async.commit_group;\n"::);
+        gr8_sm70::cp_async_commit();
     };
     uint4 wreg[WPT];
     auto ldW=[&](int st){
@@ -1646,8 +1651,8 @@ __global__ void __launch_bounds__(128) mla_proj2(Input input,int start,int n,con
     for(int st=0;st<NST;++st){
         const int cur=st&1;
         if(st+1<NST){ldX(cur^1,st+1);ldW(st+1);}
-        else asm volatile("cp.async.commit_group;\n"::);
-        asm volatile("cp.async.wait_group 1;\n"::);
+        else gr8_sm70::cp_async_commit();
+        gr8_sm70::cp_async_wait<1>();
         __syncthreads();
         const half* A=reinterpret_cast<const half*>(sm+cur*SM_ST);
         const half* B=A+XA;
@@ -1664,7 +1669,7 @@ __global__ void __launch_bounds__(128) mla_proj2(Input input,int start,int n,con
         __syncthreads();
         if(st+1<NST)stW(cur^1);
     }
-    asm volatile("cp.async.wait_group 0;\n"::);
+    gr8_sm70::cp_async_wait<0>();
     __syncthreads();
     float* O=reinterpret_cast<float*>(sm);
     #pragma unroll
@@ -1698,14 +1703,14 @@ constexpr int MLA2_SMEM_H16=(16*(LAT+8)+32*(LAT+8)+2*16*32)*sizeof(half)+
     (16*32+16*3)*sizeof(float)+TOP*sizeof(int)+((MLA2_NT+15)/16)*16;
 static_assert(MLA2_SMEM_H16==63504,"H16 sparse MLA shared memory layout");
 __device__ __forceinline__ void ldsm4(uint32_t addr,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d){
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];":"=r"(a),"=r"(b),"=r"(c),"=r"(d):"r"(addr):"memory");
+    gr8_sm70::ldmatrix_x4_addr(a,b,c,d,addr);
 }
 __device__ __forceinline__ void ldsm4t(uint32_t addr,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d){
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];":"=r"(a),"=r"(b),"=r"(c),"=r"(d):"r"(addr):"memory");
+    gr8_sm70::ldmatrix_x4_trans_addr(a,b,c,d,addr);
 }
 __device__ __forceinline__ void mma16816(float* c,uint32_t a0,uint32_t a1,uint32_t a2,uint32_t a3,uint32_t b0,uint32_t b1){
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+    float (&cr)[4] = *reinterpret_cast<float (*)[4]>(c);
+    gr8_sm70::mma16816_f16(cr,a0,a1,a2,a3,b0,b1);
 }
 // Raw (unconverted) 8 latent elements of one cached row: BF16 = 16 B; FP8 = 2 x 4 B + the 128-element group scale;
 // INT4 = 4 B + the 32-element group scale.
@@ -2033,7 +2038,16 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
             if(kp_tc==3)fa_pf::kp_scores_tc_stream<2><<<dim3(np/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,stride,p_off);
             else if(kp_tc>=2)fa_pf::kp_scores_tc<2><<<dim3(np/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,stride,p_off);
             else if(kp_tc==1)fa_pf::kp_scores_tc<1><<<dim3(np/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,stride,p_off);
-            else fa_pf::kp_scores_pf<<<dim3(np/32,(n+15)/16),256,0,stream>>>(a,start,n,w->ps,stride,p_off);
+            else {
+#ifdef GR8_SM70
+                constexpr int KP_QS_SMEM = 4 * fa::IHEADS * (fa::IDIM + 8) * (int)sizeof(half);
+                static const cudaError_t kp_attr = cudaFuncSetAttribute(fa_pf::kp_scores_pf<G6Attn>, cudaFuncAttributeMaxDynamicSharedMemorySize, KP_QS_SMEM);
+                (void)kp_attr;
+                fa_pf::kp_scores_pf<<<dim3(np/32,(n+15)/16),256,KP_QS_SMEM,stream>>>(a,start,n,w->ps,stride,p_off);
+#else
+                fa_pf::kp_scores_pf<<<dim3(np/32,(n+15)/16),256,0,stream>>>(a,start,n,w->ps,stride,p_off);
+#endif
+            }
     };
     // past KP_TILE pools, key tiles with a running top-512 (kpool.cuh kp_select_tile): the same lists, ties included
     auto select = [&](int start, int n) {
