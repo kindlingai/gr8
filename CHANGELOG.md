@@ -6,6 +6,13 @@ for versioning, release gates, and optional machine-readable specs in [`releases
 
 ---
 
+## [1.3.1](https://github.com/kindlingai/gr8/compare/v1.3.0...v1.3.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* **test:** avoid colliding with real v1.3.0 in test_releases.py ([#631](https://github.com/kindlingai/gr8/issues/631)) ([fedcef4](https://github.com/kindlingai/gr8/commit/fedcef422275e2c93b0b350bc458b36304f6fac9))
+
 ## [1.3.0](https://github.com/kindlingai/gr8/compare/v1.2.0...v1.3.0) (2026-11-26)
 
 
