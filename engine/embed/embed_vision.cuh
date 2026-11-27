@@ -104,7 +104,7 @@ __global__ void __launch_bounds__(256) k_q3v_pos_add(
     }
 }
 
-// Standard nn.LayerNorm(D, eps=1e-6) with weight and bias (works for D = 1024, 1152, 4096, 4608, etc.).
+// Standard nn.LayerNorm(D, eps=1e-6) with weight and bias (single-pass uint4 register-cached fast path for D <= 2048).
 // Grid: (M), Block: 256.
 __global__ void __launch_bounds__(256) k_q3v_layernorm(
     const bf16* __restrict__ x, const bf16* __restrict__ w, const bf16* __restrict__ b,
@@ -114,6 +114,51 @@ __global__ void __launch_bounds__(256) k_q3v_layernorm(
     if (m >= M) return;
     const bf16* xr = x + size_t(m) * D;
     bf16* yr = y + size_t(m) * D;
+
+    if (D <= 2048 && (D & 7) == 0) {
+        const int d = threadIdx.x * 8;
+        float vals[8] = {};
+        float sum = 0.0f;
+        const bool active = (d < D);
+        if (active) {
+            const uint4 r = *reinterpret_cast<const uint4*>(xr + d);
+            const float2 a0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.x));
+            const float2 a1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.y));
+            const float2 a2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.z));
+            const float2 a3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.w));
+            vals[0] = a0.x; vals[1] = a0.y; vals[2] = a1.x; vals[3] = a1.y;
+            vals[4] = a2.x; vals[5] = a2.y; vals[6] = a3.x; vals[7] = a3.y;
+            sum = (vals[0] + vals[1]) + (vals[2] + vals[3]) + (vals[4] + vals[5]) + (vals[6] + vals[7]);
+        }
+        const float mean = emb_block_sum256(sum, red) / static_cast<float>(D);
+        float vs = 0.0f;
+        if (active) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                vals[i] -= mean;
+                vs += vals[i] * vals[i];
+            }
+        }
+        const float rstd = rsqrtf(emb_block_sum256(vs, red) / static_cast<float>(D) + eps);
+        if (active) {
+            const uint4 wr = *reinterpret_cast<const uint4*>(w + d);
+            const uint4 br = *reinterpret_cast<const uint4*>(b + d);
+            const float2 w0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.x));
+            const float2 w1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.y));
+            const float2 w2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.z));
+            const float2 w3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.w));
+            const float2 b0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&br.x));
+            const float2 b1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&br.y));
+            const float2 b2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&br.z));
+            const float2 b3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&br.w));
+            *reinterpret_cast<uint4*>(yr + d) = make_uint4(
+                emb_pack_bf2(vals[0] * rstd * w0.x + b0.x, vals[1] * rstd * w0.y + b0.y),
+                emb_pack_bf2(vals[2] * rstd * w1.x + b1.x, vals[3] * rstd * w1.y + b1.y),
+                emb_pack_bf2(vals[4] * rstd * w2.x + b2.x, vals[5] * rstd * w2.y + b2.y),
+                emb_pack_bf2(vals[6] * rstd * w3.x + b3.x, vals[7] * rstd * w3.y + b3.y));
+        }
+        return;
+    }
 
     float sum = 0.0f;
     for (int d = threadIdx.x * 4; d < D; d += 256 * 4) {
@@ -152,11 +197,10 @@ __global__ void __launch_bounds__(256) k_q3v_layernorm(
     }
 }
 
-// 2D axial rotate_half RoPE applied in-place to Q and K inside qkv[N_img, 3, heads, hd].
-// Matches Qwen3VLVisionRotaryEmbedding (dim = hd / 2, theta = 10000): first hd/4 pairs use row, next hd/4 use col.
-// Grid: (N_img, heads), Block: 64 (threads j < hd/2 handle pair (j, j + hd/2) for both Q and K).
+// 2D axial rotate_half RoPE applied in-place to Q and K inside qkv[N_img, 3, heads, hd] using precomputed inv_freq.
+// Grid: (N_img, heads), Block: 64.
 __global__ void __launch_bounds__(64) k_q3v_rope(
-    bf16* __restrict__ qkv, int vit_h, int vit_w, int heads, int hd) {
+    bf16* __restrict__ qkv, const float* __restrict__ inv_freq_tbl, int vit_h, int vit_w, int heads, int hd) {
     const int p = blockIdx.x;
     const int h = blockIdx.y;
     const int j = threadIdx.x;
@@ -168,9 +212,8 @@ __global__ void __launch_bounds__(64) k_q3v_rope(
     const int rf = hd >> 2; // 16 for hd=64 (2B), 18 for hd=72 (8B)
     const int freq_idx = (j < rf) ? j : (j - rf);
     const int coord = (j < rf) ? pr : pc;
-    const float inv_freq = 1.0f / powf(10000.0f, static_cast<float>(2 * freq_idx) / static_cast<float>(half));
     float s = 0.0f, c = 0.0f;
-    __sincosf(static_cast<float>(coord) * inv_freq, &s, &c);
+    __sincosf(static_cast<float>(coord) * inv_freq_tbl[freq_idx], &s, &c);
 
     const int H_v = heads * hd;
     bf16* row = qkv + size_t(p) * (3 * H_v);
@@ -470,6 +513,7 @@ struct VisionRunner {
     int* d_cu_patches = nullptr;
     int* d_img_of_patch = nullptr;
     int2* d_img_qtiles = nullptr;
+    float* d_vit_inv_freq = nullptr;
     int cap_imgs = 0;
     int cap_qtiles = 0;
 
@@ -487,6 +531,16 @@ struct VisionRunner {
     void init(const EmbedWeights& weights) {
         W = &weights;
         d_ds_out.assign(weights.deepstack_mergers.size(), nullptr);
+        if (weights.cfg.has_vision) {
+            const int half = weights.cfg.vit_head_dim / 2;
+            const int rf = weights.cfg.vit_head_dim / 4;
+            std::vector<float> h_inv(static_cast<size_t>(rf), 0.f);
+            for (int k = 0; k < rf; ++k) {
+                h_inv[size_t(k)] = static_cast<float>(1.0 / std::pow(10000.0, double(2 * k) / double(half)));
+            }
+            EMB_CK(cudaMalloc(&d_vit_inv_freq, h_inv.size() * sizeof(float)));
+            EMB_CK(cudaMemcpy(d_vit_inv_freq, h_inv.data(), h_inv.size() * sizeof(float), cudaMemcpyHostToDevice));
+        }
     }
 
     void release() {
@@ -495,6 +549,7 @@ struct VisionRunner {
         fre(d_cu_patches);
         fre(d_img_of_patch);
         fre(d_img_qtiles);
+        fre(d_vit_inv_freq);
         fre(d_patches);
         fre(d_x);
         fre(d_ln);
@@ -567,9 +622,13 @@ struct VisionRunner {
             // Patches are already ordered in 2x2 merge blocks, so [total_patches, H_v] IS [total_tokens, 4*H_v]!
             k_q3v_layernorm<<<total_patches, 256, 0, st>>>(src_x, M.norm_w, M.norm_b, d_m_ln, total_patches, H_v, 1e-6f);
         }
-        linear_forward(d_m_ln, M.fc1_w, M.fc1_b, d_m_fc1, total_tokens, false, ws, st);
-        const size_t n_fc1 = size_t(total_tokens) * D_m;
-        k_q3v_gelu_exact<<<static_cast<unsigned>((n_fc1 + 255) / 256), 256, 0, st>>>(d_m_fc1, n_fc1);
+        if (M.fc1_w.fmt == FMT_TRELLIS) {
+            linear_forward(d_m_ln, M.fc1_w, M.fc1_b, d_m_fc1, total_tokens, false, ws, st, ACT_GELU_EXACT);
+        } else {
+            linear_forward(d_m_ln, M.fc1_w, M.fc1_b, d_m_fc1, total_tokens, false, ws, st);
+            const size_t n_fc1 = size_t(total_tokens) * D_m;
+            k_q3v_gelu_exact<<<static_cast<unsigned>((n_fc1 + 255) / 256), 256, 0, st>>>(d_m_fc1, n_fc1);
+        }
         linear_forward(d_m_fc1, M.fc2_w, M.fc2_b, dst_out, total_tokens, false, ws, st);
     }
 
@@ -666,8 +725,8 @@ struct VisionRunner {
                 for (const auto& ir : imgs) {
                     const int n_p = ir.span->vit_h * ir.span->vit_w;
                     k_q3v_rope<<<dim3(n_p, c.vit_heads), 64, 0, st>>>(
-                        d_qkv + size_t(ir.patch_off) * (3 * H_v), ir.span->vit_h, ir.span->vit_w,
-                        c.vit_heads, c.vit_head_dim);
+                        d_qkv + size_t(ir.patch_off) * (3 * H_v), d_vit_inv_freq,
+                        ir.span->vit_h, ir.span->vit_w, c.vit_heads, c.vit_head_dim);
                 }
                 if (c.vit_head_dim == 64) {
                     const dim3 ag(num_qtiles, c.vit_heads);
@@ -685,9 +744,13 @@ struct VisionRunner {
                 linear_forward(d_attn, B.proj_w, B.proj_b, d_x, total_patches, true, ws, st);
 
                 k_q3v_layernorm<<<total_patches, 256, 0, st>>>(d_x, B.norm2_w, B.norm2_b, d_ln, total_patches, H_v, 1e-6f);
-                linear_forward(d_ln, B.fc1_w, B.fc1_b, d_mlp, total_patches, false, ws, st);
-                const size_t n_mlp = size_t(total_patches) * I_v;
-                k_q3v_gelu_tanh<<<static_cast<unsigned>((n_mlp + 255) / 256), 256, 0, st>>>(d_mlp, n_mlp);
+                if (B.fc1_w.fmt == FMT_TRELLIS) {
+                    linear_forward(d_ln, B.fc1_w, B.fc1_b, d_mlp, total_patches, false, ws, st, ACT_GELU_TANH);
+                } else {
+                    linear_forward(d_ln, B.fc1_w, B.fc1_b, d_mlp, total_patches, false, ws, st);
+                    const size_t n_mlp = size_t(total_patches) * I_v;
+                    k_q3v_gelu_tanh<<<static_cast<unsigned>((n_mlp + 255) / 256), 256, 0, st>>>(d_mlp, n_mlp);
+                }
                 linear_forward(d_mlp, B.fc2_w, B.fc2_b, d_x, total_patches, true, ws, st);
 
                 for (size_t ds = 0; ds < c.deepstack_indexes.size(); ++ds) {

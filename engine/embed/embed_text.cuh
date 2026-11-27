@@ -44,6 +44,8 @@ __device__ __forceinline__ float emb_block_sum256(float v, float* red) {
 }
 
 // Qwen3VLTextRMSNorm: y = w * bf16(x_f32 * rsqrt(mean(x_f32^2) + eps)). Grid: (M), Block: 256.
+// Single-pass uint4 (8 BF16/thread) register-cached fast path for H <= 4096 (covers 2B H=2048 and 8B H=4096),
+// eliminating the second DRAM read of x.
 __global__ void __launch_bounds__(256) k_q3_rmsnorm(
     const bf16* __restrict__ x, const bf16* __restrict__ w, bf16* __restrict__ y,
     int M, int H, float eps) {
@@ -52,6 +54,54 @@ __global__ void __launch_bounds__(256) k_q3_rmsnorm(
     if (m >= M) return;
     const bf16* xr = x + size_t(m) * H;
     bf16* yr = y + size_t(m) * H;
+
+    if (H <= 4096 && (H & 7) == 0) {
+        // Up to 2 uint4 loads (16 BF16) per thread -> stays in registers, single DRAM read of x!
+        uint4 xr_buf[2];
+        int nvec = 0;
+        float ss = 0.f;
+        #pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            const int d = (threadIdx.x + pass * 256) * 8;
+            if (d < H) {
+                const uint4 r = *reinterpret_cast<const uint4*>(xr + d);
+                xr_buf[pass] = r;
+                nvec = pass + 1;
+                const float2 a0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.x));
+                const float2 a1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.y));
+                const float2 a2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.z));
+                const float2 a3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.w));
+                ss += (a0.x * a0.x + a0.y * a0.y) + (a1.x * a1.x + a1.y * a1.y) +
+                      (a2.x * a2.x + a2.y * a2.y) + (a3.x * a3.x + a3.y * a3.y);
+            }
+        }
+        const float rs = rsqrtf(emb_block_sum256(ss, red) / float(H) + eps);
+        #pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass < nvec) {
+                const int d = (threadIdx.x + pass * 256) * 8;
+                const uint4 r = xr_buf[pass];
+                const uint4 wr = *reinterpret_cast<const uint4*>(w + d);
+                const float2 a0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.x));
+                const float2 a1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.y));
+                const float2 a2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.z));
+                const float2 a3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.w));
+                const float2 w0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.x));
+                const float2 w1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.y));
+                const float2 w2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.z));
+                const float2 w3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.w));
+                auto norm_mul = [&](float v, float wt) {
+                    return __bfloat162float(__float2bfloat16_rn(v * rs)) * wt;
+                };
+                *reinterpret_cast<uint4*>(yr + d) = make_uint4(
+                    emb_pack_bf2(norm_mul(a0.x, w0.x), norm_mul(a0.y, w0.y)),
+                    emb_pack_bf2(norm_mul(a1.x, w1.x), norm_mul(a1.y, w1.y)),
+                    emb_pack_bf2(norm_mul(a2.x, w2.x), norm_mul(a2.y, w2.y)),
+                    emb_pack_bf2(norm_mul(a3.x, w3.x), norm_mul(a3.y, w3.y)));
+            }
+        }
+        return;
+    }
 
     float ss = 0.f;
     for (int d = threadIdx.x * 4; d < H; d += 256 * 4) {
@@ -68,7 +118,6 @@ __global__ void __launch_bounds__(256) k_q3_rmsnorm(
         const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.y));
         const float2 wa = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.x));
         const float2 wb = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.y));
-        // Match modeling_qwen3_vl.py: self.weight * hidden_states.to(bf16)
         const float o0 = __bfloat162float(__float2bfloat16_rn(a.x * rs)) * wa.x;
         const float o1 = __bfloat162float(__float2bfloat16_rn(a.y * rs)) * wa.y;
         const float o2 = __bfloat162float(__float2bfloat16_rn(b.x * rs)) * wb.x;
@@ -653,7 +702,12 @@ public:
         alloc(&d_attn, size_t(max_tokens) * c.num_q_heads * c.head_dim);
         alloc(&d_gate, size_t(max_tokens) * c.intermediate_size);
         alloc(&d_up, size_t(max_tokens) * c.intermediate_size);
-        alloc(&d_act, size_t(max_tokens) * c.intermediate_size);
+        // Only allocate d_act if any layer's down_proj is non-Trellis (saves 201 MiB on 2B / 402 MiB on 8B in native mode!).
+        bool need_act = false;
+        for (const auto& L : weights.text_layers) {
+            if (L.down_proj.fmt != FMT_TRELLIS) { need_act = true; break; }
+        }
+        if (need_act) alloc(&d_act, size_t(max_tokens) * c.intermediate_size);
 
         alloc(&d_toks, size_t(max_tokens));
         alloc(&d_mrope, size_t(max_tokens));
@@ -677,8 +731,9 @@ public:
         if (!W) return 0;
         const auto& c = W->cfg;
         size_t b = ws.x_rot_bytes + ws.acc_floats * sizeof(float);
+        const int n_mlp_bufs = d_act ? 3 : 2;
         b += size_t(max_tokens) * (2 * c.hidden_size + 2 * c.num_q_heads * c.head_dim +
-                                   2 * c.num_kv_heads * c.head_dim + 3 * c.intermediate_size) * sizeof(bf16);
+                                   2 * c.num_kv_heads * c.head_dim + n_mlp_bufs * c.intermediate_size) * sizeof(bf16);
         b += size_t(max_batch) * c.embedding_dim * sizeof(float);
         return b;
     }

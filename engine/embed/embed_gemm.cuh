@@ -167,14 +167,38 @@ struct EmbTr3Lane4 {
 
 // ------------------------------------------------------------------------------------------------ Epilogue helper
 
-// Applies optional bias and optional residual add when storing a 4-element float vector to BF16[row, col..col+3].
-__device__ __forceinline__ void store_bf16x4(bf16* dst, const bf16* bias, bool add_res, int col, const float (&v)[4]) {
+// Epilogue activation codes for store_bf16x4 (used by ViT FC1 & merger FC1 fusion).
+constexpr int ACT_NONE = 0;
+constexpr int ACT_GELU_TANH = 1;
+constexpr int ACT_GELU_EXACT = 2;
+
+__device__ __forceinline__ float emb_apply_act(float v, int act_mode) {
+    if (act_mode == ACT_GELU_TANH) {
+        const float bv = __bfloat162float(__float2bfloat16_rn(v));
+        const float c = 0.7978845608028654f * (bv + 0.044715f * bv * bv * bv);
+        return 0.5f * bv * (1.0f + tanhf(c));
+    }
+    if (act_mode == ACT_GELU_EXACT) {
+        const float bv = __bfloat162float(__float2bfloat16_rn(v));
+        return 0.5f * bv * (1.0f + erff(bv * 0.7071067811865475f));
+    }
+    return v;
+}
+
+// Applies optional bias, optional activation, and optional residual add when storing a 4-element float vector to BF16[row, col..col+3].
+__device__ __forceinline__ void store_bf16x4(bf16* dst, const bf16* bias, bool add_res, int col, const float (&v)[4], int act_mode = ACT_NONE) {
     float o[4] = {v[0], v[1], v[2], v[3]};
     if (bias) {
         const uint2 br = *reinterpret_cast<const uint2*>(bias + col);
         const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&br.x));
         const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&br.y));
         o[0] += b01.x; o[1] += b01.y; o[2] += b23.x; o[3] += b23.y;
+    }
+    if (act_mode != ACT_NONE) {
+        o[0] = emb_apply_act(o[0], act_mode);
+        o[1] = emb_apply_act(o[1], act_mode);
+        o[2] = emb_apply_act(o[2], act_mode);
+        o[3] = emb_apply_act(o[3], act_mode);
     }
     if (add_res) {
         const uint2 rr = *reinterpret_cast<const uint2*>(dst + col);
@@ -383,7 +407,7 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA
     const __half* __restrict__ svh,
     const bf16* __restrict__ bias,
     bf16* __restrict__ y,
-    int M, int N, int K, int64_t sB, int64_t sG, int add_res) {
+    int M, int N, int K, int64_t sB, int64_t sG, int add_res, int act_mode = ACT_NONE) {
     using C = EmbTrH16Cfg<BM>;
     constexpr int NT = C::NT, ST = C::ST;
     extern __shared__ __align__(16) unsigned char sm[];
@@ -577,7 +601,7 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA
             v[1] = __fmul_rn(v[1], s01.y);
             v[2] = __fmul_rn(v[2], s23.x);
             v[3] = __fmul_rn(v[3], s23.y);
-            store_bf16x4(y + size_t(row) * N, bias, add_res != 0, c0 + lane * 4, v);
+            store_bf16x4(y + size_t(row) * N, bias, add_res != 0, c0 + lane * 4, v, act_mode);
         }
     }
 }
@@ -949,7 +973,7 @@ __global__ void __launch_bounds__(256) k_emb_splitk_reduce_epi(
     const __half* __restrict__ svh,
     const bf16* __restrict__ bias,
     bf16* __restrict__ y,
-    int M, int N, int ks_parts, int add_res) {
+    int M, int N, int ks_parts, int add_res, int act_mode = ACT_NONE) {
     const int bx = blockIdx.x;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.y * 8 + warp;
@@ -969,7 +993,7 @@ __global__ void __launch_bounds__(256) k_emb_splitk_reduce_epi(
     v[1] = __fmul_rn(v[1], s01.y);
     v[2] = __fmul_rn(v[2], s23.x);
     v[3] = __fmul_rn(v[3], s23.y);
-    store_bf16x4(y + size_t(row) * N, bias, add_res != 0, c0 + lane * 4, v);
+    store_bf16x4(y + size_t(row) * N, bias, add_res != 0, c0 + lane * 4, v, act_mode);
 }
 
 // ------------------------------------------------------------------------------------------------ FP8_ROW & INT4 kernels
@@ -1280,7 +1304,7 @@ inline void launch_swiglu_rot_h16(const bf16* gate, const bf16* up, const __half
 }
 
 inline void launch_trellis_with_rot(const DevMatrix& W, const bf16* bias, bf16* Y, int M, bool add_res,
-                                    GemmWorkspace& ws, cudaStream_t st) {
+                                    GemmWorkspace& ws, cudaStream_t st, int act_mode = ACT_NONE) {
     const int RB = (M + 15) / 16;
     const int NB = W.out / 128;
     const int ar = add_res ? 1 : 0;
@@ -1295,7 +1319,7 @@ inline void launch_trellis_with_rot(const DevMatrix& W, const bf16* bias, bf16* 
             k_emb_tr_h16_splitk<<<dim3(NB, ks), EmbTrH16Cfg<4>::NTH, EmbTrH16Cfg<4>::SMEM, st>>>(
                 ws.x_rot, W.data, ws.f32_acc, M, W.inp, W.sB, W.sG, ks);
             k_emb_splitk_reduce_epi<<<dim3(NB, (M + 7) / 8), 256, 0, st>>>(
-                ws.f32_acc, W.svh, bias, Y, M, W.out, ks, ar);
+                ws.f32_acc, W.svh, bias, Y, M, W.out, ks, ar, act_mode);
             return;
         }
     }
@@ -1303,22 +1327,22 @@ inline void launch_trellis_with_rot(const DevMatrix& W, const bf16* bias, bf16* 
     if (M >= 128) {
         const dim3 grid(NB, (RB + 7) / 8);
         k_emb_tr_h16<8><<<grid, EmbTrH16Cfg<8>::NTH, EmbTrH16Cfg<8>::SMEM, st>>>(
-            ws.x_rot, W.data, W.svh, bias, Y, M, W.out, W.inp, W.sB, W.sG, ar);
+            ws.x_rot, W.data, W.svh, bias, Y, M, W.out, W.inp, W.sB, W.sG, ar, act_mode);
     } else {
         const dim3 grid(NB, (RB + 3) / 4);
         k_emb_tr_h16<4><<<grid, EmbTrH16Cfg<4>::NTH, EmbTrH16Cfg<4>::SMEM, st>>>(
-            ws.x_rot, W.data, W.svh, bias, Y, M, W.out, W.inp, W.sB, W.sG, ar);
+            ws.x_rot, W.data, W.svh, bias, Y, M, W.out, W.inp, W.sB, W.sG, ar, act_mode);
     }
 }
 
-// Unified linear projection: Y[M, W.out] = X[M, W.inp] @ W^T [+ bias] [+ residual].
+// Unified linear projection: Y[M, W.out] = X[M, W.inp] @ W^T [+ bias] [+ residual] (with optional fused activation for Trellis).
 inline void linear_forward(const bf16* X, const DevMatrix& W, const bf16* bias, bf16* Y, int M,
-                           bool add_res, GemmWorkspace& ws, cudaStream_t st) {
+                           bool add_res, GemmWorkspace& ws, cudaStream_t st, int act_mode = ACT_NONE) {
     if (M <= 0) return;
     switch (W.fmt) {
         case FMT_TRELLIS: {
             launch_rot_h16(X, W.suh, M, W.inp, ws, st);
-            launch_trellis_with_rot(W, bias, Y, M, add_res, ws, st);
+            launch_trellis_with_rot(W, bias, Y, M, add_res, ws, st, act_mode);
             break;
         }
         case FMT_FP8_ROW: {
