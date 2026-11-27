@@ -846,7 +846,7 @@ int main(int argc, char** argv)
     auto qs_enqueue = [&](unsigned long long step, int M) { if (fabg_on) fabg.enqueue_step(step, qs_sizes(m, M)); };
     // the same for a draft step (GR8_MTP_SPLIT); D is built further down, before any step
     Draft D;
-    auto qsd_enqueue = [&](unsigned long long step, int M) { if (fabdg_on) fabdg.enqueue_step(step, qs_sizes(D.d, M)); };
+    auto qsd_enqueue = [&](unsigned long long step, int M, bool solo_cache = false) { if (fabdg_on) fabdg.enqueue_step(step, qs_sizes(D.d, M, solo_cache)); };
 #if defined(G6_CP) && G6_CP
     if (cp_on)
         for (int c = 0; c < cp_colls.ncoll(); ++c)
@@ -974,7 +974,7 @@ int main(int argc, char** argv)
         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MX);   // Flash draft prefill: decode draft steps (flash_prefill.cuh)
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
 #else
-        if (mtp_split) { D.d.qs.mode = 1; D.d.qs.iq = true; D.d.qs.eh = true; }   // GR8_MTP_SPLIT: eh_proj, q_a / kv_a / idx, idx_q
+        if (mtp_split) { D.d.qs.mode = mtp_last ? 2 : 1; D.d.qs.iq = true; D.d.qs.eh = true; }   // GR8_MTP_SPLIT: eh_proj, q_a (+ kv_a/idx when !mtp_last), idx_q
 #ifdef DEC_S2
         if (pool_pages != cap / 64) D.d.kv_pages = pool_pages;   // GR8_CAP_TOTAL: the drafter holds every session's tail
 #endif
@@ -2807,7 +2807,7 @@ int main(int argc, char** argv)
                 if (c || p) fprintf(stderr, "# rank %d: S2 extra error words: cp %08x cp_pf|qp %08x\n", R, c, p);
                 return c | p;
             },
-            [&](unsigned long long step, int rows) { qsd_enqueue(step, rows); }};
+            [&](unsigned long long step, int rows, bool solo_cache) { qsd_enqueue(step, rows, solo_cache); }};
         // GR8_RT_STORE: slot q's table as the attention reads it: the layers' own tables while it runs alone (solo), its
         // slot table in batched steps
         std::vector<int> rt_tab;
@@ -4037,11 +4037,12 @@ int main(int argc, char** argv)
             auto rd = [&](const StepIn& di, bool chain, int s, double& ms) {
                 const int M = di.M;
                 *in_d = di;
-                const int frows = draft_solo_cache_only(D.d, M, chain) ? 1 : M;
+                const bool solo_cache = draft_solo_cache_only(D.d, M, chain);
+                const int frows = solo_cache ? 1 : M;
                 std::vector<uint32_t> sizes(3, (uint32_t)(frows * HID * 2));
                 sizes[2] = (uint32_t)glue::head_bytes(frows, nc);
                 fabd.enqueue_step(di.step, sizes);
-                qsd_enqueue(di.step, M);
+                qsd_enqueue(di.step, M, solo_cache);
                 const auto t0 = std::chrono::steady_clock::now();
                 if (graph) G6RT_CK(cudaGraphLaunch(exec_d[bucket_of(D.d, di.context)][chain][M], st));
                 else launch_draft_step(D, M, di.context, chain, st);

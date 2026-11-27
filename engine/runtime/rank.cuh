@@ -1475,10 +1475,15 @@ __global__ void __launch_bounds__(256) k_qs_get(QsGeo a, g6::FabricDev g, const 
     }
 }
 // payload bytes of the gather collectives of a step with M rows (Fabric::enqueue_step on the gather fabric)
-inline std::vector<uint32_t> qs_sizes(const Model& m, int M)
+// solo_cache: solo GR8_MTP_LASTROW first-form draft runs eh_proj over all M rows and layer 78's q_a / idx_q over 1 row
+inline std::vector<uint32_t> qs_sizes(const Model& m, int M, bool solo_cache = false)
 {
     std::vector<uint32_t> s(m.qs.ncoll());
-    for (int c = 0; c < m.qs.ncoll(); ++c) s[c] = (uint32_t)(M * m.qs.geo[c].wmax * 2);
+    for (int c = 0; c < m.qs.ncoll(); ++c)
+    {
+        const int rows = (solo_cache && c != m.qs.ceh) ? 1 : M;
+        s[c] = (uint32_t)(rows * m.qs.geo[c].wmax * 2);
+    }
     return s;
 }
 // gather collective c: this rank's columns out (the tiles' GEMVs ran before it on the stream)
@@ -2883,7 +2888,9 @@ __global__ void __launch_bounds__(32) k_mtp_scatter_last_out(int* tok_out, float
 inline bool draft_solo_cache_only(const Model& d, int M, bool chain)
 {
 #if !G6_MODEL_FLASH && !G6_MODEL_DS41
-    return !d.s2on && d.route_last && !chain && M > 1 && !d.qs.mode && !d.qs.iq;
+    // mode == 1 splits kv_a / idx_k across ranks so rows 0..M-2 cannot append caches locally;
+    // mode == 0 (unsplit) and mode == 2 (q_a split only; kv_a / idx_k local) both support solo cache-only.
+    return !d.s2on && d.route_last && !chain && M > 1 && d.qs.mode != 1;
 #else
     (void)d; (void)M; (void)chain;
     return false;
