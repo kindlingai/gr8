@@ -73,6 +73,24 @@ work in place of this file: they set `MODEL_CACHE` and `MODEL_LOADER`, and `MODE
 The `cache` volume is not used then. A `run --rm gr8 prepare` asks model-loader for this box's pieces and waits until
 it holds them, without booting.
 
+## With spark-attic (stock DGX OS)
+
+On stock DGX OS, [spark-attic](https://github.com/bertholomus/spark-attic)'s `atticd` lends the ~2 GiB display
+carveout over the `dispram` socket protocol using a per-box key file (`DISPRAM_KEY_FILE`). Because `atticd` owns
+`/run/spark-attic/attic.sock` (`0660 root:root`) and `/etc/spark-attic/key` (`0600 root:root`) while the `gr8`
+container runs as uid 1000 with `cap_drop: [ALL]` and a read-only rootfs, add `docker/compose.spark-attic.yaml`:
+
+    docker compose -f docker/compose.yaml -f docker/compose.spark-attic.yaml up -d
+
+The overlay:
+
+- runs a one-shot `attic-key` init container (`network_mode: none`, `read_only: true`, `cap_drop: [ALL]`,
+  `cap_add: [CHOWN, FOWNER]`) that copies `/etc/spark-attic/key` into a private named volume as `0400 1000:1000`;
+- adds `group_add: ["0"]` and read-only mounts for `/run/spark-attic` and the key volume to `gr8`, and sets
+  `DISPRAM=1`, `DISPRAM_SOCKET=/run/spark-attic/attic.sock` and `DISPRAM_KEY_FILE=/run/gr8-attic/key`.
+
+Give both `-f` files to every compose command (or combine with `-f docker/model-loader.yaml`).
+
 ## Updating
 
 CI publishes `ghcr.io/kindlingai/gr8:latest` from every push to main, and `sha-<commit>` and release tags beside it.
