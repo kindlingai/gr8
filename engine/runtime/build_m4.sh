@@ -14,6 +14,7 @@ export PATH=/usr/local/cuda/bin:$PATH
 A=${1:-121a}
 WHAT=${2:-all}
 GEN="-gencode=arch=compute_${A},code=sm_${A} ${EXTRA:-}"   # EXTRA: optional nvcc flags, e.g. EXTRA=-DPF_FC2GL=6
+case "$A" in 7*) GEN="-DGR8_SM70=1 $GEN" ;; esac
 CPU=""
 [ "$(uname -m)" = aarch64 ] && CPU="-mcpu=neoverse-v2+crypto"
 OUT=${OUT:-../../bin}

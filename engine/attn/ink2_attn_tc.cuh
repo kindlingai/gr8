@@ -18,9 +18,8 @@ inline size_t attn_tc_smem(int gq) { return static_cast<size_t>(TC_KT) * TC_KLD 
 
 __device__ __forceinline__ void tc_mma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1)
 {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    float (&cr)[4] = *reinterpret_cast<float (*)[4]>(c);
+    gr8_sm70::mma16816_bf16(cr, a[0], a[1], a[2], a[3], b0, b1);
 }
 
 // q_raw -> q and r_raw -> r of every (row, query head), in place. grid rows * nh_q.

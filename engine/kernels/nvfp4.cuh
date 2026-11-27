@@ -28,6 +28,7 @@
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include "sm70_compat.cuh"
 #define NV4_HD __host__ __device__ __forceinline__
 #define NV4_CX __host__ __device__
 #else
@@ -76,9 +77,7 @@ NV4_HD float mul_rn(float a, float b)
 NV4_HD u32 rd32(const void* p)
 {
 #ifdef __CUDA_ARCH__
-    u32 v;
-    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(v) : "l"(p));
-    return v;
+    return gr8_sm70::ld_nc_u32(p);
 #else
     u32 v;
     memcpy(&v, p, 4);
@@ -88,9 +87,7 @@ NV4_HD u32 rd32(const void* p)
 NV4_HD u64 rd64(const void* p)
 {
 #ifdef __CUDA_ARCH__
-    u64 v;
-    asm volatile("ld.global.nc.L1::no_allocate.u64 %0, [%1];" : "=l"(v) : "l"(p));
-    return v;
+    return gr8_sm70::ld_nc_u64(p);
 #else
     u64 v;
     memcpy(&v, p, 8);
@@ -100,9 +97,7 @@ NV4_HD u64 rd64(const void* p)
 NV4_HD u32 rd16(const void* p)
 {
 #ifdef __CUDA_ARCH__
-    u32 v;
-    asm volatile("{ .reg .u16 t; ld.global.nc.L1::no_allocate.u16 t, [%1]; cvt.u32.u16 %0, t; }" : "=r"(v) : "l"(p));
-    return v;
+    return gr8_sm70::ld_nc_u16_to_u32(p);
 #else
     uint16_t v;
     memcpy(&v, p, 2);
@@ -291,14 +286,54 @@ struct Frag
         b1 = static_cast<u32>(v >> 32);
     }
 #ifdef __CUDACC__
+    static __device__ __noinline__ void mma_sm70(float* d, u32 a0, u32 a1, u32 a2, u32 a3, u32 sa, u32 b0, u32 b1, u32 sb)
+    {
+        constexpr unsigned FULL = 0xffffffffu;
+        const int lane = threadIdx.x & 31, m = lane >> 2, t = lane & 3;
+        const int shift = t * 8;
+        const u32 sa_r0 = __shfl_sync(FULL, sa, m * 4);
+        const u32 sa_r1 = __shfl_sync(FULL, sa, m * 4 + 1);
+        const u32 sb_c0 = __shfl_sync(FULL, sb, (2 * t) * 4);
+        const u32 sb_c1 = __shfl_sync(FULL, sb, (2 * t + 1) * 4);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            const int s0 = m * 4 + ((j & 1) << 1);
+            const int s1 = s0 + 1;
+            const u32 ra0 = (j < 2) ? a0 : a2;
+            const u32 ra1 = (j < 2) ? a1 : a3;
+            const u32 rb  = (j < 2) ? b0 : b1;
+            const u32 fa0 = gr8_sm70::e2m1x2_to_f16x2((__shfl_sync(FULL, ra0, s0) >> shift) & 0xffu);
+            const u32 fa1 = gr8_sm70::e2m1x2_to_f16x2((__shfl_sync(FULL, ra1, s0) >> shift) & 0xffu);
+            const u32 fa2 = gr8_sm70::e2m1x2_to_f16x2((__shfl_sync(FULL, ra0, s1) >> shift) & 0xffu);
+            const u32 fa3 = gr8_sm70::e2m1x2_to_f16x2((__shfl_sync(FULL, ra1, s1) >> shift) & 0xffu);
+            const u32 fb0 = gr8_sm70::e2m1x2_to_f16x2((__shfl_sync(FULL, rb,  s0) >> shift) & 0xffu);
+            const u32 fb1 = gr8_sm70::e2m1x2_to_f16x2((__shfl_sync(FULL, rb,  s1) >> shift) & 0xffu);
+            float p[4] = {0.f, 0.f, 0.f, 0.f};
+            gr8_sm70::mma16816_f16(p, fa0, fa1, fa2, fa3, fb0, fb1);
+            const float sa0 = e4m3_val((sa_r0 >> (8 * j)) & 0xffu);
+            const float sa1 = e4m3_val((sa_r1 >> (8 * j)) & 0xffu);
+            const float sc0 = e4m3_val((sb_c0 >> (8 * j)) & 0xffu);
+            const float sc1 = e4m3_val((sb_c1 >> (8 * j)) & 0xffu);
+            d[0] += p[0] * (sa0 * sc0);
+            d[1] += p[1] * (sa0 * sc1);
+            d[2] += p[2] * (sa1 * sc0);
+            d[3] += p[3] * (sa1 * sc1);
+        }
+    }
+
     // d += A (16 rows x 64 k) @ B (64 k x 8 columns), both block scaled.
     static __device__ __forceinline__ void mma(float (&d)[4], const A& a, u32 b0, u32 b1, u32 sb)
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
         asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
                      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
                      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                      : "r"(a.a0), "r"(a.a1), "r"(a.a2), "r"(a.a3), "r"(b0), "r"(b1),
                        "r"(a.s), "n"(BID_A), "n"(TID_A), "r"(sb), "n"(BID_B), "n"(TID_B));
+#else
+        mma_sm70(d, a.a0, a.a1, a.a2, a.a3, a.s, b0, b1, sb);
+#endif
     }
 #endif
 };

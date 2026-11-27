@@ -16,7 +16,7 @@
 // says which one `mine` is. The FP32 sum is 0 + lo + hi in that fixed order (the order depends on the layer, never on
 // which rank owns the row), then + resid, then the k_own_add_norm tail (normed rows -> out and the send slot of
 // c + 1 = c1, then its doorbell). Row j = owner row pf_r0(M, rank) + j. grid (RN_CL, max(rows, 1)), block RN_T.
-__global__ void __cluster_dims__(glue::RN_CL, 1, 1) __launch_bounds__(glue::RN_T)
+__global__ void GR8_RN_ATTR
 k_pair_add_norm(RsNormArgs a, const __nv_bfloat16* mine, int peer, bool mine_lo)
 {
     const u64 step = *a.stepp;
@@ -24,7 +24,7 @@ k_pair_add_norm(RsNormArgs a, const __nv_bfloat16* mine, int peer, bool mine_lo)
     if (j < pf_rows(a.M, a.f.rank, a.f.nr))
     {
         const int m = pf_r0(a.M, a.f.rank, a.f.nr) + j;
-        const int col0 = blockIdx.x * glue::RN_COLS + threadIdx.x * 8;
+        const int col0 = GR8_RN_COL0;
         const size_t off = (size_t)j * HID + col0;
         const __nv_bfloat16* other = reinterpret_cast<const __nv_bfloat16*>(rs_slice(a.f, step, a.c, peer, a.loop));
         const __nv_bfloat16* lo = mine_lo ? mine : other;
@@ -416,6 +416,6 @@ inline void pf_qp_norm(Prefill& P, int M, const __nv_bfloat16* w, __half* out, c
     k_wait_rs1<<<1, 32, 0, st>>>(P.f, P.stepp, 0, M, P.loop, cp);
     RsNormArgs a{P.f, P.stepp, 0, M, P.loop, P.resid, w, out, glue::RMS_EPS, P.tickets + 1};
     a.steer = steer;
-    k_pair_add_norm<<<dim3(glue::RN_CL, rows > 0 ? rows : 1), glue::RN_T, 0, st>>>(a, P.qp_mine, cp, (P.f.rank >> 1) == pair_lo(P.qp_pend));
+    k_pair_add_norm<<<GR8_RN_GRID(rows > 0 ? rows : 1), GR8_RN_BLOCK, 0, st>>>(a, P.qp_mine, cp, (P.f.rank >> 1) == pair_lo(P.qp_pend));
     P.qp_pend = -1;
 }

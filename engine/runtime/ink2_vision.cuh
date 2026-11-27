@@ -226,9 +226,8 @@ constexpr int AT_LD = HD + 8;           // row stride of the K and transposed-V 
 
 __device__ __forceinline__ void at_mma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1)
 {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    float (&cr)[4] = *reinterpret_cast<float (*)[4]>(c);
+    gr8_sm70::mma16816_bf16(cr, a[0], a[1], a[2], a[3], b0, b1);
 }
 __device__ __forceinline__ uint32_t at_pack(float lo, float hi)
 {
@@ -586,8 +585,8 @@ private:
         for (int r0 = 0; r0 < M; r0 += pass)
         {
             const int rows = std::min(pass, M - r0);
-            INK2V_BLAS(cublasGemmEx(blas_, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, K, &one, W, CUDA_R_16BF, K, x + static_cast<size_t>(r0) * ldx, CUDA_R_16BF,
-                                    ldx, &zero, acc_, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            INK2V_BLAS(gr8_sm70::cublas_gemm_bf16_tn(blas_, N, rows, K, &one, W, K, x + static_cast<size_t>(r0) * ldx,
+                                                     ldx, &zero, acc_, CUDA_R_32F, N, CUBLAS_GEMM_DEFAULT));
             const size_t tot = static_cast<size_t>(rows) * N;
             vis::k_ink2v_epi<<<static_cast<unsigned>((tot + 255) / 256), 256>>>(acc_, bias, ls, y + static_cast<size_t>(r0) * ldy, rows, N, ldy, mode);
         }

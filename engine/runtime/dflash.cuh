@@ -204,11 +204,11 @@ __global__ void __launch_bounds__(256) k_tap_mhc(const float* streams, __half* f
 
 // collective 0: every rank's [B][NFR] fp32 fc columns -> the full rows -> hidden_norm -> fp16. grid (RN_CL, B), block RN_T
 struct CtxArgs { g6::FabricDev f; const u64* stepp; int c; const __nv_bfloat16* w; __half* out; float eps; };
-__global__ void __cluster_dims__(glue::RN_CL, 1, 1) __launch_bounds__(glue::RN_T) k_ctx_norm(CtxArgs a)
+__global__ void GR8_RN_ATTR k_ctx_norm(CtxArgs a)
 {
     const u64 step = *a.stepp;
     const int m = blockIdx.y;
-    const int col0 = blockIdx.x * glue::RN_COLS + threadIdx.x * 8;
+    const int col0 = GR8_RN_COL0;
     const int p = col0 / NFR;
     const float* src = reinterpret_cast<const float*>(glue::peer_slot(a.f, step, a.c, p)) + (size_t)m * NFR + (col0 - p * NFR);
     float x[8];
@@ -393,11 +393,11 @@ struct ArArgs
     __half* out;
     float eps;
 };
-__global__ void __cluster_dims__(glue::RN_CL, 1, 1) __launch_bounds__(glue::RN_T) k_ar_conv_norm(ArArgs a)
+__global__ void GR8_RN_ATTR k_ar_conv_norm(ArArgs a)
 {
     const u64 step = *a.stepp;
     const int m = blockIdx.y;
-    const int col0 = blockIdx.x * glue::RN_COLS + threadIdx.x * 8, g = col0 / GS;
+    const int col0 = GR8_RN_COL0, g = col0 / GS;
     float y[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}, yp[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (int p = 0; p < a.f.nr; ++p)
     {
@@ -1148,11 +1148,11 @@ inline void dfl_consume(Dfl& D, int c, const float* dlt, const __nv_bfloat16* ba
     if constexpr (dfl::REP)           // the KS partials in part, summed p = 0..KS-1 as the all-reduce sums TP4's ranks
     {
         (void)c;
-        dflk::k_ar_conv_norm<<<dim3(glue::RN_CL, dfl::B), glue::RN_T, 0, st>>>(dflk::ArArgs{D.lpart, D.stepp, 0, dlt, base, D.resid, w, D.x, D.eps});
+        dflk::k_ar_conv_norm<<<GR8_RN_GRID(dfl::B), GR8_RN_BLOCK, 0, st>>>(dflk::ArArgs{D.lpart, D.stepp, 0, dlt, base, D.resid, w, D.x, D.eps});
         return;
     }
     dfl_wait(D, c, dfl_payload(D, c), st);
-    dflk::k_ar_conv_norm<<<dim3(glue::RN_CL, dfl::B), glue::RN_T, 0, st>>>(dflk::ArArgs{D.f, D.stepp, c, dlt, base, D.resid, w, D.x, D.eps});
+    dflk::k_ar_conv_norm<<<GR8_RN_GRID(dfl::B), GR8_RN_BLOCK, 0, st>>>(dflk::ArArgs{D.f, D.stepp, c, dlt, base, D.resid, w, D.x, D.eps});
 }
 // the context part from collective c (fc slices) on: hidden_norm, this rank's K/V of every layer -> the ring
 inline void dfl_ctx_store(Dfl& D, int c, cudaStream_t st, bool defer_kv = false)
@@ -1161,12 +1161,12 @@ inline void dfl_ctx_store(Dfl& D, int c, cudaStream_t st, bool defer_kv = false)
     if constexpr (REP)                // fco is local (Dfl::lfc). A fill step (c = NT) first waits for the barrier
     {
         if (c) dfl_wait(D, c, 0, st);
-        dflk::k_ctx_norm<<<dim3(glue::RN_CL, B), glue::RN_T, 0, st>>>(dflk::CtxArgs{D.lfc, D.stepp, 0, D.hnorm, D.ctxn, D.eps});
+        dflk::k_ctx_norm<<<GR8_RN_GRID(B), GR8_RN_BLOCK, 0, st>>>(dflk::CtxArgs{D.lfc, D.stepp, 0, D.hnorm, D.ctxn, D.eps});
     }
     else
     {
         dfl_wait(D, c, (size_t)B * NFR * 4, st);
-        dflk::k_ctx_norm<<<dim3(glue::RN_CL, B), glue::RN_T, 0, st>>>(dflk::CtxArgs{D.f, D.stepp, c, D.hnorm, D.ctxn, D.eps});
+        dflk::k_ctx_norm<<<GR8_RN_GRID(B), GR8_RN_BLOCK, 0, st>>>(dflk::CtxArgs{D.f, D.stepp, c, D.hnorm, D.ctxn, D.eps});
     }
     dfl_xfrag(D.ctxn, HID, D.xf_ctxn, D.xb_ctxn, st);
     if (defer_kv) return;             // GR8_DFL_DEDUP query step: context K/V come from y.kv2 in dfl_attn
@@ -1200,7 +1200,7 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
     {
         dfl_ctx_store(D, 0, st, D.dedup && query);
         if (!query) return;
-        glue::k_embed_norm<<<dim3(glue::RN_CL, B), glue::RN_T, 0, st>>>(glue::EmbedArgs{D.emb_rows ? D.emb_rows : D.tok, D.emb, D.ly[0].in_norm, D.resid, D.x, D.eps, D.emb_i8, D.emb_scale});
+        glue::k_embed_norm<<<GR8_RN_GRID(B), GR8_RN_BLOCK, 0, st>>>(glue::EmbedArgs{D.emb_rows ? D.emb_rows : D.tok, D.emb, D.ly[0].in_norm, D.resid, D.x, D.eps, D.emb_i8, D.emb_scale});
         dfl_attn(D, 0, st);
         return;
     }

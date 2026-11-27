@@ -288,8 +288,7 @@ __global__ void __launch_bounds__(256) k_shared_fp8(const uint8_t* fc1, const ui
     }
     // weight t from its state (the 16 stream bits ending at bit (t + 1) bits; pmcgx: the 20 ending at weight t | 1)
     const u32 h2 = tr3_weight<CB, true>(p, t, bits);              // low half = weight t, E4M3-rounded
-    unsigned short e;
-    asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(e) : "r"(h2));
+    const unsigned short e = gr8_sm70::f16x2_to_e4m3x2(h2);
     const uint8_t q8 = static_cast<uint8_t>(e & 0xff);
     if (mat == 0) cg[static_cast<size_t>(n) * HID + k] = q8;
     else if (mat == 1) cu[static_cast<size_t>(n) * HID + k] = q8;
@@ -580,23 +579,40 @@ inline void launch(const Gv& g, cudaStream_t st)
     g6mx::nt_dispatch(g6mx::tiles(g.M), [&](auto N) {
         constexpr int NTv = decltype(N)::value;     // row tiles of 8: M <= 8 launches the NT = 1 kernel
         auto go = [&](auto* kern, auto&&... tail) {
+#ifdef GR8_SM70
+            const int tpc = gv_fit_tpc(kern, g.tpc, g.ks);
+#else
             const int tpc = NTv == 1 ? g.tpc : gv_fit_tpc(kern, g.tpc, g.ks);
+#endif
             kern<<<(ot + tpc - 1) / tpc, tpc * g.ks * 32, 0, st>>>(g.w, g.xfrag, g.K, ot, tpc, g.ks, g.M, tail...);
         };
-        const bool b512 = g.ks <= 16;      // NT > 1: the 512-thread kernels (more registers) when one tile's ks warps fit
+        const bool b512 = g.ks <= 16;      // NT > 1 (and SM70 NT == 1): 512-thread kernels (128 regs, zero spills)
 #ifdef DEC_SLOT
         if (g.slot.send)
         {
+#ifdef GR8_SM70
+            if (g.codec == INT4) { if (b512) go(gv_gemv_slot_lb512<Int4v, NTv>, g.ld, g.slot); else if constexpr (NTv == 1) go(gv_gemv_slot<Int4v, 1>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int4v, NTv>, g.ld, g.slot); }
+            else if (g.codec == BF16W) { if (b512) go(gv_gemv_slot_lb512<Bf16w, NTv>, g.ld, g.slot); else if constexpr (NTv == 1) go(gv_gemv_slot<Bf16w, 1>, g.ld, g.slot); else go(gv_gemv_slot_lb<Bf16w, NTv>, g.ld, g.slot); }
+            else { if (b512) go(gv_gemv_slot_lb512<Mxfp8, NTv>, g.ld, g.slot); else if constexpr (NTv == 1) go(gv_gemv_slot<Mxfp8, 1>, g.ld, g.slot); else go(gv_gemv_slot_lb<Mxfp8, NTv>, g.ld, g.slot); }
+#else
             if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv_slot<Int4v, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Int4v, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int4v, NTv>, g.ld, g.slot); }
             else if (g.codec == BF16W) { if constexpr (NTv == 1) go(gv_gemv_slot<Bf16w, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Bf16w, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Bf16w, NTv>, g.ld, g.slot); }
             else { if constexpr (NTv == 1) go(gv_gemv_slot<Mxfp8, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Mxfp8, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Mxfp8, NTv>, g.ld, g.slot); }
+#endif
             return;
         }
 #endif
+#ifdef GR8_SM70
+        if (g.codec == INT4) { if (b512) go(gv_gemv_lb512<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); else if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); }
+        else if (g.codec == MXFP8) { if (b512) go(gv_gemv_lb512<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); else if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); }
+        else if (g.codec == FP8R) { if (b512) go(gv_gemv_lb512<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); else if constexpr (NTv == 1) go(gv_gemv<Fp8r, 1>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); }
+        else { if (b512) go(gv_gemv_lb512<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); else if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); }
+#else
         if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); }
         else if (g.codec == MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); }
         else if (g.codec == FP8R) { if constexpr (NTv == 1) go(gv_gemv<Fp8r, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); }
         else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); }
+#endif
     });
 }
 
@@ -612,7 +628,11 @@ inline void make_gv_multi(std::initializer_list<const Gv*> gs, int M, GvMulti& o
 #ifdef DEC_SLOT
         if (g->slot.send) { out = GvMulti(); return; }
 #endif
+#ifdef GR8_SM70
+        if (g->tpc * g->ks > 16 || out.n == GvMulti::MAXP) { out = GvMulti(); return; }
+#else
         if (g->tpc * g->ks > 32 || out.n == GvMulti::MAXP) { out = GvMulti(); return; }
+#endif
         const int ot = g->O / 16;
         out.p[out.n++] = GvPart{g->w, g->xfrag, g->y, g->codec, g->K, ot, g->tpc, g->ks, g->ld, g->odt, out.ctas};
         out.ctas += (ot + g->tpc - 1) / g->tpc;
@@ -620,7 +640,11 @@ inline void make_gv_multi(std::initializer_list<const Gv*> gs, int M, GvMulti& o
     out.M = M;
 }
 static_assert(INT4 == 0 && MXFP8 == 1 && BF16W == 2, "gv_multi dispatches on these codec numbers");
+#ifdef GR8_SM70
+inline void launch(const GvMulti& a, cudaStream_t st) { gv_multi<<<a.ctas, 512, 0, st>>>(a); }
+#else
 inline void launch(const GvMulti& a, cudaStream_t st) { gv_multi<<<a.ctas, 1024, 0, st>>>(a); }
+#endif
 
 // tpc (output tiles per CTA) and ks (k parts per tile, one warp each): best split per shape on the GB10
 // (time is flat in M). ks is halved until it divides the tensor's group count.
@@ -633,8 +657,14 @@ inline const char* make_gv(const Tensor& t, int codec, int tpc, int ks, int M, c
     if (t.nd != 3 || t.shape[2] != GR) return "GEMV tensor is not a [O/16][NG][GR] record of its codec";
     if (codec == FP8R && !rscale) return "FP8R GEMV requires row scales";
     const int ng = static_cast<int>(t.shape[1]);
+#ifdef GR8_SM70
+    if (ks > 16) ks = 16;
+    while (ks > 1 && ng % ks) ks >>= 1;
+    while (tpc * ks > 16 && tpc > 1) tpc >>= 1;
+#else
     while (ks > 1 && ng % ks) ks >>= 1;
     while (tpc * ks > 32) tpc >>= 1;
+#endif
     g.on = 1; g.codec = codec;
     g.w = static_cast<const uint8_t*>(t.p);
     g.rscale = rscale;

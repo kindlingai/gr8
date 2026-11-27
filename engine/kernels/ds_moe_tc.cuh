@@ -76,10 +76,14 @@ __device__ __forceinline__ void mma_mx(float (&d)[4], u32 a0, u32 a1, u32 a2, u3
 {
     if constexpr (MXTC_ABL == 1) { d[0] += __uint_as_float((a0 ^ a1 ^ a2 ^ a3 ^ b0 ^ b1 ^ sa ^ sb) & 0x3fffffffu); return; }
     static_assert(BA >= 0 && BA < 4 && BB >= 0 && BB < 4, "scale byte");
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
     asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e4m3.f32.ue8m0 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sa), "n"(BA), "n"(0), "r"(sb), "n"(BB), "n"(0));
+#else
+    (void)d; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1; (void)sa; (void)sb;
+#endif
 }
 // A record word w = {row r byte c, row r+8 byte c, row r byte c+4, row r+8 byte c+4} (mxfp4.cuh) -> the four containers of row r (x4lo) and
 // row r+8 (x4hi): nibbles (byte c low, byte c high, byte c+4 low, byte c+4 high) at bits 5..2 of containers 0..3.
@@ -98,9 +102,9 @@ struct Rec
         s = *reinterpret_cast<const u32*>(rec + SOFF + (lane >> 2) * 4) >> (8 * (lane & 1));
     }
 };
-__device__ __forceinline__ void cp16(void* s, const void* g) { asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"((u32)__cvta_generic_to_shared(s)), "l"(g)); }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void cp16(void* s, const void* g) { gr8_sm70::cp_async_cg_16(s, g); }
+__device__ __forceinline__ void cp_commit() { gr8_sm70::cp_async_commit(); }
+template <int N> __device__ __forceinline__ void cp_wait() { gr8_sm70::cp_async_wait<N>(); }
 // One k32 step of a warp's tile row against NT token tiles from the smem stage: A words from record R, B 16-B words at bb + (t 8 + g) XREC + c 16, scale
 // words sb[t] (byte BB). acc[t] += A(R) x B(t).
 template <int H, int BB, int NT>
@@ -128,9 +132,8 @@ __device__ __forceinline__ u32 mx_scale(float amax, float& inv)
 }
 __device__ __forceinline__ u32 e4m3x4(float a, float b, float c, float d)   // four floats -> four E4M3 bytes (a = low), RN, saturating
 {
-    u32 lo, hi;
-    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, %2, %1; cvt.u32.u16 %0, t; }" : "=r"(lo) : "f"(a), "f"(b));
-    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, %2, %1; cvt.u32.u16 %0, t; }" : "=r"(hi) : "f"(c), "f"(d));
+    const u32 lo = gr8_sm70::f32x2_to_e4m3x2(a, b);
+    const u32 hi = gr8_sm70::f32x2_to_e4m3x2(c, d);
     return lo | (hi << 16);
 }
 // 32 values v[0..31] of one row's 32-block j (physical k = 32 j + i) -> the 8 words of the record layout at rec = row's record (j / 2), h = j & 1:
@@ -386,7 +389,7 @@ constexpr int YP = 136;           // fc2 output staging: halves per row (128 col
 #endif
 __device__ __forceinline__ void l2_discard(const void* p)
 {
-    if constexpr (DS41_TC_DISCARD) asm volatile("discard.global.L2 [%0], 128;" :: "l"(p) : "memory");
+    if constexpr (DS41_TC_DISCARD) gr8_sm70::discard_l2_128(const_cast<void*>(p));
 }
 // The combine of one token's slice [n0s, n0s + SL) by one warp: out = bf16(sum over routes k in order of ypart[slot k] + shared), the sum and the order of
 // dsh::k_combine_mt (fp32 adds, one rounding). Then the routes' slice lines are discarded from L2.

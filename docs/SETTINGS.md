@@ -158,7 +158,7 @@ the short version. [ENV.md](ENV.md) lists every knob (`GR8_*`, formerly `G6_*`) 
 | `GR8_XTRACE_OUT` | /tmp | directory for the dumps, `g6xtrace.r<rank>.f<n>.txt` |
 | `GR8_XTRACE_QUIT` | unset | path of a file; when it appears, each fabric dumps once |
 | `GR8_XTRACE_PF` | 0 | 1 = with `GR8_XTRACE=1`, trace the two prefill fabrics instead of the decode fabric |
-| `GR8_GLM53F_KDA_MX` | 1 | 1 = KDA decode q / k / v read MXFP8 records built at bind (FP16 activations), 0 = the BF16 weights: not byte-exact, and a third copy of q / k / v on each rank (about 1.2 GB at TP3) outside the loader's accounting |
+| `GR8_GLM53F_KDA_MX` | 1 | 1 = KDA decode q / k / v read MXFP8 records with FP16 activations: the release's stored records, and the loader skips the BF16 `.gv` generation that setting 0 needs (about 6.85 GB/rank less device image at TP=4); 0 = the BF16 weights: not byte-exact, and a third copy of q / k / v on each rank (about 1.2 GB at TP3) outside the loader's accounting |
 | `GR8_ATTN_HEADS` | 1 | decode attention scores and context with one key load for a group of heads; 0 = the per-head kernels |
 | `GR8_ATTN_SC2` | 0 | decode attention scores of the head-group kernel with S = 1, 2, 4 or 8 key slots per warp, the query loaded once for all S; 0 = off. FP8 KV only, same bits |
 | `GR8_ATTN_SC2_PART` | 1 | with `GR8_ATTN_SC2` (and `GR8_ATTN_QT`): a head count that is not a multiple of 16 (TP=6: 10 or 11 heads a rank; TP=3: 21 or 22) also takes the scores kernel, its last head group partial (the missing heads load nothing and are not stored). 0 = those layers keep the head-group kernel of 16. Inert at TP=4. Same bits |

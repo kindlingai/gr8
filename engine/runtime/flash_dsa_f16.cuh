@@ -179,8 +179,8 @@ inline void gemm_bf(cublasHandle_t h, const Mat& w, const __nv_bfloat16* x, int 
 {
     const float zero = 0.f;
     if (cublasSetStream(h, st) != CUBLAS_STATUS_SUCCESS) die("flash_dsa_f16: cublasSetStream failed");
-    if (cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, w.O, M, w.K, &w.alpha, w.w, CUDA_R_16BF, w.K, x, CUDA_R_16BF, ldx, &zero,
-                     y, CUDA_R_32F, w.O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+    if (gr8_sm70::cublas_gemm_bf16_tn(h, w.O, M, w.K, &w.alpha, w.w, w.K, x, ldx, &zero,
+                                      y, CUDA_R_32F, w.O, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
         die("flash_dsa_f16: cublasGemmEx (bf16) failed");
 }
 
@@ -204,6 +204,7 @@ inline void gemm_bf_split(cublasHandle_t h, const Mat& w, const u32* xb_frag, in
 constexpr size_t GEMMEX_WS = size_t(32) << 20;   // = flash_dsa_pf::F16_WS, the GemmEx handle's workspace
 inline bool lt_on()
 {
+    if (gr8_sm70::current_cc_major() < 8) return false;
     return knob::glm53f_pf_dsa_lt();
 }
 inline cublasLtHandle_t lt_handle()
@@ -335,8 +336,9 @@ inline void gemm(cublasHandle_t h, const Mat& w, const __half* x, int ldx, int M
     if (!lt_gemm(w, x, ldx, M, y32, st))
     {
         if (cublasSetStream(h, st) != CUBLAS_STATUS_SUCCESS) die("flash_dsa_f16: cublasSetStream failed");
+        const cublasGemmAlgo_t algo = gr8_sm70::current_cc_major() < 8 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
         if (cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, w.O, M, w.K, &w.alpha, w.w, CUDA_R_16F, w.K, x, CUDA_R_16F, ldx, &zero,
-                         y32, CUDA_R_32F, w.O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+                         y32, CUDA_R_32F, w.O, CUBLAS_COMPUTE_32F, algo) != CUBLAS_STATUS_SUCCESS)
             die("flash_dsa_f16: cublasGemmEx failed");
     }
     const size_t outs = static_cast<size_t>(M) * w.O;

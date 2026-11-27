@@ -185,7 +185,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_GLM53F_DSA_XIN_ORDER` | flag | `0` |  | Flash decode with GR8_GV_MULTI: a nonzero value launches the layer-input GEMVs in the order idx_k, q_a, idx_w, idx_g, kv_a instead of q_a, kv_a, idx_k, idx_w, idx_g. |
 | `GR8_GLM53F_FPF_DENSE_P1` | flag | `0` |  | Flash prefill dense MLP layers run the P1 bodies instead of the GEMM bodies. |
 | `GR8_GLM53F_FPF_KDA_P1` | flag | `0` |  | Flash prefill KDA q, k, v and o_proj run as the P1 projections instead of M-row GEMMs. |
-| `GR8_GLM53F_KDA_MX` | flag | `1` | 0\|1 | KDA decode q / k / v read MXFP8 records built at bind with FP16 activations. 0 reads the BF16 weights. Not byte- exact, and the records are an extra copy outside the loader's accounting. |
+| `GR8_GLM53F_KDA_MX` | flag | `1` | 0\|1 | KDA decode q / k / v read MXFP8 records with FP16 activations: the release's stored records, and the loader skips the BF16 .gv generation that 0 needs (about 6.85 GB/rank less device image at TP=4). 0 reads the BF16 weights. Not byte-exact, and the records are an extra copy outside the loader's accounting. |
 | `GR8_GLM53F_KDA_OPROJ_SPLIT` | ints | ks 8 at 1 row, 4 at 2+ rows, sub 1 |  | Sets the k-split and sub-split of the KDA o_proj trellis GEMV as k1,s1,k4,s4 (1 row, then 2+ rows), in `kernels/dtr.cuh`. |
 | `GR8_GLM53F_KDA_PF_IN1` | flag | `0` | 0\|1 | 1 runs the older v1 intra-chunk kernel in KDA prefill instead of k_kda_intra3. |
 | `GR8_GLM53F_KDA_PF_P1` | flag | `0` | 0\|1 | 1 runs the older row-loop prep kernel in KDA prefill instead of launch_prep_pf. |

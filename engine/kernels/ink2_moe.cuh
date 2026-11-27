@@ -108,11 +108,7 @@ struct Mx8Frag
 #ifdef __CUDACC__
     static __device__ __forceinline__ void mma(float (&d)[4], const A& a, u32 b0, u32 b1, u32 sb)
     {
-        asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
-                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
-                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                     : "r"(a.a0), "r"(a.a1), "r"(a.a2), "r"(a.a3), "r"(b0), "r"(b1),
-                       "r"(a.s), "n"(BID_A), "n"(TID_A), "r"(sb), "n"(BID_B), "n"(TID_B));
+        gr8_sm70::mma_mx8_m16n8k32(d, a.a0, a.a1, a.a2, a.a3, b0, b1, a.s, sb);
     }
 #endif
 };

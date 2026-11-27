@@ -116,6 +116,9 @@ __device__ __forceinline__ void publish_after(const g6::FabricDev& f, int c, u64
 // counts clusters. Clusters must lie along x (gridDim.x / cluster size clusters per row of the grid).
 __device__ __forceinline__ void publish_cluster(const g6::FabricDev& f, int c, u64 seq, unsigned* ticket)
 {
+#ifdef GR8_SM70
+    publish(f, c, seq, ticket);
+#else
     if (threadIdx.x == 0 && cg::this_cluster().block_rank() == 0)
     {
         __threadfence_system();
@@ -130,6 +133,7 @@ __device__ __forceinline__ void publish_cluster(const g6::FabricDev& f, int c, u
             if (xr) { xr[g6::XT_DB] = xt_now(); xr[g6::XT_SEQ] = seq; }
         }
     }
+#endif
 }
 #endif
 
@@ -181,8 +185,19 @@ __global__ void __launch_bounds__(32) k_wait_peers(g6::FabricDev f, const u64* s
 // ---------------------------------------------------------------- RMSNorm over a 6144 row split across a cluster
 
 constexpr int RN_CL = 8;                 // CTAs (cluster size) per row
-constexpr int RN_COLS = HID / RN_CL;     // 768 columns per CTA
-constexpr int RN_T = RN_COLS / 8;        // 96 threads, 8 consecutive columns each
+constexpr int RN_COLS = HID / RN_CL;     // 768 columns per CTA (512 on Flash)
+constexpr int RN_T = RN_COLS / 8;        // 96 threads (64 on Flash), 8 consecutive columns each
+#ifdef GR8_SM70
+#define GR8_RN_ATTR __launch_bounds__(glue::RN_CL * glue::RN_T)
+#define GR8_RN_GRID(rows) dim3(1, (rows))
+#define GR8_RN_BLOCK (glue::RN_CL * glue::RN_T)
+#define GR8_RN_COL0 (threadIdx.x * 8)
+#else
+#define GR8_RN_ATTR __cluster_dims__(glue::RN_CL, 1, 1) __launch_bounds__(glue::RN_T)
+#define GR8_RN_GRID(rows) dim3(glue::RN_CL, (rows))
+#define GR8_RN_BLOCK glue::RN_T
+#define GR8_RN_COL0 (blockIdx.x * glue::RN_COLS + threadIdx.x * 8)
+#endif
 
 // Immutable direction metadata is resident on device. Decode supplies one scale per row through StepIn; tensor
 // prefill supplies the request's one scale by value. Projection is folded into the existing writer consume kernel,
@@ -233,8 +248,6 @@ __device__ __forceinline__ void cluster_project(float (&x)[8], const SteerArgs& 
     const float* dir;
     float sa;
     if (!steer_row(a, row, dir, sa)) return;
-    __shared__ float wsum[RN_T / 32];
-    __shared__ float cta_dot;
     const float4 r0 = *reinterpret_cast<const float4*>(dir + col0);
     const float4 r1 = *reinterpret_cast<const float4*>(dir + col0 + 4);
     const float r[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
@@ -243,6 +256,33 @@ __device__ __forceinline__ void cluster_project(float (&x)[8], const SteerArgs& 
     for (int k = 0; k < 8; ++k) dot = fmaf(x[k], r[k], dot);
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+#ifdef GR8_SM70
+    constexpr int WPC = RN_T / 32;
+    __shared__ float wsum[RN_CL * WPC];
+    __shared__ float s_total;
+    if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = dot;
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        float total = 0.f;
+        #pragma unroll
+        for (int c = 0; c < RN_CL; ++c)
+        {
+            float t = 0.f;
+            #pragma unroll
+            for (int i = 0; i < WPC; ++i) t += wsum[c * WPC + i];
+            total += t;
+        }
+        s_total = total;
+    }
+    __syncthreads();
+    const float kappa = sa * s_total;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) x[k] -= kappa * r[k];
+    __syncthreads();
+#else
+    __shared__ float wsum[RN_T / 32];
+    __shared__ float cta_dot;
     if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = dot;
     __syncthreads();
     if (threadIdx.x == 0)
@@ -261,6 +301,7 @@ __device__ __forceinline__ void cluster_project(float (&x)[8], const SteerArgs& 
     #pragma unroll
     for (int k = 0; k < 8; ++k) x[k] -= kappa * r[k];
     cl.sync();
+#endif
 }
 
 // x: this thread's 8 values of row m (columns col0..col0+7). Writes fp16(x * rsqrt(mean(x^2)+eps) * w).
@@ -272,13 +313,35 @@ __device__ __forceinline__ void cluster_rms_store(const float (&x)[8], const __n
 #endif
                                                   )
 {
-    __shared__ float wsum[RN_T / 32];
-    __shared__ float cta_ss;
     float ss = 0.f;
     #pragma unroll
     for (int k = 0; k < 8; ++k) ss = fmaf(x[k], x[k], ss);
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+#ifdef GR8_SM70
+    constexpr int WPC = RN_T / 32;
+    __shared__ float wsum[RN_CL * WPC];
+    __shared__ float s_tot;
+    if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        float tot = 0.f;
+        #pragma unroll
+        for (int c = 0; c < RN_CL; ++c)
+        {
+            float t = 0.f;
+            #pragma unroll
+            for (int i = 0; i < WPC; ++i) t += wsum[c * WPC + i];
+            tot += t;
+        }
+        s_tot = tot;
+    }
+    __syncthreads();
+    const float tot = s_tot;
+#else
+    __shared__ float wsum[RN_T / 32];
+    __shared__ float cta_ss;
     if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = ss;
     __syncthreads();
     if (threadIdx.x == 0)
@@ -293,6 +356,7 @@ __device__ __forceinline__ void cluster_rms_store(const float (&x)[8], const __n
     float tot = 0.f;
     #pragma unroll
     for (int r = 0; r < RN_CL; ++r) tot += *cl.map_shared_rank(&cta_ss, r);
+#endif
     const float inv = rsqrtf(tot * (1.f / HID) + eps);
     uint4 wv = *reinterpret_cast<const uint4*>(w + col0);
     float wf[8];
@@ -307,7 +371,11 @@ __device__ __forceinline__ void cluster_rms_store(const float (&x)[8], const __n
 #ifdef DEC_SLOT
     if (o_ret) *o_ret = o;
 #endif
+#ifdef GR8_SM70
+    __syncthreads();
+#else
     cl.sync();   // peers may still be reading our cta_ss
+#endif
 }
 
 // Project the writer before adding the incoming residual, then normalize the actual stored result.
@@ -348,11 +416,11 @@ struct EmbedArgs
     const float* emb_scale = nullptr; // [VOCAB] per-row scale
 };
 
-// grid (RN_CL, M), block RN_T
-__global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_embed_norm(EmbedArgs a)
+// grid (RN_CL, M), block RN_T (or (1, M), RN_CL*RN_T on GR8_SM70)
+__global__ void GR8_RN_ATTR k_embed_norm(EmbedArgs a)
 {
     const int m = blockIdx.y;
-    const int col0 = blockIdx.x * RN_COLS + threadIdx.x * 8;
+    const int col0 = GR8_RN_COL0;
     float x[8];
     if (a.emb_i8)
     {
@@ -425,16 +493,19 @@ __device__ __forceinline__ void frag_store(const uint4& o, int col0, int m, int 
 }
 #endif
 
-// grid (RN_CL, M), block RN_T. Slot payload = M x 6144 BF16 row-major.
+// grid (RN_CL, M), block RN_T (or (1, M), RN_CL*RN_T on GR8_SM70). Slot payload = M x 6144 BF16 row-major.
 // When a.wait_code != 0, cluster rank 0 spins on peer tails and syncs the cluster, then other CTAs perform a single
 // system-scope acquire load before reading peer slots (eliminating the separate k_wait_peers launch).
-__global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_norm(ArNormArgs a)
+__global__ void GR8_RN_ATTR k_ar_add_norm(ArNormArgs a)
 {
     const u64 step = *a.stepp;
     if (a.wait_code)
     {
         const size_t payload = (size_t)a.M * HID * 2;
         const u64 seq = g6::coll_seq(step, a.c, a.f.ncoll);
+#ifdef GR8_SM70
+        wait_peers(a.f, step, a.c, seq, payload, a.wait_code, blockIdx.y == 0);
+#else
         const cg::cluster_group cl = cg::this_cluster();
         if (cl.block_rank() == 0)
             wait_peers(a.f, step, a.c, seq, payload, a.wait_code, blockIdx.y == 0);
@@ -446,9 +517,10 @@ __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_n
                 (void)ld_acquire_sys(reinterpret_cast<const u64*>(peer_slot(a.f, step, a.c, p) + payload));
             __syncthreads();
         }
+#endif
     }
     const int m = blockIdx.y;
-    const int col0 = blockIdx.x * RN_COLS + threadIdx.x * 8;
+    const int col0 = GR8_RN_COL0;
     const size_t off = ((size_t)m * HID + col0) * 2;
     float x[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     float4* r = reinterpret_cast<float4*>(a.resid + (size_t)m * HID + col0);

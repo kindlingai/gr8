@@ -326,11 +326,10 @@ __device__ __forceinline__ void fc1_stage_b_record(u32* dst, const ArgsMT& A, in
             const int lane0 = c.pair * 2;
             const int tok = A.tile_tok[(t0 + c.tile) * 8 + (lane0 >> 2)];
             const u32* src = A.xfrag + dsr::fc1_bstg_src_word<K1, NGP>(tok, lane0, c.part, rec, c.step);
-            const unsigned sm = static_cast<unsigned>(__cvta_generic_to_shared(dst + i * 4));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sm), "l"(src) : "memory");
+            gr8_sm70::cp_async_cg_16(dst + i * 4, src);
         }
     }
-    asm volatile("cp.async.commit_group;" ::: "memory");
+    gr8_sm70::cp_async_commit();
 }
 
 // Staged-B twin of k_fc1_ro. The original kernel remains byte-for-byte on the
@@ -381,8 +380,8 @@ __global__ void __launch_bounds__(KS * CW * 32, MINB) k_fc1_ro_bstg(ArgsMT A)
         #pragma unroll 1
         for (int rec = 0; rec < NGP; ++rec)
         {
-            if (rec + 1 < NGP) asm volatile("cp.async.wait_group 1;" ::: "memory");
-            else asm volatile("cp.async.wait_group 0;" ::: "memory");
+            if (rec + 1 < NGP) gr8_sm70::cp_async_wait<1>();
+            else gr8_sm70::cp_async_wait<0>();
             __syncthreads();
             const Grp cur_g = next_g, cur_u = next_u;
             if (rec + 1 < NGP)

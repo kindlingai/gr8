@@ -16,8 +16,10 @@
 // passes, so it stays near 0.6 GB.
 #pragma once
 #include <cublas_v2.h>
+#include "../kernels/sm70_cublas.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include "../kernels/sm70_compat.cuh"
 
 #include <algorithm>
 #include <chrono>
@@ -198,9 +200,8 @@ constexpr int FA_LD = VHD + 8;           // bf16 row stride of the K and transpo
 
 __device__ __forceinline__ void fa_mma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1)
 {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    float (&cr)[4] = *reinterpret_cast<float (*)[4]>(c);
+    gr8_sm70::mma16816_bf16(cr, a[0], a[1], a[2], a[3], b0, b1);
 }
 __device__ __forceinline__ uint32_t fa_pack(float lo, float hi)
 {
@@ -480,8 +481,8 @@ private:
     void gemm(const bf16* x, int ldx, const bf16* W, int ldw, float* acc, int ldc, int rows, int N, int K)
     {
         const float one = 1.f, zero = 0.f;
-        GLM5V_BLAS(cublasGemmEx(blas_, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, K, &one, W, CUDA_R_16BF, ldw, x, CUDA_R_16BF, ldx,
-                                &zero, acc, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        GLM5V_BLAS(gr8_sm70::cublas_gemm_bf16_tn(blas_, N, rows, K, &one, W, ldw, x, ldx,
+                                                 &zero, acc, CUDA_R_32F, ldc, CUBLAS_GEMM_DEFAULT));
     }
 
     // y [M][N] (epilogue) = x [M][K] * W [N][K]^T, in passes through the accumulator

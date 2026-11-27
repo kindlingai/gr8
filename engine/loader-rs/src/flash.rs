@@ -144,15 +144,15 @@ fn kda_bf16(p: &mut Planner, l: usize, label: String, f: &Arc<StFile>, local: &s
             Ok(exlr8::decode_par(&m, 0..o, 0..k, threads)?.into_iter().map(exlr8::bf16_bits).collect())
         }
     };
-    p.note(l, Form { what: "KDA projection", src: fmt_name(&m), form: "BF16", exact: BF16_OF });
     if name.ends_with("f_b_proj.weight") || name.ends_with("g_b_proj.weight") {
+        p.note(l, Form { what: "KDA projection", src: fmt_name(&m), form: "BF16", exact: BF16_OF });
         p.gen(label.clone(), vec![(label, "bf16", vec![o as i64, k as i64])], move || {
             Ok(vec![decode()?.iter().flat_map(|v| v.to_le_bytes()).collect()])
         });
     } else {
         if o % 16 != 0 || k % 16 != 0 { return Err(format!("{local}: {o}x{k} is not in 16-row tiles")); }
         if !name.ends_with("b_proj.weight") {
-            // q / k / v: also this rank's heads as MXFP8 as stored, for the prefill GEMM (flash_prefill.cuh pf_kda_proj_gemm)
+            // q / k / v: this rank's heads as MXFP8 as stored (prefill GEMM, and decode when GR8_GLM53F_KDA_MX=1)
             let (h0, nh) = p.chunk(Group::Heads(l))?;
             let rows = h0 * 128..(h0 + nh) * 128;
             let (n, f2, local2) = (rows.len() as i64, f.clone(), local.to_string());
@@ -161,7 +161,12 @@ fn kda_bf16(p: &mut Planner, l: usize, label: String, f: &Arc<StFile>, local: &s
                 let (c, s) = Matrix::open(&f2, &local2)?.mxfp8(&rows)?;
                 Ok(vec![c, s])
             });
+            if gr8knobs::GLM53F_KDA_MX.get() {
+                p.note(l, Form { what: "KDA projection", src: fmt_name(&m), form: "MXFP8 (own heads)", exact: EXACT });
+                return Ok(());
+            }
         }
+        p.note(l, Form { what: "KDA projection", src: fmt_name(&m), form: "BF16", exact: BF16_OF });
         let gv = format!("{label}.gv");
         p.gen(gv.clone(), vec![(gv, "u8", vec![(o / 16) as i64, (k / 16) as i64, 512])], move || {
             Ok(vec![records::bf16_record(&decode()?, k)])
