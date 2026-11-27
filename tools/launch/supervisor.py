@@ -271,6 +271,23 @@ def resolve_model(o, refresh=False, log=log):
                                           'model.safetensors.index.json and its shards, and the tokenizer files)'
                                           if model else f'no model: pass --model <{m.title} checkpoint directory>')
             ms = modelset.ink2_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
+        elif models.of(o).engine_profile == 'embed':   # multi-group exlr8-v2 dense embedding release (HF or local dir)
+            m = models.of(o)
+            if hf:
+                if not o.get('MODEL_CACHE'):
+                    raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: this box fetches the '
+                                              'release there')
+                release = hfsource.DenseRelease(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log)
+                release.fetch_meta()
+                model = release.dir
+                ms = modelset.embed_set(model, int(o.get('TP')), o.get('MODEL_DIR') or release.tokenizer, str(release))
+            elif modelset.is_embed_release(model):
+                ms = modelset.embed_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
+            else:
+                raise modelset.ModelError(f'--model {model}: want an exlr8 dense embedding release URL '
+                                          '(https://huggingface.co/<org>/<repo>[@rev]) or local directory '
+                                          '(config.json, exlr8-vocab.safetensors, exlr8-dense-*.safetensors, tokenizer)'
+                                          if model else f'no model: pass --model <{m.title} release URL or directory>')
         elif models.of(o).native_release:   # an exlr8 native release, read in place: no index slices, no variants
             m = models.of(o)
             if not modelset.is_release(model):
@@ -379,7 +396,8 @@ def running_engines(proc='/proc'):
             cwd = os.readlink(os.path.join(proc, pid, 'cwd'))
         except OSError:
             continue
-        if b'--rank' in argv and any(os.path.basename(a) in ENGINES for a in argv[:2]):
+        base = [os.path.basename(a) for a in argv[:2]]
+        if (b'--rank' in argv and any(b in ENGINES for b in base)) or (b'g6embed' in base and b'--socket' in argv):
             out.append((int(pid), cwd))
     return out
 
@@ -630,8 +648,12 @@ class Supervisor:
             err = os.path.join(self.out, f'g6m4.r{self.rank}.err')
             s['last_line'] = tail(err, 1).strip()
         if self.rank == 0:
-            for p in ('shim', 'front'):
-                s[p] = bool(recorded(os.path.join(self.out, f'{p}.pid')))
+            if models.of(self.o).engine_profile == 'embed':
+                s['direct_socket'] = True
+                s['front'] = bool(recorded(os.path.join(self.out, 'front.pid')))
+            else:
+                for p in ('shim', 'front'):
+                    s[p] = bool(recorded(os.path.join(self.out, f'{p}.pid')))
             if self.scale:
                 s['scale'] = {k: self.scale.get(k) for k in ('id', 'phase', 'error', 'members', 'old_members', 'pause_s',
                                                              'drain_s', 'timeline', 'config')}
@@ -644,6 +666,8 @@ class Supervisor:
              'compaction_proactiveness': read_int('/proc/sys/vm/compaction_proactiveness')}
         if self.state != 'serving' or not (self.engine and self.engine.poll() is None):
             return {**r, 'ok': False, 'error': f'the engine is not serving ({self.state})'}
+        if models.of(self.o).engine_profile == 'embed':
+            return {**r, 'ok': True, 'weights': {'ok': True, 'mode': 'embed'}}
         with self.check_lock:   # the engine answers check.<n> in order
             n, self.check_n = self.check_n, self.check_n + 1
             req = os.path.join(self.home, 's2', f'check.{n}')
@@ -1032,7 +1056,7 @@ class Supervisor:
         if rank == 0:
             if not os.access(self.front_bin(), os.X_OK):
                 fails.append(f'no {self.front_bin()}: ./gr8 glm53 build (or scripts/build_front.sh bin/)')
-            if not os.access(self.py(), os.X_OK):
+            if models.of(o).engine_profile != 'embed' and not os.access(self.py(), os.X_OK):
                 fails.append(f'no {self.py()} for the shim: python3 -m venv {self.home}/venv && '
                              f'{self.home}/venv/bin/pip install -r frontend/requirements.txt')
         else:
@@ -1267,6 +1291,9 @@ class Supervisor:
                                epoch=hs['epoch'], set_id=self.model_id, kv_store=self.kv_store(),
                                kv_rows=self.kv_rows(),
                                dispram_bytes=0 if self.dispram_off else int(hs.get('dispram_bytes') or 0))
+        if models.of(o).engine_profile == 'embed':
+            self._boot_embed(plan)
+            return
         work = os.path.join(self.home, 's2')
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)
@@ -1327,6 +1354,44 @@ class Supervisor:
             self.donate(plan['knobs'])
         self.run_forever()
 
+    def _boot_embed(self, plan):
+        """TP=1 dense embedding boot: g6embed speaks PROTOCOL.md directly over run/engine.sock to g6front-rs (no shim)."""
+        o, hs, r = self.o, self.hs, self.rank
+        sock = os.path.join(self.home, 'run', 'engine.sock')
+        os.makedirs(os.path.dirname(sock), exist_ok=True)
+        try:
+            os.unlink(sock)
+        except FileNotFoundError:
+            pass
+        self.check_n = 0
+        env = self.engine_env(plan)
+        argv = ['./bin/' + engine_bin(o), *plan['args']]
+        log(f'engine: {" ".join(plan["env"])} {" ".join(argv)}')
+        rotate_logs(self.out, [f'g6m4.r{r}.txt', f'g6m4.r{r}.err'])
+        with open(os.path.join(self.out, f'g6m4.r{r}.txt'), 'wb') as so, \
+                open(os.path.join(self.out, f'g6m4.r{r}.err'), 'wb') as se:
+            self.engine = subprocess.Popen(argv, cwd=self.home, env=env, stdout=so, stderr=se, stdin=subprocess.DEVNULL,
+                                           start_new_session=True)
+        with open(os.path.join(self.out, 'g6m4.pid'), 'w') as f:
+            f.write(f'{self.engine.pid}\n')
+        self.started = True
+        self.mark('started')
+        self.set_state('loading')
+        tmo = float(plan['knobs'].get('READY_TMO') or 600)
+        t0 = time.monotonic()
+        log(f'g6embed started (epoch {hs["epoch"]}); waiting for {sock} (up to {tmo:.0f}s)')
+        while not os.path.exists(sock):
+            self.watch()
+            if time.monotonic() - t0 > tmo:
+                raise Stop(1, f'g6embed did not open {sock} within {tmo:.0f}s')
+            time.sleep(0.1)
+        self.mark('ready')
+        log(f'g6embed ready after {time.monotonic() - t0:.1f}s')
+        if 'front' not in self.helpers:
+            self.start_front(plan, unlink_sock=False)
+        self._wait_front_and_serve()
+        self.run_forever()
+
     def donate(self, knobs):
         """GLM-5.3-Flash with FLASH_KV_DONATE_GIB > 0: lend this box's spare memory, measured now that the serve has
         booted, to a KV node beside it: flash_donor_budget GiB, a host ledger crediting them to the node,
@@ -1378,20 +1443,25 @@ class Supervisor:
         log(f'KV donation: a KV node beside the serve for group {knobs["FLASH_KV_GROUP"]}, {gib} GiB, locked lease '
             f'by lease (ledger {ledger})' + (f', and {gpu} bytes of GPU KV chunks lent while idle' if gpu else ''))
 
-    def start_front(self, plan):
+    def start_front(self, plan, unlink_sock=True):
         o = self.o
         sock = os.path.join(self.home, 'run', 'engine.sock')
         os.makedirs(os.path.dirname(sock), exist_ok=True)
-        try:
-            os.unlink(sock)
-        except FileNotFoundError:
-            pass
+        if unlink_sock:
+            try:
+                os.unlink(sock)
+            except FileNotFoundError:
+                pass
         model = models.of(o)
         front = [self.front_bin()]
         if model.dialect != 'glm':
             front += ['--dialect', model.dialect]
-        if model.served:
-            front += ['--served-model-name', *model.served]
+        served = model.served
+        if model.engine_profile == 'embed' and not served:
+            repo_label = self.ms.release.label if (self.ms and self.ms.release) else ''
+            served = models.embed_served_names(self.ms.tokenizer if self.ms else '', repo_label)
+        if served:
+            front += ['--served-model-name', *served]
         if plan['knobs'].get('REUSE') == '1' or opt.kv_stores(o) or model.dialect == 'glm':
             # glm keeps prefix reuse on; other models report reused rows in the a line when REUSE=1 or --kv-store is set
             front += ['--enable-prompt-tokens-details']
@@ -1475,6 +1545,9 @@ class Supervisor:
             time.sleep(0.2)
         else:
             raise Stop(1, f'the shim did not open {sock}:\n{tail(os.path.join(self.out, "shim.log"), 20)}')
+        self._wait_front_and_serve()
+
+    def _wait_front_and_serve(self):
         port = self.o.get('PORT')
         code = 0
         for _ in range(300):
@@ -2372,14 +2445,14 @@ def stop_local(home, log=log, quit_s=10, keep=()):
         return False
     if os.path.isdir(os.path.join(home, 's2')):
         open(os.path.join(home, 's2', 'quit'), 'w').close()
-    for _ in range(int(quit_s * 10)):
-        if not alive(pid):
-            break
-        try:
-            os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
-        time.sleep(0.1)
+        for _ in range(int(quit_s * 10)):
+            if not alive(pid):
+                break
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            time.sleep(0.1)
     if alive(pid):
         signal_pid(pid, signal.SIGTERM, 'engine', log)
         for _ in range(50):

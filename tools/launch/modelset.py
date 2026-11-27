@@ -141,6 +141,48 @@ def release_set(d, tp, model_dir=None, label=None):
     return ModelSet(describe_release(d, tp, tok), label or f'{d} (exlr8 release)', tok, d)
 
 
+def _embed_weight_dir(d):
+    """Directory holding exlr8-vocab.safetensors and exlr8-dense-*.safetensors (either <d>/dense or <d>)."""
+    if not d:
+        return None
+    for sub in (os.path.join(d, 'dense'), d):
+        if os.path.isfile(os.path.join(sub, 'exlr8-vocab.safetensors')):
+            return sub
+    return None
+
+
+def is_embed_release(d):
+    """A multi-group exlr8 dense embedding release directory (exlr8-vocab.safetensors + config.json)."""
+    return bool(d) and os.path.isfile(os.path.join(d, 'config.json')) and _embed_weight_dir(d) is not None
+
+
+def embed_set(d, tp, model_dir=None, label=None):
+    """The model set of a multi-group exlr8 dense embedding release (local or fetched from Hugging Face).
+    Weights are named by config.json plus hashes/*.sha256 when present, else the safetensors headers."""
+    tok = tokenizer_dir(d, model_dir, models.TOKENIZER_EMBED)
+    parts = {}
+    cfg = os.path.join(d, 'config.json')
+    if os.path.isfile(cfg):
+        parts['config.json'] = sha256_file(cfg)
+    hashes_dir = os.path.join(d, 'hashes')
+    if os.path.isdir(hashes_dir):
+        for name in sorted(os.listdir(hashes_dir)):
+            if name.endswith('.sha256'):
+                parts[f'hashes/{name}'] = sha256_file(os.path.join(hashes_dir, name))
+    if len(parts) <= 1:
+        wdir = _embed_weight_dir(d)
+        if wdir:
+            for name in sorted(os.listdir(wdir)):
+                if name == 'exlr8-vocab.safetensors' or (name.startswith('exlr8-dense-') and name.endswith('.safetensors')):
+                    parts[name] = safetensors_header_sha256(os.path.join(wdir, name))
+    weights = hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    s = {'format': FORMAT, 'tp': tp, 'ranks': [], 'dflash': [], 'qo': None,
+         'tokenizer': {f: sha256_file(os.path.join(tok, f)) for f in models.TOKENIZER_EMBED},
+         'source': {'kind': 'exlr8-dense-embed', 'weights': weights}}
+    s['set_id'] = compute_id(s)
+    return ModelSet(s, label or f'{d} (exlr8 dense embedding release)', tok, d)
+
+
 class ModelSet:
     """A resolved model set: its description, the release directory and the tokenizer on this box. release: the
     Hugging Face release (hfsource.Release) when it was fetched, and drafter the DFlash2 drafter fetched and converted

@@ -12,6 +12,7 @@ import shlex
 TOKENIZER_GLM = ('chat_template.jinja', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json')
 TOKENIZER_DS = ('tokenizer.json', 'tokenizer_config.json')
 TOKENIZER_INK2 = ('chat_template.jinja', 'tokenizer.json', 'tokenizer_config.json')
+TOKENIZER_EMBED = ('chat_template.jinja', 'tokenizer.json', 'tokenizer_config.json')
 
 
 class ModelMismatch(Exception):
@@ -160,7 +161,15 @@ HY4 = Model('hy4', 'Hy4-flash', 'https://huggingface.co/tencent/Hy4-flash',
             serve_options=('CHUNK', 'EAGER'), engine_prefixes=('GR8_HY4_',),
             min_free_gib=8, checkpoint_cache=False,
             build_widths=('1', '2'), build_define='G6_MODEL_HY4', build_fc2gl=4, build_what_env='HY4_WHAT')
-MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, INK2, QW38, HY4, PSEUDO)}
+# Dense multimodal embeddings (g6embed): Qwen3-VL-Embedding-2B / 8B in exlr8-v2 multi-group dense format
+# (exlr8-dense-{text,vision,global}-LLL.safetensors + exlr8-vocab.safetensors). TP=1, direct Unix socket to g6front-rs.
+EMBED = Model('embed', 'Qwen3-VL-Embedding', 'https://huggingface.co/kindlingai/Qwen3-VL-Embedding-8B-exlr8-k4',
+              'g6embed', 'embed', ('1',), {}, {}, 'gr8-embed', 'Qwen3VLForConditionalGeneration',
+              False, False, False, dialect='qwen', served=(),
+              defaults=(('MAX_MODEL_LEN', '16384'),),
+              max_positions=262144, engine_profile='embed', simulator='', smoke_script='smoketest/embed.sh',
+              min_free_gib=2, build_widths=('1',))
+MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, INK2, QW38, HY4, EMBED, PSEUDO)}
 
 
 # The models a runner names. pseudo, the test engine, is served when named but left out of the lists.
@@ -239,15 +248,36 @@ def release_metadata(model: Model, directory: str) -> dict:
     return {'vocab': vocab, 'eos_ids': eos_ids, 'max_positions': max_positions}
 
 
+def embed_served_names(directory: str, repo_label: str = '') -> tuple:
+    """Served model IDs for g6front-rs on a dense embedding release (primary ID matches g6embed's hello.model)."""
+    cfg = _read_json_dict(directory, 'config.json')
+    text_cfg = cfg.get('text_config') if isinstance(cfg.get('text_config'), dict) else {}
+    hidden = _pos_int(text_cfg.get('hidden_size')) or _pos_int(cfg.get('hidden_size'))
+    layers = _pos_int(text_cfg.get('num_hidden_layers')) or _pos_int(cfg.get('num_hidden_layers'))
+    if hidden == 4096 and layers == 36:
+        names = ['qwen3-vl-embedding-8b', 'Qwen/Qwen3-VL-Embedding-8B', 'embed']
+    elif hidden == 2048 and layers == 28:
+        names = ['qwen3-vl-embedding-2b', 'Qwen/Qwen3-VL-Embedding-2B', 'embed']
+    else:
+        names = ['qwen3-vl-embedding', 'embed']
+    if repo_label and repo_label not in names:
+        names.append(repo_label)
+    return tuple(names)
+
+
 def describe(m):
     """What `./gr8 models` prints for m: the name to give and the values the model's options take."""
     defaults = ', '.join(f'TP={tp} ' + ' else '.join(m.default_variant.get(int(tp), ('home',))) for tp in m.tp)
     extra = [o for o, on in (('--drafter URL (DFlash2)', m.drafter), ('--kv-format int4', m.int4_kv),
                              ('--default-reasoning-effort none', m.thinking_off)) if on]
-    # A model without variants (ds41) reads its release in place, from a local copy fetched beforehand.
-    copy = '' if m.variants else 'a local copy of '
-    variant = ([f'        --variant  {", ".join(m.variants)}', f'                   by default {defaults}'] if m.variants
-               else ['        --variant  none: the release is read in place (docs/DEEPSEEK-BOOT.md)'])
+    if m.engine_profile == 'embed':
+        copy = ''
+        variant = ['        --variant  none: multi-group exlr8-v2 dense release (g6embed)']
+    else:
+        # A model without variants (ds41) reads its release in place, from a local copy fetched beforehand.
+        copy = '' if m.variants else 'a local copy of '
+        variant = ([f'        --variant  {", ".join(m.variants)}', f'                   by default {defaults}'] if m.variants
+                   else ['        --variant  none: the release is read in place (docs/DEEPSEEK-BOOT.md)'])
     return '\n'.join([f'{m.name:7} {m.title}: ./gr8 {m.name} <command>, or GR8_MODEL={m.name}',
                       f'        --model    {copy}an exlr8 release of {m.architecture} (config.json `architectures`), such as',
                       f'                   {m.release}',

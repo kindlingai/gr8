@@ -403,6 +403,148 @@ class Release:
         self.log(f'{self}: rank {rank} of TP={tp}, variant {variant.name}, is complete in {self.dir}')
 
 
+EMBED_META_FILES = ('config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')
+EMBED_OPT_FILES = ('added_tokens.json', 'vocab.json', 'merges.txt', 'special_tokens_map.json',
+                   'preprocessor_config.json', 'video_preprocessor_config.json', 'generation_config.json',
+                   'config_sentence_transformers.json', 'modules.json', 'sentence_bert_config.json')
+
+
+class DenseRelease:
+    """A multi-group exlr8-v2 dense embedding release (e.g. Qwen3-VL-Embedding-2B/8B) at one commit on Hugging Face.
+
+    Layout in the cache (<cache>/hf/<org>--<repo>/<commit>/):
+        config.json, tokenizer.json, tokenizer_config.json, chat_template.jinja, ...
+        hashes/*.sha256                        (when present in the release)
+        exlr8-dense-*.safetensors, exlr8-vocab.safetensors   (at root or under dense/, matching the repo)
+        complete/dense.json                    written last, once every file is hash-verified
+    """
+
+    def __init__(self, cache, repo, rev, refresh=False, log=print):
+        self.repo = Repo(cache, repo, rev, refresh, log)
+        self.log = log
+        self.dir = os.path.join(self.repo.root, self.repo.commit)
+        self.tokenizer = self.dir
+
+    @property
+    def commit(self):
+        return self.repo.commit
+
+    @property
+    def label(self):
+        return self.repo.repo
+
+    def __str__(self):
+        return f'{self.repo.repo}@{self.commit[:12]}'
+
+    @property
+    def id(self):
+        return f'{self.repo.repo}@{self.commit}'
+
+    def fetch_meta(self):
+        """Fetch config, tokenizer, chat template, optional assets, and hashes/*.sha256 into self.dir."""
+        done = os.path.join(self.dir, 'meta.json')
+        if os.path.isfile(done):
+            return
+        t = self.repo.tree()
+        missing = [n for n in EMBED_META_FILES if n not in t]
+        if missing:
+            raise modelset.ModelError(f'{self} lacks {", ".join(missing)} at its root')
+        fetched = []
+        for name in EMBED_META_FILES:
+            self.repo.fetch(name, os.path.join(self.dir, name))
+            fetched.append(name)
+        for name in EMBED_OPT_FILES:
+            if name in t:
+                self.repo.fetch(name, os.path.join(self.dir, name))
+                fetched.append(name)
+        for p in sorted(t):
+            if p.startswith('hashes/') and p.endswith('.sha256'):
+                self.repo.fetch(p, os.path.join(self.dir, p))
+                fetched.append(p)
+        with open(done + '.tmp', 'w') as f:
+            json.dump({'release': f'{self.repo.repo}@{self.commit}', 'files': fetched}, f, indent=1)
+        os.replace(done + '.tmp', done)
+
+    def weight_files(self):
+        """All exlr8 dense & vocab safetensors files in the release (at root or under dense/)."""
+        t = self.repo.tree()
+        files = []
+        for p in sorted(t):
+            base = os.path.basename(p)
+            parent = os.path.dirname(p)
+            if parent in ('', 'dense') and (
+                base == 'exlr8-vocab.safetensors'
+                or (base.startswith('exlr8-dense-') and base.endswith('.safetensors'))
+            ):
+                files.append(p)
+        if not files:
+            raise modelset.ModelError(f'{self} has no exlr8-dense-*.safetensors / exlr8-vocab.safetensors files')
+        return files
+
+    def reuse(self):
+        """Hard-link unchanged files from an earlier cached commit of the same repo."""
+        mine = self.repo.ids()
+        os.makedirs(self.dir, exist_ok=True)
+        save_json(os.path.join(self.dir, TREE), mine)
+        n = 0
+        for c in sorted(os.listdir(self.repo.root)):
+            old_dir = os.path.join(self.repo.root, c)
+            if c == self.commit or not re.fullmatch(r'[0-9a-f]{40}', c) or not os.path.isdir(old_dir):
+                continue
+            old = load_json(os.path.join(old_dir, TREE))
+            if old is None:
+                continue
+            for p, ident in mine.items():
+                src, dst = os.path.join(old_dir, p), os.path.join(self.dir, p)
+                if old.get(p) != ident or not os.path.isfile(src) or os.path.exists(dst):
+                    continue
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                try:
+                    os.link(src, dst)
+                    n += 1
+                except OSError:
+                    continue
+        if n:
+            self.log(f'{self}: {n} files unchanged since an earlier commit, linked from the cache')
+
+    def marker(self):
+        return os.path.join(self.dir, 'complete', 'dense.json')
+
+    def check(self, tp=1, rank=0, variant=None):
+        """Problems with this dense release in the cache. [] = ready."""
+        try:
+            with open(self.marker()) as f:
+                c = json.load(f)
+        except (OSError, ValueError):
+            return [f'{self} dense weights are not in the cache yet']
+        return [f'{p}: missing or not {n} bytes' for p, n in sorted(c['files'].items())
+                if not os.path.isfile(os.path.join(self.dir, p)) or os.path.getsize(os.path.join(self.dir, p)) != n]
+
+    def fetch_rank(self, tp=1, rank=0, variant=None, workers=None):
+        """Fetch and hash-verify every exlr8 dense & vocab safetensors file, then write complete/dense.json."""
+        t = self.repo.tree()
+        self.reuse()
+        weights = self.weight_files()
+        left = sum(t[p] - (os.path.getsize(os.path.join(self.dir, p) + '.part')
+                           if os.path.exists(os.path.join(self.dir, p) + '.part') else 0)
+                   for p in weights if not os.path.isfile(os.path.join(self.dir, p)))
+        meter = Meter(left, self.log, f'fetching {self}')
+        self.log(f'{self}: {len(weights)} weight files, {meter.total / 1e9:.2f} GB to fetch')
+        with ThreadPoolExecutor(4) as ex:
+            for f in [ex.submit(self.repo.fetch, p, os.path.join(self.dir, p), meter) for p in weights]:
+                f.result()
+        meter.line()
+        files = {p: t[p] for p in weights}
+        m = self.marker()
+        os.makedirs(os.path.dirname(m), exist_ok=True)
+        with open(m + '.tmp', 'w') as f:
+            json.dump({'release': f'{self.repo.repo}@{self.commit}', 'files': files}, f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(m + '.tmp', m)
+        self.log(f'{self}: complete in {self.dir}')
+
+
 class Drafter:
     """The DFlash2 drafter at one commit, and this box's converted rank at TP=4, TP=2, TP=1 or TP=6 (the replicated
     layout: every rank's pack holds the whole drafter, tools/convert/dflash2.py):

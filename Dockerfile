@@ -9,8 +9,8 @@
 # CUDA_ARCH overrides the CUDA SM target (empty defaults to 121a on arm64 and 120a on amd64 via scripts/build.sh).
 # Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader), kvman (the host Rust: page allocator,
 # scheduler, planner), knobs and front (the Rust front end) -> rust-dist -> engine, engine-int4, engine-flash,
-# engine-flash-int4, engine-ds41, engine-ink2, engine-qw38 and engine-tests-ship -> dist (the binaries only)
-# -> runtime (CUDA runtime + binaries, scripts, shims).
+# engine-flash-int4, engine-ds41, engine-ink2, engine-qw38, engine-hy4, engine-embed and engine-tests-ship -> dist
+# (the binaries only) -> runtime (CUDA runtime + binaries, scripts, shims).
 ARG CUDA_VERSION=13.0.1
 ARG UBUNTU=ubuntu24.04
 
@@ -258,6 +258,16 @@ RUN --mount=type=cache,id=gr8-nvcc-hy4-${TARGETARCH},target=/var/cache/gr8-nvcc 
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_hy4 ! -name m4sim_hy4 -exec rm -rf {} +
 
+# Dense multimodal embeddings (Qwen3-VL-Embedding 2B/8B): g6embed (MODEL=embed), TP 1, without request grammars
+FROM engine-src AS engine-embed
+ARG TARGETARCH
+COPY engine/embed/*.cu engine/embed/*.cuh engine/embed/*.h engine/embed/*.sh engine/embed/
+RUN --mount=type=cache,id=gr8-nvcc-embed-${TARGETARCH},target=/var/cache/gr8-nvcc \
+    touch "$GR8_NVCC_CACHE_DIR/.start" \
+ && MODEL=embed scripts/build.sh /out/bin \
+ && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
+ && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6embed -exec rm -rf {} +
+
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
 FROM engine-src-glm AS engine-int4
@@ -303,6 +313,9 @@ COPY --from=engine-qw38 /out/bin/g6m4_qw38 /out/bin/m4sim_qw38 /bin/
 FROM scratch AS dist-hy4
 COPY --from=engine-hy4 /out/bin/g6m4_hy4 /out/bin/m4sim_hy4 /bin/
 
+FROM scratch AS dist-embed
+COPY --from=engine-embed /out/bin/g6embed /bin/
+
 FROM scratch AS dist-tests
 COPY --from=engine-tests-ship /out/bin/gpuprobe /out/bin/tr3_e4m3_test /bin/
 
@@ -316,6 +329,7 @@ COPY --from=dist-ds41 / /
 COPY --from=dist-ink2 / /
 COPY --from=dist-qw38 / /
 COPY --from=dist-hy4 / /
+COPY --from=dist-embed / /
 COPY --from=dist-tests / /
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime

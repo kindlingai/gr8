@@ -20,7 +20,7 @@ _model_registry=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/launch" && pwd)/mo
 model_field() { python3 "$_model_registry" get "${GR8_MODEL:-glm53}" "$@"; }
 _engine_profile=$(model_field engine_profile) || return 2
 _engine_binary=$(model_field engine) || return 2
-case $_engine_profile in glm|flash|ds41|ink2|qw38|hy4|pseudo) ;;
+case $_engine_profile in glm|flash|ds41|ink2|qw38|hy4|embed|pseudo) ;;
   *) echo "unknown engine profile: $_engine_profile" >&2; return 2 ;;
 esac
 
@@ -365,6 +365,7 @@ engine_defaults() {
   [ "$_engine_profile" = ink2 ] && { ink2_defaults; return; }
   [ "$_engine_profile" = qw38 ] && { qw38_defaults; return; }
   [ "$_engine_profile" = hy4 ] && { hy4_defaults; return; }
+  [ "$_engine_profile" = embed ] && { embed_defaults; return; }
   [ "$_engine_profile" = pseudo ] && { pseudo_defaults; return; }
   local _cap_set=${CAP:+1} _base_p=0; DISPRAM_MIN_BYTES=0
   case $TP in
@@ -572,6 +573,19 @@ hy4_env() {
   ENGINE_ENV="${KV_FORMAT:+GR8_HY4_KV_FORMAT=$KV_FORMAT }${EXTRA_ENV:-}"
 }
 
+# Dense multimodal embeddings (g6embed): TP=1, direct Unix socket to g6front-rs (no S2 shim or KV cache).
+embed_defaults() {
+  case $TP in 1) ;; *) echo "engine_defaults: TP=$TP; embed (g6embed) wants TP=1" >&2; return 2 ;; esac
+  CAP=${CAP:-16384}; MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}; READY_TMO=${READY_TMO:-600}
+  SESS=${SESS:-1}; SHARE_LIMIT=${SHARE_LIMIT:-16384}
+  S2PORT=${S2PORT:-7341}; MTP=0; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
+}
+
+embed_env() {
+  ENGINE_BIN=$_engine_binary
+  ENGINE_ENV="${EXTRA_ENV:-}"
+}
+
 # Qwen3.8-Flash-Next: passes PTAB (GR8_PTAB=0|1|2) and EXTRA_ENV through.
 qw38_env() {
   ENGINE_BIN=$_engine_binary
@@ -587,6 +601,7 @@ engine_env() {
   [ "$_engine_profile" = ink2 ] && { ink2_env; return 0; }
   [ "$_engine_profile" = qw38 ] && { qw38_env; return 0; }
   [ "$_engine_profile" = hy4 ] && { hy4_env; return 0; }
+  [ "$_engine_profile" = embed ] && { embed_env; return 0; }
   [ "$_engine_profile" = pseudo ] && { ENGINE_BIN=$_engine_binary; ENGINE_ENV=""; return 0; }
   ENGINE_BIN=$_engine_binary; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=$_engine_binary-int4
   local _pf_dense=8192 _pf_streams=2 _pf_attn=1024 _pf_blas=1024
@@ -766,6 +781,12 @@ engine_args() {
   [ -n "${V2_DENSE:-}" ] && a="--image --layers all"
   if [ "$_engine_profile" = pseudo ]; then
     a="--model $V2_DENSE --cap $CAP --serve $home/s2 --s2-sessions $SESS --s2-epoch $epoch ${SET_ID:+--set-id $SET_ID}"
+    (set -f; echo $a ${EXTRA_ARGS:-})
+    return
+  fi
+  if [ "$_engine_profile" = embed ]; then
+    a="--model-dir ${V2_DENSE:-$rp} --socket $home/run/engine.sock --max-batched-tokens $CAP --max-model-len ${MAX_MODEL_LEN:-$CAP}"
+    [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     (set -f; echo $a ${EXTRA_ARGS:-})
     return
   fi
