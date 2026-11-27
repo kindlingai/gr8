@@ -41,6 +41,12 @@
 #include "../kvman-rs/g6kvman.h"
 #include "../knobs-rs/gr8_knobs.h"
 
+// s2_migrate_pages compares block-table pages against attn.h's CP marker. Test TUs that never
+// include attn.h (dfltest) still see the constant; where attn.h is included its value wins.
+#ifndef G6_CP_REMOTE
+#define G6_CP_REMOTE (-2)
+#endif
+
 namespace g6rt
 {
 
