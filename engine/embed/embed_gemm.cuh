@@ -234,26 +234,30 @@ __global__ void __launch_bounds__(256) k_emb_rot_h16(
     out_blk[lane] = make_uint4(a0, a1, a2, a3);
 }
 
-// Stage 2 (H16 exact path): On-the-fly Trellis K4 -> E4M3 FP16 -> mma.m16n8k16 + H128*svh (+ bias/residual) epilogue.
-// Matches k_gemm_tr_h16 in bind_prefill.cuh with zero GLM coupling.
+// Stage 2 (H16 exact path v2): Cooperative-decode on-the-fly Trellis K4 -> E4M3 FP16 -> ldmatrix.x4 -> mma.m16n8k16
+// + RGRP=4 L2-swizzled CTA rasterization + 3-stage cp.async + pure-FP32 H128*svh (+ bias/residual) epilogue.
+// Each tile is decoded ONCE across all NW warps into double-buffered XOR-swizzled FP16 sdec (eliminating 4x redundant decode).
 template <int BM>
 struct EmbTrH16Cfg {
+    static constexpr int KS = 2; // 2 k16 steps = 32 K elements = 16 trellis tiles per stage
     static constexpr int WM = BM / 4;
     static constexpr int WN = (BM >= 8) ? 4 : 8;
     static constexpr int NW = WM * WN;
     static constexpr int NTH = 32 * NW;
     static constexpr int WC = 128 / WN;
     static constexpr int NT = WC / 8;
-    static constexpr int A = 4 * BM * 512;
-    static constexpr int RAW = 32 * 128;
-    static constexpr int STG = A + RAW;
-    static constexpr int ST = (BM == 16) ? 2 : 3;
+    static constexpr int A = KS * BM * 512;       // BM=16: 16384 B, BM=8: 8192 B, BM=4: 4096 B
+    static constexpr int RAW = 16 * 128;          // 2048 B (16 trellis tiles)
+    static constexpr int STG = A + RAW;           // BM=16: 18432 B, BM=8: 10240 B, BM=4: 6144 B
+    static constexpr int B = 128 * KS * 16 * 2;   // 8192 B per decoded FP16 stage [128 cols][32 K]
+    static constexpr int ST = 3;
     // Shared memory must also hold 64 * 136 * 4 = 34816 B for the H128 epilogue.
-    static constexpr int SMEM = (ST * STG > 34816) ? (ST * STG) : 34816;
+    static constexpr int SMEM = (ST * STG + 2 * B > 34816) ? (ST * STG + 2 * B) : 34816;
+    static constexpr int MIN_CTA = (BM >= 16) ? 1 : 2;
 };
 
 template <int BM>
-__global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH) k_emb_tr_h16(
+__global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA) k_emb_tr_h16(
     const uint8_t* __restrict__ x_h16,
     const uint8_t* __restrict__ tw,
     const __half* __restrict__ svh,
@@ -261,42 +265,91 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH) k_emb_tr_h16(
     bf16* __restrict__ y,
     int M, int N, int K, int64_t sB, int64_t sG, int add_res) {
     using C = EmbTrH16Cfg<BM>;
-    constexpr int NT = C::NT;
+    constexpr int NT = C::NT, ST = C::ST;
     extern __shared__ __align__(16) unsigned char sm[];
 
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int wm = warp / C::WN, wn = warp % C::WN;
-    const int K16 = K >> 4, KG = K >> 6, RB = (M + 15) >> 4;
-    const int c0 = blockIdx.x * 128, rb0 = blockIdx.y * BM;
+    const int K16 = K >> 4, NST = K >> 5, RB = (M + 15) >> 4;
+
+    // L2-friendly CTA rasterization (column-major for small M, RGRP=4 grouped for large M)
+    int bx = blockIdx.x, by = blockIdx.y;
+    const int lin = blockIdx.y * gridDim.x + blockIdx.x;
+    if (gridDim.y <= 8) {
+        by = lin % gridDim.y;
+        bx = lin / gridDim.y;
+    } else {
+        constexpr int RGRP = 4;
+        const int per = RGRP * gridDim.x;
+        const int grp = lin / per;
+        const int gy0 = grp * RGRP;
+        const int gh = min(RGRP, gridDim.y - gy0);
+        const int r = lin - grp * per;
+        by = gy0 + r % gh;
+        bx = r / gh;
+    }
+
+    const int c0 = bx * 128, rb0 = by * BM;
     const int nb = min(BM, RB - rb0), colw = wn * C::WC;
     const bool full = (nb == BM);
+    unsigned char* sdec = sm + ST * C::STG;
+    const uint8_t* tw_bx = tw + int64_t(bx) * sB;
 
-    EmbTr3Lane4<true> tl;
-    tl.init(lane);
-
-    auto loadAB = [&](int slot, int kb) {
-        unsigned char* a = sm + slot * C::STG;
-        for (int c = t; c < 4 * BM * 32; c += C::NTH) {
-            const int j = c / (BM * 32), rem = c % (BM * 32), mb = rem >> 5, ch = rem & 31;
-            if (mb < nb && kb * 4 + j < K16) {
-                emb_cp16(a + c * 16, x_h16 + (size_t(rb0 + mb) * K16 + kb * 4 + j) * 512 + ch * 16);
+    auto loadAB = [&](int st) {
+        unsigned char* a = sm + (st % ST) * C::STG;
+        const int k16_0 = st * 2;
+        if (full) {
+            #pragma unroll
+            for (int c = t; c < 2 * BM * 32; c += C::NTH) {
+                const int j = c / (BM * 32), rem = c % (BM * 32), mb = rem >> 5, ch = rem & 31;
+                emb_cp16(a + c * 16, x_h16 + (size_t(rb0 + mb) * K16 + k16_0 + j) * 512 + ch * 16);
+            }
+        } else {
+            for (int c = t; c < 2 * BM * 32; c += C::NTH) {
+                const int j = c / (BM * 32), rem = c % (BM * 32), mb = rem >> 5, ch = rem & 31;
+                if (mb < nb) {
+                    emb_cp16(a + c * 16, x_h16 + (size_t(rb0 + mb) * K16 + k16_0 + j) * 512 + ch * 16);
+                }
             }
         }
-        for (int c = t; c < 256; c += C::NTH) {
-            const int ti = c >> 3, ks = kb * 4 + (ti >> 3);
-            if (ks < K16) {
-                emb_cp16(a + C::A + c * 16,
-                         tw + int64_t(blockIdx.x) * sB + int64_t(ks >> 3) * sG +
-                             int64_t((ks & 7) * 8 + (ti & 7)) * 128 + (c & 7) * 16);
-            }
+        if (t < 128) {
+            const int ti = t >> 3;
+            const int ks = k16_0 + (ti >> 3);
+            emb_cp16(a + C::A + t * 16, tw_bx + int64_t(ks >> 3) * sG + int64_t((ks & 7) * 8 + (ti & 7)) * 128 + (t & 7) * 16);
+        }
+    };
+
+    const int r8 = lane >> 2, kc = 2 * (lane & 3);
+    EmbTr3Lane4<true> tl;
+    tl.init(lane);
+    auto at = [&](int n, int k) { return n * 64 + (((k >> 3) ^ ((n >> 1) & 3)) << 4) + ((k & 7) << 1); };
+
+    auto decode = [&](int st) {
+        const unsigned char* raw = sm + (st % ST) * C::STG + C::A;
+        unsigned char* d = sdec + (st & 1) * C::B;
+        #pragma unroll
+        for (int u = 0; u < 16 / C::NW; ++u) {
+            const int ti = warp + u * C::NW;
+            const int j = ti >> 3, c = ti & 7;
+            const int nd = c * 16 + r8, kd = j * 16 + kc;
+            const u32* tile = reinterpret_cast<const u32*>(raw + ti * 128);
+            u32 f0[2], f1[2];
+            tl.decode(tile[tl.i0], tile[tl.i1], f0, f1);
+            *reinterpret_cast<u32*>(d + at(nd, kd)) = f0[0];
+            *reinterpret_cast<u32*>(d + at(nd, kd + 8)) = f0[1];
+            *reinterpret_cast<u32*>(d + at(nd + 8, kd)) = f1[0];
+            *reinterpret_cast<u32*>(d + at(nd + 8, kd + 8)) = f1[1];
         }
     };
 
     #pragma unroll
-    for (int p = 0; p < C::ST - 1; ++p) {
-        if (p < KG) loadAB(p, p);
+    for (int p = 0; p < ST - 1; ++p) {
+        if (p < NST) loadAB(p);
         emb_cp_commit();
     }
+    emb_cp_wait<ST - 2>();
+    __syncthreads();
+    if (NST > 0) decode(0);
 
     float acc[4][NT][4];
     #pragma unroll
@@ -306,34 +359,50 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH) k_emb_tr_h16(
             #pragma unroll
             for (int i = 0; i < 4; ++i) acc[mb][nt][i] = 0.f;
 
-    for (int kb = 0; kb < KG; ++kb) {
-        emb_cp_wait<C::ST - 2>();
-        __syncthreads();
-        if (kb + C::ST - 1 < KG) loadAB((kb + C::ST - 1) % C::ST, kb + C::ST - 1);
+    const int mat = lane >> 3, lr = lane & 7;
+    const int wm4 = wm * 4;
+    const int mb_lim = min(4, max(0, nb - wm4));
+
+    for (int st = 0; st < NST; ++st) {
+        if (st + ST - 1 < NST) loadAB(st + ST - 1);
         emb_cp_commit();
-        const unsigned char* a = sm + (kb % C::ST) * C::STG;
-        const unsigned char* raw = a + C::A;
+        __syncthreads();
+        const unsigned char* a = sm + (st % ST) * C::STG;
+        const unsigned char* b = sdec + (st & 1) * C::B;
         #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            if (kb * 4 + j >= K16) continue;
+        for (int j = 0; j < 2; ++j) {
             u32 bf[NT][2];
             #pragma unroll
             for (int pr = 0; pr < NT / 2; ++pr) {
-                const int ti = j * 8 + wn * (NT / 2) + pr;
-                const u32* tile = reinterpret_cast<const u32*>(raw + ti * 128);
-                tl.decode(tile[tl.i0], tile[tl.i1], bf[2 * pr], bf[2 * pr + 1]);
+                const int n = colw + (pr * 2 + (mat >> 1)) * 8 + lr;
+                const int ch = j * 2 + (mat & 1);
+                emb_ldsm_x4(b + n * 64 + ((ch ^ ((n >> 1) & 3)) << 4),
+                            bf[2 * pr][0], bf[2 * pr][1], bf[2 * pr + 1][0], bf[2 * pr + 1][1]);
             }
-            #pragma unroll
-            for (int mb = 0; mb < 4; ++mb) {
-                const int m = wm * 4 + mb;
-                if (!full && m >= nb) continue;
-                const uint4 fa = *reinterpret_cast<const uint4*>(a + (j * BM + m) * 512 + lane * 16);
+            if (full) {
                 #pragma unroll
-                for (int nt = 0; nt < NT; ++nt) {
-                    emb_mma16816(acc[mb][nt], fa.x, fa.y, fa.z, fa.w, bf[nt][0], bf[nt][1]);
+                for (int mb = 0; mb < 4; ++mb) {
+                    const uint4 fa = *reinterpret_cast<const uint4*>(a + (j * BM + wm4 + mb) * 512 + lane * 16);
+                    #pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        emb_mma16816(acc[mb][nt], fa.x, fa.y, fa.z, fa.w, bf[nt][0], bf[nt][1]);
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int mb = 0; mb < 4; ++mb) {
+                    if (mb >= mb_lim) break;
+                    const uint4 fa = *reinterpret_cast<const uint4*>(a + (j * BM + wm4 + mb) * 512 + lane * 16);
+                    #pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        emb_mma16816(acc[mb][nt], fa.x, fa.y, fa.z, fa.w, bf[nt][0], bf[nt][1]);
+                    }
                 }
             }
         }
+        emb_cp_wait<ST - 2>();
+        __syncthreads();
+        if (st + 1 < NST) decode(st + 1);
     }
     emb_cp_wait<0>();
 
