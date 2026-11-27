@@ -25,6 +25,7 @@ pub mod codebook;
 pub mod compact;
 pub mod dflash2;
 pub mod ds41;
+pub mod embed_plan;
 pub mod exlr8;
 pub mod fetch;
 pub mod gencache;
@@ -802,6 +803,205 @@ pub unsafe extern "C" fn g6l_plan_read(h: *mut c_void, off: u64, n: u64, dst: *m
 pub unsafe extern "C" fn g6l_plan_free(h: *mut c_void) {
     if !h.is_null() {
         drop(Box::from_raw(h as *mut (v2plan::V2Image, Instant)));
+    }
+}
+
+/// C-ABI descriptor for one component tensor of an `EmbedItem` (e.g. `trellis`/`suh`/`svh`, `fp8`/`scale`, or `raw`).
+#[repr(C)]
+pub struct G6lEmbedComp {
+    pub suffix: *const c_char,
+    pub dtype: *const c_char,
+    pub nbytes: u64,
+    pub ndim: u32,
+    pub shape: [u64; embed_plan::MAX_SHAPE_DIMS],
+}
+
+/// C-ABI descriptor for one HF matrix or raw tensor in a multi-group exlr8 dense release.
+#[repr(C)]
+pub struct G6lEmbedItem {
+    pub hf_name: *const c_char,
+    pub dtype: *const c_char,
+    pub is_matrix: i32,
+    pub fmt: i32,
+    pub side: i32,
+    pub k: i32,
+    pub unit: i32,
+    pub ndim: u32,
+    pub shape: [u64; embed_plan::MAX_SHAPE_DIMS],
+    pub ncomp: u32,
+    pub comps: [G6lEmbedComp; embed_plan::MAX_COMPONENTS],
+}
+
+/// Opens a multi-group exlr8 dense release (`qwen3_vl`, `embedding_gemma2`, `glm`) for `g6embed`.
+/// Verifies every matrix's XXH64 checksum when `verify_checksums != 0`.
+///
+/// # Safety
+/// `release_dir` must be a valid NUL-terminated C string; `err` must hold `errlen` bytes when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_embed_open(
+    release_dir: *const c_char,
+    verify_checksums: i32,
+    err: *mut c_char,
+    errlen: usize,
+) -> *mut c_void {
+    if release_dir.is_null() {
+        write_err(err, errlen, "g6l_embed_open: null release_dir");
+        return std::ptr::null_mut();
+    }
+    let dir = match CStr::from_ptr(release_dir).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            write_err(err, errlen, "g6l_embed_open: non-UTF-8 release_dir");
+            return std::ptr::null_mut();
+        }
+    };
+    match embed_plan::EmbedRelease::open(dir, verify_checksums != 0) {
+        Ok(rel) => Box::into_raw(Box::new(rel)) as *mut c_void,
+        Err(e) => {
+            write_err(err, errlen, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Returns the discovered profile name (`"qwen3_vl"`, `"embedding_gemma2"`, `"glm"`).
+///
+/// # Safety
+/// `h` must come from `g6l_embed_open`.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_embed_profile(h: *const c_void) -> *const c_char {
+    if h.is_null() {
+        return std::ptr::null();
+    }
+    let rel = &*(h as *const embed_plan::EmbedRelease);
+    rel.profile.as_ptr()
+}
+
+/// Returns the number of HF items (matrices + copied raw tensors) in the release.
+///
+/// # Safety
+/// `h` must come from `g6l_embed_open`.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_embed_item_count(h: *const c_void) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    let rel = &*(h as *const embed_plan::EmbedRelease);
+    rel.items.len()
+}
+
+/// Populates `*out` with metadata for item `idx`. Returned string pointers stay valid until `g6l_embed_close(h)`.
+///
+/// # Safety
+/// `h` must come from `g6l_embed_open`; `out` must be non-null.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_embed_item_info(h: *const c_void, idx: usize, out: *mut G6lEmbedItem) -> i32 {
+    if h.is_null() || out.is_null() {
+        return 1;
+    }
+    let rel = &*(h as *const embed_plan::EmbedRelease);
+    let Some(item) = rel.items.get(idx) else {
+        return 1;
+    };
+    let empty_comp = || G6lEmbedComp {
+        suffix: std::ptr::null(),
+        dtype: std::ptr::null(),
+        nbytes: 0,
+        ndim: 0,
+        shape: [0; embed_plan::MAX_SHAPE_DIMS],
+    };
+    let mut comps = [empty_comp(), empty_comp(), empty_comp()];
+    for (i, c) in item.components.iter().take(embed_plan::MAX_COMPONENTS).enumerate() {
+        comps[i] = G6lEmbedComp {
+            suffix: c.suffix.as_ptr(),
+            dtype: c.dtype.as_ptr(),
+            nbytes: c.nbytes,
+            ndim: c.ndim,
+            shape: c.shape,
+        };
+    }
+    *out = G6lEmbedItem {
+        hf_name: item.hf_name.as_ptr(),
+        dtype: item.dtype.as_ptr(),
+        is_matrix: i32::from(item.is_matrix),
+        fmt: item.fmt,
+        side: item.side,
+        k: item.k,
+        unit: item.unit,
+        ndim: item.ndim,
+        shape: item.shape,
+        ncomp: item.components.len().min(embed_plan::MAX_COMPONENTS) as u32,
+        comps,
+    };
+    0
+}
+
+/// Reads component `comp` of item `idx` into `dst[..dst_bytes]` via `pread` (64K-page safe, no mmap).
+///
+/// # Safety
+/// `h` must come from `g6l_embed_open`; `dst` must hold `dst_bytes` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_embed_read_component(
+    h: *const c_void,
+    idx: usize,
+    comp: usize,
+    dst: *mut c_void,
+    dst_bytes: usize,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32 {
+    if h.is_null() || (dst.is_null() && dst_bytes > 0) {
+        return write_err(err, errlen, "g6l_embed_read_component: null argument");
+    }
+    let rel = &*(h as *const embed_plan::EmbedRelease);
+    let buf = if dst_bytes == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(dst as *mut u8, dst_bytes)
+    };
+    match rel.read_component(idx, comp, buf) {
+        Ok(()) => 0,
+        Err(e) => write_err(err, errlen, &e),
+    }
+}
+
+/// Decodes quantized matrix item `idx` into row-major BF16 bytes `[out, inp]` in `dst[..dst_bytes]`.
+///
+/// # Safety
+/// `h` must come from `g6l_embed_open`; `dst` must hold `out * inp * 2` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_embed_decode_bf16(
+    h: *const c_void,
+    idx: usize,
+    dst: *mut c_void,
+    dst_bytes: usize,
+    threads: u32,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32 {
+    if h.is_null() || (dst.is_null() && dst_bytes > 0) {
+        return write_err(err, errlen, "g6l_embed_decode_bf16: null argument");
+    }
+    let rel = &*(h as *const embed_plan::EmbedRelease);
+    let buf = if dst_bytes == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(dst as *mut u8, dst_bytes)
+    };
+    match rel.decode_bf16(idx, buf, threads as usize) {
+        Ok(()) => 0,
+        Err(e) => write_err(err, errlen, &e),
+    }
+}
+
+/// Frees a handle returned by `g6l_embed_open`.
+///
+/// # Safety
+/// `h` must come from `g6l_embed_open` and must not be used again.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_embed_close(h: *mut c_void) {
+    if !h.is_null() {
+        drop(Box::from_raw(h as *mut embed_plan::EmbedRelease));
     }
 }
 
