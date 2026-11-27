@@ -176,9 +176,15 @@ class HealthTests(unittest.TestCase):
         os.makedirs(self.out)
 
     def process(self, *words):
-        p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', *words])
+        # Wait for the child to reach Python before returning: Linux posix_spawn() can return before /proc/cmdline is set.
+        p = subprocess.Popen([sys.executable, '-c', 'import time; print(flush=True); time.sleep(60)', *words],
+                             stdout=subprocess.PIPE)
         self.addCleanup(p.wait)
         self.addCleanup(p.kill)
+        try:
+            p.stdout.readline()
+        finally:
+            p.stdout.close()
         return p.pid
 
     def write(self, state, pid, node=None):

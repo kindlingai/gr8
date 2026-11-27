@@ -984,10 +984,16 @@ class HealthTests(unittest.TestCase):
 
     def fake_supervisor(self):
         """A process whose command line is a supervisor's (`launch.py supervise`), as health() checks in /proc."""
-        p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)',
-                              os.path.join(self.home, 'launch.py'), 'supervise'])
+        # Wait for the child to reach Python before returning: on Linux posix_spawn() (CLONE_VFORK) returns once
+        # exec_mmap() releases the old mm, before create_elf_tables() populates /proc/<pid>/cmdline.
+        p = subprocess.Popen([sys.executable, '-c', 'import time; print(flush=True); time.sleep(60)',
+                              os.path.join(self.home, 'launch.py'), 'supervise'], stdout=subprocess.PIPE)
         self.addCleanup(p.wait)
         self.addCleanup(p.kill)
+        try:
+            p.stdout.readline()
+        finally:
+            p.stdout.close()
         return p.pid
 
     def write(self, state, rank, pid=None, supervisor=True):
@@ -1096,7 +1102,8 @@ class HealthTests(unittest.TestCase):
         self.write('serving', 1)
         p = os.path.join(self.out, 'supervisor.pid')
         os.utime(p, (time.time() - 3600,) * 2)    # NTP stepped back an hour: the file looks older than the process
-        self.assertEqual(self.run_health()[0], 0)
+        rc, line = self.run_health()
+        self.assertEqual(rc, 0, line)
 
     def test_an_http_proxy_in_the_environment_is_not_used(self):
         """As docker runs it: a new process, with an HTTP_PROXY (docker's daemon proxies) that answers nothing."""
