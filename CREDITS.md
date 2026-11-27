@@ -92,3 +92,4 @@ Thanks to:
   vector format ([spec](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md)) and its
   reader-conformance contract, which the native steering input implements.
 - The tool-call cases in `frontend/g6front-rs/src/parser.rs` are ported from vLLM's GLM tool-parser tests (Apache-2.0).
+- [Fish Audio](https://fish.audio/) (`fishaudio/drama-3` and `fish-speech`): Drama 3 TTS architecture and S2-Pro `modded_dac` audio codec. Built with Fish Audio.

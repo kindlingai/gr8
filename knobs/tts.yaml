@@ -1,0 +1,35 @@
+# Drama 3 native TTS runtime settings (g6tts). knobs/README.md describes the fields.
+prefix: "GR8_TTS_"
+scope: outside
+knobs:
+  GR8_TTS_STREAMS:
+    kind: int
+    default: "8"
+    values: "1..64"
+    legacy: []
+    doc: >-
+      Maximum concurrent streaming TTS sessions in g6tts when --streams is not passed on the command line. Default: 8.
+  GR8_TTS_GRAPH:
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = capture and replay one CUDA graph per frame (backbone step, 13 codebook-MTP tower layers, and
+      10 on-GPU samplings) plus codec decode graphs. 0 = eager kernel-by-kernel launch for parity debugging.
+  GR8_TTS_VOC_STRIDES:
+    kind: ints
+    default: "1,1,2,4"
+    legacy: []
+    doc: >-
+      Per-stream codec decode stride schedule in frames (each frame is 2048 samples at 44.1 kHz, 46.4 ms). The last
+      entry repeats for the remainder of the stream. Default: 1,1,2,4 (low TTFA on frame 1, batched codec thereafter).
+  GR8_TTS_CODEC_FP32:
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = run the native modded_dac codec decoder GEMMs in strict IEEE FP32 so streaming strides 1,1,2,4
+      match whole-sequence decode within 1 LSB of s16 (encoder always runs in FP32). 0 = FP16 decoder GEMMs with FP32
+      accumulation, Snake, RMSNorm, LayerNorm, LayerScale, depthwise conv, KV rings, final conv, and Tanh.

@@ -13,6 +13,7 @@ TOKENIZER_GLM = ('chat_template.jinja', 'generation_config.json', 'tokenizer.jso
 TOKENIZER_DS = ('tokenizer.json', 'tokenizer_config.json')
 TOKENIZER_INK2 = ('chat_template.jinja', 'tokenizer.json', 'tokenizer_config.json')
 TOKENIZER_EMBED = ('chat_template.jinja', 'tokenizer.json', 'tokenizer_config.json')
+TOKENIZER_TTS = ('chat_template.jinja', 'tokenizer.json', 'tokenizer_config.json')
 
 
 class ModelMismatch(Exception):
@@ -169,7 +170,19 @@ EMBED = Model('embed', 'Qwen3-VL-Embedding', 'https://huggingface.co/kindlingai/
               defaults=(('MAX_MODEL_LEN', '16384'),),
               max_positions=262144, engine_profile='embed', simulator='', smoke_script='smoketest/embed.sh',
               min_free_gib=2, build_widths=('1',))
-MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, INK2, QW38, HY4, EMBED, PSEUDO)}
+# Native Drama 3 TTS (g6tts): FishOmniModel in exlr8 v2/v4 trellis experts (K2/K3/K4) + multi-group dense
+# (gdn/attn/mtp_shared/mtp/global + vocab) + native exlr8-codec.safetensors. TP=1, direct Unix socket to g6front-rs.
+TTS = Model('tts', 'Drama 3', 'https://huggingface.co/kindlingai/drama-3-exlr8',
+            'g6tts', 'tts', ('1',),
+            {'bit200': 2.0, 'bit300': 3.0, 'bit400': 4.0},
+            {1: ('bit300', 'bit400', 'bit200')},
+            'gr8-tts', 'FishOmniModel',
+            False, False, False, dialect='qwen', served=('drama-3',),
+            vocab=252288, eos_ids=(248046,),
+            max_positions=8192, engine_profile='tts', simulator='', smoke_script='smoketest/tts.sh',
+            engine_prefixes=('GR8_TTS_',),
+            min_free_gib=4, checkpoint_cache=False, build_widths=('1',))
+MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, INK2, QW38, HY4, EMBED, TTS, PSEUDO)}
 
 
 # The models a runner names. pseudo, the test engine, is served when named but left out of the lists.

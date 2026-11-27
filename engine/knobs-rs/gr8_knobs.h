@@ -27,7 +27,7 @@ namespace knob
 {
 
 /// The hash of the table this header was written from.
-constexpr uint64_t TABLE_HASH = 0xc44302750b40463dull;
+constexpr uint64_t TABLE_HASH = 0x2eeb2399f281cdb5ull;
 
 /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
 /// of errors. The engine stops when it is not 0.
@@ -4529,87 +4529,115 @@ inline bool tr3_wide4()
     return v;
 }
 
+/// GR8_TTS_CODEC_FP32
+inline bool tts_codec_fp32()
+{
+    static const bool v = *detail::flag(636, 0);
+    return v;
+}
+
+/// GR8_TTS_GRAPH
+inline bool tts_graph()
+{
+    static const bool v = *detail::flag(637, 0);
+    return v;
+}
+
+/// GR8_TTS_STREAMS
+inline int64_t tts_streams()
+{
+    static const int64_t v = *detail::int_(638, 0);
+    return v;
+}
+
+/// GR8_TTS_VOC_STRIDES
+inline const std::vector<int64_t>& tts_voc_strides()
+{
+    static const std::vector<int64_t> v = *detail::ints(639, 0);
+    return v;
+}
+
 /// GR8_V2_SHARED
 inline const std::optional<std::string>& v2_shared()
 {
-    static const std::optional<std::string> v = detail::text(636, 0);
+    static const std::optional<std::string> v = detail::text(640, 0);
     return v;
 }
 
 /// GR8_WARM
 inline int64_t warm()
 {
-    static const int64_t v = *detail::int_(637, 0);
+    static const int64_t v = *detail::int_(641, 0);
     return v;
 }
 
 /// GR8_WEIGHT_CHECK
 inline bool weight_check()
 {
-    static const bool v = *detail::flag(638, 0);
+    static const bool v = *detail::flag(642, 0);
     return v;
 }
 
 /// GR8_WEIGHT_CHECK_FLIP
 inline const std::optional<std::string>& weight_check_flip()
 {
-    static const std::optional<std::string> v = detail::text(639, 0);
+    static const std::optional<std::string> v = detail::text(643, 0);
     return v;
 }
 
 /// GR8_WIDTHS
 inline const std::optional<std::string>& widths()
 {
-    static const std::optional<std::string> v = detail::text(640, 0);
+    static const std::optional<std::string> v = detail::text(644, 0);
     return v;
 }
 
 /// GR8_WORK_DIR
 inline const std::optional<std::string>& work_dir()
 {
-    static const std::optional<std::string> v = detail::text(641, 0);
+    static const std::optional<std::string> v = detail::text(645, 0);
     return v;
 }
 
 /// GR8_XGRAMMAR
 inline const std::optional<std::string>& xgrammar()
 {
-    static const std::optional<std::string> v = detail::text(642, 0);
+    static const std::optional<std::string> v = detail::text(646, 0);
     return v;
 }
 
 /// GR8_XGRAMMAR_LIB
 inline const std::optional<std::string>& xgrammar_lib()
 {
-    static const std::optional<std::string> v = detail::text(643, 0);
+    static const std::optional<std::string> v = detail::text(647, 0);
     return v;
 }
 
 /// GR8_XTRACE
 inline bool xtrace()
 {
-    static const bool v = *detail::flag(644, 0);
+    static const bool v = *detail::flag(648, 0);
     return v;
 }
 
 /// GR8_XTRACE_OUT
 inline const std::optional<std::string>& xtrace_out()
 {
-    static const std::optional<std::string> v = detail::text(645, 0);
+    static const std::optional<std::string> v = detail::text(649, 0);
     return v;
 }
 
 /// GR8_XTRACE_PF
 inline bool xtrace_pf()
 {
-    static const bool v = *detail::flag(646, 0);
+    static const bool v = *detail::flag(650, 0);
     return v;
 }
 
 /// GR8_XTRACE_QUIT
 inline const std::optional<std::string>& xtrace_quit()
 {
-    static const std::optional<std::string> v = detail::text(647, 0);
+    static const std::optional<std::string> v = detail::text(651, 0);
     return v;
 }
 

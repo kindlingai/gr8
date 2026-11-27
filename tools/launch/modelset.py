@@ -183,6 +183,55 @@ def embed_set(d, tp, model_dir=None, label=None):
     return ModelSet(s, label or f'{d} (exlr8 dense embedding release)', tok, d)
 
 
+def is_tts_release(d):
+    """A Drama 3 exlr8 TTS release directory (config.json + exlr8-vocab.safetensors at root or dense/)."""
+    return bool(d) and os.path.isfile(os.path.join(d, 'config.json')) and _embed_weight_dir(d) is not None
+
+
+def tts_set(d, tp, model_dir=None, label=None):
+    """The model set of a Drama 3 exlr8 TTS release (local or fetched from Hugging Face)."""
+    tok = tokenizer_dir(d, model_dir, models.TOKENIZER_TTS)
+    weights = None
+    for mdir in (os.path.join(d, 'manifests'), d):
+        if not os.path.isdir(mdir):
+            continue
+        for p in sorted(os.listdir(mdir)):
+            if not (p.startswith('exlr8-manifest-') and p.endswith('.json')):
+                continue
+            try:
+                with open(os.path.join(mdir, p)) as f:
+                    weights = json.load(f).get('set_id') or weights
+            except (OSError, ValueError):
+                continue
+        if weights:
+            break
+    if not weights:
+        parts = {'config.json': sha256_file(os.path.join(d, 'config.json'))}
+        hashes_dir = os.path.join(d, 'hashes')
+        if os.path.isdir(hashes_dir):
+            for root, _, names in os.walk(hashes_dir):
+                for name in sorted(names):
+                    if name.endswith('.sha256'):
+                        full = os.path.join(root, name)
+                        relp = os.path.relpath(full, d).replace(os.sep, '/')
+                        parts[relp] = sha256_file(full)
+        if len(parts) <= 1:
+            wdir = _embed_weight_dir(d)
+            if wdir:
+                for name in sorted(os.listdir(wdir)):
+                    if name == 'exlr8-vocab.safetensors' or (name.startswith('exlr8-dense-') and name.endswith('.safetensors')):
+                        parts[name] = safetensors_header_sha256(os.path.join(wdir, name))
+            codec = os.path.join(d, 'codec', 'exlr8-codec.safetensors')
+            if os.path.isfile(codec):
+                parts['codec/exlr8-codec.safetensors'] = safetensors_header_sha256(codec)
+        weights = hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    s = {'format': FORMAT, 'tp': tp, 'ranks': [], 'dflash': [], 'qo': None,
+         'tokenizer': {f: sha256_file(os.path.join(tok, f)) for f in models.TOKENIZER_TTS},
+         'source': {'kind': 'exlr8-tts', 'weights': weights}}
+    s['set_id'] = compute_id(s)
+    return ModelSet(s, label or f'{d} (exlr8 TTS release)', tok, d)
+
+
 class ModelSet:
     """A resolved model set: its description, the release directory and the tokenizer on this box. release: the
     Hugging Face release (hfsource.Release) when it was fetched, and drafter the DFlash2 drafter fetched and converted

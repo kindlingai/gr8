@@ -20,7 +20,7 @@ _model_registry=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/launch" && pwd)/mo
 model_field() { python3 "$_model_registry" get "${GR8_MODEL:-glm53}" "$@"; }
 _engine_profile=$(model_field engine_profile) || return 2
 _engine_binary=$(model_field engine) || return 2
-case $_engine_profile in glm|flash|ds41|ink2|qw38|hy4|embed|pseudo) ;;
+case $_engine_profile in glm|flash|ds41|ink2|qw38|hy4|embed|tts|pseudo) ;;
   *) echo "unknown engine profile: $_engine_profile" >&2; return 2 ;;
 esac
 
@@ -366,6 +366,7 @@ engine_defaults() {
   [ "$_engine_profile" = qw38 ] && { qw38_defaults; return; }
   [ "$_engine_profile" = hy4 ] && { hy4_defaults; return; }
   [ "$_engine_profile" = embed ] && { embed_defaults; return; }
+  [ "$_engine_profile" = tts ] && { tts_defaults; return; }
   [ "$_engine_profile" = pseudo ] && { pseudo_defaults; return; }
   local _cap_set=${CAP:+1} _base_p=0; DISPRAM_MIN_BYTES=0
   case $TP in
@@ -592,6 +593,19 @@ embed_env() {
   ENGINE_ENV="${EXTRA_ENV:-}"
 }
 
+# Native Drama 3 TTS (g6tts): TP=1, direct Unix socket to g6front-rs (no S2 shim).
+tts_defaults() {
+  case $TP in 1) ;; *) echo "engine_defaults: TP=$TP; tts (g6tts) wants TP=1" >&2; return 2 ;; esac
+  CAP=${CAP:-4096}; MAX_MODEL_LEN=${MAX_MODEL_LEN:-$CAP}; READY_TMO=${READY_TMO:-600}
+  SESS=${SESS:-8}; SHARE_LIMIT=${SHARE_LIMIT:-$CAP}
+  S2PORT=${S2PORT:-7341}; MTP=0; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
+}
+
+tts_env() {
+  ENGINE_BIN=$_engine_binary
+  ENGINE_ENV="${EXTRA_ENV:-}"
+}
+
 # Qwen3.8-Flash-Next: passes PTAB (GR8_PTAB=0|1|2) and EXTRA_ENV through.
 qw38_env() {
   ENGINE_BIN=$_engine_binary
@@ -608,6 +622,7 @@ engine_env() {
   [ "$_engine_profile" = qw38 ] && { qw38_env; return 0; }
   [ "$_engine_profile" = hy4 ] && { hy4_env; return 0; }
   [ "$_engine_profile" = embed ] && { embed_env; return 0; }
+  [ "$_engine_profile" = tts ] && { tts_env; return 0; }
   [ "$_engine_profile" = pseudo ] && { ENGINE_BIN=$_engine_binary; ENGINE_ENV=""; return 0; }
   ENGINE_BIN=$_engine_binary; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=$_engine_binary-int4
   local _pf_dense=8192 _pf_streams=2 _pf_attn=1024 _pf_blas=1024
@@ -794,6 +809,18 @@ engine_args() {
   fi
   if [ "$_engine_profile" = embed ]; then
     a="--model-dir ${V2_DENSE:-$rp} --socket $home/run/engine.sock --max-batched-tokens $CAP --max-model-len ${MAX_MODEL_LEN:-$CAP}"
+    [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
+    (set -f; echo $a ${EXTRA_ARGS:-})
+    return
+  fi
+  if [ "$_engine_profile" = tts ]; then
+    local _man
+    if [ -n "${V2_WIDTHS:-}" ]; then
+      _man=$(basename "$V2_WIDTHS")
+    else
+      _man="exlr8-manifest-${VARIANT:-bit300}.json"
+    fi
+    a="--model-dir ${V2_DENSE:-$rp} --manifest $_man --socket $home/run/engine.sock --streams $SESS --cap $CAP"
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     (set -f; echo $a ${EXTRA_ARGS:-})
     return
