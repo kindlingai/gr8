@@ -393,9 +393,7 @@ engine_defaults() {
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then
          tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
          case " ${EXTRA_ENV:-} " in *" GR8_ATTN_FLIP=1 "*) ;; *) tp4_default CP_ONECHAIN 1 ;; esac
-         if [ "${KVB:-bf16}" != fp8 ]; then
-           case " ${EXTRA_ENV:-} " in *" GR8_KVB=fp8 "*) ;; *) tp4_default KV4_FOLD 1 ;; esac
-         fi
+         tp4_default KV4_FOLD 1
          local _fold_eff=${KV4_FOLD:-0}
          case " ${EXTRA_ENV:-} " in *" GR8_KV4_FOLD=1 "*) _fold_eff=1 ;; *" GR8_KV4_FOLD=0 "*) _fold_eff=0 ;; esac
          if [ "$_fold_eff" = 1 ]; then tp4_default KV4_TC 1; fi
@@ -456,9 +454,7 @@ engine_defaults() {
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then
          tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
          case " ${EXTRA_ENV:-} " in *" GR8_ATTN_FLIP=1 "*) ;; *) tp4_default CP_ONECHAIN 1 ;; esac
-         if [ "${KVB:-bf16}" != fp8 ]; then
-           case " ${EXTRA_ENV:-} " in *" GR8_KVB=fp8 "*) ;; *) tp4_default KV4_FOLD 1 ;; esac
-         fi
+         tp4_default KV4_FOLD 1
          local _fold_eff=${KV4_FOLD:-0}
          case " ${EXTRA_ENV:-} " in *" GR8_KV4_FOLD=1 "*) _fold_eff=1 ;; *" GR8_KV4_FOLD=0 "*) _fold_eff=0 ;; esac
          if [ "$_fold_eff" = 1 ]; then tp4_default KV4_TC 1; fi
@@ -593,8 +589,8 @@ qw38_env() {
 }
 
 engine_env() {
-  if [ "${KV4_FOLD:-0}" = 1 ] && { [ "$(model_field kv4_fold)" != 1 ] || [ "${KV_FORMAT:-fp8}" != int4 ] || [ "${KVB:-bf16}" = fp8 ]; }; then
-    echo "engine_env: KV4_FOLD=1 requires glm53 int4 KV and BF16 kv_b" >&2; return 2
+  if [ "${KV4_FOLD:-0}" = 1 ] && { [ "$(model_field kv4_fold)" != 1 ] || [ "${KV_FORMAT:-fp8}" != int4 ]; }; then
+    echo "engine_env: KV4_FOLD=1 requires glm53 int4 KV" >&2; return 2
   fi
   [ "$_engine_profile" = flash ] && { flash_env; return 0; }
   [ "$_engine_profile" = ds41 ] && { ds41_env; return 0; }

@@ -132,6 +132,49 @@ pub fn fwht512_rows(w: &mut [f32]) {
     }
 }
 
+/// Dequantizes row-major [rows][512] FP8 E4M3 weights with [rows][4] block scales, applies the normalized
+/// 512-point Sylvester Hadamard transform along each latent row, and re-quantizes per-row 1x128 blocks to
+/// E4M3FN bytes + F32 scales.
+pub(crate) fn fp8_fold_rows(w: &[u8], s: &[f32]) -> (Vec<u8>, Vec<f32>) {
+    assert_eq!(w.len() % 512, 0);
+    let nrows = w.len() / 512;
+    assert_eq!(s.len(), nrows * 4);
+    let mut out_w = vec![0u8; w.len()];
+    let mut out_s = vec![0.0f32; s.len()];
+    let mut row = [0.0f32; 512];
+    for r in 0..nrows {
+        let w_in = &w[r * 512..(r + 1) * 512];
+        let s_in = &s[r * 4..(r + 1) * 4];
+        for b in 0..4 {
+            let sc = s_in[b];
+            let off = b * 128;
+            for k in 0..128 {
+                row[off + k] = exlr8::e4m3_to_f32(w_in[off + k]) * sc;
+            }
+        }
+        fwht512_rows(&mut row);
+        let w_out = &mut out_w[r * 512..(r + 1) * 512];
+        let s_out = &mut out_s[r * 4..(r + 1) * 4];
+        for b in 0..4 {
+            let off = b * 128;
+            let blk = &row[off..off + 128];
+            let amax = blk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            if amax == 0.0 || !amax.is_finite() {
+                s_out[b] = 0.0;
+                continue;
+            }
+            let sc = (amax / 448.0).max(f32::MIN_POSITIVE);
+            let inv = 1.0f64 / (sc as f64);
+            s_out[b] = sc;
+            for k in 0..128 {
+                let q = exlr8::e4m3_round(((blk[k] as f64) * inv) as f32);
+                w_out[off + k] = if q == 0.0 { 0 } else { records::e4m3_byte(q) };
+            }
+        }
+    }
+    (out_w, out_s)
+}
+
 fn bf16v(v: &[f32]) -> Vec<u16> {
     v.iter().map(|&x| bf16_bits(x)).collect()
 }
@@ -555,7 +598,13 @@ impl Planner<'_> {
             return Err(format!("{}: kv_b is {} [{} x {}]: GR8_KVB=fp8 needs the release's block FP8 [28672 x 512]",
                                f.path, fmt_name(kvb), kvb.rec.out, kvb.rec.inp));
         }
-        self.note(l, Form { what: "kv_b", src: fmt_name(kvb), form: "FP8 + block scales (UK, UV; GR8_KVB=fp8)", exact: EXACT });
+        let kvb_rot = self.kvb_rot;
+        self.note(l, Form {
+            what: "kv_b",
+            src: fmt_name(kvb),
+            form: if kvb_rot { "FP8 + per-row scales (UK H, UV H; GR8_KVB=fp8 + GR8_KV4_FOLD)" } else { "FP8 + block scales (UK, UV; GR8_KVB=fp8)" },
+            exact: if kvb_rot { ROUNDED } else { EXACT },
+        });
         let f2 = f.clone();
         self.gen(format!("{p}.kv_b"), vec![
             (format!("{p}.kv_b.uk"), "u8", vec![nh as i64, 192, 512]),
@@ -563,6 +612,7 @@ impl Planner<'_> {
             (format!("{p}.kv_b.uk.scale"), "f32", vec![nh as i64, 192, 4]),
             (format!("{p}.kv_b.uv.scale"), "f32", vec![nh as i64, 256, 4])], move || {
             let (w, s) = Matrix::open(&f2, "self_attn.kv_b_proj")?.fp8_rows(&(h0 * 448..(h0 + nh) * 448))?;
+            let (w, s) = if kvb_rot { fp8_fold_rows(&w, &s) } else { (w, s) };
             let (mut uk, mut uv, mut uks, mut uvs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for h in 0..nh {
                 uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
@@ -847,7 +897,6 @@ pub struct Opts {
 }
 
 fn validate_kvb_opts(opts: Opts, is_flash: bool) -> Result<(), String> {
-    if opts.kvb_fp8 && opts.kvb_rot { return Err("GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8".into()); }
     if is_flash && opts.kvb_rot { return Err("GR8_KV4_FOLD=1 is for GLM-5.3 G6_KV4 only".into()); }
     Ok(())
 }
@@ -934,11 +983,64 @@ mod tests {
 
     #[test]
     fn fold_options_fail_closed() {
-        let folded=super::Opts { kvb_rot:true, ..Default::default() };
-        assert!(super::validate_kvb_opts(folded,false).is_ok());
-        assert_eq!(super::validate_kvb_opts(folded,true).unwrap_err(), "GR8_KV4_FOLD=1 is for GLM-5.3 G6_KV4 only");
-        let bad=super::Opts {kvb_fp8:true,..folded};
-        assert_eq!(super::plan("", "", "", "", 4, 0, None, bad).err().unwrap(), "GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8");
+        let folded = super::Opts { kvb_rot: true, ..Default::default() };
+        assert!(super::validate_kvb_opts(folded, false).is_ok());
+        assert_eq!(super::validate_kvb_opts(folded, true).unwrap_err(), "GR8_KV4_FOLD=1 is for GLM-5.3 G6_KV4 only");
+        let fp8_folded = super::Opts { kvb_fp8: true, ..folded };
+        assert!(super::validate_kvb_opts(fp8_folded, false).is_ok());
+        assert_eq!(super::validate_kvb_opts(fp8_folded, true).unwrap_err(), "GR8_KV4_FOLD=1 is for GLM-5.3 G6_KV4 only");
+    }
+
+    #[test]
+    fn fp8_fold_roundtrip_accuracy() {
+        let nrows = 8usize;
+        let mut w_in = vec![0u8; nrows * 512];
+        let mut s_in = vec![0.0f32; nrows * 4];
+        let mut ref_raw = vec![0.0f32; nrows * 512];
+        for r in 0..nrows {
+            for b in 0..4 {
+                let sc = if r == nrows - 1 && b == 2 { 0.0 } else { 0.002 * ((r * 4 + b + 1) as f32) };
+                s_in[r * 4 + b] = sc;
+                for k in 0..128 {
+                    let v = (((r * 131 + b * 53 + k * 19) % 251) as f32 - 125.0) * 1.5;
+                    let q = crate::exlr8::e4m3_round(v);
+                    let byte = if q == 0.0 { 0 } else { crate::records::e4m3_byte(q) };
+                    w_in[r * 512 + b * 128 + k] = byte;
+                    ref_raw[r * 512 + b * 128 + k] = crate::exlr8::e4m3_to_f32(byte) * sc;
+                }
+            }
+        }
+        let mut expected = ref_raw.clone();
+        super::fwht512_rows(&mut expected);
+
+        let (w_rot, s_rot) = super::fp8_fold_rows(&w_in, &s_in);
+        assert_eq!(w_rot.len(), w_in.len());
+        assert_eq!(s_rot.len(), s_in.len());
+        assert!(s_rot.iter().all(|&x| x.is_finite() && x >= 0.0));
+        assert!(w_rot.iter().all(|&b| (b & 0x7f) != 0x7f), "no E4M3FN NaN bytes");
+
+        let mut got = vec![0.0f32; nrows * 512];
+        for r in 0..nrows {
+            for b in 0..4 {
+                let sc = s_rot[r * 4 + b];
+                for k in 0..128 {
+                    got[r * 512 + b * 128 + k] = crate::exlr8::e4m3_to_f32(w_rot[r * 512 + b * 128 + k]) * sc;
+                }
+            }
+        }
+        let err_sq: f64 = got.iter().zip(&expected).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum();
+        let ref_sq: f64 = expected.iter().map(|&b| (b as f64).powi(2)).sum();
+        // Theoretical E4M3FN (3 mantissa bits) RMS relative quantization error is ~2.4%
+        let rel_l2 = (err_sq / ref_sq).sqrt();
+        assert!(rel_l2 < 3.0e-2, "fp8_fold_rows rel_l2={rel_l2:.5} too high");
+
+        // Verify orthogonality: <H(w_row), H(x)> ~= <w_row, x>
+        let x: Vec<f32> = (0..512).map(|i| (((i * 37) % 199) as f32 - 99.0) / 100.0).collect();
+        let mut hx = x.clone();
+        super::fwht512_rows(&mut hx);
+        let dot_orig: f64 = ref_raw[..512].iter().zip(&x).map(|(&a, &b)| a as f64 * b as f64).sum();
+        let dot_rot: f64 = got[..512].iter().zip(&hx).map(|(&a, &b)| a as f64 * b as f64).sum();
+        assert!((dot_orig - dot_rot).abs() / dot_orig.abs().max(1e-6) < 3.0e-2);
     }
 
     #[test]
@@ -971,7 +1073,7 @@ mod tests {
         let p=std::ptr::null();
         let handle=unsafe{crate::g6l_release_plan(p,p,p,p,4,0,0,0,p,p,err.as_mut_ptr(),err.len())};
         assert!(handle.is_null());
-        assert_eq!(unsafe{std::ffi::CStr::from_ptr(err.as_ptr())}.to_str().unwrap(),"GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8");
+        assert_eq!(unsafe{std::ffi::CStr::from_ptr(err.as_ptr())}.to_str().unwrap(),"g6l_release_plan: no dense dir");
         let a=crate::gencache::GenCache::from_env("release kvb_rot=false").unwrap();
         a.write("L000.kv_b", &[1,2,3,4]);
         let b=crate::gencache::GenCache::from_env("release kvb_rot=true").unwrap();

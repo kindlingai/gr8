@@ -286,7 +286,6 @@ int main(int argc, char** argv)
         fprintf(stderr, "GR8_KV4_FOLD=1 is supported on GLM-5.3 only\n"); return 2;
 #else
         if (!release) { fprintf(stderr, "GR8_KV4_FOLD=1 requires --v2-dense (release boot) so loader-rs folds kv_b\n"); return 2; }
-        if (knob::kvb() == "fp8") { fprintf(stderr, "GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8\n"); return 2; }
 #endif
     }
     if (eo.check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }

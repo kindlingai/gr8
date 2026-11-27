@@ -515,7 +515,6 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
     let r = (|| {
         let kvb_fp8 = kvb_fp8()?;
         let kvb_rot = kvb_rot();
-        if kvb_fp8 && kvb_rot { return Err("GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8".into()); }
         let layout_path: Option<String> = cstr(layout);
         let layout = cstr(layout).map(|p| layout::Layout::read(&p)).transpose()?;
         let (img, table) = release::plan(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
