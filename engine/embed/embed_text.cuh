@@ -219,6 +219,200 @@ __global__ void __launch_bounds__(128) k_q3_causal_gqa_attn(
     }
 }
 
+// Tensor-Core BF16 FlashAttention-2 for packed variable-length causal/bidirectional GQA (head_dim = 128).
+// BQ = 64 (4 warps x 16 Q rows), BK = 64 KV rows, Q kept 100% in registers, online softmax via 4-lane quad shuffles.
+// Grid: (num_q_tiles, nq), Block: 128.
+constexpr int TEXT_TC_BQ = 64;
+constexpr int TEXT_TC_BK = 64;
+
+__global__ void __launch_bounds__(128, 2) k_q3_flash_attn_tc(
+    const bf16* __restrict__ Q,
+    const bf16* __restrict__ K,
+    const bf16* __restrict__ V,
+    bf16* __restrict__ O,
+    const int* __restrict__ cu_seqlens,
+    const int2* __restrict__ q_tiles,
+    int num_q_tiles, int nq, int nkv, bool causal) {
+    __shared__ __align__(16) bf16 sK[TEXT_TC_BK][136];
+    __shared__ __align__(16) bf16 sV[TEXT_TC_BK][136];
+
+    const int tile_idx = blockIdx.x;
+    if (tile_idx >= num_q_tiles) return;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int r = lane >> 2;
+    const int c = (lane & 3) * 2;
+
+    const int2 qt = q_tiles[tile_idx];
+    const int seq = qt.x;
+    const int q_local_base = qt.y;
+    const int s_start = cu_seqlens[seq];
+    const int seq_len = cu_seqlens[seq + 1] - s_start;
+    const int hq = blockIdx.y;
+    const int hkv = hq / (nq / nkv);
+    const float scale = 0.08838834764831845f; // 1 / sqrt(128)
+
+    const int q_row0 = q_local_base + warp * 16 + r;
+    const int q_row1 = q_row0 + 8;
+
+    u32 q_frag[8][4];
+    const bf16* qp0 = (q_row0 < seq_len) ? (Q + (size_t(s_start + q_row0) * nq + hq) * 128) : nullptr;
+    const bf16* qp1 = (q_row1 < seq_len) ? (Q + (size_t(s_start + q_row1) * nq + hq) * 128) : nullptr;
+    #pragma unroll
+    for (int ks = 0; ks < 8; ++ks) {
+        const int col = ks * 16 + c;
+        q_frag[ks][0] = qp0 ? *reinterpret_cast<const u32*>(qp0 + col) : 0u;
+        q_frag[ks][1] = qp1 ? *reinterpret_cast<const u32*>(qp1 + col) : 0u;
+        q_frag[ks][2] = qp0 ? *reinterpret_cast<const u32*>(qp0 + col + 8) : 0u;
+        q_frag[ks][3] = qp1 ? *reinterpret_cast<const u32*>(qp1 + col + 8) : 0u;
+    }
+
+    float O_acc[16][4];
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        O_acc[dt][0] = O_acc[dt][1] = O_acc[dt][2] = O_acc[dt][3] = 0.f;
+    }
+    float m_max0 = -1e30f, m_max1 = -1e30f;
+    float l_sum0 = 0.f, l_sum1 = 0.f;
+
+    const int kv_end = causal ? min(seq_len, q_local_base + TEXT_TC_BQ) : seq_len;
+
+    for (int k0 = 0; k0 < kv_end; k0 += TEXT_TC_BK) {
+        const int kt = min(TEXT_TC_BK, kv_end - k0);
+        // 64 * 128 / 8 = 1024 uint4 loads -> 8 per thread
+        #pragma unroll
+        for (int idx = tid; idx < TEXT_TC_BK * 16; idx += 128) {
+            const int kr = idx >> 4;
+            const int kc = (idx & 15) * 8;
+            if (kr < kt) {
+                const size_t off = (size_t(s_start + k0 + kr) * nkv + hkv) * 128 + kc;
+                *reinterpret_cast<uint4*>(&sK[kr][kc]) = *reinterpret_cast<const uint4*>(K + off);
+                *reinterpret_cast<uint4*>(&sV[kr][kc]) = *reinterpret_cast<const uint4*>(V + off);
+            } else {
+                *reinterpret_cast<uint4*>(&sK[kr][kc]) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(&sV[kr][kc]) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+
+        // Skip warps completely before the causal boundary of this KV tile
+        const int warp_q_hi = q_local_base + warp * 16 + 15;
+        if (!causal || k0 <= warp_q_hi) {
+            float S[8][4];
+            #pragma unroll
+            for (int nt = 0; nt < 8; ++nt) S[nt][0] = S[nt][1] = S[nt][2] = S[nt][3] = 0.f;
+
+            #pragma unroll
+            for (int ks = 0; ks < 8; ++ks) {
+                const int kcol = ks * 16 + c;
+                #pragma unroll
+                for (int nt = 0; nt < 8; ++nt) {
+                    const int kr = nt * 8 + r;
+                    const u32 b0 = *reinterpret_cast<const u32*>(&sK[kr][kcol]);
+                    const u32 b1 = *reinterpret_cast<const u32*>(&sK[kr][kcol + 8]);
+                    emb_mma16816_bf16(S[nt], q_frag[ks][0], q_frag[ks][1], q_frag[ks][2], q_frag[ks][3], b0, b1);
+                }
+            }
+
+            const bool need_mask = (k0 + TEXT_TC_BK > seq_len) || (causal && (k0 + TEXT_TC_BK > q_local_base + warp * 16));
+            float rmax0 = -1e30f, rmax1 = -1e30f;
+            #pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                const int kp0 = k0 + nt * 8 + c;
+                const int kp1 = kp0 + 1;
+                float s0 = S[nt][0] * scale, s1 = S[nt][1] * scale;
+                float s2 = S[nt][2] * scale, s3 = S[nt][3] * scale;
+                if (need_mask) {
+                    if (kp0 >= seq_len || (causal && kp0 > q_row0)) s0 = -1e30f;
+                    if (kp1 >= seq_len || (causal && kp1 > q_row0)) s1 = -1e30f;
+                    if (kp0 >= seq_len || (causal && kp0 > q_row1)) s2 = -1e30f;
+                    if (kp1 >= seq_len || (causal && kp1 > q_row1)) s3 = -1e30f;
+                }
+                S[nt][0] = s0; S[nt][1] = s1; S[nt][2] = s2; S[nt][3] = s3;
+                rmax0 = fmaxf(rmax0, fmaxf(s0, s1));
+                rmax1 = fmaxf(rmax1, fmaxf(s2, s3));
+            }
+            // Quad-reduce max across 4 lanes holding the same query row
+            rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffffu, rmax0, 1));
+            rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffffu, rmax0, 2));
+            rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffffu, rmax1, 1));
+            rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffffu, rmax1, 2));
+
+            const float m_new0 = fmaxf(m_max0, rmax0);
+            const float m_new1 = fmaxf(m_max1, rmax1);
+            const float alpha0 = (m_max0 > -1e20f) ? __expf(m_max0 - m_new0) : 0.f;
+            const float alpha1 = (m_max1 > -1e20f) ? __expf(m_max1 - m_new1) : 0.f;
+
+            #pragma unroll
+            for (int dt = 0; dt < 16; ++dt) {
+                O_acc[dt][0] *= alpha0; O_acc[dt][1] *= alpha0;
+                O_acc[dt][2] *= alpha1; O_acc[dt][3] *= alpha1;
+            }
+            l_sum0 *= alpha0;
+            l_sum1 *= alpha1;
+
+            float rsum0 = 0.f, rsum1 = 0.f;
+            u32 pf[4][4];
+            #pragma unroll
+            for (int ks = 0; ks < 4; ++ks) {
+                const int n0 = ks * 2, n1 = ks * 2 + 1;
+                const float p00 = (S[n0][0] > -1e20f) ? __expf(S[n0][0] - m_new0) : 0.f;
+                const float p01 = (S[n0][1] > -1e20f) ? __expf(S[n0][1] - m_new0) : 0.f;
+                const float p02 = (S[n0][2] > -1e20f) ? __expf(S[n0][2] - m_new1) : 0.f;
+                const float p03 = (S[n0][3] > -1e20f) ? __expf(S[n0][3] - m_new1) : 0.f;
+                const float p10 = (S[n1][0] > -1e20f) ? __expf(S[n1][0] - m_new0) : 0.f;
+                const float p11 = (S[n1][1] > -1e20f) ? __expf(S[n1][1] - m_new0) : 0.f;
+                const float p12 = (S[n1][2] > -1e20f) ? __expf(S[n1][2] - m_new1) : 0.f;
+                const float p13 = (S[n1][3] > -1e20f) ? __expf(S[n1][3] - m_new1) : 0.f;
+                rsum0 += (p00 + p01) + (p10 + p11);
+                rsum1 += (p02 + p03) + (p12 + p13);
+                pf[ks][0] = emb_pack_bf2(p00, p01);
+                pf[ks][1] = emb_pack_bf2(p02, p03);
+                pf[ks][2] = emb_pack_bf2(p10, p11);
+                pf[ks][3] = emb_pack_bf2(p12, p13);
+            }
+            rsum0 += __shfl_xor_sync(0xffffffffu, rsum0, 1);
+            rsum0 += __shfl_xor_sync(0xffffffffu, rsum0, 2);
+            rsum1 += __shfl_xor_sync(0xffffffffu, rsum1, 1);
+            rsum1 += __shfl_xor_sync(0xffffffffu, rsum1, 2);
+            l_sum0 += rsum0;
+            l_sum1 += rsum1;
+            m_max0 = m_new0;
+            m_max1 = m_new1;
+
+            // O_acc += P @ sV
+            #pragma unroll
+            for (int ks = 0; ks < 4; ++ks) {
+                const int krow = ks * 16 + c;
+                #pragma unroll
+                for (int dt = 0; dt < 16; ++dt) {
+                    const int dc = dt * 8 + r;
+                    const uint16_t v0 = *reinterpret_cast<const uint16_t*>(&sV[krow][dc]);
+                    const uint16_t v1 = *reinterpret_cast<const uint16_t*>(&sV[krow + 1][dc]);
+                    const uint16_t v2 = *reinterpret_cast<const uint16_t*>(&sV[krow + 8][dc]);
+                    const uint16_t v3 = *reinterpret_cast<const uint16_t*>(&sV[krow + 9][dc]);
+                    const u32 b0 = static_cast<u32>(v0) | (static_cast<u32>(v1) << 16);
+                    const u32 b1 = static_cast<u32>(v2) | (static_cast<u32>(v3) << 16);
+                    emb_mma16816_bf16(O_acc[dt], pf[ks][0], pf[ks][1], pf[ks][2], pf[ks][3], b0, b1);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    const float inv0 = (l_sum0 > 0.f) ? (1.0f / l_sum0) : 0.f;
+    const float inv1 = (l_sum1 > 0.f) ? (1.0f / l_sum1) : 0.f;
+    bf16* op0 = (q_row0 < seq_len) ? (O + (size_t(s_start + q_row0) * nq + hq) * 128) : nullptr;
+    bf16* op1 = (q_row1 < seq_len) ? (O + (size_t(s_start + q_row1) * nq + hq) * 128) : nullptr;
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        const int col = dt * 8 + c;
+        if (op0) *reinterpret_cast<u32*>(op0 + col) = emb_pack_bf2(O_acc[dt][0] * inv0, O_acc[dt][1] * inv0);
+        if (op1) *reinterpret_cast<u32*>(op1 + col) = emb_pack_bf2(O_acc[dt][2] * inv1, O_acc[dt][3] * inv1);
+    }
+}
+
 // SwiGLU activation: out = bf16(bf16(silu(gate)) * up). Grid: ceil(M * I / 256), Block: 256.
 __global__ void __launch_bounds__(256) k_q3_swiglu(
     const bf16* __restrict__ gate, const bf16* __restrict__ up, bf16* __restrict__ out, size_t n) {
@@ -391,6 +585,7 @@ public:
     int3* d_mrope = nullptr;     // [max_tokens]
     int* d_cu_seqlens = nullptr; // [max_batch + 1]
     int* d_seq_of_row = nullptr; // [max_tokens]
+    int2* d_q_tiles = nullptr;   // [max_tokens / 64 + max_batch + 16]
     int* d_img_pos = nullptr;    // [max_tokens]
     int* d_req_dims = nullptr;   // [max_batch]
     int* d_req_norm = nullptr;   // [max_batch]
@@ -423,6 +618,7 @@ public:
         alloc(&d_mrope, size_t(max_tokens));
         alloc(&d_cu_seqlens, size_t(max_batch + 1));
         alloc(&d_seq_of_row, size_t(max_tokens));
+        alloc(&d_q_tiles, size_t(max_tokens / TEXT_TC_BQ + max_batch + 16));
         alloc(&d_img_pos, size_t(max_tokens));
         alloc(&d_req_dims, size_t(max_batch));
         alloc(&d_req_norm, size_t(max_batch));
@@ -443,7 +639,7 @@ public:
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
         fr(d_hidden); fr(d_normed); fr(d_q); fr(d_k); fr(d_v); fr(d_attn);
         fr(d_gate); fr(d_up); fr(d_act);
-        fr(d_toks); fr(d_mrope); fr(d_cu_seqlens); fr(d_seq_of_row); fr(d_img_pos);
+        fr(d_toks); fr(d_mrope); fr(d_cu_seqlens); fr(d_seq_of_row); fr(d_q_tiles); fr(d_img_pos);
         fr(d_req_dims); fr(d_req_norm); fr(d_out_emb);
         ws.release();
         prof.release();
@@ -498,10 +694,21 @@ public:
             }
         }
 
+        std::vector<int2> h_qtiles;
+        h_qtiles.reserve(size_t(total_M / TEXT_TC_BQ + B + 4));
+        for (int b = 0; b < B; ++b) {
+            const int len = static_cast<int>(batch[size_t(b)].prompt.size());
+            for (int ql = 0; ql < len; ql += TEXT_TC_BQ) {
+                h_qtiles.push_back(make_int2(b, ql));
+            }
+        }
+        const int num_q_tiles = static_cast<int>(h_qtiles.size());
+
         EMB_CK(cudaMemcpyAsync(d_toks, h_toks.data(), size_t(total_M) * sizeof(int), cudaMemcpyHostToDevice, st));
         EMB_CK(cudaMemcpyAsync(d_mrope, h_mrope.data(), size_t(total_M) * sizeof(int3), cudaMemcpyHostToDevice, st));
         EMB_CK(cudaMemcpyAsync(d_cu_seqlens, h_cu.data(), size_t(B + 1) * sizeof(int), cudaMemcpyHostToDevice, st));
         EMB_CK(cudaMemcpyAsync(d_seq_of_row, h_seq.data(), size_t(total_M) * sizeof(int), cudaMemcpyHostToDevice, st));
+        EMB_CK(cudaMemcpyAsync(d_q_tiles, h_qtiles.data(), size_t(num_q_tiles) * sizeof(int2), cudaMemcpyHostToDevice, st));
         EMB_CK(cudaMemcpyAsync(d_req_dims, h_dims.data(), size_t(B) * sizeof(int), cudaMemcpyHostToDevice, st));
         EMB_CK(cudaMemcpyAsync(d_req_norm, h_norm.data(), size_t(B) * sizeof(int), cudaMemcpyHostToDevice, st));
 
@@ -557,10 +764,17 @@ public:
             });
 
             prof.record(prof.attn_ms, st, [&] {
-                const dim3 grid((total_M + TEXT_FA_QW - 1) / TEXT_FA_QW, c.num_q_heads);
-                k_q3_causal_gqa_attn<<<grid, 128, 0, st>>>(
-                    d_q, d_k, d_v, d_attn, d_cu_seqlens, d_seq_of_row,
-                    total_M, c.num_q_heads, c.num_kv_heads, c.head_dim, is_causal);
+                if (c.head_dim == 128) {
+                    const dim3 grid(num_q_tiles, c.num_q_heads);
+                    k_q3_flash_attn_tc<<<grid, 128, 0, st>>>(
+                        d_q, d_k, d_v, d_attn, d_cu_seqlens, d_q_tiles,
+                        num_q_tiles, c.num_q_heads, c.num_kv_heads, is_causal);
+                } else {
+                    const dim3 grid((total_M + TEXT_FA_QW - 1) / TEXT_FA_QW, c.num_q_heads);
+                    k_q3_causal_gqa_attn<<<grid, 128, 0, st>>>(
+                        d_q, d_k, d_v, d_attn, d_cu_seqlens, d_seq_of_row,
+                        total_M, c.num_q_heads, c.num_kv_heads, c.head_dim, is_causal);
+                }
             });
 
             prof.record(prof.o_proj_ms, st, [&] {
