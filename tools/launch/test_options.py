@@ -655,7 +655,7 @@ class CanonicalTests(unittest.TestCase):
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
-        self.assertIn('GR8_PF_OWN=1', p['env'])
+        self.assertIn('GR8_PF_OWN=2', p['env'])
         self.assertEqual(p['args'][:2], ['--manifest', '/r/rank2.manifest.json'])
         self.assertEqual(p['args'][-2:], ['--set-id', 'ab'])
         self.assertIn('/h/s2', p['args'])
@@ -682,8 +682,11 @@ class CanonicalTests(unittest.TestCase):
         self.assertFalse(any(a.startswith(('GR8_DEC_BK=', 'GR8_PF_SELX_CTX=')) for a in e))
         e = env(PEERS, '--extra-env', 'GR8_ROUTE_OVL=0 GR8_DEC_BK=2048')   # EXTRA_ENV keeps its own value, no second copy
         self.assertEqual([a for a in e if a.startswith(('GR8_ROUTE_OVL=', 'GR8_DEC_BK='))], ['GR8_ROUTE_OVL=0', 'GR8_DEC_BK=2048'])
-        e = env('10.0.0.1,10.0.0.2,10.0.0.3')   # TP=3 unchanged
-        self.assertFalse(any(a.split('=')[0] in [v.split('=')[0] for v in on] for a in e))
+        e = env('10.0.0.1,10.0.0.2,10.0.0.3')   # TP=3 shares the tuned serve defaults
+        for v in on:
+            self.assertIn(v, e)
+        self.assertIn('GR8_PF_OWN=2', e)
+        self.assertIn('GR8_PF_OWN=1', env('10.0.0.1,10.0.0.2,10.0.0.3', '--pf-own', '1'))
 
     def test_tp4_int4_reuse_grid_default_and_rollback(self):
         def grid(peers, *argv, environ=None):
@@ -753,7 +756,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(env(PEERS), ['GR8_TR3_W2ALL=1'])
         self.assertEqual(env(PEERS, '--tr3-w2all', '0'), ['GR8_TR3_W2ALL=0'])
         self.assertEqual(env(PEERS, '--extra-env', 'GR8_TR3_W2ALL=0'), ['GR8_TR3_W2ALL=0'])   # EXTRA_ENV keeps its value, no second copy
-        self.assertEqual(env('10.0.0.1,10.0.0.2,10.0.0.3'), [])   # TP=3 unchanged
+        self.assertEqual(env('10.0.0.1,10.0.0.2,10.0.0.3'), ['GR8_TR3_W2ALL=1'])   # TP=3 shares TR3_W2ALL default
 
     def test_tp4_exact_knobs_and_union_cap_defaults_and_overrides(self):
         exact = ['GR8_DEC_DENSE_OPT=1', 'GR8_DTR_EXACT_OPT=1', 'GR8_MOE_RTR_FIN_OPT=1', 'GR8_TR3_WIDE4=1',
@@ -782,11 +785,8 @@ class CanonicalTests(unittest.TestCase):
         e_extra = env(PEERS, '--extra-env', 'GR8_DEC_DENSE_OPT=0 GR8_MOE_UNION_CAP=0')
         self.assertEqual([a for a in e_extra if a.startswith(('GR8_DEC_DENSE_OPT=', 'GR8_MOE_UNION_CAP='))],
                          ['GR8_DEC_DENSE_OPT=0', 'GR8_MOE_UNION_CAP=0'])
-        # other TP widths: TP=3 stays untouched; TP=5 and TP=6 share the 7 exact kernels, DEC_BK_MAX=2048,
+        # other TP widths: TP=3, TP=5 and TP=6 share the 7 exact kernels, DEC_BK_MAX=2048,
         # MOE_UNION_CAP=48, and the MTP/prefill tuning defaults (no DFL_DEDUP without DFlash2)
-        e_tp3 = env('10.0.0.1,10.0.0.2,10.0.0.3')
-        keys = {v.split('=')[0] for v in exact} | {'GR8_MOE_UNION_CAP', 'GR8_MOE_UNION_MODE', 'GR8_L2PF', 'GR8_PF_GEMMF32', 'GR8_DFL_REUSE_MIN'}
-        self.assertFalse(any(a.split('=')[0] in keys for a in e_tp3))
         tp4_extra = ['GR8_L2PF=31', 'GR8_PF_GEMMF32=1', 'GR8_MTP_L2PF=3', 'GR8_MTP_LASTROW=1', 'GR8_DRAFT_HEAD2=1', 'GR8_DFL_REUSE_MIN=0']
         for v in tp4_extra:
             self.assertIn(v, e)
@@ -794,13 +794,15 @@ class CanonicalTests(unittest.TestCase):
         e_nomtp = env(PEERS, '--mtp', '0', '--dflash', '0')
         for k in ('GR8_MTP_L2PF=', 'GR8_MTP_LASTROW=', 'GR8_DRAFT_HEAD2='):
             self.assertFalse(any(a.startswith(k) for a in e_nomtp))
-        tp56_want = ['GR8_DEC_BK_MAX=2048', 'GR8_L2PF=31', 'GR8_PF_GEMMF32=1', 'GR8_MTP_L2PF=3', 'GR8_MTP_LASTROW=1',
-                     'GR8_DRAFT_HEAD2=1', 'GR8_DEC_DENSE_OPT=1', 'GR8_DTR_EXACT_OPT=1', 'GR8_MOE_RTR_FIN_OPT=1',
-                     'GR8_TR3_WIDE4=1', 'GR8_PF_ATTN_OPT=1', 'GR8_PF_DENSE_OPT=1', 'GR8_PF_ISGRT_CLEAN=1',
-                     'GR8_MOE_UNION_CAP=48']
-        for peers in (','.join(f'10.0.0.{i}' for i in range(1, 6)), ','.join(f'10.0.0.{i}' for i in range(1, 7))):
+        tp356_want = ['GR8_DEC_BK_MAX=2048', 'GR8_L2PF=31', 'GR8_PF_GEMMF32=1', 'GR8_MTP_L2PF=3', 'GR8_MTP_LASTROW=1',
+                      'GR8_DRAFT_HEAD2=1', 'GR8_DEC_DENSE_OPT=1', 'GR8_DTR_EXACT_OPT=1', 'GR8_MOE_RTR_FIN_OPT=1',
+                      'GR8_TR3_WIDE4=1', 'GR8_PF_ATTN_OPT=1', 'GR8_PF_DENSE_OPT=1', 'GR8_PF_ISGRT_CLEAN=1',
+                      'GR8_MOE_UNION_CAP=48']
+        for peers in (','.join(f'10.0.0.{i}' for i in range(1, 4)),
+                      ','.join(f'10.0.0.{i}' for i in range(1, 6)),
+                      ','.join(f'10.0.0.{i}' for i in range(1, 7))):
             e_wide = env(peers)
-            for v in tp56_want:
+            for v in tp356_want:
                 self.assertIn(v, e_wide)
             self.assertFalse(any(a.startswith('GR8_DFL_DEDUP=') for a in e_wide))
             self.assertIn('GR8_MOE_UNION_CAP=32', env(peers, '--moe-union-cap', '32'))

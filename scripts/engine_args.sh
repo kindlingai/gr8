@@ -420,7 +420,30 @@ engine_defaults() {
        tp4_default MOE_UNION_CAP 48 ;;
     3) SHARE_LIMIT=${SHARE_LIMIT:-32768}; _base_p=1941; CAP=${CAP:-$(pool_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
-       DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
+       DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-2}; REUSE=${REUSE:-1}
+       case " ${EXTRA_ENV:-} " in *" GR8_TR3_W2ALL="*) ;; *) TR3_W2ALL=${TR3_W2ALL:-1} ;; esac
+       tp4_default ROUTE_OVL 1; [ "$MTP" = 0 ] || tp4_default DRAFT_HEAD_I4 1
+       tp4_default ATTN_SC2 4; tp4_default ATTN_SC2_TR 2; tp4_default ATTN_CTX2 4; tp4_default ATTN_CTX3 2
+       tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
+       tp4_default IDX_VEC 1; tp4_default DEC_BK 2048; tp4_default DEC_BK_MAX 2048; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
+       tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248
+       tp4_default L2PF 31; tp4_default PF_GEMMF32 1
+       [ "$MTP" = 0 ] || { tp4_default MTP_L2PF 3; tp4_default MTP_LASTROW 1; tp4_default DRAFT_HEAD2 1; }
+       tp4_default DEC_DENSE_OPT 1; tp4_default DTR_EXACT_OPT 1; tp4_default MOE_RTR_FIN_OPT 1
+       tp4_default TR3_WIDE4 1; tp4_default PF_ATTN_OPT 1; tp4_default PF_DENSE_OPT 1; tp4_default PF_ISGRT_CLEAN 1
+       tp4_default MOE_UNION_CAP 48
+       if [ "${KV_FORMAT:-fp8}" = int4 ]; then
+         tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
+         if [ "${KVB:-bf16}" != fp8 ]; then
+           case " ${EXTRA_ENV:-} " in *" GR8_KVB=fp8 "*) ;; *) tp4_default KV4_FOLD 1 ;; esac
+         fi
+         local _fold_eff=${KV4_FOLD:-0}
+         case " ${EXTRA_ENV:-} " in *" GR8_KV4_FOLD=1 "*) _fold_eff=1 ;; *" GR8_KV4_FOLD=0 "*) _fold_eff=0 ;; esac
+         if [ "$_fold_eff" = 1 ]; then tp4_default KV4_TC 1; fi
+         if [ "$REUSE" = 1 ]; then
+           case " ${EXTRA_ENV:-} " in *" GR8_REUSE_ALIGN=0 "*|*" G6_REUSE_ALIGN=0 "*) ;; *) tp4_default REUSE_GRID 64 ;; esac
+         fi
+       fi ;;
     5) [ "${KV_FORMAT:-fp8}" = fp8 ] || [ -n "${CAP:-}" ] || { echo "engine_defaults: KV_FORMAT=$KV_FORMAT at TP=5: no TP5 int4 page count; set CAP" >&2; return 2; }
        SHARE_LIMIT=${SHARE_LIMIT:-32768}; _base_p=1981; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        # 1,981 pages a rank = TP4's default (not boot-proven at TP5; a rank holds about 1/5 of the experts, so more fit)

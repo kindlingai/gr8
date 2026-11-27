@@ -98,9 +98,15 @@ class Kv4ExactOptionsTests(unittest.TestCase):
                 self.assertEqual([w for w in env if w.startswith(word.split('=')[0] + '=')], [word])
 
     def test_other_shapes_unchanged(self):
-        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (4, ('--kv-format', 'fp8'))):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'fp8')), (4, ('--kv-format', 'fp8'))):
             env = self.plan(*args, tp=tp)['env']
             self.assertFalse([w for w in env if w.startswith('GR8_KV4_')])
+
+    def test_tp3_int4_defaults(self):
+        env = self.plan('--kv-format', 'int4', tp=3)['env']
+        for word in self.WORDS + ('GR8_KV4_FOLD=1', 'GR8_KV4_TC=1'):
+            self.assertEqual([w for w in env if w.startswith(word.split('=')[0] + '=')], [word])
+        self.assertNotIn('GR8_CP_ONECHAIN=1', env)
 
     def test_extra_env_wins_once(self):
         keys = ('GR8_KV4_SC', 'GR8_KV4_CTX', 'GR8_KV4_QT', 'GR8_KV4_FUSE_ROT')
@@ -153,7 +159,7 @@ class Kv4OptionsTests(unittest.TestCase):
         self.assertNotIn('GR8_CP_ONECHAIN=1', env)
 
     def test_no_defaults_for_other_shapes(self):
-        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (4, ('--kv-format', 'fp8'))):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'fp8')), (4, ('--kv-format', 'fp8'))):
             env = self.plan(*args, tp=tp)['env']
             self.assertFalse([w for w in env if w.startswith(('GR8_KV4_', 'GR8_CP_ONECHAIN='))])
 
@@ -169,7 +175,7 @@ class Kv4OptionsTests(unittest.TestCase):
 
 
 class ReuseGridOptionsTests(unittest.TestCase):
-    """REUSE_GRID: 64 at TP=4 with int4 KV (GR8_REUSE_GRID), unchanged elsewhere."""
+    """REUSE_GRID: 64 at TP=3 and TP=4 with int4 KV (GR8_REUSE_GRID), unchanged elsewhere."""
 
     @staticmethod
     def grid(*argv, tp=4):
@@ -204,8 +210,9 @@ class ReuseGridOptionsTests(unittest.TestCase):
             self.assertEqual(self.grid(*args, *store, tp=tp), [])
 
     def test_other_shapes_unchanged(self):
-        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (5, ()), (4, ('--kv-format', 'fp8'))):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'fp8')), (5, ()), (4, ('--kv-format', 'fp8'))):
             self.assertEqual(self.grid(*args, tp=tp), [])
+        self.assertEqual(self.grid('--kv-format', 'int4', tp=3), ['GR8_REUSE_GRID=64'])
 
     def test_refusals(self):
         for args in (('--reuse-grid', '32'), ('--reuse-grid', '100'), ('--reuse', '0', '--reuse-grid', '64'),

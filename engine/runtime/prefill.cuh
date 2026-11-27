@@ -1590,10 +1590,14 @@ inline void pf_ix_score(Model& m, Prefill& P, int i, int M, int context, cudaStr
         s.rows = r; s.context = context - (M - c0 - r); s.positions = P.pos + c0; s.index_k = P.idx_k + (size_t)c0 * IDXK;
         G6RT_CK(g6_attn_bind_index_append(&y.ab, &s, st));
     }
-    G6AttnStep s{};
-    s.rows = r1 - r0; s.context = context - (M - r1); s.positions = P.pos + r0;
-    s.index_q = P.idx_q + (size_t)r0 * IDXQ; s.index_weight = P.idx_w + (size_t)r0 * IDXW;
-    G6RT_CK(g6_attn_bind_prefill_index_rows(P.av[j], &y.ab, &s, P.idx_all + (size_t)r0 * 2048, nullptr, st));
+    for (int c0 = r0; c0 < r1; c0 += P.attn_rows)        // owner rows' top-2048, in attention-sized chunks
+    {
+        const int r = std::min(P.attn_rows, r1 - c0);
+        G6AttnStep s{};
+        s.rows = r; s.context = context - (M - c0 - r); s.positions = P.pos + c0;
+        s.index_q = P.idx_q + (size_t)c0 * IDXQ; s.index_weight = P.idx_w + (size_t)c0 * IDXW;
+        G6RT_CK(g6_attn_bind_prefill_index_rows(P.av[j], &y.ab, &s, P.idx_all + (size_t)c0 * 2048, nullptr, st));
+    }
     k_put_publish_n<<<PF_PUT, 128, 0, st>>>(reinterpret_cast<const uint4*>(P.idx_all + (size_t)r0 * 2048), P.f, P.stepp, 4,
                                             (r1 - r0) * (IX_ROW / 16), P.tickets + 4);
     pf_mark(8, st);
