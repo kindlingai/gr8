@@ -26,6 +26,7 @@ pub mod compact;
 pub mod dflash2;
 pub mod ds41;
 pub mod embed_plan;
+pub mod ernie55;
 pub mod exlr8;
 pub mod fetch;
 pub mod gencache;
@@ -633,6 +634,45 @@ pub unsafe extern "C" fn g6l_hy4_plan(release_dir: *const c_char, widths: *const
             std::ptr::null_mut()
         }
     }
+}
+
+/// Plans rank `rank` of `nr` of an ERNIE-5.5-Flash-Preview exlr8 release directory (split `part` 0..=4).
+///
+/// # Safety
+/// Every C string pointer must be valid; `err` must hold `errlen` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_ernie55_plan_part(release_dir: *const c_char, widths: *const c_char, nr: u32, rank: u32, part: u32,
+                                               out_manifest: *const c_char, err: *mut c_char, errlen: usize) -> *mut c_void {
+    let t0 = Instant::now();
+    let arg = |p: *const c_char, what: &str| cstr(p).ok_or_else(|| format!("g6l_ernie55_plan_part: missing {what}"));
+    let r = (|| {
+        let dir = arg(release_dir, "release dir")?;
+        let wd = if part == 2 { String::new() } else { arg(widths, "width manifest")? };
+        let mut img = ernie55::plan_part(&dir, &wd, nr as usize, rank as usize, part)?;
+        let out = arg(out_manifest, "output manifest")?;
+        std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
+        let key_text = format!("ernie55 part={part} dir={dir} widths={wd} nr={nr} rank={rank}\n{}\n{}",
+                               img.manifest(), gencache::source_identity(&[&dir, &wd]));
+        img.cache = gencache::GenCache::from_env(&key_text);
+        Ok::<_, String>(img)
+    })();
+    match r {
+        Ok(img) => Box::into_raw(Box::new((img, t0))) as *mut c_void,
+        Err(e) => {
+            write_err(err, errlen, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Plans rank `rank` of `nr` of an ERNIE-5.5-Flash-Preview exlr8 release directory (full resident image).
+///
+/// # Safety
+/// Every C string pointer must be valid; `err` must hold `errlen` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_ernie55_plan(release_dir: *const c_char, widths: *const c_char, nr: u32, rank: u32,
+                                          out_manifest: *const c_char, err: *mut c_char, errlen: usize) -> *mut c_void {
+    g6l_ernie55_plan_part(release_dir, widths, nr, rank, 0, out_manifest, err, errlen)
 }
 
 /// Loads an image g6l_v2_plan planned. The stats count time from the plan call. Returns 0, or 1 with a message in

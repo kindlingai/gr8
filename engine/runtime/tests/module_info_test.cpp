@@ -51,6 +51,10 @@ int main()
     CHECK(m.model == G6_MODEL_ID_HY4 && std::strcmp(m.name, "hy4") == 0 && m.max_sessions == 8 && m.mtp_layers == 0);
     CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
     CHECK(m.caps == G6_CAP_MTP0);
+#elif G6_MODEL_ERNIE55
+    CHECK(m.model == G6_MODEL_ID_ERNIE55 && std::strcmp(m.name, "ernie55") == 0 && m.max_sessions == 8 && m.mtp_layers == 0);
+    CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
+    CHECK(m.caps == G6_CAP_MTP0);
 #elif G6_MODEL_FLASH
     CHECK(m.model == G6_MODEL_ID_GLM53F && std::strcmp(m.name, "glm-5.3-flash") == 0 && m.max_sessions == 8);
     CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
