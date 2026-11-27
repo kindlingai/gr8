@@ -291,7 +291,8 @@ int main(int argc, char** argv) {
                      G6_NR, ernie55rt::kv_fmt_name(e.o.kv_fmt), e.o.mx8_dense ? 1 : 0, e.o.use_hybrid ? 1 : 0,
                      bench_kv_pos, gen, sessions, dec_ms, tps, tps * sessions);
         if (e.o.profile) e.prof.print(0);
-        return 0;
+        if (bench_ctx <= 0 && tok_str.empty()) return 0;
+        if (e.o.profile) e.prof.reset();
     }
 
     std::vector<int> prompt;

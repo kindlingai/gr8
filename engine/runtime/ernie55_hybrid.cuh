@@ -22,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +41,7 @@
 #include "../kernels/ernie55_moe.cuh"
 #include "../loader/g6pack.h"
 #include "../loader-rs/g6load.h"
+#include "ernie55_hybrid_cpu.h"
 
 namespace ernie55rt {
 
@@ -334,7 +336,7 @@ struct HybridConfig {
     float       heat_cap = 16.0f;
     float       min_promote_heat = 2.5f;
     float       static_pin_frac = 0.45f;
-    int         stage_slots = 16; // experts per cold staging chunk
+    int         stage_slots = 8; // experts per cold staging buffer (8 = 24 MiB x 2)
 };
 
 inline HybridConfig load_hybrid_config() {
@@ -375,6 +377,11 @@ struct HybridExpertCache {
         std::vector<ExpMeta> exp;         // [NE]
         std::vector<long long> h_tab;     // [NE * 6]
         std::vector<long long> h_kmix;    // [NE] (empty if absent)
+        // Host copies of small FP16 scale tensors (ONLY populated when cfg.cpu_overlap == true, ~285 MiB total)
+        std::vector<uint16_t> h_sg;       // [2 * EH]
+        std::vector<uint16_t> h_v1b;      // [nblk * 2 * EHB]
+        std::vector<uint16_t> h_v2;       // [nblk * 3 * 128]
+        std::vector<uint16_t> h_v3b;      // [nblk * EHB]
     };
 
     HybridConfig cfg;
@@ -399,28 +406,160 @@ struct HybridExpertCache {
     int      dyn_active_slots = 0;
     int      ring_slots = 0;
 
+    // Lightweight persistent thread pool for parallel host->pinned memcpy of cold experts
+    struct CopyPool {
+        struct Task {
+            uint8_t*       dst;
+            const uint8_t* src;
+            size_t         bytes;
+        };
+        std::vector<std::thread> workers;
+        const Task* cur_tasks = nullptr;
+        int cur_n = 0;
+        std::atomic<int> next_idx{0};
+        std::atomic<int> done_cnt{0};
+        std::atomic<uint64_t> gen{0};
+        std::atomic<bool> stop{false};
+        std::atomic<int> sleeping{0};
+        std::mutex mu;
+        std::condition_variable cv;
+
+        static inline void cpu_pause() {
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            asm volatile("yield" ::: "memory");
+#else
+            std::this_thread::yield();
+#endif
+        }
+
+        void start(int n_workers) {
+            shutdown();
+            if (n_workers <= 0) return;
+            stop.store(false, std::memory_order_relaxed);
+            workers.reserve(static_cast<size_t>(n_workers));
+            for (int w = 0; w < n_workers; ++w) {
+                workers.emplace_back([this]() {
+                    uint64_t seen = 0;
+                    for (;;) {
+                        uint64_t g = gen.load(std::memory_order_acquire);
+                        if (g == seen) {
+                            for (int spin = 0; spin < 4000; ++spin) {
+                                g = gen.load(std::memory_order_acquire);
+                                if (g != seen || stop.load(std::memory_order_relaxed)) break;
+                                cpu_pause();
+                            }
+                            if (g == seen) {
+                                if (stop.load(std::memory_order_acquire)) return;
+                                sleeping.fetch_add(1, std::memory_order_seq_cst);
+                                std::unique_lock<std::mutex> lk(mu);
+                                cv.wait(lk, [&]() {
+                                    return gen.load(std::memory_order_seq_cst) != seen ||
+                                           stop.load(std::memory_order_seq_cst);
+                                });
+                                lk.unlock();
+                                sleeping.fetch_sub(1, std::memory_order_acq_rel);
+                                g = gen.load(std::memory_order_acquire);
+                            }
+                        }
+                        if (stop.load(std::memory_order_relaxed)) return;
+                        seen = g;
+                        const Task* tasks = cur_tasks;
+                        const int n = cur_n;
+                        int completed = 0;
+                        for (;;) {
+                            const int idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+                            if (idx >= n) break;
+                            std::memcpy(tasks[idx].dst, tasks[idx].src, tasks[idx].bytes);
+                            ++completed;
+                        }
+                        if (completed > 0) done_cnt.fetch_add(completed, std::memory_order_release);
+                    }
+                });
+            }
+        }
+
+        void run(const Task* tasks, int n) {
+            if (n <= 0) return;
+            if (n == 1 || workers.empty()) {
+                for (int i = 0; i < n; ++i) std::memcpy(tasks[i].dst, tasks[i].src, tasks[i].bytes);
+                return;
+            }
+            cur_tasks = tasks;
+            cur_n = n;
+            next_idx.store(0, std::memory_order_relaxed);
+            done_cnt.store(0, std::memory_order_relaxed);
+            gen.fetch_add(1, std::memory_order_seq_cst);
+            if (sleeping.load(std::memory_order_seq_cst) > 0) {
+                std::lock_guard<std::mutex> lk(mu);
+                cv.notify_all();
+            }
+            int completed = 0;
+            for (;;) {
+                const int idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= n) break;
+                std::memcpy(tasks[idx].dst, tasks[idx].src, tasks[idx].bytes);
+                ++completed;
+            }
+            if (completed > 0) done_cnt.fetch_add(completed, std::memory_order_release);
+            while (done_cnt.load(std::memory_order_acquire) < n) cpu_pause();
+        }
+
+        void shutdown() {
+            if (workers.empty()) return;
+            stop.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                cv.notify_all();
+            }
+            for (auto& th : workers) if (th.joinable()) th.join();
+            workers.clear();
+        }
+
+        ~CopyPool() { shutdown(); }
+    };
+
     // Double-buffered bounded staging for cold experts (decode & prefill)
     size_t   stg_slot_stride = 0;
-    int      stg_slots = 16;
+    int      stg_slots = 8;
     uint8_t* stg_vram[2]    = {nullptr, nullptr}; // [stg_slots * stg_slot_stride] in VRAM
     uint8_t* stg_bounce[2]  = {nullptr, nullptr}; // [stg_slots * stg_slot_stride] pinned host
     const uint8_t** stg_d_ptab[2] = {nullptr, nullptr}; // [NE * EB * 2] in VRAM
-    const uint8_t** stg_h_ptab[2] = {nullptr, nullptr}; // [NE * EB * 2] pinned host
+    PtabPatchEntry* stg_d_patches[2] = {nullptr, nullptr}; // [stg_slots * EB * 2] in VRAM
+    PtabPatchEntry* stg_h_patches[2] = {nullptr, nullptr}; // [stg_slots * EB * 2] pinned host
+    int stg_max_patches = 0;
     cudaEvent_t stg_h2d_ev[2]  = {nullptr, nullptr};
     cudaEvent_t stg_comp_ev[2] = {nullptr, nullptr};
+    bool stg_buf_busy[2] = {false, false};
 
-    // Host/device group buffers for partitioned hot + cold chunk execution
-    int* h_topk_idx = nullptr; // pinned [max_M * 10]
+    // Host/device group buffers: [0..1] cold ping-pong, [2] dedicated hot groups
+    int* h_topk_idx = nullptr; // pinned [max_M * TOPK]
     int  max_routes_cap = 0;
-    int* h_grp_n[2]      = {nullptr, nullptr};
-    int* h_grp_exp[2]    = {nullptr, nullptr};
-    int* h_grp_cnt[2]    = {nullptr, nullptr};
-    int* h_grp_routes[2] = {nullptr, nullptr};
-    int* d_grp_n[2]      = {nullptr, nullptr};
-    int* d_grp_exp[2]    = {nullptr, nullptr};
-    int* d_grp_cnt[2]    = {nullptr, nullptr};
-    int* d_grp_routes[2] = {nullptr, nullptr};
+    int* h_grp_n[3]      = {nullptr, nullptr, nullptr};
+    int* h_grp_exp[3]    = {nullptr, nullptr, nullptr};
+    int* h_grp_cnt[3]    = {nullptr, nullptr, nullptr};
+    int* h_grp_routes[3] = {nullptr, nullptr, nullptr};
+    int* d_grp_n[3]      = {nullptr, nullptr, nullptr};
+    int* d_grp_exp[3]    = {nullptr, nullptr, nullptr};
+    int* d_grp_cnt[3]    = {nullptr, nullptr, nullptr};
+    int* d_grp_routes[3] = {nullptr, nullptr, nullptr};
     int  max_grp_cap = 0;
+
+    cudaEvent_t topk_ready_ev = nullptr;
+    cudaEvent_t topk_d2h_ev = nullptr;
+    cudaEvent_t hot_h2d_ev = nullptr;
+    bool hot_h2d_busy = false;
+    bool begin_called = false;
+
+    // Zero-alloc per-layer routing scratch + parallel copy pool
+    int exp_head[NE];
+    int exp_tail[NE];
+    std::vector<int> route_next;
+    std::vector<int> hot_exps_buf;
+    std::vector<int> cold_exps_buf;
+    std::vector<CopyPool::Task> copy_tasks_buf;
+    CopyPool copy_pool;
 
     // Residency, heat, and async promotion state [n_layers * NE]
     // exp_slot[idx]: -2 = static pinned, -1 = cold (host RAM), >= 0 = dynamic slot
@@ -446,11 +585,27 @@ struct HybridExpertCache {
     struct PendingSwap { int new_idx, old_idx, stg_slot, old_slot; };
     std::vector<PendingSwap> pending_swaps;
 
+    // Optional CPU-overlap evaluator state (allocated ONLY when cfg.cpu_overlap == true!)
+    bool      cpu_scales_ready = false;
+    bool      x_begin_called = false;
+    uint16_t* h_x_had_r = nullptr;            // pinned [EH] FP16 for M=1
+    float*    h_topk_w = nullptr;             // pinned [TOPK] FP32 for M=1
+    float*    h_cpu_fc2_part[2] = {nullptr, nullptr}; // double-buffered pinned [TOPK * EH] FP32
+    cudaEvent_t x_ready_ev = nullptr;
+    cudaEvent_t x_d2h_ev = nullptr;
+    cudaEvent_t cpu_fc2_h2d_ev[2] = {nullptr, nullptr};
+    bool      cpu_fc2_busy[2] = {false, false};
+    int       cpu_buf_cur = 0;
+    ernie55cpu::CpuExpertDesc cpu_exps_buf[geom::TOPK] = {};
+    int       cpu_routes_buf[geom::TOPK] = {};
+    ernie55cpu::CpuExpertPool cpu_pool;
+
     // Telemetry
     uint64_t stat_hits = 0;
     uint64_t stat_misses = 0;
     uint64_t stat_swaps = 0;
     uint64_t stat_cold_staged = 0;
+    uint64_t stat_cpu_evals = 0;
     uint64_t stat_steps = 0;
 
     ~HybridExpertCache() {
@@ -459,16 +614,36 @@ struct HybridExpertCache {
     }
 
     void release() {
+        cpu_pool.shutdown();
+        copy_pool.shutdown();
+        if (hot_h2d_busy && hot_h2d_ev) { cudaEventSynchronize(hot_h2d_ev); hot_h2d_busy = false; }
+        for (int b = 0; b < 2; ++b) {
+            if (stg_buf_busy[b] && stg_comp_ev[b]) { cudaEventSynchronize(stg_comp_ev[b]); stg_buf_busy[b] = false; }
+            if (cpu_fc2_busy[b] && cpu_fc2_h2d_ev[b]) { cudaEventSynchronize(cpu_fc2_h2d_ev[b]); cpu_fc2_busy[b] = false; }
+        }
         if (h2d_stream) { cudaStreamSynchronize(h2d_stream); cudaStreamDestroy(h2d_stream); h2d_stream = nullptr; }
         if (promo_ev) { cudaEventDestroy(promo_ev); promo_ev = nullptr; }
         if (patch_ev) { cudaEventDestroy(patch_ev); patch_ev = nullptr; }
+        if (topk_ready_ev) { cudaEventDestroy(topk_ready_ev); topk_ready_ev = nullptr; }
+        if (topk_d2h_ev)   { cudaEventDestroy(topk_d2h_ev); topk_d2h_ev = nullptr; }
+        if (hot_h2d_ev)    { cudaEventDestroy(hot_h2d_ev); hot_h2d_ev = nullptr; }
+        if (x_ready_ev)    { cudaEventDestroy(x_ready_ev); x_ready_ev = nullptr; }
+        if (x_d2h_ev)      { cudaEventDestroy(x_d2h_ev); x_d2h_ev = nullptr; }
+        begin_called = false;
+        x_begin_called = false;
+        cpu_scales_ready = false;
         for (int b = 0; b < 2; ++b) {
-            if (stg_h2d_ev[b])  { cudaEventDestroy(stg_h2d_ev[b]); stg_h2d_ev[b] = nullptr; }
-            if (stg_comp_ev[b]) { cudaEventDestroy(stg_comp_ev[b]); stg_comp_ev[b] = nullptr; }
-            if (stg_vram[b])    { cudaFree(stg_vram[b]); stg_vram[b] = nullptr; }
-            if (stg_bounce[b])  { cudaFreeHost(stg_bounce[b]); stg_bounce[b] = nullptr; }
-            if (stg_d_ptab[b])  { cudaFree(stg_d_ptab[b]); stg_d_ptab[b] = nullptr; }
-            if (stg_h_ptab[b])  { cudaFreeHost(stg_h_ptab[b]); stg_h_ptab[b] = nullptr; }
+            if (cpu_fc2_h2d_ev[b]) { cudaEventDestroy(cpu_fc2_h2d_ev[b]); cpu_fc2_h2d_ev[b] = nullptr; }
+            if (h_cpu_fc2_part[b]) { cudaFreeHost(h_cpu_fc2_part[b]); h_cpu_fc2_part[b] = nullptr; }
+            if (stg_h2d_ev[b])    { cudaEventDestroy(stg_h2d_ev[b]); stg_h2d_ev[b] = nullptr; }
+            if (stg_comp_ev[b])   { cudaEventDestroy(stg_comp_ev[b]); stg_comp_ev[b] = nullptr; }
+            if (stg_vram[b])      { cudaFree(stg_vram[b]); stg_vram[b] = nullptr; }
+            if (stg_bounce[b])    { cudaFreeHost(stg_bounce[b]); stg_bounce[b] = nullptr; }
+            if (stg_d_ptab[b])    { cudaFree(stg_d_ptab[b]); stg_d_ptab[b] = nullptr; }
+            if (stg_d_patches[b]) { cudaFree(stg_d_patches[b]); stg_d_patches[b] = nullptr; }
+            if (stg_h_patches[b]) { cudaFreeHost(stg_h_patches[b]); stg_h_patches[b] = nullptr; }
+        }
+        for (int b = 0; b < 3; ++b) {
             if (h_grp_n[b])     { cudaFreeHost(h_grp_n[b]); h_grp_n[b] = nullptr; }
             if (h_grp_exp[b])   { cudaFreeHost(h_grp_exp[b]); h_grp_exp[b] = nullptr; }
             if (h_grp_cnt[b])   { cudaFreeHost(h_grp_cnt[b]); h_grp_cnt[b] = nullptr; }
@@ -479,6 +654,8 @@ struct HybridExpertCache {
             if (d_grp_routes[b]){ cudaFree(d_grp_routes[b]); d_grp_routes[b] = nullptr; }
         }
         if (h_topk_idx)   { cudaFreeHost(h_topk_idx); h_topk_idx = nullptr; }
+        if (h_x_had_r)    { cudaFreeHost(h_x_had_r); h_x_had_r = nullptr; }
+        if (h_topk_w)     { cudaFreeHost(h_topk_w); h_topk_w = nullptr; }
         if (h_embed_rows) { cudaFreeHost(h_embed_rows); h_embed_rows = nullptr; }
         if (d_embed_rows) { cudaFree(d_embed_rows); d_embed_rows = nullptr; }
         if (vram_static_pool) { cudaFree(vram_static_pool); vram_static_pool = nullptr; }
@@ -624,6 +801,26 @@ struct HybridExpertCache {
         hybrid_ck(cudaStreamSynchronize(st), "hybrid init_tables sync");
     }
 
+    // Bind host copies of small FP16 scale tensors (sg, v1b, v2, v3b) for GR8_ERNIE55_HYBRID_CPU_OVERLAP=1.
+    void init_cpu_scales(std::vector<std::vector<uint16_t>>& sgs,
+                         std::vector<std::vector<uint16_t>>& v1bs,
+                         std::vector<std::vector<uint16_t>>& v2s,
+                         std::vector<std::vector<uint16_t>>& v3bs) {
+        if (!active || !cfg.cpu_overlap || static_cast<int>(sgs.size()) != n_layers) return;
+        size_t total_bytes = 0;
+        for (int li = 0; li < n_layers; ++li) {
+            auto& ld = layers[static_cast<size_t>(li)];
+            ld.h_sg  = std::move(sgs[static_cast<size_t>(li)]);
+            ld.h_v1b = std::move(v1bs[static_cast<size_t>(li)]);
+            ld.h_v2  = std::move(v2s[static_cast<size_t>(li)]);
+            ld.h_v3b = std::move(v3bs[static_cast<size_t>(li)]);
+            total_bytes += (ld.h_sg.size() + ld.h_v1b.size() + ld.h_v2.size() + ld.h_v3b.size()) * sizeof(uint16_t);
+        }
+        cpu_scales_ready = true;
+        std::fprintf(stderr, "# ernie55 hybrid cpu_overlap: cached %.1f MiB host FP16 scales across %d layers\n",
+                     total_bytes / double(1ull << 20), n_layers);
+    }
+
     // Phase 2 (AFTER KV + scratch allocations): allocate staging buffers and carve remaining VRAM into hot-expert pool!
     void init_vram_pool(int max_M, cudaStream_t main_st) {
         if (!active || n_layers == 0) return;
@@ -631,13 +828,53 @@ struct HybridExpertCache {
         hybrid_ck(cudaStreamCreateWithFlags(&h2d_stream, cudaStreamNonBlocking), "h2d_stream");
         hybrid_ck(cudaEventCreateWithFlags(&promo_ev, cudaEventDisableTiming), "promo_ev");
         hybrid_ck(cudaEventCreateWithFlags(&patch_ev, cudaEventDisableTiming), "patch_ev");
+        hybrid_ck(cudaEventCreateWithFlags(&topk_ready_ev, cudaEventDisableTiming), "topk_ready_ev");
+        hybrid_ck(cudaEventCreateWithFlags(&topk_d2h_ev, cudaEventDisableTiming), "topk_d2h_ev");
+        hybrid_ck(cudaEventCreateWithFlags(&hot_h2d_ev, cudaEventDisableTiming), "hot_h2d_ev");
+        hot_h2d_busy = false;
+        begin_called = false;
+        stg_buf_busy[0] = stg_buf_busy[1] = false;
 
         // Allocate double-buffered cold staging scratch + pinned bounce buffers BEFORE sizing hot pool
         stg_slots = std::max(4, cfg.stage_slots);
         const size_t stg_bytes = static_cast<size_t>(stg_slots) * stg_slot_stride;
         const size_t ptab_n = static_cast<size_t>(NE) * EB * 2;
+        stg_max_patches = stg_slots * EB * 2;
         max_routes_cap = max_M * geom::TOPK;
         max_grp_cap = std::max(NE + max_routes_cap, 1024);
+
+        for (int e = 0; e < NE; ++e) { exp_head[e] = -1; exp_tail[e] = -1; }
+        route_next.assign(static_cast<size_t>(max_routes_cap), -1);
+        hot_exps_buf.reserve(NE);
+        cold_exps_buf.reserve(NE);
+        copy_tasks_buf.reserve(256);
+        const int n_copy_workers = std::min(3, std::max(0, static_cast<int>(std::thread::hardware_concurrency()) - 1));
+        copy_pool.start(n_copy_workers);
+
+        if (cfg.cpu_overlap) {
+            hybrid_ck(cudaEventCreateWithFlags(&x_ready_ev, cudaEventDisableTiming), "x_ready_ev");
+            hybrid_ck(cudaEventCreateWithFlags(&x_d2h_ev, cudaEventDisableTiming), "x_d2h_ev");
+            hybrid_ck(cudaHostAlloc(&h_x_had_r, static_cast<size_t>(geom::EH) * sizeof(uint16_t), cudaHostAllocDefault), "h_x_had_r");
+            hybrid_ck(cudaHostAlloc(&h_topk_w, static_cast<size_t>(geom::TOPK) * sizeof(float), cudaHostAllocDefault), "h_topk_w");
+            for (int b = 0; b < 2; ++b) {
+                hybrid_ck(cudaEventCreateWithFlags(&cpu_fc2_h2d_ev[b], cudaEventDisableTiming), "cpu_fc2_h2d_ev");
+                hybrid_ck(cudaHostAlloc(&h_cpu_fc2_part[b], static_cast<size_t>(geom::TOPK) * geom::EH * sizeof(float), cudaHostAllocDefault), "h_cpu_fc2_part");
+                cpu_fc2_busy[b] = false;
+            }
+            cpu_buf_cur = 0;
+            const int hw_t = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+            // Reserve 2-3 threads for copy_pool/main during concurrent PCIe staging, use rest for CPU eval!
+            const int cpu_t = (hw_t >= 8) ? std::max(4, hw_t - 3) : std::max(1, hw_t - 1);
+            cpu_pool.start(cpu_t);
+            std::fprintf(stderr, "# ernie55 hybrid cpu_overlap: started %d-thread AVX512/VNNI=%d CPU expert pool\n",
+                         cpu_t,
+#if ERNIE55_CPU_CAN_AVX512
+                         ernie55cpu::cpu_has_avx512_vnni() ? 1 : 0
+#else
+                         0
+#endif
+            );
+        }
 
         hybrid_ck(cudaHostAlloc(&h_topk_idx, static_cast<size_t>(max_routes_cap) * sizeof(int), cudaHostAllocDefault), "h_topk_idx");
         for (int b = 0; b < 2; ++b) {
@@ -646,7 +883,11 @@ struct HybridExpertCache {
             hybrid_ck(cudaMalloc(&stg_vram[b], stg_bytes), "stg_vram");
             hybrid_ck(cudaHostAlloc(&stg_bounce[b], stg_bytes, cudaHostAllocDefault), "stg_bounce");
             hybrid_ck(cudaMalloc(&stg_d_ptab[b], ptab_n * sizeof(void*)), "stg_d_ptab");
-            hybrid_ck(cudaHostAlloc(&stg_h_ptab[b], ptab_n * sizeof(void*), cudaHostAllocDefault), "stg_h_ptab");
+            hybrid_ck(cudaMemsetAsync(stg_d_ptab[b], 0, ptab_n * sizeof(void*), main_st), "stg_d_ptab zero");
+            hybrid_ck(cudaMalloc(&stg_d_patches[b], static_cast<size_t>(stg_max_patches) * sizeof(PtabPatchEntry)), "stg_d_patches");
+            hybrid_ck(cudaHostAlloc(&stg_h_patches[b], static_cast<size_t>(stg_max_patches) * sizeof(PtabPatchEntry), cudaHostAllocDefault), "stg_h_patches");
+        }
+        for (int b = 0; b < 3; ++b) {
             hybrid_ck(cudaHostAlloc(&h_grp_n[b], sizeof(int), cudaHostAllocDefault), "h_grp_n");
             hybrid_ck(cudaHostAlloc(&h_grp_exp[b], static_cast<size_t>(max_grp_cap) * sizeof(int), cudaHostAllocDefault), "h_grp_exp");
             hybrid_ck(cudaHostAlloc(&h_grp_cnt[b], static_cast<size_t>(max_grp_cap) * sizeof(int), cudaHostAllocDefault), "h_grp_cnt");
@@ -807,44 +1048,85 @@ struct HybridExpertCache {
                      free_after / double(1ull << 20));
     }
 
-    // Run routed MoE experts for layer `moe_li` (0..41) using VRAM hot cache + double-buffered cold H2D staging.
-    // Caller has already executed `moe_route`, `fc1_lat`, and `k_ernie55_prerot_x<EHB>`.
+    // Kick off async D2H of `sc.topk_idx` (and `sc.topk_w` if cpu_overlap && M==1) on `h2d_stream`
+    // immediately after `moe_route`, overlapping with `fc1_lat`, `prerot_x`, and `moe_shared`!
+    void begin_routed_layer(const ernie55::MoeScratch& sc, int M, cudaStream_t st) {
+        const int n_routes = M * geom::TOPK;
+        hybrid_ck(cudaEventRecord(topk_ready_ev, st), "topk_ready_ev");
+        hybrid_ck(cudaStreamWaitEvent(h2d_stream, topk_ready_ev, 0), "h2d wait topk");
+        hybrid_ck(cudaMemcpyAsync(h_topk_idx, sc.topk_idx, static_cast<size_t>(n_routes) * sizeof(int),
+                                  cudaMemcpyDeviceToHost, h2d_stream), "topk D2H");
+        if (cfg.cpu_overlap && cpu_scales_ready && M == 1) {
+            hybrid_ck(cudaMemcpyAsync(h_topk_w, sc.topk_w, static_cast<size_t>(geom::TOPK) * sizeof(float),
+                                      cudaMemcpyDeviceToHost, h2d_stream), "topk_w D2H");
+        }
+        hybrid_ck(cudaEventRecord(topk_d2h_ev, h2d_stream), "topk_d2h_ev");
+        begin_called = true;
+        x_begin_called = false;
+    }
+
+    // Kick off async D2H of `sc.x_had_r` (4 KiB) right after `k_ernie55_prerot_x` when cpu_overlap && M==1,
+    // overlapped with `moe_shared` on the compute stream! No-op when cpu_overlap is off or M > 1.
+    void begin_routed_x(const ernie55::MoeScratch& sc, int M, cudaStream_t st) {
+        if (!cfg.cpu_overlap || !cpu_scales_ready || M != 1) return;
+        hybrid_ck(cudaEventRecord(x_ready_ev, st), "x_ready_ev");
+        hybrid_ck(cudaStreamWaitEvent(h2d_stream, x_ready_ev, 0), "h2d wait x_had_r");
+        hybrid_ck(cudaMemcpyAsync(h_x_had_r, sc.x_had_r, static_cast<size_t>(geom::EH) * sizeof(uint16_t),
+                                  cudaMemcpyDeviceToHost, h2d_stream), "x_had_r D2H");
+        hybrid_ck(cudaEventRecord(x_d2h_ev, h2d_stream), "x_d2h_ev");
+        x_begin_called = true;
+    }
+
+    // Run routed MoE experts for layer `moe_li` (0..41) using VRAM hot cache + micro-pipelined
+    // double-buffered cold H2D staging with parallel host->pinned memcpy & compact ptab scatter.
+    // Caller has already executed `moe_route`, `fc1_lat`, `k_ernie55_prerot_x<EHB>`, and `moe_shared`.
     // Output `sc.fc2_part_r[route * EH]` is 100% bit-exact vs resident GPU execution!
     void run_routed_layer(int moe_li, const ernie55::MoeWeights& w, ernie55::MoeScratch& sc,
                           int M, cudaStream_t st) {
         const auto& ld = layers[static_cast<size_t>(moe_li)];
         const int n_routes = M * geom::TOPK;
-        hybrid_ck(cudaMemcpyAsync(h_topk_idx, sc.topk_idx, static_cast<size_t>(n_routes) * sizeof(int),
-                                  cudaMemcpyDeviceToHost, st), "topk D2H");
-        hybrid_ck(cudaStreamSynchronize(st), "topk D2H sync");
+        if (begin_called) {
+            hybrid_ck(cudaEventSynchronize(topk_d2h_ev), "topk D2H sync");
+            begin_called = false;
+        } else {
+            hybrid_ck(cudaMemcpyAsync(h_topk_idx, sc.topk_idx, static_cast<size_t>(n_routes) * sizeof(int),
+                                      cudaMemcpyDeviceToHost, st), "topk D2H");
+            hybrid_ck(cudaStreamSynchronize(st), "topk D2H sync");
+        }
 
         const int GMAX = (M < 16) ? 8 : 16;
-        // Group routes by expert id
-        std::vector<int> exp_routes[NE];
-        std::vector<int> hot_exps;
-        std::vector<int> cold_exps;
-        hot_exps.reserve(64);
-        cold_exps.reserve(64);
+        hot_exps_buf.clear();
+        cold_exps_buf.clear();
+        const size_t layer_off = static_cast<size_t>(moe_li) * NE;
         for (int r = 0; r < n_routes; ++r) {
             const int e = h_topk_idx[r];
             if (e < 0 || e >= NE) hybrid_die("bad routed expert id " + std::to_string(e));
-            if (exp_routes[e].empty()) {
-                if (exp_slot[static_cast<size_t>(moe_li) * NE + static_cast<size_t>(e)] != -1) hot_exps.push_back(e);
-                else cold_exps.push_back(e);
+            route_next[static_cast<size_t>(r)] = -1;
+            if (exp_head[e] < 0) {
+                exp_head[e] = r;
+                exp_tail[e] = r;
+                if (exp_slot[layer_off + static_cast<size_t>(e)] != -1) hot_exps_buf.push_back(e);
+                else cold_exps_buf.push_back(e);
+            } else {
+                route_next[static_cast<size_t>(exp_tail[e])] = r;
+                exp_tail[e] = r;
             }
-            exp_routes[e].push_back(r);
         }
 
         auto fill_groups = [&](int buf, const std::vector<int>& exps, size_t lo, size_t hi) -> int {
             int ng = 0;
             for (size_t idx = lo; idx < hi; ++idx) {
                 const int e = exps[idx];
-                const auto& rv = exp_routes[e];
-                for (size_t p = 0; p < rv.size(); p += static_cast<size_t>(GMAX)) {
-                    const int cnt = static_cast<int>(std::min<size_t>(static_cast<size_t>(GMAX), rv.size() - p));
+                int r = exp_head[e];
+                while (r >= 0) {
+                    int cnt = 0;
+                    int* dst_r = &h_grp_routes[buf][ng * GMAX];
+                    while (r >= 0 && cnt < GMAX) {
+                        dst_r[cnt++] = r;
+                        r = route_next[static_cast<size_t>(r)];
+                    }
                     h_grp_exp[buf][ng] = e;
                     h_grp_cnt[buf][ng] = cnt;
-                    for (int k = 0; k < cnt; ++k) h_grp_routes[buf][ng * GMAX + k] = rv[p + static_cast<size_t>(k)];
                     ++ng;
                 }
             }
@@ -852,12 +1134,13 @@ struct HybridExpertCache {
             return ng;
         };
 
-        auto launch_groups = [&](int buf, int ng, const uint8_t* const* ptab, cudaStream_t stream) {
+        auto launch_groups = [&](int buf, int ng, const uint8_t* const* ptab, cudaStream_t stream, cudaEvent_t h2d_ev) {
             if (ng <= 0) return;
             hybrid_ck(cudaMemcpyAsync(d_grp_n[buf], h_grp_n[buf], sizeof(int), cudaMemcpyHostToDevice, stream), "grp_n");
             hybrid_ck(cudaMemcpyAsync(d_grp_exp[buf], h_grp_exp[buf], static_cast<size_t>(ng) * sizeof(int), cudaMemcpyHostToDevice, stream), "grp_exp");
             hybrid_ck(cudaMemcpyAsync(d_grp_cnt[buf], h_grp_cnt[buf], static_cast<size_t>(ng) * sizeof(int), cudaMemcpyHostToDevice, stream), "grp_cnt");
             hybrid_ck(cudaMemcpyAsync(d_grp_routes[buf], h_grp_routes[buf], static_cast<size_t>(ng) * GMAX * sizeof(int), cudaMemcpyHostToDevice, stream), "grp_routes");
+            if (h2d_ev) hybrid_ck(cudaEventRecord(h2d_ev, stream), "grp h2d ev");
             if (GMAX == 8) {
                 ernie55::k_ernie55_routed_fc1_grp<<<ng * w.routed.eb, 256, 0, stream>>>(
                     sc.x_had_r, d_grp_n[buf], d_grp_exp[buf], d_grp_cnt[buf], d_grp_routes[buf],
@@ -876,69 +1159,154 @@ struct HybridExpertCache {
         };
 
         auto stage_cold_chunk = [&](int buf, size_t lo, size_t hi) {
-            const size_t ptab_n = static_cast<size_t>(NE) * EB * 2;
-            std::memset(stg_h_ptab[buf], 0, ptab_n * sizeof(void*));
+            constexpr size_t COPY_SLICE = 512ull << 10;
+            copy_tasks_buf.clear();
+            int np = 0;
             size_t cur_off = 0;
             for (size_t idx = lo; idx < hi; ++idx) {
-                const int e = cold_exps[idx];
+                const int e = cold_exps_buf[idx];
                 const auto& em = ld.exp[static_cast<size_t>(e)];
                 const size_t fc1_al = round256(em.fc1_bytes);
                 const size_t need = fc1_al + round256(em.fc2_bytes);
                 uint8_t* bdst = stg_bounce[buf] + cur_off;
                 uint8_t* vdst = stg_vram[buf] + cur_off;
-                std::memcpy(bdst, ld.h_fc1 + em.fc1_off, em.fc1_bytes);
-                std::memcpy(bdst + fc1_al, ld.h_fc2 + em.fc2_off, em.fc2_bytes);
+                for (size_t off = 0; off < em.fc1_bytes; off += COPY_SLICE) {
+                    const size_t n = std::min(COPY_SLICE, em.fc1_bytes - off);
+                    copy_tasks_buf.push_back({bdst + off, ld.h_fc1 + em.fc1_off + off, n});
+                }
+                for (size_t off = 0; off < em.fc2_bytes; off += COPY_SLICE) {
+                    const size_t n = std::min(COPY_SLICE, em.fc2_bytes - off);
+                    copy_tasks_buf.push_back({bdst + fc1_al + off, ld.h_fc2 + em.fc2_off + off, n});
+                }
                 for (int b = 0; b < em.nb; ++b) {
                     const int sl = (e * EB + b) * 2;
-                    stg_h_ptab[buf][static_cast<size_t>(sl)]     = vdst + em.piece_fc1_off[b];
-                    stg_h_ptab[buf][static_cast<size_t>(sl) + 1] = vdst + fc1_al + em.piece_fc2_off[b];
+                    stg_h_patches[buf][np++] = {stg_d_ptab[buf] + sl,     vdst + em.piece_fc1_off[b]};
+                    stg_h_patches[buf][np++] = {stg_d_ptab[buf] + sl + 1, vdst + fc1_al + em.piece_fc2_off[b]};
                 }
                 cur_off += need;
             }
+            copy_pool.run(copy_tasks_buf.data(), static_cast<int>(copy_tasks_buf.size()));
             if (cur_off > 0) {
                 hybrid_ck(cudaMemcpyAsync(stg_vram[buf], stg_bounce[buf], cur_off, cudaMemcpyHostToDevice, h2d_stream), "cold stg H2D");
             }
-            hybrid_ck(cudaMemcpyAsync(stg_d_ptab[buf], stg_h_ptab[buf], ptab_n * sizeof(void*), cudaMemcpyHostToDevice, h2d_stream), "cold ptab H2D");
+            if (np > 0) {
+                hybrid_ck(cudaMemcpyAsync(stg_d_patches[buf], stg_h_patches[buf],
+                                          static_cast<size_t>(np) * sizeof(PtabPatchEntry),
+                                          cudaMemcpyHostToDevice, h2d_stream), "cold patch H2D");
+                k_ernie55_ptab_patch<<<(np + 255) / 256, 256, 0, h2d_stream>>>(stg_d_patches[buf], np);
+            }
             hybrid_ck(cudaEventRecord(stg_h2d_ev[buf], h2d_stream), "stg_h2d_ev");
             stat_cold_staged += (hi - lo);
         };
 
-        // 1. Run all VRAM-hot groups immediately on `st` (buf 0) while CPU prepares cold chunk 0!
-        if (!hot_exps.empty()) {
-            const int ng_hot = fill_groups(0, hot_exps, 0, hot_exps.size());
-            launch_groups(0, ng_hot, ld.d_ptab, st);
-            hybrid_ck(cudaEventRecord(stg_comp_ev[0], st), "hot comp ev");
+        // 1. Run all VRAM-hot groups immediately on dedicated buf=2 (ZERO stall before cold chunk 0!)
+        if (!hot_exps_buf.empty()) {
+            if (hot_h2d_busy) {
+                hybrid_ck(cudaEventSynchronize(hot_h2d_ev), "hot grp h2d sync");
+                hot_h2d_busy = false;
+            }
+            const int ng_hot = fill_groups(2, hot_exps_buf, 0, hot_exps_buf.size());
+            launch_groups(2, ng_hot, ld.d_ptab, st, hot_h2d_ev);
+            hot_h2d_busy = true;
         }
 
-        // 2. Process cold experts in double-buffered chunks of `stg_slots`
-        const size_t n_cold = cold_exps.size();
-        const size_t stride = static_cast<size_t>(stg_slots);
-        if (n_cold > 0) {
-            const size_t n_chunks = (n_cold + stride - 1) / stride;
-            bool buf_in_flight[2] = {false, false};
+        // 2. Process cold experts: optional parallel CPU DDR5 evaluation + micro-pipelined PCIe H2D staging!
+        const size_t n_cold = cold_exps_buf.size();
+        size_t n_gpu_cold = n_cold;
+        int n_cpu_cold = 0;
+        const int cb = cpu_buf_cur;
+
+        if (cfg.cpu_overlap && cpu_scales_ready && M == 1 && n_cold >= 2 && cpu_pool.workers.size() >= 2) {
+            if (x_begin_called) {
+                hybrid_ck(cudaEventSynchronize(x_d2h_ev), "x_had_r D2H sync");
+                x_begin_called = false;
+            } else {
+                hybrid_ck(cudaMemcpyAsync(h_x_had_r, sc.x_had_r, static_cast<size_t>(geom::EH) * sizeof(uint16_t),
+                                          cudaMemcpyDeviceToHost, st), "x_had_r D2H fallback");
+                hybrid_ck(cudaMemcpyAsync(h_topk_w, sc.topk_w, static_cast<size_t>(geom::TOPK) * sizeof(float),
+                                          cudaMemcpyDeviceToHost, st), "topk_w D2H fallback");
+                hybrid_ck(cudaStreamSynchronize(st), "x_had_r fallback sync");
+            }
+            if (cpu_fc2_busy[cb]) {
+                hybrid_ck(cudaEventSynchronize(cpu_fc2_h2d_ev[cb]), "cpu_fc2 reuse sync");
+                cpu_fc2_busy[cb] = false;
+            }
+            // Optimal balanced t=0 split for concurrent AVX-512 DDR5 eval + PCIe 4.0 H2D staging:
+            // n_cold=2..4 -> 1 CPU, 5..7 -> 2 CPU, 8..10 -> 3 CPU.
+            const size_t want_cpu = std::min<size_t>((n_cold + 1) / 3, static_cast<size_t>(geom::TOPK));
+            while (static_cast<size_t>(n_cpu_cold) < want_cpu && n_gpu_cold > 0) {
+                const int e = cold_exps_buf[n_gpu_cold - 1];
+                const int r = exp_head[e];
+                if (r < 0 || r >= geom::TOPK || route_next[static_cast<size_t>(r)] != -1) break;
+                const auto& em = ld.exp[static_cast<size_t>(e)];
+                const long long* tr = &ld.h_tab[static_cast<size_t>(e) * 6];
+                auto& d = cpu_exps_buf[n_cpu_cold];
+                d.exp_fc1       = ld.h_fc1 + em.fc1_off;
+                d.exp_fc2       = ld.h_fc2 + em.fc2_off;
+                d.piece_fc1_off = em.piece_fc1_off;
+                d.piece_fc2_off = em.piece_fc2_off;
+                d.v1b           = ld.h_v1b.data();
+                d.v2            = ld.h_v2.data();
+                d.v3b           = ld.h_v3b.data();
+                d.sg_out        = ld.h_sg.data() + geom::EH;
+                d.brow0         = static_cast<size_t>(tr[2]);
+                d.kmix          = ld.h_kmix.empty() ? 0LL : ld.h_kmix[static_cast<size_t>(e)];
+                d.nb            = em.nb;
+                d.dk            = static_cast<int>(tr[4]);
+                d.topk_w        = h_topk_w[r];
+                d.out_2048      = h_cpu_fc2_part[cb] + static_cast<size_t>(n_cpu_cold) * geom::EH;
+                cpu_routes_buf[n_cpu_cold] = r;
+                ++n_cpu_cold;
+                --n_gpu_cold;
+            }
+            if (n_cpu_cold > 0) {
+                // Launch CPU worker threads IMMEDIATELY (t=0) in parallel with GPU hot + PCIe cold staging!
+                cpu_pool.launch_async(cpu_exps_buf, n_cpu_cold, h_x_had_r);
+            }
+        }
+
+        const size_t stride = (M <= 4)
+            ? std::min<size_t>(static_cast<size_t>(stg_slots), 2u)
+            : ((M <= 16) ? std::min<size_t>(static_cast<size_t>(stg_slots), 4u)
+                         : static_cast<size_t>(stg_slots));
+        if (n_gpu_cold > 0) {
+            const size_t n_chunks = (n_gpu_cold + stride - 1) / stride;
             for (size_t ch = 0; ch < n_chunks; ++ch) {
                 const int buf = static_cast<int>(ch & 1);
                 const size_t lo = ch * stride;
-                const size_t hi = std::min(n_cold, lo + stride);
-                if (ch == 0 && !hot_exps.empty()) {
-                    // Wait for hot group buffers on buf 0 to finish DMA before reusing h_grp_*[0]
-                    hybrid_ck(cudaEventSynchronize(stg_comp_ev[0]), "hot grp sync");
-                }
-                if (buf_in_flight[buf]) {
+                const size_t hi = std::min(n_gpu_cold, lo + stride);
+                if (stg_buf_busy[buf]) {
                     hybrid_ck(cudaEventSynchronize(stg_comp_ev[buf]), "cold buf reuse sync");
-                    buf_in_flight[buf] = false;
+                    stg_buf_busy[buf] = false;
                 }
                 stage_cold_chunk(buf, lo, hi);
-                const int ng_c = fill_groups(buf, cold_exps, lo, hi);
+                const int ng_c = fill_groups(buf, cold_exps_buf, lo, hi);
                 hybrid_ck(cudaStreamWaitEvent(st, stg_h2d_ev[buf], 0), "wait cold H2D");
-                launch_groups(buf, ng_c, stg_d_ptab[buf], st);
+                launch_groups(buf, ng_c, stg_d_ptab[buf], st, nullptr);
                 hybrid_ck(cudaEventRecord(stg_comp_ev[buf], st), "cold comp ev");
-                buf_in_flight[buf] = true;
-            }
-            for (int b = 0; b < 2; ++b) {
-                if (buf_in_flight[b]) hybrid_ck(cudaEventSynchronize(stg_comp_ev[b]), "cold final sync");
+                stg_buf_busy[buf] = true;
             }
         }
+
+        if (n_cpu_cold > 0) {
+            cpu_pool.wait_async();
+            for (int i = 0; i < n_cpu_cold; ++i) {
+                const int r = cpu_routes_buf[i];
+                hybrid_ck(cudaMemcpyAsync(sc.fc2_part_r + static_cast<size_t>(r) * geom::EH,
+                                          h_cpu_fc2_part[cb] + static_cast<size_t>(i) * geom::EH,
+                                          static_cast<size_t>(geom::EH) * sizeof(float),
+                                          cudaMemcpyHostToDevice, h2d_stream), "cpu fc2_part H2D");
+            }
+            hybrid_ck(cudaEventRecord(cpu_fc2_h2d_ev[cb], h2d_stream), "cpu_fc2_h2d_ev");
+            hybrid_ck(cudaStreamWaitEvent(st, cpu_fc2_h2d_ev[cb], 0), "wait cpu_fc2 H2D");
+            cpu_fc2_busy[cb] = true;
+            cpu_buf_cur ^= 1;
+            stat_cpu_evals += static_cast<uint64_t>(n_cpu_cold);
+        }
+
+        // Reset only touched entries in exp_head (O(n_exps), zero memset of NE!)
+        for (int e : hot_exps_buf)  exp_head[e] = -1;
+        for (int e : cold_exps_buf) exp_head[e] = -1;
     }
 
     // Commit completed async H2D promotions into fixed-address `d_ptab` on `st`.
@@ -1090,10 +1458,11 @@ struct HybridExpertCache {
         const uint64_t tot = stat_hits + stat_misses;
         const double hit_pct = tot ? (100.0 * static_cast<double>(stat_hits) / static_cast<double>(tot)) : 0.0;
         std::fprintf(stderr,
-                     "# ernie55 hybrid stats (%llu steps): hit=%.1f%% (%llu/%llu), swaps=%llu, cold_staged=%llu\n",
+                     "# ernie55 hybrid stats (%llu steps): hit=%.1f%% (%llu/%llu), swaps=%llu, cold_staged=%llu, cpu_evals=%llu\n",
                      static_cast<unsigned long long>(stat_steps), hit_pct,
                      static_cast<unsigned long long>(stat_hits), static_cast<unsigned long long>(tot),
-                     static_cast<unsigned long long>(stat_swaps), static_cast<unsigned long long>(stat_cold_staged));
+                     static_cast<unsigned long long>(stat_swaps), static_cast<unsigned long long>(stat_cold_staged),
+                     static_cast<unsigned long long>(stat_cpu_evals));
     }
 };
 

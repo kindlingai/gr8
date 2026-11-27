@@ -724,6 +724,7 @@ run_job hy4_unit_tests '
 run_job ernie55_unit_tests '
   g++ -std=c++20 -O2 -Wall -Wextra -DG6_MODEL_ERNIE55=1 -I "$REPO/engine" "$REPO/engine/tests/test_ernie55_geom.cpp" -o "$D/test_ernie55_geom" && "$D/test_ernie55_geom"
   g++ -std=c++20 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_ernie55_math.cpp" -o "$D/test_ernie55_math" && "$D/test_ernie55_math"
+  g++ -std=c++20 -O2 -Wall -Wextra -pthread -I "$REPO/engine" "$REPO/engine/tests/test_ernie55_hybrid_cpu.cpp" -o "$D/test_ernie55_hybrid_cpu" && "$D/test_ernie55_hybrid_cpu"
 '
 
 wait

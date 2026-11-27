@@ -669,6 +669,11 @@ struct Engine {
 
         std::vector<std::vector<long long>> hyb_tabs(o.use_hybrid ? geom::N_MOE_LAYERS : 0);
         std::vector<std::vector<long long>> hyb_kmixes(o.use_hybrid ? geom::N_MOE_LAYERS : 0);
+        const bool hyb_cpu_ov = o.use_hybrid && hcfg.cpu_overlap;
+        std::vector<std::vector<uint16_t>> hyb_sgs(hyb_cpu_ov ? geom::N_MOE_LAYERS : 0);
+        std::vector<std::vector<uint16_t>> hyb_v1bs(hyb_cpu_ov ? geom::N_MOE_LAYERS : 0);
+        std::vector<std::vector<uint16_t>> hyb_v2s(hyb_cpu_ov ? geom::N_MOE_LAYERS : 0);
+        std::vector<std::vector<uint16_t>> hyb_v3bs(hyb_cpu_ov ? geom::N_MOE_LAYERS : 0);
 
         L.resize(geom::L_MAIN);
         for (int l = 0; l < geom::L_MAIN; ++l) {
@@ -751,6 +756,12 @@ struct Engine {
                         im.read_host<long long>(lname(l, "tr3.table"), hyb_tabs[size_t(y.moe_idx)]);
                         if (im.find(lname(l, "tr3.kmix")))
                             im.read_host<long long>(lname(l, "tr3.kmix"), hyb_kmixes[size_t(y.moe_idx)]);
+                        if (hyb_cpu_ov) {
+                            im.read_host<uint16_t>(lname(l, "tr3.sg"),  hyb_sgs[size_t(y.moe_idx)]);
+                            im.read_host<uint16_t>(lname(l, "tr3.v1b"), hyb_v1bs[size_t(y.moe_idx)]);
+                            im.read_host<uint16_t>(lname(l, "tr3.v2"),  hyb_v2s[size_t(y.moe_idx)]);
+                            im.read_host<uint16_t>(lname(l, "tr3.v3b"), hyb_v3bs[size_t(y.moe_idx)]);
+                        }
                     } else {
                         rl.moe_w.routed.fc1 = im.get<uint8_t>(lname(l, "tr3.fc1"));
                         rl.moe_w.routed.fc2 = im.get<uint8_t>(lname(l, "tr3.fc2"));
@@ -901,6 +912,7 @@ struct Engine {
         if (o.use_hybrid) {
             hybrid_host.load_part4(release_dir, o.widths_path, o.nr, o.rank0);
             hybrid_cache.init_tables(hcfg, hybrid_host, hyb_tabs, hyb_kmixes, o.max_rows, stream);
+            if (hyb_cpu_ov) hybrid_cache.init_cpu_scales(hyb_sgs, hyb_v1bs, hyb_v2s, hyb_v3bs);
             for (int l = geom::FIRST_MOE; l < geom::L_MAIN; ++l) {
                 L[size_t(l)].rk[0].moe_w.routed.ptab = hybrid_cache.layer_ptab(L[size_t(l)].moe_idx);
             }
@@ -1129,10 +1141,12 @@ struct Engine {
                 ernie55::dense_mlp_forward(blas, rl.dense_w, dense_sc, mixed_ln, p_dst, M, mx8_x8, stream);
             } else if (o.use_hybrid) {
                 ernie55::moe_route(blas, rl.moe_w, moe_sc, mixed_ln, M, hybrid_cache.layer_hits(y.moe_idx), stream);
+                hybrid_cache.begin_routed_layer(moe_sc, M, stream);
                 ernie55::mx8::linear_w(blas, mixed_ln, rl.moe_w.fc1_lat, moe_sc.routed_in, M, geom::EH, geom::HID, mx8_x8, nullptr, stream);
                 ernie55::k_ernie55_prerot_x<geom::EHB><<<M * geom::EHB, 32, 0, stream>>>(moe_sc.routed_in, rl.moe_w.routed.sg, moe_sc.x_had_r, M);
-                hybrid_cache.run_routed_layer(y.moe_idx, rl.moe_w, moe_sc, M, stream);
+                hybrid_cache.begin_routed_x(moe_sc, M, stream);
                 ernie55::moe_shared(rl.moe_w, moe_sc, mixed_ln, M, stream);
+                hybrid_cache.run_routed_layer(y.moe_idx, rl.moe_w, moe_sc, M, stream);
                 ernie55::moe_routed_finish(blas, rl.moe_w, moe_sc, p_dst, M, mx8_x8, stream, fuse_tp1_moe);
             } else {
                 const bool use_par_sh = (capture_mode || !o.profile);
