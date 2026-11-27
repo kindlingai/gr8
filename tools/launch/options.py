@@ -105,6 +105,14 @@ def renamed_keys(d, where, warnings):
     return d
 
 
+def _is_bare_gr8_engine_knob(key):
+    """True for a GR8_* engine knob (scope != 'outside') that must travel via EXTRA_ENV rather than bare env/config."""
+    if not key.startswith('GR8_') or key in KEYS or key in IGNORED:
+        return False
+    knob = knobs.knob_of(key)
+    return bool(knob and knob['scope'] != 'outside')
+
+
 def default_file(environ):
     for p in (environ.get('GR8_CLUSTER') or environ.get('G6_CLUSTER'), 'cluster.env',
               os.path.join(REPO, 'config', 'cluster.env')):
@@ -183,7 +191,7 @@ def parse(argv, environ=None):
         if 'HOSTS' in filev and 'PEERS' not in filev:
             filev['PEERS'] = ','.join(filev['HOSTS'].split())
         for k in sorted(filev):
-            if k not in KEYS and k not in IGNORED:
+            if k not in KEYS and k not in IGNORED and not _is_bare_gr8_engine_knob(k):
                 warnings.append(f'{path}: unknown key {k}, ignored')
     environ = renamed_keys(environ, 'the environment', warnings)
     values, origin = {}, {}
@@ -249,6 +257,7 @@ def parse(argv, environ=None):
     opts.argv = list(argv)   # as given (old names renamed): `scale` boots the same options plus its own
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
+    opts.gr8env = sorted({k for k in (*environ, *filev) if _is_bare_gr8_engine_knob(k)})
     for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'GR8_WORK_DIR', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT',
               'DFLASH_DIR', 'V2_DENSE', 'STEERING_PROFILE', 'STEERING_CHAT_TEMPLATE', 'LAYOUT', 'GRAMMAR_DIR'):
         if not values.get(k) or (k == 'MODEL' and looks_remote(values[k])) or \
@@ -455,6 +464,10 @@ def validate(o):
     if o.g6env:
         raise OptionError(f'{", ".join(o.g6env)} set in the environment: the engine does not inherit G6_* variables. Pass '
                           'them as GR8_ names with --extra-env "NAME=value ..." so every box compares them')
+    if getattr(o, 'gr8env', None):
+        raise OptionError(f'{", ".join(o.gr8env)} set directly in the environment or config file: the engine does not '
+                          'inherit GR8_* engine variables. Pass them via EXTRA_ENV="NAME=value ..." (--extra-env) so '
+                          'every box compares them')
     for name in (w.partition('=')[0] for w in (o.get('EXTRA_ENV') or '').split()):
         k = knobs.knob_of(name)
         if k and k['scope'] == 'test':
