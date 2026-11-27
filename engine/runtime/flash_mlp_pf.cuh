@@ -227,7 +227,9 @@ inline void bind_layer_tensors(Model& m, int i, const Find* find, cudaStream_t s
             if (const char* e = bind::make_shared_fp8(y.T, st))
                 die("layer " + std::to_string(y.l) + ": " + e);
         const bool wide = !knob::glm53f_pf_nowide();
-        if (wide && !y.T.fc1_wide)
+        bool dec_prepared = false;
+        for (int r = 1; r <= MX; ++r) if (y.flash_mlp[r].M) { dec_prepared = true; break; }
+        if (wide && !y.T.fc1_wide && !dec_prepared)
         {
             bind::widen_fc1(y.T, st);
             if (!knob::nowide2()) bind::widen_fc2(y.T, st);
@@ -363,20 +365,20 @@ inline void pf_mlp_block_gemm(Model& m, Prefill& P, int i, int M, cudaStream_t s
         flash_mlp::k_to_bf16<<<(static_cast<long long>(M) * HID + 255) / 256, 256, 0, st>>>(P.xn2, S.sc.xb, M * HID);
         const float one = 1.f, zero = 0.f;
         if (cublasSetStream(S.blas, st) != CUBLAS_STATUS_SUCCESS) die("flash_mlp_pf: cublasSetStream failed");
-        if (cublasGemmEx(S.blas, CUBLAS_OP_T, CUBLAS_OP_N, w.I, M, HID, &one, w.gate, CUDA_R_16BF, HID,
-                         S.sc.xb, CUDA_R_16BF, HID, &zero, S.bf16_act, CUDA_R_32F, w.I, CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        if (gr8_sm70::cublas_gemm_bf16_tn(S.blas, w.I, M, HID, &one, w.gate, HID,
+                                          S.sc.xb, HID, &zero, S.bf16_act, CUDA_R_32F, w.I,
+                                          CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
             die("flash_mlp_pf: cuBLAS dense gate failed");
-        if (cublasGemmEx(S.blas, CUBLAS_OP_T, CUBLAS_OP_N, w.I, M, HID, &one, w.up, CUDA_R_16BF, HID,
-                         S.sc.xb, CUDA_R_16BF, HID, &zero, S.bf16_up, CUDA_R_32F, w.I, CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        if (gr8_sm70::cublas_gemm_bf16_tn(S.blas, w.I, M, HID, &one, w.up, HID,
+                                          S.sc.xb, HID, &zero, S.bf16_up, CUDA_R_32F, w.I,
+                                          CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
             die("flash_mlp_pf: cuBLAS dense up failed");
         const long long nmid = static_cast<long long>(M) * w.I;
         flash_mlp_pf::k_swiglu_bf16<<<static_cast<unsigned>((nmid + 255) / 256), 256, 0, st>>>(
             S.bf16_act, S.bf16_up, S.bf16_mid, nmid);
-        if (cublasGemmEx(S.blas, CUBLAS_OP_T, CUBLAS_OP_N, HID, M, w.I, &one, w.down, CUDA_R_16BF, w.I,
-                         S.bf16_mid, CUDA_R_16BF, w.I, &zero, S.bf16_out, CUDA_R_32F, HID, CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        if (gr8_sm70::cublas_gemm_bf16_tn(S.blas, HID, M, w.I, &one, w.down, w.I,
+                                          S.bf16_mid, w.I, &zero, S.bf16_out, CUDA_R_32F, HID,
+                                          CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
             die("flash_mlp_pf: cuBLAS dense down failed");
         flash_mlp::k_to_bf16<<<(static_cast<long long>(M) * HID + 255) / 256, 256, 0, st>>>(
             S.bf16_out, reinterpret_cast<uint16_t*>(P.part[1]), M * HID);

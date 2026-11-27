@@ -16,7 +16,11 @@ __device__ __forceinline__ void tail_tile(const ProjPart& p, const u32* xf, floa
     gv_gemv_body<C, NT>(p.w, xf, p.K, p.ot, p.tpc, p.ks, rows, y, ld, gv::O_F32, red, cta);
 }
 template<int NT>
+#ifdef GR8_SM70
+__global__ void __launch_bounds__(512) k_kda_tail_gemm(ProjArgs a)
+#else
 __global__ void __launch_bounds__(1024) k_kda_tail_gemm(ProjArgs a)
+#endif
 {
     __shared__ float4 red[32][32];
     const int m0 = blockIdx.y * (8 * NT);
@@ -33,9 +37,14 @@ __global__ void __launch_bounds__(1024) k_kda_tail_gemm(ProjArgs a)
 }
 inline void launch_tail_gemm(const ProjArgs& a, int row_tile, cudaStream_t st)
 {
+#ifdef GR8_SM70
+    constexpr int B = 512;
+#else
+    constexpr int B = 1024;
+#endif
     if (row_tile == 64)
-        k_kda_tail_gemm<8><<<dim3(a.ctas, (a.M + 63) / 64), 1024, 0, st>>>(a);
+        k_kda_tail_gemm<8><<<dim3(a.ctas, (a.M + 63) / 64), B, 0, st>>>(a);
     else
-        k_kda_tail_gemm<4><<<dim3(a.ctas, (a.M + 31) / 32), 1024, 0, st>>>(a);
+        k_kda_tail_gemm<4><<<dim3(a.ctas, (a.M + 31) / 32), B, 0, st>>>(a);
 }
 } // namespace kda

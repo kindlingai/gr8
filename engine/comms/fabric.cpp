@@ -12,11 +12,13 @@
 #include <infiniband/verbs.h>
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -307,6 +309,25 @@ struct Fabric::Impl {
   bool var = false; VLayout L;  // variable layout (cfg.vcap non-empty)
   bool bulk = false; BulkDev bd{};                    // bulk mode (cfg.bulk_bytes > 0)
   bool solo = false;                                  // one rank: the region only, no NIC, bootstrap or proxy
+  // Intra-node backends (loopback_mode: every cfg.ips address 127.0.0.1 / 127.0.0.2 -> POSIX SHM, 127.0.0.3 -> NVLink
+  // CUDA-IPC with SHM fallback).
+  bool shm = false;                                   // POSIX shm_open + cudaHostRegisterMapped
+  bool ipc = false;                                   // GPU HBM2 cudaMalloc + cudaIpcOpenMemHandle over NVLink + SHM ctl
+  std::vector<char*> shm_peer_base;                   // [nr] peer mmap bases (whole region for shm, ctl region for ipc)
+  std::vector<size_t> shm_peer_bytes;                 // [nr] peer mmap sizes
+  std::vector<char*> shm_peer_recv;                   // [nr] peer recv base in shm mode (or flags base in ipc bulk)
+  int ipc_dev = -1;                                   // this rank's CUDA device id
+  char* ipc_dev_buf = nullptr;                        // GPU HBM2 allocation: send | recv (or bulk)
+  size_t ipc_dev_bytes = 0;
+  std::vector<int> ipc_peer_dev;                      // [nr] peer CUDA device ids
+  std::vector<char*> ipc_peer_base;                   // [nr] cudaIpcOpenMemHandle peer bases
+  std::vector<char*> ipc_peer_recv;                   // [nr] peer recv (or bulk) GPU pointers
+  std::vector<cudaStream_t> ipc_stream;               // [nr] dedicated non-blocking NVLink copy stream per peer
+  unsigned long long* ipc_seq_ring = nullptr;         // pinned host ring [4096] for ordered 8-B tail copies
+  unsigned long long* ipc_seq_dev = nullptr;          // local GPU HBM2 staging [nr][4096] for peer tail copies
+  unsigned ipc_seq_pos = 0;
+  unsigned long long* ipc_pool_tails = nullptr;       // [2][ncoll][nr] in our ctl SHM (when dev_.pool > 0)
+  std::vector<unsigned long long*> ipc_peer_pool_tails; // [nr] peers' ipc_pool_tails in their ctl SHM
   std::vector<std::deque<int>> batches;               // bulk: per peer, WR counts of the signaled batches in flight
   std::vector<int> inflight;                          // bulk: per peer, WRs posted and not yet known complete
   std::thread th;
@@ -453,12 +474,77 @@ void Fabric::close() {
     if (R.pd) { FCHECK(ibv_dealloc_pd(R.pd) == 0); R.pd = nullptr; live(kLivePd, -1); }
     if (R.ctx) { FCHECK(ibv_close_device(R.ctx) == 0); R.ctx = nullptr; live(kLiveCtx, -1); }
   }
+  if (I.ipc) {
+    for (int p = 0; p < (int)I.ipc_stream.size(); p++)
+      if (I.ipc_stream[p]) { CUCHECK(cudaStreamSynchronize(I.ipc_stream[p])); CUCHECK(cudaStreamDestroy(I.ipc_stream[p])); I.ipc_stream[p] = nullptr; }
+    for (int p = 0; p < (int)I.ipc_peer_base.size(); p++)
+      if (I.ipc_peer_base[p]) { CUCHECK(cudaIpcCloseMemHandle(I.ipc_peer_base[p])); I.ipc_peer_base[p] = nullptr; }
+    barrier();
+    if (I.ipc_dev_buf) { CUCHECK(cudaFree(I.ipc_dev_buf)); I.ipc_dev_buf = nullptr; }
+    if (I.ipc_seq_dev) { CUCHECK(cudaFree(I.ipc_seq_dev)); I.ipc_seq_dev = nullptr; }
+    if (I.ipc_seq_ring) { CUCHECK(cudaFreeHost(I.ipc_seq_ring)); I.ipc_seq_ring = nullptr; }
+  }
+  if (I.shm || I.ipc) {
+    for (int p = 0; p < (int)I.shm_peer_base.size(); p++)
+      if (I.shm_peer_base[p]) { munmap(I.shm_peer_base[p], I.shm_peer_bytes[p]); I.shm_peer_base[p] = nullptr; }
+    if (I.xgpu) { CUCHECK(cudaFree(I.xgpu)); I.xgpu = nullptr; }
+    if (I.region) {
+      cudaHostUnregister(I.region);
+      munmap(I.region, I.region_bytes);
+      I.region = nullptr;
+      live(kLivePinned, -(long)I.region_bytes);
+    }
+    delete impl_; impl_ = nullptr;
+    dev_ = FabricDev{}; cfg_ = FabricConfig{};
+    live(kLiveFab, -1);
+    return;
+  }
   if (I.xgpu) { CUCHECK(cudaFree(I.xgpu)); I.xgpu = nullptr; }
   if (I.region) { CUCHECK(cudaFreeHost(I.region)); I.region = nullptr; live(kLivePinned, -(long)I.region_bytes); }
   delete impl_; impl_ = nullptr;
   dev_ = FabricDev{}; cfg_ = FabricConfig{};
   live(kLiveFab, -1);
 }
+
+namespace {
+// 0 = normal RoCE v2, 2 = 127.0.0.1 / 127.0.0.2 (POSIX SHM, low-latency decode + zero HBM overhead),
+// 1 = 127.0.0.3 (opt-in experimental NVLink CUDA-IPC with SHM fallback)
+int loopback_mode(const std::vector<std::string>& ips) {
+  if (ips.size() < 2) return 0;
+  bool all12 = true, all3 = true;
+  for (const auto& ip : ips) {
+    if (ip != "127.0.0.1" && ip != "127.0.0.2") all12 = false;
+    if (ip != "127.0.0.3") all3 = false;
+  }
+  return all3 ? 1 : (all12 ? 2 : 0);
+}
+std::string make_shm_name(int port, int rank) {
+  static std::atomic<uint64_t> seq{0};
+  char buf[64];
+  snprintf(buf, sizeof buf, "/gr8f_%d_%d_%llu_r%d", (int)getpid(), port, (unsigned long long)seq.fetch_add(1), rank);
+  return buf;
+}
+char* create_shm_region(const std::string& name, size_t bytes, bool reg_cuda) {
+  shm_unlink(name.c_str());
+  int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+  FCHECK(fd >= 0);
+  FCHECK(ftruncate(fd, (off_t)bytes) == 0);
+  void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  FCHECK(p != MAP_FAILED);
+  memset(p, 0, bytes);
+  if (reg_cuda) {
+    CUCHECK(cudaHostRegister(p, bytes, cudaHostRegisterMapped | cudaHostRegisterPortable));
+    char* devp = nullptr;
+    CUCHECK(cudaHostGetDevicePointer((void**)&devp, p, 0));
+    FCHECK(devp == (char*)p);
+  }
+  return (char*)p;
+}
+struct IntraProbe { int dev; int can_ipc; };
+struct ShmPeerInfo { char name[64]; uint64_t recv_off; uint64_t bytes; };
+struct IpcPeerInfo { int dev; cudaIpcMemHandle_t handle; uint64_t recv_off; char ctl_name[64]; uint64_t ctl_bytes; uint64_t pool_off; };
+}  // namespace
 
 void Fabric::init(const FabricConfig& cfg) {
   FCHECK(!impl_);                                     // close() first to init again
@@ -479,6 +565,180 @@ void Fabric::init(const FabricConfig& cfg) {
   }
   FCHECK(cfg_.rank >= 0 && cfg_.rank < nr && (I.bulk || (cfg_.ncoll > 0 && (I.var || cfg_.slot_bytes > 0))));
   I.nrails = cfg.ips2.empty() ? 1 : 2;
+  const int lb_mode = !cfg.ring ? loopback_mode(cfg.ips) : 0;
+  if (lb_mode > 0) {
+    live(kLiveFab, 1);
+    const int me = cfg.rank;
+    size_t send_bytes = 0, recv_bytes = 0, stride = 0, db_bytes = 0, fl = 0, db = 0;
+    FabricDev rl{};
+    if (I.bulk) {
+      fl = (size_t)cfg.bulk_flags * nr * 16;
+      db = (size_t)cfg.bulk_flags * 8;
+    } else {
+      stride = I.var ? 0 : (cfg.slot_bytes + 8 + 255) & ~size_t(255);
+      FCHECK(fab_runs_allowed(cfg, I.var) && (!cfg.compact || !I.var));
+      if (!I.var) FCHECK(fab_slot_layout(cfg, cfg_.ncoll, &rl) && rl.stride == stride);
+      const size_t half = fab_slot_base(rl, cfg_.ncoll);
+      send_bytes = I.var ? I.L.send_bytes() : 2 * half;
+      rl.nr = nr; rl.compact = cfg.compact ? 1 : 0;
+      recv_bytes = I.var ? I.L.recv_bytes() : fab_recv_bytes(rl);
+      db_bytes = (size_t)cfg_.ncoll * 8;
+    }
+    const size_t data_bytes = ((I.bulk ? cfg.bulk_bytes : (send_bytes + recv_bytes)) + 4095) & ~size_t(4095);
+    // Probe whether all ranks sit on distinct GPUs with NVLink/P2P access and enough HBM headroom for IPC.
+    bool use_ipc = false;
+    int my_dev = -1;
+    if (lb_mode == 1) {
+      size_t free_b = 0, total_b = 0;
+      int has_gpu = (cudaGetDevice(&my_dev) == cudaSuccess && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) ? 1 : 0;
+      int want_ipc = (has_gpu && free_b > data_bytes + (size_t(2) << 30)) ? 1 : 0;
+      IntraProbe mp{my_dev, want_ipc};
+      auto pall = allgather(me, nr, cfg.ips[0], cfg.port, &mp, sizeof mp);
+      const IntraProbe* P = (const IntraProbe*)pall.data();
+      use_ipc = true;
+      for (int p = 0; p < nr && use_ipc; p++) {
+        if (!P[p].can_ipc || P[p].dev < 0) { use_ipc = false; break; }
+        for (int q = p + 1; q < nr; q++) if (P[p].dev == P[q].dev) { use_ipc = false; break; }
+        if (use_ipc && p != me) {
+          int can = 0;
+          if (cudaDeviceCanAccessPeer(&can, my_dev, P[p].dev) != cudaSuccess || !can) use_ipc = false;
+        }
+      }
+      int agree = use_ipc ? 1 : 0;
+      auto aall = allgather(me, nr, cfg.ips[0], cfg.port + 1, &agree, sizeof agree);
+      for (int p = 0; p < nr; p++) if (((const int*)aall.data())[p] == 0) use_ipc = false;
+    }
+    if (use_ipc) {
+      I.ipc = true;
+      I.ipc_dev = my_dev;
+      I.ipc_dev_bytes = data_bytes;
+      CUCHECK(cudaMalloc((void**)&I.ipc_dev_buf, I.ipc_dev_bytes));
+      CUCHECK(cudaMemset(I.ipc_dev_buf, 0, I.ipc_dev_bytes));
+      CUCHECK(cudaHostAlloc((void**)&I.ipc_seq_ring, 4096 * sizeof(unsigned long long), cudaHostAllocPortable));
+      memset(I.ipc_seq_ring, 0, 4096 * sizeof(unsigned long long));
+      CUCHECK(cudaMalloc((void**)&I.ipc_seq_dev, (size_t)nr * 4096 * sizeof(unsigned long long)));
+      CUCHECK(cudaMemset(I.ipc_seq_dev, 0, (size_t)nr * 4096 * sizeof(unsigned long long)));
+      const std::string ctl_name = make_shm_name(cfg.port, me);
+      uint64_t pool_off = 0;
+      if (I.bulk) {
+        I.region_bytes = ((fl + 2 * db + 64) + 4095) & ~size_t(4095);
+        I.region = create_shm_region(ctl_name, I.region_bytes, true);
+        live(kLivePinned, (long)I.region_bytes);
+        I.bd.bulk = I.ipc_dev_buf;
+        I.bd.flags = (unsigned long long*)I.region;
+        I.bd.doorbell = (unsigned long long*)(I.region + fl);
+        I.bd.aux_out = (unsigned long long*)(I.region + fl + db);
+        I.bd.error = (unsigned int*)(I.region + fl + 2 * db);
+        I.bd.rank = me; I.bd.nr = nr; I.bd.nflags = cfg.bulk_flags;
+        dev_ = FabricDev{}; dev_.error = I.bd.error; dev_.rank = me; dev_.nr = nr; dev_.recv = I.ipc_dev_buf;
+      } else {
+        const size_t pool_bytes = (!I.var && rl.pool) ? (size_t)2 * cfg_.ncoll * nr * 8 : 0;
+        pool_off = ((db_bytes + 64) + 63) & ~size_t(63);
+        I.region_bytes = ((pool_off + pool_bytes + 64) + 4095) & ~size_t(4095);
+        I.region = create_shm_region(ctl_name, I.region_bytes, true);
+        live(kLivePinned, (long)I.region_bytes);
+        dev_.send = I.ipc_dev_buf;
+        dev_.recv = I.ipc_dev_buf + send_bytes;
+        dev_.doorbell = (unsigned long long*)I.region;
+        dev_.error = (unsigned int*)(I.region + db_bytes);
+        dev_.rank = me; dev_.nr = nr; dev_.ncoll = cfg_.ncoll; dev_.stride = stride;
+        dev_.c1 = rl.c1; dev_.c2 = rl.c2; dev_.stride1 = rl.stride1; dev_.stride2 = rl.stride2; dev_.c3 = rl.c3; dev_.stride3 = rl.stride3;
+        dev_.compact = rl.compact; dev_.pool = I.var ? 0 : rl.pool;
+        if (dev_.pool) I.ipc_pool_tails = (unsigned long long*)(I.region + pool_off);
+      }
+      IpcPeerInfo mi{};
+      mi.dev = my_dev;
+      CUCHECK(cudaIpcGetMemHandle(&mi.handle, I.ipc_dev_buf));
+      mi.recv_off = I.bulk ? 0 : send_bytes;
+      snprintf(mi.ctl_name, sizeof mi.ctl_name, "%s", ctl_name.c_str());
+      mi.ctl_bytes = I.region_bytes;
+      mi.pool_off = pool_off;
+      auto all = allgather(me, nr, cfg.ips[0], cfg.port + 2, &mi, sizeof mi);
+      const IpcPeerInfo* A = (const IpcPeerInfo*)all.data();
+      I.ipc_peer_dev.assign(nr, -1);
+      I.ipc_peer_base.assign(nr, nullptr);
+      I.ipc_peer_recv.assign(nr, nullptr);
+      I.ipc_stream.assign(nr, nullptr);
+      I.shm_peer_base.assign(nr, nullptr);
+      I.shm_peer_bytes.assign(nr, 0);
+      I.shm_peer_recv.assign(nr, nullptr);
+      I.ipc_peer_pool_tails.assign(nr, nullptr);
+      for (int p = 0; p < nr; p++) {
+        if (p == me) continue;
+        I.ipc_peer_dev[p] = A[p].dev;
+        cudaError_t pe = cudaDeviceEnablePeerAccess(A[p].dev, 0);
+        if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) CUCHECK(pe);
+        if (pe == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+        CUCHECK(cudaIpcOpenMemHandle((void**)&I.ipc_peer_base[p], A[p].handle, cudaIpcMemLazyEnablePeerAccess));
+        I.ipc_peer_recv[p] = I.ipc_peer_base[p] + A[p].recv_off;
+        CUCHECK(cudaStreamCreateWithFlags(&I.ipc_stream[p], cudaStreamNonBlocking));
+        int fd = shm_open(A[p].ctl_name, O_RDWR, 0); FCHECK(fd >= 0);
+        void* mp = mmap(nullptr, A[p].ctl_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        ::close(fd); FCHECK(mp != MAP_FAILED);
+        I.shm_peer_base[p] = (char*)mp;
+        I.shm_peer_bytes[p] = A[p].ctl_bytes;
+        I.shm_peer_recv[p] = (char*)mp;   // bulk: peer flags start at offset 0 of ctl SHM
+        if (dev_.pool) I.ipc_peer_pool_tails[p] = (unsigned long long*)((char*)mp + A[p].pool_off);
+      }
+      I.bump = 2;   // port+0/1/2 just used by probe/agree/handles; barrier uses port+3
+      barrier();
+      shm_unlink(ctl_name.c_str());
+      fprintf(stderr, "[fabric r%d port %d] intra-node NVLink IPC: gpu %d, %.1f MiB HBM2 (%s)\n",
+              me, cfg.port, my_dev, I.ipc_dev_bytes / (1024.0 * 1024.0), I.bulk ? "bulk" : (I.var ? "var" : "uniform"));
+      return;
+    }
+    // POSIX SHM fallback (127.0.0.2, or 127.0.0.1 when GPUs share a device or lack P2P/VRAM headroom)
+    I.shm = true;
+    const std::string shm_name = make_shm_name(cfg.port, me);
+    const size_t recv_off = I.bulk ? 0 : send_bytes;
+    if (I.bulk) {
+      I.region_bytes = ((cfg.bulk_bytes + fl + 2 * db + 64) + 4095) & ~size_t(4095);
+      I.region = create_shm_region(shm_name, I.region_bytes, true);
+      live(kLivePinned, (long)I.region_bytes);
+      I.bd.bulk = I.region;
+      I.bd.flags = (unsigned long long*)(I.region + cfg.bulk_bytes);
+      I.bd.doorbell = (unsigned long long*)(I.region + cfg.bulk_bytes + fl);
+      I.bd.aux_out = (unsigned long long*)(I.region + cfg.bulk_bytes + fl + db);
+      I.bd.error = (unsigned int*)(I.region + cfg.bulk_bytes + fl + 2 * db);
+      I.bd.rank = me; I.bd.nr = nr; I.bd.nflags = cfg.bulk_flags;
+      dev_ = FabricDev{}; dev_.error = I.bd.error; dev_.rank = me; dev_.nr = nr; dev_.recv = I.region;
+    } else {
+      I.region_bytes = ((send_bytes + recv_bytes + db_bytes + 64) + 4095) & ~size_t(4095);
+      I.region = create_shm_region(shm_name, I.region_bytes, true);
+      live(kLivePinned, (long)I.region_bytes);
+      dev_.send = I.region;
+      dev_.recv = I.region + send_bytes;
+      dev_.doorbell = (unsigned long long*)(I.region + send_bytes + recv_bytes);
+      dev_.error = (unsigned int*)(I.region + send_bytes + recv_bytes + db_bytes);
+      dev_.rank = me; dev_.nr = nr; dev_.ncoll = cfg_.ncoll; dev_.stride = stride;
+      dev_.c1 = rl.c1; dev_.c2 = rl.c2; dev_.stride1 = rl.stride1; dev_.stride2 = rl.stride2; dev_.c3 = rl.c3; dev_.stride3 = rl.stride3;
+      dev_.compact = rl.compact; dev_.pool = I.var ? 0 : rl.pool;
+    }
+    ShmPeerInfo mi{};
+    snprintf(mi.name, sizeof mi.name, "%s", shm_name.c_str());
+    mi.recv_off = recv_off;
+    mi.bytes = I.region_bytes;
+    auto all = allgather(me, nr, cfg.ips[0], cfg.port + 2, &mi, sizeof mi);
+    const ShmPeerInfo* A = (const ShmPeerInfo*)all.data();
+    I.shm_peer_base.assign(nr, nullptr);
+    I.shm_peer_bytes.assign(nr, 0);
+    I.shm_peer_recv.assign(nr, nullptr);
+    for (int p = 0; p < nr; p++) {
+      if (p == me) continue;
+      int fd = shm_open(A[p].name, O_RDWR, 0); FCHECK(fd >= 0);
+      void* mp = mmap(nullptr, A[p].bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      ::close(fd); FCHECK(mp != MAP_FAILED);
+      I.shm_peer_base[p] = (char*)mp;
+      I.shm_peer_bytes[p] = A[p].bytes;
+      I.shm_peer_recv[p] = (char*)mp + A[p].recv_off;
+    }
+    I.bump = 2;   // port+2 just used by ShmPeerInfo allgather; barrier uses port+3
+    barrier();
+    shm_unlink(shm_name.c_str());
+    fprintf(stderr, "[fabric r%d port %d] intra-node POSIX SHM: %.1f MiB pinned (%s)\n",
+            me, cfg.port, I.region_bytes / (1024.0 * 1024.0), I.bulk ? "bulk" : (I.var ? "var" : "uniform"));
+    return;
+  }
   if (I.bulk) {
     const size_t fl = (size_t)cfg.bulk_flags * nr * 16, db = (size_t)cfg.bulk_flags * 8;
     I.region_bytes = ((cfg.bulk_bytes + fl + 2 * db + 64) + 4095) & ~size_t(4095);
@@ -849,6 +1109,171 @@ void Fabric::start_proxy() {
     }
     I.proxy_started.store(true, std::memory_order_release);
     const int me = cfg_.rank, nr = I.nr;
+    if (I.ipc) CUCHECK(cudaSetDevice(I.ipc_dev));
+    // ---- Intra-node POSIX SHM / NVLink CUDA-IPC proxy loop ----
+    if (I.shm || I.ipc) {
+      auto spin_u64 = [&](volatile unsigned long long* w, unsigned long long want, unsigned code) -> bool {
+        auto t0 = std::chrono::steady_clock::now();
+        while (*w < want) {
+          if (I.stop.load(std::memory_order_relaxed) || *dev_.error != 0) return false;
+          if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) {
+            fprintf(stderr, "[fabric r%d] intra proxy TIMEOUT code %08x (want %llu have %llu)\n", me, code, want, (unsigned long long)*w);
+            *dev_.error = code; return false;
+          }
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return true;
+      };
+      auto intra_bulk = [&](const BulkJob& b) -> bool {
+        if (b.db >= 0 && !spin_u64(I.bd.doorbell + b.db, b.seq, 0x72000000u | (unsigned)b.db)) return false;
+        if (b.wait_flag >= 0)
+          for (int p = 0; p < nr; p++)
+            if (p != me && bulk_to(b.peer, p) &&
+                !spin_u64(I.bd.flags + ((size_t)b.wait_flag * nr + p) * 2, b.wait_min, 0x73000000u | (unsigned)(b.wait_flag << 8) | (unsigned)p))
+              return false;
+        const unsigned long long aux = b.post_flag >= 0 ? *(volatile unsigned long long*)(I.bd.aux_out + b.post_flag) : 0ull;
+        for (int k = 1; k < nr; k++) {
+          const int p = (me + k) % nr;
+          if (!bulk_to(b.peer, p)) continue;
+          if (I.ipc) {
+            for (const auto& rg : b.ranges)
+              CUCHECK(cudaMemcpyAsync(I.ipc_peer_recv[p] + rg.first, I.bd.bulk + rg.first, rg.second, cudaMemcpyDeviceToDevice, I.ipc_stream[p]));
+            if (b.post_flag >= 0) CUCHECK(cudaStreamSynchronize(I.ipc_stream[p]));
+          } else {
+            for (const auto& rg : b.ranges)
+              memcpy(I.shm_peer_recv[p] + rg.first, I.bd.bulk + rg.first, rg.second);
+          }
+          if (b.post_flag >= 0) {
+            unsigned long long* pf = I.ipc
+                ? (unsigned long long*)I.shm_peer_recv[p] + ((size_t)b.post_flag * nr + me) * 2
+                : (unsigned long long*)(I.shm_peer_recv[p] + cfg_.bulk_bytes) + ((size_t)b.post_flag * nr + me) * 2;
+            __atomic_store_n(pf + 1, aux, __ATOMIC_RELEASE);
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            __atomic_store_n(pf + 0, b.post_val, __ATOMIC_RELEASE);
+          }
+        }
+        return true;
+      };
+      while (!I.stop.load(std::memory_order_relaxed)) {
+        Job job;
+        {
+          std::unique_lock<std::mutex> lk(I.mu);
+          if (I.q.empty()) I.cv.wait_for(lk, std::chrono::microseconds(200), [&] { return !I.q.empty() || I.stop.load(); });
+          if (I.q.empty()) continue;
+          job = std::move(I.q.front()); I.q.pop_front();
+        }
+        if (job.bulk) { if (!intra_bulk(job.b)) return; I.pending.fetch_sub(1, std::memory_order_release); continue; }
+        const int par = (int)(job.step & 1);
+        auto post_intra = [&](int c, unsigned long long seq) -> bool {
+          if (I.var) {
+            const VLayout& L = I.L;
+            const uint32_t bytes = job.sizes[c];
+            char* src = dev_.send + L.send_at(c, par);
+            unsigned seq_slot = 0;
+            unsigned long long* seqp = nullptr;
+            if (I.ipc) { seq_slot = I.ipc_seq_pos++ & 4095u; seqp = &I.ipc_seq_ring[seq_slot]; *seqp = seq; }
+            else *(volatile unsigned long long*)(src + bytes) = seq;
+            for (int kk = 1; kk < nr; kk++) {
+              const int p = stagger_peer(me, kk, nr);
+              const int j = L.slot_of(c, p, me);
+              if (j < 0) continue;
+              const size_t roff = L.recv_at(c, par, j);
+              if (I.ipc) {
+                unsigned long long* dseq = I.ipc_seq_dev + (size_t)p * 4096 + seq_slot;
+                if (bytes) CUCHECK(cudaMemcpyAsync(I.ipc_peer_recv[p] + roff, src, bytes, cudaMemcpyDeviceToDevice, I.ipc_stream[p]));
+                CUCHECK(cudaMemcpyAsync(dseq, seqp, 8, cudaMemcpyHostToDevice, I.ipc_stream[p]));
+                CUCHECK(cudaMemcpyAsync(I.ipc_peer_recv[p] + roff + bytes, dseq, 8, cudaMemcpyDeviceToDevice, I.ipc_stream[p]));
+              } else {
+                char* dst = I.shm_peer_recv[p] + roff;
+                if (bytes) memcpy(dst, src, bytes);
+                __atomic_store_n((unsigned long long*)(dst + bytes), seq, __ATOMIC_RELEASE);
+              }
+            }
+            if (I.ipc) {
+              for (int kk = 1; kk < nr; kk++) {
+                const int p = stagger_peer(me, kk, nr);
+                if (L.slot_of(c, p, me) < 0) continue;
+                CUCHECK(cudaStreamSynchronize(I.ipc_stream[p]));
+              }
+            }
+            return true;
+          }
+          const bool rs = mask_bit(job.rs_mask, c), flat = rs && mask_bit(job.rs_flat, c);
+          const uint32_t bytes = job.sizes[c];
+          if (!job.credit.empty() && job.credit[c] >= 0) {
+            const int k = job.credit[c];
+            const unsigned long long want = coll_seq(job.step, k, cfg_.ncoll);
+            const size_t nbk = mask_bit(job.rs_mask, k) ? job.rs_bytes[me] : job.sizes[k];
+            for (int p = 0; p < nr; p++) {
+              if (p == me) continue;
+              const volatile unsigned long long* t = I.ipc
+                  ? (const volatile unsigned long long*)(I.ipc_pool_tails + ((size_t)par * cfg_.ncoll + k) * nr + p)
+                  : (const volatile unsigned long long*)(dev_.recv + fab_recv_off(dev_, par, k, p) + nbk);
+              const auto t0 = std::chrono::steady_clock::now();
+              while (*t != want) {
+                if (I.stop.load(std::memory_order_relaxed) || *dev_.error != 0) return false;
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+                  fprintf(stderr, "[fabric r%d] slot pool: no credit from rank %d for step %llu coll %d (credit coll %d, have %llu)\n", me, p, job.step, c, k, (unsigned long long)*t);
+                  *dev_.error = 0x76000000u | ((unsigned)c << 8) | (unsigned)p;
+                  return false;
+                }
+              }
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+          }
+          char* src = dev_.send + fab_send_off(dev_, par, c);
+          const bool psplit = !rs && mask_bit(job.pair_split, c);
+          unsigned seq_slot = 0;
+          unsigned long long* seqp = nullptr;
+          if (I.ipc) {
+            seq_slot = I.ipc_seq_pos++ & 4095u;
+            seqp = &I.ipc_seq_ring[seq_slot];
+            *seqp = seq;
+          } else {
+            if (!rs) *(volatile unsigned long long*)(src + bytes) = seq;
+            if (psplit) *(volatile unsigned long long*)(src + job.pair_common) = seq;
+          }
+          for (int idx = 1; idx < nr; idx++) {
+            const int p = stagger_peer(me, idx, nr);
+            if (p == me || (mask_bit(job.p2p, c) && p != job.peer)) continue;
+            char* sp = rs ? src + fab_rs_slice_off(job.rs_ss, p) : src;
+            const uint32_t nb = rs ? job.rs_bytes[p] : (psplit && p != job.peer ? job.pair_common : bytes);
+            if (!I.ipc && rs) *(volatile unsigned long long*)(src + fab_rs_tail_off(job.rs_ss, p, nb, flat, nr)) = seq;
+            const size_t roff = fab_recv_off_at(dev_, par, c, p, me);
+            if (I.ipc) {
+              unsigned long long* dseq = I.ipc_seq_dev + (size_t)p * 4096 + seq_slot;
+              if (nb) CUCHECK(cudaMemcpyAsync(I.ipc_peer_recv[p] + roff, sp, nb, cudaMemcpyDeviceToDevice, I.ipc_stream[p]));
+              CUCHECK(cudaMemcpyAsync(dseq, seqp, 8, cudaMemcpyHostToDevice, I.ipc_stream[p]));
+              CUCHECK(cudaMemcpyAsync(I.ipc_peer_recv[p] + roff + nb, dseq, 8, cudaMemcpyDeviceToDevice, I.ipc_stream[p]));
+            } else {
+              char* dst = I.shm_peer_recv[p] + roff;
+              if (nb) memcpy(dst, sp, nb);
+              __atomic_store_n((unsigned long long*)(dst + nb), seq, __ATOMIC_RELEASE);
+            }
+          }
+          if (I.ipc) {
+            for (int idx = 1; idx < nr; idx++) {
+              const int p = stagger_peer(me, idx, nr);
+              if (p == me || (mask_bit(job.p2p, c) && p != job.peer)) continue;
+              CUCHECK(cudaStreamSynchronize(I.ipc_stream[p]));
+              if (dev_.pool) __atomic_store_n(I.ipc_peer_pool_tails[p] + ((size_t)par * cfg_.ncoll + c) * nr + me, seq, __ATOMIC_RELEASE);
+            }
+          }
+          return true;
+        };
+        const StepWalk w = walk_step(job.step, cfg_.ncoll, job.sizes.size(), job.order, job.skip,
+          [&](int c) { return *(volatile unsigned long long*)(dev_.doorbell + c); },
+          [&] { return I.stop.load(std::memory_order_relaxed) || *dev_.error != 0; },
+          [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }, 30.0, post_intra);
+        if (w.rc == kWalkTimeout) {
+          fprintf(stderr, "[fabric r%d] intra proxy TIMEOUT waiting doorbell step %llu coll %d (have %llu)\n", me, job.step, w.c, w.have);
+          *dev_.error = 0x70000000u | (unsigned)w.c;
+        }
+        if (w.rc != kWalkOk) return;
+        I.pending.fetch_sub(1, std::memory_order_release);
+      }
+      return;
+    }
     // bulk mode: drain completions until peer p has room for one more WR (signaled every 64 WRs, wr_id = peer);
     // CQ error / bad completion / 60 s without a completion -> error word (bulk_proxy.h)
     auto cqpoll = [&](int r, BulkCompl* out, int max) -> int {

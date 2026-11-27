@@ -41,6 +41,10 @@ Thanks to:
     ([#45](https://github.com/kindlingai/gr8/pull/45) and its extracted steering PRs).
   - Ring relay backpressure and regression tests
     ([#58](https://github.com/kindlingai/gr8/pull/58), [#59](https://github.com/kindlingai/gr8/pull/59)).
+- [@jkyamog](https://github.com/jkyamog)
+  - Volta SM70 (Tesla V100) support: the `gr8_sm70` compatibility layer (bit-exact FP8/FP4 conversions, ldmatrix
+    emulation, `m16n8k16` MMA on Volta's hardware tensor cores, exhaustive conversion tests), intra-node POSIX-SHM and
+    NVLink CUDA-IPC fabrics with their wire test, and the served GLM-5.3-Flash TP=4 and Inkling-2-Mini TP=1 V100 builds.
 - [@knapcio](https://github.com/knapcio)
   - Performance experiments and proposals for speculative decoding and INT4 draft weights
     ([#83](https://github.com/kindlingai/gr8/pull/83), [#85](https://github.com/kindlingai/gr8/pull/85),

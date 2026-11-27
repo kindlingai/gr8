@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cuda_fp16.h>
+#include "sm70_compat.cuh"
 #include "../g6nr.h"
 #include "../g6mx.h"
 #include "activation.cuh"
@@ -15,18 +16,8 @@ constexpr int KSH = geom::KSH;       // k16 steps over hidden: 384 / 256
 constexpr float SQ128 = 0.088388347648f;
 
 // streaming loads: weights are read once, keep them out of L1
-__device__ __forceinline__ u32 ld_nc(const void* p)
-{
-    u32 v;
-    asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(v) : "l"(p));
-    return v;
-}
-__device__ __forceinline__ u64 ld_nc64(const void* p)
-{
-    u64 v;
-    asm volatile("ld.global.nc.L1::no_allocate.u64 %0, [%1];" : "=l"(v) : "l"(p));
-    return v;
-}
+__device__ __forceinline__ u32 ld_nc(const void* p) { return gr8_sm70::ld_nc_u32(p); }
+__device__ __forceinline__ u64 ld_nc64(const void* p) { return gr8_sm70::ld_nc_u64(p); }
 
 // L2 warm-up: one prefetch.global.L2 per 64 B line of [p, p + 64 * nlines). grid = ceil(nlines / 2048), block 256.
 // The old body (ld_nc, result unused) compiled to LDC + EXIT,
@@ -52,12 +43,7 @@ inline void launch_warm(const void* p, size_t bytes, cudaStream_t st)
     const long long nl = static_cast<long long>((bytes + 63) / 64);
     k_warm<<<static_cast<unsigned>((nl + 2047) / 2048), 256, 0, st>>>(static_cast<const uint8_t*>(p) - (reinterpret_cast<size_t>(p) & 3), nl);
 }
-__device__ __forceinline__ u32 ld_nc16(const void* p)
-{
-    u32 v;
-    asm volatile("{ .reg .u16 t; ld.global.nc.L1::no_allocate.u16 t, [%1]; cvt.u32.u16 %0, t; }" : "=r"(v) : "l"(p));
-    return v;
-}
+__device__ __forceinline__ u32 ld_nc16(const void* p) { return gr8_sm70::ld_nc_u16_to_u32(p); }
 
 // mma m16n8k16, fp16 operands, fp32 accumulate. A: 16 rows x 16 k, B: 16 k x 8 cols.
 //   A regs: a0 (row l/4,   k 2c..2c+1), a1 (row l/4+8, same k), a2 (row l/4, k+8), a3 (row l/4+8, k+8)
@@ -65,24 +51,11 @@ __device__ __forceinline__ u32 ld_nc16(const void* p)
 //   C regs: c0,c1 (row l/4, col 2c, 2c+1), c2,c3 (row l/4+8)          with l = lane, c = l%4
 __device__ __forceinline__ void mma16816(float (&c)[4], u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1)
 {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    gr8_sm70::mma16816_f16(c, a0, a1, a2, a3, b0, b1);
 }
 
-__device__ __forceinline__ u32 e2m1x2(u32 byte)   // two FP4 E2M1 nibbles -> half2 (low nibble = low half)
-{
-    u32 r;
-    asm("{ .reg .b8 t; cvt.u8.u32 t, %1; cvt.rn.f16x2.e2m1x2 %0, t; }" : "=r"(r) : "r"(byte));
-    return r;
-}
-__device__ __forceinline__ u32 e4m3x2(u32 two)    // two FP8 E4M3 bytes -> half2
-{
-    u32 r;
-    asm("{ .reg .b16 t; cvt.u16.u32 t, %1; cvt.rn.f16x2.e4m3x2 %0, t; }" : "=r"(r) : "r"(two));
-    return r;
-}
+__device__ __forceinline__ u32 e2m1x2(u32 byte) { return gr8_sm70::e2m1x2_to_f16x2(byte); }   // two FP4 E2M1 nibbles -> half2
+__device__ __forceinline__ u32 e4m3x2(u32 two) { return gr8_sm70::e4m3x2_to_f16x2(two); }      // two FP8 E4M3 bytes -> half2
 
 __device__ __forceinline__ __half2 as_h2(u32 v) { return *reinterpret_cast<__half2*>(&v); }
 __device__ __forceinline__ u32 as_u32(__half2 h) { return *reinterpret_cast<u32*>(&h); }

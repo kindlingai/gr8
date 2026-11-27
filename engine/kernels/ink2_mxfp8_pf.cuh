@@ -323,11 +323,8 @@ __device__ __forceinline__ float mx8_h16_sum(float v) {
 
 // ------------------------------------------------------------------------------------------- Dense MXFP8 GEMV (M = 1..15)
 __device__ __forceinline__ void mx8_fp8x4_unpack_raw(uint32_t v, float2& f0, float2& f1) {
-    uint32_t r0, r1;
-    const uint16_t lo = static_cast<uint16_t>(v & 0xffffu);
-    const uint16_t hi = static_cast<uint16_t>(v >> 16);
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r0) : "h"(lo));
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r1) : "h"(hi));
+    const uint32_t r0 = gr8_sm70::e4m3x2_to_f16x2(v & 0xffffu);
+    const uint32_t r1 = gr8_sm70::e4m3x2_to_f16x2(v >> 16);
     f0 = __half22float2(*reinterpret_cast<const __half2*>(&r0));
     f1 = __half22float2(*reinterpret_cast<const __half2*>(&r1));
 }

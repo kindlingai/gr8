@@ -173,14 +173,14 @@ struct RsNormArgs
 };
 // grid (RN_CL, max(rows, 1)), block RN_T: k_ar_add_norm on this rank's rows (same op order), the normed row also
 // into the send slot of collective c + 1 (row j of the rank at j * 6144), then the doorbell of c + 1
-__global__ void __cluster_dims__(glue::RN_CL, 1, 1) __launch_bounds__(glue::RN_T) k_rs_add_norm(RsNormArgs a)
+__global__ void GR8_RN_ATTR k_rs_add_norm(RsNormArgs a)
 {
     const u64 step = *a.stepp;
     const int j = blockIdx.y;
     if (j < pf_rows(a.M, a.f.rank, a.f.nr))
     {
         const int m = pf_r0(a.M, a.f.rank, a.f.nr) + j;
-        const int col0 = blockIdx.x * glue::RN_COLS + threadIdx.x * 8;
+        const int col0 = GR8_RN_COL0;
         const size_t off = ((size_t)j * HID + col0) * 2;
         float x[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         for (int p = 0; p < a.f.nr; ++p)
@@ -329,14 +329,14 @@ __global__ void __launch_bounds__(glue::RN_CL * glue::RN_T) k_rs_add_norm_w(RsNo
 // GR8_PF_OWN=3: k_rs_add_norm with ONE source, this rank's complete o_proj rows o [rows][6144] FP32 (row j = owner row
 // pf_r0(M, rank) + j): resid += o, normed rows -> out and the send slot of collective c + 1 (= c1), then its doorbell.
 // grid (RN_CL, max(rows, 1)), block RN_T.
-__global__ void __cluster_dims__(glue::RN_CL, 1, 1) __launch_bounds__(glue::RN_T) k_own_add_norm(RsNormArgs a, const float* o)
+__global__ void GR8_RN_ATTR k_own_add_norm(RsNormArgs a, const float* o)
 {
     const u64 step = *a.stepp;
     const int j = blockIdx.y;
     if (j < pf_rows(a.M, a.f.rank, a.f.nr))
     {
         const int m = pf_r0(a.M, a.f.rank, a.f.nr) + j;
-        const int col0 = blockIdx.x * glue::RN_COLS + threadIdx.x * 8;
+        const int col0 = GR8_RN_COL0;
         const float4* ov = reinterpret_cast<const float4*>(o + (size_t)j * HID + col0);
         const float4 o0 = ov[0], o1 = ov[1];
         float x[8] = {o0.x, o0.y, o0.z, o0.w, o1.x, o1.y, o1.z, o1.w};
@@ -1137,7 +1137,7 @@ inline void pf_inputs(Prefill& P, int M, const int* tok, const int* pos)
 inline void pf_embed(Model& m, Prefill& P, int M, cudaStream_t st)
 {
     glue::EmbedArgs a{P.tok, m.emb, m.layers[0].attn_norm, P.resid, P.x, glue::RMS_EPS, m.emb_i8, m.emb_scale};
-    glue::k_embed_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
+    glue::k_embed_norm<<<GR8_RN_GRID(M), GR8_RN_BLOCK, 0, st>>>(a);
 }
 inline void pf_set_step(Prefill& P, u64 ls, cudaStream_t st) { k_set_step<<<1, 1, 0, st>>>(P.stepp, ls); }
 // GR8_PF_RSHASH=1 (measurement only, synchronizes the stream): FNV of every owner slice of the RS send slot just filled
@@ -1366,7 +1366,7 @@ inline void pf_attn_block_qo(Model& m, Prefill& P, int i, int M, int context, cu
     pf_mark(2, st);
     RsNormArgs a{P.f, P.stepp, 0, M, P.loop, P.resid, y.mlp_norm, P.x2, glue::RMS_EPS, P.tickets + 1};
     a.steer = pf_steer(m, P, i, true);
-    k_own_add_norm<<<dim3(glue::RN_CL, Ro > 0 ? Ro : 1), glue::RN_T, 0, st>>>(a, P.qo_o);
+    k_own_add_norm<<<GR8_RN_GRID(Ro > 0 ? Ro : 1), GR8_RN_BLOCK, 0, st>>>(a, P.qo_o);
     if (qp) Q.tick(st, i, 7);
     pf_mark(4, st);
 }
@@ -1463,7 +1463,7 @@ inline void pf_consume_rs(Prefill& P, int c, int M, const __nv_bfloat16* w, __ha
 #ifdef PF_RNWIDE
     k_rs_add_norm_w<<<rows > 0 ? rows : 1, glue::RN_CL * glue::RN_T, 0, st>>>(a);
 #else
-    k_rs_add_norm<<<dim3(glue::RN_CL, rows > 0 ? rows : 1), glue::RN_T, 0, st>>>(a);
+    k_rs_add_norm<<<GR8_RN_GRID(rows > 0 ? rows : 1), GR8_RN_BLOCK, 0, st>>>(a);
 #endif
 }
 inline void pf_consume_ag(Prefill& P, int c, int M, __half* out, cudaStream_t st)
@@ -1490,7 +1490,7 @@ inline void pf_consume(Prefill& P, int c, int M, const __nv_bfloat16* w, __half*
     glue::ArNormArgs a{P.f, P.stepp, c, M, P.resid, w, out, glue::RMS_EPS};
     a.steer = steer;
     glue::k_wait_peers<<<1, 32, 0, st>>>(P.f, P.stepp, c, (size_t)M * HID * 2, glue::ERR_AR);
-    glue::k_ar_add_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
+    glue::k_ar_add_norm<<<GR8_RN_GRID(M), GR8_RN_BLOCK, 0, st>>>(a);
     pf_mark(4, st);
 }
 // ---- the consume of the MLP partial of layer i (collectives c2 / c3 in the RS form), GR8_PF_OWN aware
@@ -1971,7 +1971,7 @@ inline void pf_draft(Draft& D, DraftPrefill& Q, const __half* hid, int M, int co
     xq.on = 1; xq.src = Q.eh_in; xq.ld = 2 * HID; xq.K = 2 * HID; xq.M = M; xq.dst = Q.x8;
     bindp::launch(xq, st);
     bindp::launch(g, st);
-    k_mtp_resid_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(Q.eh_out, d.layers[0].attn_norm, P.resid, P.x, glue::RMS_EPS);
+    k_mtp_resid_norm<<<GR8_RN_GRID(M), GR8_RN_BLOCK, 0, st>>>(Q.eh_out, d.layers[0].attn_norm, P.resid, P.x, glue::RMS_EPS);
 #ifdef PF_DRAFTKV
     pf_draft_kv(d, P, M, context, st);
 #else

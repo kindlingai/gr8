@@ -38,23 +38,31 @@ constexpr int SOFF = 512;     // scale bytes inside it
 
 __device__ __forceinline__ void ld4(const void* p, u32 (&v)[4])
 {
-    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]) : "l"(p));
+    gr8_sm70::ld_nc_v4_u32(p, v);
 }
 // GR8_DS_MOE_L2HINT: the two weight loads of Grp::load with an L2 evict_last hint. Each asm makes its own policy (createpolicy ... 1.0), so no 64-bit policy is held in a
 // register across the loop. Reached only through Grp::loadh<true>; nothing else calls them.
 __device__ __forceinline__ void ld4_last(const void* p, u32 (&v)[4])
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("{\n\t.reg .b64 pol;\n\tcreatepolicy.fractional.L2::evict_last.b64 pol, 1.0;\n\t"
                  "ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], pol;\n\t}"
                  : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]) : "l"(p));
+#else
+    gr8_sm70::ld_nc_v4_u32(p, v);
+#endif
 }
 __device__ __forceinline__ u32 ld_nc_last(const void* p)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     u32 v;
     asm volatile("{\n\t.reg .b64 pol;\n\tcreatepolicy.fractional.L2::evict_last.b64 pol, 1.0;\n\t"
                  "ld.global.nc.L1::no_allocate.L2::cache_hint.u32 %0, [%1], pol;\n\t}"
                  : "=r"(v) : "l"(p));
     return v;
+#else
+    return gr8_sm70::ld_nc_u32(p);
+#endif
 }
 // Programmatic dependent launch: a no-op unless the kernel was launched with cudaLaunchAttributeProgrammaticStreamSerialization.
 // fc1 lets fc2 start once its last CTA has started; fc2 issues its first weight loads (independent of fc1) and then waits for
@@ -62,8 +70,8 @@ __device__ __forceinline__ u32 ld_nc_last(const void* p)
 // The whole-layer chain (ds41_moe_ops.cuh) uses the PDLM = 1 instances / _p twins below: build_xfrag_p and k_fc2_p trigger at the start,
 // k_fc1_p waits just before its act stores (tail wait), and every CTA of a PDL-launched kernel reaches a pdl_wait even on its early exits,
 // so each kernel's completion implies its predecessor's. The PDLM = 0 kernels keep their shipped codegen.
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() { gr8_sm70::pdl_trigger(); }
+__device__ __forceinline__ void pdl_wait() { gr8_sm70::pdl_wait(); }
 __device__ __forceinline__ float e8(u32 b) { b &= 0xffu; return __uint_as_float(b ? b << 23 : 0x00400000u); }   // 2^(b - 127), as Mxfp8::e8m0
 
 // One lane's share of a 16-row x 64-k record: 4 code words (k16 steps 0..3) and the 4 scale bytes of its rows r, r + 8.

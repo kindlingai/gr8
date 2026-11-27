@@ -119,6 +119,9 @@ struct FlashPrefill
     int* vis_row = nullptr;                      // [MP] device
     const __nv_bfloat16* vis_pool = nullptr;     // [pool rows][HID] device
     int vis_n = 0;
+    cublasHandle_t sm70_kda_blas = nullptr;      // SM70: cuBLAS FP16 Tensor Core GEMM for MXFP8 KDA q/k/v
+    __half* sm70_kda_w16 = nullptr;              // [nhmax * DK * HID] FP16 scratch (~16 MiB at TP=4)
+    void* sm70_kda_ws = nullptr;                 // 16 MiB cuBLAS workspace
 };
 inline bool pf_mhc_stage()
 {
@@ -362,6 +365,25 @@ inline void build_flash_prefill(Model& m, FlashPrefill& P, int MP, const g6::Fab
         }
     }
     for (const Layer& y : m.layers) P.any_kda |= y.kda;
+    // Widen K2/K3 MoE expert tensors at boot (before prepare_flash and CUDA graph capture) so decode plans
+    // and prefill always agree on the in-place weight layout across all TP widths (not only TP=2 where prewarm defaults on).
+    if (!knob::fpf_p1() && !knob::glm53f_pf_nowide())
+    {
+        const bool shfp8 = knob::glm53f_pf_shfp8().value_or(knob::pf_moe8());
+        const bool wide2 = !knob::nowide2();
+        for (Layer& y : m.layers)
+        {
+            if (!y.moe || !(y.T.k2 || y.T.k3) || y.T.fc1_wide) continue;
+            bool prepared = false;
+            for (int r = 1; r <= MX; ++r) if (y.flash_mlp[r].M) { prepared = true; break; }
+            if (prepared) continue;
+            if (shfp8 && !y.T.shfp8.codes[0] && !y.T.fc2_wide)
+                if (const char* e = bind::make_shared_fp8(y.T, st)) die("layer " + std::to_string(y.l) + ": " + e);
+            bind::widen_fc1(y.T, st);
+            if (wide2) bind::widen_fc2(y.T, st);
+            y.flash_mlp_w.experts = y.T;
+        }
+    }
     if (pf_mhc_pk() && HID == 4096)
         for (const Layer& y : m.layers)
             for (int h = 0; h < 2; ++h)
@@ -413,6 +435,15 @@ inline void build_flash_prefill(Model& m, FlashPrefill& P, int MP, const g6::Fab
     {
         if (const char* e = kda::build_scratch(P.ksc, MP, g6nr::NR)) die(e);
         if (const char* e = kda::build_prefill_scratch(P.kps, MP, g6nr::NR)) die(e);
+        if (gr8_sm70::current_cc_major() < 8)
+        {
+            const size_t n = static_cast<size_t>(kda::nhmax(g6nr::NR)) * kda::DK * HID;
+            P.sm70_kda_w16 = dmalloc<__half>(n);
+            P.sm70_kda_ws = dmalloc<uint8_t>(size_t(16) << 20);
+            if (cublasCreate(&P.sm70_kda_blas) != CUBLAS_STATUS_SUCCESS) die("Flash prefill: cublasCreate (sm70 kda) failed");
+            if (cublasSetWorkspace(P.sm70_kda_blas, P.sm70_kda_ws, size_t(16) << 20) != CUBLAS_STATUS_SUCCESS)
+                die("Flash prefill: cublasSetWorkspace (sm70 kda) failed");
+        }
     }
     flash_dsa_pf::f16_prepare(m, &P, MP, st);   // GR8_GLM53F_PF_DSA_F16GEMM only: decode + cuBLAS handle at load, not in a prefill
     if (flash_dsa_f16::on()) check_headroom(f.rank, MP, false);   // F16 decoded weights and per-lane workspace now count
@@ -543,12 +574,62 @@ inline void pf_kda_tail_control(Model& m, FlashPrefill& P, const kda::KdaLayer& 
         kda::launch_proj(pa, st);
     }
 }
+// On-the-fly MXFP8 (E4M3 codes + UE8M0 group-32 scales) -> FP16 row-major decode for SM70 Volta cuBLAS Tensor Core GEMM.
+// Scale multiply runs in FP32 to avoid FP16 subnormal underflow on tiny E8M0 scales.
+__global__ void __launch_bounds__(256) k_sm70_mxfp8_to_f16(const uint8_t* __restrict__ codes,
+                                                           const uint8_t* __restrict__ scales,
+                                                           __half* __restrict__ out,
+                                                           long long ngroups)
+{
+    const long long g = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x;
+    if (g >= ngroups) return;
+    const float sc = gr8_sm70::ue8m0_to_f32(scales[g]);
+    const uint4* cp = reinterpret_cast<const uint4*>(codes + g * 32);
+    uint4* op = reinterpret_cast<uint4*>(out + g * 32);
+    #pragma unroll
+    for (int h = 0; h < 2; ++h)
+    {
+        const uint4 c = cp[h];
+        const uint32_t w[4] = {c.x, c.y, c.z, c.w};
+        uint32_t f[8];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            const uint32_t p0 = gr8_sm70::e4m3x2_to_f16x2(w[i] & 0xffffu);
+            const uint32_t p1 = gr8_sm70::e4m3x2_to_f16x2(w[i] >> 16);
+            const float2 a0 = __half22float2(*reinterpret_cast<const __half2*>(&p0));
+            const float2 a1 = __half22float2(*reinterpret_cast<const __half2*>(&p1));
+            const __half2 h0 = __floats2half2_rn(a0.x * sc, a0.y * sc);
+            const __half2 h1 = __floats2half2_rn(a1.x * sc, a1.y * sc);
+            f[2 * i] = *reinterpret_cast<const uint32_t*>(&h0);
+            f[2 * i + 1] = *reinterpret_cast<const uint32_t*>(&h1);
+        }
+        op[2 * h] = make_uint4(f[0], f[1], f[2], f[3]);
+        op[2 * h + 1] = make_uint4(f[4], f[5], f[6], f[7]);
+    }
+}
+
 inline void pf_kda_proj_gemm(Model& m, FlashPrefill& P, const kda::KdaLayer& w, const kda::Args& a, int M, cudaStream_t st)
 {
     bindp::Scratch& sc = flash_mlp_pf::ensure_state(m, P, nullptr, st).sc;
     const kda::PLayout pl = a.pl();
     const int ld = pl.ld(), dl = a.dl();
-    if (!w.qt.w)                        // MXFP8 q / k / v (the published release): one FP8 quantization of x feeds all three
+    if (!w.qt.w && P.sm70_kda_blas && P.sm70_kda_w16)
+    {
+        const long long ng = static_cast<long long>(dl) * (HID / 32);
+        const float one = 1.f, zero = 0.f;
+        if (cublasSetStream(P.sm70_kda_blas, st) != CUBLAS_STATUS_SUCCESS) die("pf_kda_proj_gemm: cublasSetStream failed");
+        for (int s = 0; s < 3; ++s)
+        {
+            k_sm70_mxfp8_to_f16<<<static_cast<unsigned>((ng + 255) / 256), 256, 0, st>>>(w.mxc[s], w.mxs[s], P.sm70_kda_w16, ng);
+            if (cublasGemmEx(P.sm70_kda_blas, CUBLAS_OP_T, CUBLAS_OP_N, dl, M, HID, &one,
+                             P.sm70_kda_w16, CUDA_R_16F, HID, P.x, CUDA_R_16F, HID, &zero,
+                             P.ksc.P + pl.q() + s * dl, CUDA_R_32F, ld,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS)
+                die("pf_kda_proj_gemm: SM70 cuBLAS FP16 GEMM failed");
+        }
+    }
+    else if (!w.qt.w)                        // MXFP8 q / k / v (the published release): one FP8 quantization of x feeds all three
     {
         for (int s = 0; s < 3; ++s)
         {

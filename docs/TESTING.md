@@ -107,6 +107,13 @@ against its own decoded values), `l2pf_queue_test`, `k1_split_test`,
 | `dtr_test_tp4`, `dtr_test_flash_tp4` | dense trellis matrices, at TP4: dumps for `engine/ref/dtr_ref.py`, and decode timing (needs release entries) |
 | the DS41 v2 tests above, and `ds41_v2_fc2_profile` | the v2 down kernels' occupancy on this GPU (a profile, not a test) |
 
+The SM70 port's own tests (also one GPU; build them with `ARCH=70 scripts/build.sh bin` or directly):
+
+| test | checks |
+|---|---|
+| `sm70_mma_test` (`engine/kernels/tests/sm70_mma_test.cu`) | the `gr8_sm70` compatibility primitives on a Volta GPU: all 256 E4M3 and E2M1 byte conversions bit-exact against `cuda_fp8.h`, all 65,536 half values bit-exact for `f16x2 -> e4m3x2` and the round-trip (saturating, RN-even), `ldmatrix` x2/x4 and trans emulations against direct shared reads, `mma16816_f16`/`mma16816_bf16`/`mma_fp8_m16n8k32`/`mma_mx8_m16n8k32` against double-precision references, and `cublas_gemm_bf16_tn`'s BF16->FP16 V100 path |
+| `fabric_ipc_test` (`engine/comms/tests/fabric_ipc_test.cu`) | the intra-node fabric backends on one machine: uniform and variable-layout collectives, reduce-scatter and pair-split writes, the slot pool's credit path and bulk mode, GPU doorbell -> SHM proxy -> GPU spin round trips, every word verified |
+
 `engine/runtime/build_m4.sh` builds these, by mode:
 
 | mode | test | checks | needs |

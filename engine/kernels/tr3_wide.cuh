@@ -230,70 +230,13 @@ constexpr int TR4W_GROUP = 8 * 8 * 128;          // 8192 B per fc1 K4 group
 constexpr int TR4W_MAT   = KSH * 8 * 128;        // 393216 B per K4 fc1 matrix / fc2 block
 constexpr int TR4W_NT    = 8 * 128;              // 1024 B per K4 fc2 n-tile
 
-__device__ __forceinline__ uint4 tr4w_ld128(const void* p)
-{
-    uint4 v;
-    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
-    return v;
-}
-
-__device__ __forceinline__ uint4 tr4w_ld128_p256(const void* p)
-{
-    uint4 v;
-    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
-    return v;
-}
-
-__device__ __forceinline__ uint4 tr4w_ld128_ef(const void* p)
-{
-    uint4 v;
-    asm volatile(
-        "{\n\t.reg .b64 pol;\n\t"
-        "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
-        "ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], pol;\n\t}"
-        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
-    return v;
-}
-
-__device__ __forceinline__ u64 tr4w_ld64_ef(const void* p)
-{
-    u64 v;
-    asm volatile(
-        "{\n\t.reg .b64 pol;\n\t"
-        "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
-        "ld.global.nc.L1::no_allocate.L2::cache_hint.u64 %0, [%1], pol;\n\t}"
-        : "=l"(v) : "l"(p));
-    return v;
-}
-
-__device__ __forceinline__ void tr4w_st128_el(void* p, uint4 v)
-{
-    asm volatile(
-        "{\n\t.reg .b64 pol;\n\t"
-        "createpolicy.fractional.L2::evict_last.b64 pol, 1.0;\n\t"
-        "st.global.L2::cache_hint.v4.u32 [%0], {%1,%2,%3,%4}, pol;\n\t}"
-        :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
-}
-
-__device__ __forceinline__ void tr4w_st128_ef(void* p, uint4 v)
-{
-    asm volatile(
-        "{\n\t.reg .b64 pol;\n\t"
-        "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
-        "st.global.L2::cache_hint.v4.u32 [%0], {%1,%2,%3,%4}, pol;\n\t}"
-        :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
-}
-
-__device__ __forceinline__ void tr4w_st32_ef(void* p, u32 v)
-{
-    asm volatile(
-        "{\n\t.reg .b64 pol;\n\t"
-        "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
-        "st.global.L2::cache_hint.u32 [%0], %1, pol;\n\t}"
-        :: "l"(p), "r"(v) : "memory");
-}
+__device__ __forceinline__ uint4 tr4w_ld128(const void* p) { return gr8_sm70::ld_nc_uint4(p); }
+__device__ __forceinline__ uint4 tr4w_ld128_p256(const void* p) { return gr8_sm70::ld_nc_uint4_l2_256b(p); }
+__device__ __forceinline__ uint4 tr4w_ld128_ef(const void* p) { return gr8_sm70::ld_nc_uint4_ef(p); }
+__device__ __forceinline__ u64 tr4w_ld64_ef(const void* p) { return gr8_sm70::ld_nc_u64_ef(p); }
+__device__ __forceinline__ void tr4w_st128_el(void* p, uint4 v) { gr8_sm70::st_uint4_el(p, v); }
+__device__ __forceinline__ void tr4w_st128_ef(void* p, uint4 v) { gr8_sm70::st_uint4_ef(p, v); }
+__device__ __forceinline__ void tr4w_st32_ef(void* p, u32 v) { gr8_sm70::st_u32_ef(p, v); }
 
 __global__ void __launch_bounds__(256) k_tr4_widen(uint8_t* fc1, const long long* tab, const long long* kmix, int nb,
                                                    const uint8_t* const* ptab = nullptr)

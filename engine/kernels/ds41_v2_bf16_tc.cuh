@@ -2,6 +2,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include "sm70_compat.cuh"
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -11,26 +12,15 @@ constexpr int BM = 64, BN = 64, BK = 64, ST = 3;
 constexpr int TC_SMEM_BYTES = ST * (BM + BN) * BK * sizeof(__nv_bfloat16);
 
 __device__ __forceinline__ void cp16_zfill(void* smem_ptr, const void* gmem_ptr, bool valid) {
-    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    const int src_bytes = valid ? 16 : 0;
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(addr), "l"(gmem_ptr), "r"(src_bytes) : "memory");
+    gr8_sm70::cp_async_cg_16_pred(smem_ptr, gmem_ptr, valid ? 16 : 0);
 }
-__device__ __forceinline__ void cp_commit() {
-    asm volatile("cp.async.commit_group;" ::: "memory");
-}
-template<int N> __device__ __forceinline__ void cp_wait() {
-    asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
-}
+__device__ __forceinline__ void cp_commit() { gr8_sm70::cp_async_commit(); }
+template<int N> __device__ __forceinline__ void cp_wait() { gr8_sm70::cp_async_wait<N>(); }
 __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* smem_ptr) {
-    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+    gr8_sm70::ldmatrix_x4(r[0], r[1], r[2], r[3], smem_ptr);
 }
 __device__ __forceinline__ void mma_bf16_m16n8k16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    gr8_sm70::mma16816_bf16(d, a[0], a[1], a[2], a[3], b0, b1);
 }
 
 template<class OutT, bool PAIRED>

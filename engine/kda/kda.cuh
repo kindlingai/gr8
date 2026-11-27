@@ -114,20 +114,6 @@ template <class FindT> inline const char* bind_kda(KdaLayer& w, int l, const Fin
             if (err.empty()) err = "KDA: bad trellis shape for " + base;
     };
     err.clear();
-    if (find(A + "q_proj.weight.trellis").p)
-    {
-        tmat(A + "q_proj.weight", dtr::SIDE_OUT, HID, dl, w.qt);
-        tmat(A + "k_proj.weight", dtr::SIDE_OUT, HID, dl, w.kt);
-        tmat(A + "v_proj.weight", dtr::SIDE_OUT, HID, dl, w.vt);
-    }
-    else
-    {
-        const uint8_t* q = static_cast<const uint8_t*>(get(A + "q_proj.weight.gv", {D / 16, G, 512}));
-        const uint8_t* k = static_cast<const uint8_t*>(get(A + "k_proj.weight.gv", {D / 16, G, 512}));
-        const uint8_t* v = static_cast<const uint8_t*>(get(A + "v_proj.weight.gv", {D / 16, G, 512}));
-        const size_t off = static_cast<size_t>(w.h0) * (DK / 16) * row16;
-        w.q = q ? q + off : nullptr; w.k = k ? k + off : nullptr; w.v = v ? v + off : nullptr;
-    }
     const char* qkv[3] = {"q_proj", "k_proj", "v_proj"};
     for (int i = 0; i < 3; ++i)
         if (find(A + qkv[i] + ".weight.mx.codes").p)
@@ -135,10 +121,24 @@ template <class FindT> inline const char* bind_kda(KdaLayer& w, int l, const Fin
             w.mxc[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.codes", {dl, HID}));
             w.mxs[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.scales", {dl, HID / 32}));
         }
+    const bool kda_mx_ready = knob::glm53f_kda_mx() && w.mxc[0] && w.mxc[1] && w.mxc[2] && w.mxs[0] && w.mxs[1] && w.mxs[2] && dl % 16 == 0;
+    if (find(A + "q_proj.weight.trellis").p)
+    {
+        tmat(A + "q_proj.weight", dtr::SIDE_OUT, HID, dl, w.qt);
+        tmat(A + "k_proj.weight", dtr::SIDE_OUT, HID, dl, w.kt);
+        tmat(A + "v_proj.weight", dtr::SIDE_OUT, HID, dl, w.vt);
+    }
+    else if (!kda_mx_ready || find(A + "q_proj.weight.gv").p)
+    {
+        const uint8_t* q = static_cast<const uint8_t*>(get(A + "q_proj.weight.gv", {D / 16, G, 512}));
+        const uint8_t* k = static_cast<const uint8_t*>(get(A + "k_proj.weight.gv", {D / 16, G, 512}));
+        const uint8_t* v = static_cast<const uint8_t*>(get(A + "v_proj.weight.gv", {D / 16, G, 512}));
+        const size_t off = static_cast<size_t>(w.h0) * (DK / 16) * row16;
+        w.q = q ? q + off : nullptr; w.k = k ? k + off : nullptr; w.v = v ? v + off : nullptr;
+    }
     // GR8_GLM53F_KDA_MX (default on, =0 off): decode q / k / v read MXFP8 records with FP16 activations instead of the BF16
-    // weights. Not byte-exact, and a third copy of q / k / v per rank (dl / 16 x HID / 32 x 528 B per matrix) outside the
-    // loader's accounting.
-    if (knob::glm53f_kda_mx() && !w.qt.w && w.mxc[0] && w.mxc[1] && w.mxc[2] && w.mxs[0] && w.mxs[1] && w.mxs[2] && dl % 16 == 0)
+    // weights. When the release loader omits the unused full-BF16 .gv copies, this saves 6.85 GB/rank at TP=4.
+    if (kda_mx_ready && !w.qt.w)
         for (int i = 0; i < 3; ++i)
         {
             const size_t recs = static_cast<size_t>(dl / 16) * (HID / 32);
@@ -224,6 +224,12 @@ struct ProjArgs
     void add(const uint8_t* w, void* y, int K, int O, int tpc, int ks, const u32* xf = nullptr, int codec = 2)
     {
         if (!w) return;
+#ifdef GR8_SM70
+        const int ng = K / (codec == 1 ? 32 : 16);
+        if (ks > 16) ks = 16;
+        while (ks > 1 && ng % ks) ks >>= 1;
+        while (tpc * ks > 16 && tpc > 1) tpc >>= 1;
+#endif
         const int ot = O / 16;
         p[n++] = ProjPart{w, xf ? xf : xfrag, y, codec, K, ot, tpc, ks, ctas};
         ctas += (ot + tpc - 1) / tpc;
@@ -231,7 +237,11 @@ struct ProjArgs
 };
 // several BF16 / MXFP8 GEMVs on one input, each part as gv_gemv would run it (gv_multi with up to 6 parts and NT row tiles)
 template <int NT>
+#ifdef GR8_SM70
+__global__ void __launch_bounds__(512) k_kda_proj(ProjArgs a)
+#else
 __global__ void __launch_bounds__(1024) k_kda_proj(ProjArgs a)
+#endif
 {
     int i = 0;
     while (i + 1 < a.n && static_cast<int>(blockIdx.x) >= a.p[i + 1].cta0) ++i;
@@ -244,7 +254,11 @@ inline void launch_proj(const ProjArgs& a, cudaStream_t st)
     if (!a.n || !a.ctas) return;
     g6mx::nt_dispatch(g6mx::tiles(a.M), [&](auto N) {
         constexpr int NTv = decltype(N)::value;
+#ifdef GR8_SM70
+        k_kda_proj<NTv><<<a.ctas, 512, 0, st>>>(a);
+#else
         k_kda_proj<NTv><<<a.ctas, 1024, 0, st>>>(a);
+#endif
     });
 }
 

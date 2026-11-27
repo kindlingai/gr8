@@ -21,31 +21,30 @@ template <int KIND>
 __device__ __forceinline__ void mma(float (&d)[4], const uint4& a, u32 b0, u32 b1, u32 sa, u32 sb)
 {
     if constexpr (KIND == F16)
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
+        gr8_sm70::mma16816_f16(d, a.x, a.y, a.z, a.w, b0, b1);
     else if constexpr (KIND == BF16)
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
+        gr8_sm70::mma16816_bf16(d, a.x, a.y, a.z, a.w, b0, b1);
     else if constexpr (KIND == NVF4)
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
         // scale data (thread ids 0): quad lane 0 supplies row l/4, lane 1 row l/4+8; quad lane 0 supplies col l/4
         const uint16_t z = 0;
         asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
                      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
                      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                      : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "r"(sa), "h"(z), "h"(z), "r"(sb), "h"(z), "h"(z));
+#else
+        (void)d; (void)a; (void)b0; (void)b1; (void)sa; (void)sb;
+#endif
     }
     else
-        asm volatile("mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1));
+        gr8_sm70::mma_fp8_m16n8k32(d, a.x, a.y, a.z, a.w, b0, b1);
 }
 
 __device__ __forceinline__ u32 h2_e4m3x2(u32 h2)   // half2 -> two e4m3 bytes (low half = low byte), RN, saturating
 {
     const float2 f = __half22float2(as_h2(h2));
-    u32 r;
-    asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, %2, %1; cvt.u32.u16 %0, t; }" : "=r"(r) : "f"(f.x), "f"(f.y));
-    return r;
+    return gr8_sm70::f32x2_to_e4m3x2(f.x, f.y);
 }
 
 template <int KIND, int MB, int BITS>

@@ -271,6 +271,11 @@ If you are an agent (or developer) building on gr8, start from the matching entr
 - **A Docker image.** `ghcr.io/kindlingai/gr8` has the engine for every TP width and all three models, so GLM-5.3 on
   three to six boxes needs no build ([Docker Compose](docs/DEPLOY.md#docker-compose)). The one-box and two-box recipes publish their
   own images.
+- **Volta (SM70) GPUs.** The engine also builds for Tesla V100-class hardware (`ARCH=70`): an SM70 compatibility layer
+  (`engine/kernels/sm70_compat.cuh`) reproduces every SM80+ instruction bit-exactly on Volta's tensor cores, and TP
+  ranks on one node talk over POSIX shared memory (or opt-in NVLink CUDA-IPC) when every `--ips` address is loopback.
+  GLM-5.3-Flash serves at TP=4 on 4x V100-32GB with DFlash2, and Inkling-2-Mini at TP=1
+  (contributed by [@jkyamog](https://github.com/jkyamog)).
 
 ## Models and install
 
@@ -489,6 +494,9 @@ Thanks to:
     ([#45](https://github.com/kindlingai/gr8/pull/45) and its extracted steering PRs).
   - Ring relay backpressure and regression tests
     ([#58](https://github.com/kindlingai/gr8/pull/58), [#59](https://github.com/kindlingai/gr8/pull/59)).
+- [@jkyamog](https://github.com/jkyamog)
+  - Volta SM70 (Tesla V100) support: the `gr8_sm70` compatibility layer, intra-node POSIX-SHM and NVLink CUDA-IPC
+    fabrics with their wire test, and the served GLM-5.3-Flash TP=4 and Inkling-2-Mini TP=1 V100 builds.
 - [@knapcio](https://github.com/knapcio)
   - Performance experiments and proposals for speculative decoding and INT4 draft weights
     ([#83](https://github.com/kindlingai/gr8/pull/83), [#85](https://github.com/kindlingai/gr8/pull/85),

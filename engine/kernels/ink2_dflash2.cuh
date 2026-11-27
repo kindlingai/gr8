@@ -22,6 +22,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include "sm70_cublas.cuh"
 #include "ink2_norm_res.cuh"
 #endif
 
@@ -2288,20 +2289,22 @@ struct Ink2DFlash2 {
                         ctx_k_f32, ctx_v_f32, ly[l].k_norm, slot_ptr, pos_ptr, d_idx, kring, vring, l, RMS_EPS);
                 }
             } else {
-                // Fast cuBLAS BF16 path for prefill chunks (M = 9..4096, tiled in slices of <=512)
+                // Fast cuBLAS BF16 path for prefill chunks (M = 9..4096, tiled in slices of <=512), through the SM70
+                // bridge: native BF16 on SM80+, FP16 tensor cores on Volta; the ink2 GEMM kernels if cuBLAS refuses
                 const float one = 1.0f, zero = 0.0f;
-                cublasSetStream(blas, st);
-                cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, HID, n_acc, NT * HID, &one,
-                             fc_bf16, CUDA_R_16BF, NT * HID, ctx_taps_bf16, CUDA_R_16BF, NT * HID,
-                             &zero, ctx_fc_bf16, CUDA_R_16BF, HID, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                auto bf16_gemm = [&](const uint16_t* x, const uint16_t* w, int M_, int K_, int N_, void* y) {
+                    cublasStatus_t rc = blas ? cublasSetStream(blas, st) : CUBLAS_STATUS_NOT_INITIALIZED;
+                    if (rc == CUBLAS_STATUS_SUCCESS)
+                        rc = gr8_sm70::cublas_gemm_bf16_tn(blas, N_, M_, K_, &one, w, K_, x, K_,
+                                                           &zero, y, CUDA_R_16BF, N_,
+                                                           CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    if (rc != CUBLAS_STATUS_SUCCESS) ink2::gemm(x, w, M_, K_, N_, y, ink2::GEMM_BF16, 0, N_, st);
+                };
+                bf16_gemm(ctx_taps_bf16, fc_bf16, n_acc, NT * HID, HID, ctx_fc_bf16);
                 k_df2_rmsnorm_q8<false, true, true><<<n_acc, 256, 0, st>>>(ctx_fc_bf16, hidden_norm, nullptr, ctx_norm_bf16, nullptr, nullptr, nullptr, RMS_EPS);
                 for (int l = 0; l < L; ++l) {
-                    cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, NKV * HD, n_acc, HID, &one,
-                                 ly[l].k_bf16, CUDA_R_16BF, HID, ctx_norm_bf16, CUDA_R_16BF, HID,
-                                 &zero, ctx_k_bf16, CUDA_R_16BF, NKV * HD, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-                    cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, NKV * HD, n_acc, HID, &one,
-                                 ly[l].v_bf16, CUDA_R_16BF, HID, ctx_norm_bf16, CUDA_R_16BF, HID,
-                                 &zero, ctx_v_bf16, CUDA_R_16BF, NKV * HD, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    bf16_gemm(ctx_norm_bf16, ly[l].k_bf16, n_acc, HID, NKV * HD, ctx_k_bf16);
+                    bf16_gemm(ctx_norm_bf16, ly[l].v_bf16, n_acc, HID, NKV * HD, ctx_v_bf16);
                     k_df2_ctx_kv_scatter<true><<<n_acc * NKV, 128, 0, st>>>(
                         ctx_k_bf16, ctx_v_bf16, ly[l].k_norm, slot_ptr, pos_ptr, d_idx, kring, vring, l, RMS_EPS);
                 }
@@ -2421,10 +2424,14 @@ struct Ink2DFlash2 {
                 k_df2_rescore_bf16_top16<<<MK, 256, 0, st>>>(target_lm_bf16, out_bf16, h2_cand, d_cands);
             } else {
                 const float one = 1.0f, zero = 0.0f;
-                cublasSetStream(blas, st);
-                cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, valid_vocab, MK, HID, &one,
-                             target_lm_bf16, CUDA_R_16BF, HID, out_bf16, CUDA_R_16BF, HID,
-                             &zero, head_logits, CUDA_R_32F, valid_vocab, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                cublasStatus_t rc = blas ? cublasSetStream(blas, st) : CUBLAS_STATUS_NOT_INITIALIZED;
+                if (rc == CUBLAS_STATUS_SUCCESS)
+                    rc = gr8_sm70::cublas_gemm_bf16_tn(blas, valid_vocab, MK, HID, &one,
+                                                       target_lm_bf16, HID, out_bf16, HID,
+                                                       &zero, head_logits, CUDA_R_32F, valid_vocab,
+                                                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                if (rc != CUBLAS_STATUS_SUCCESS)
+                    ink2::gemm(out_bf16, target_lm_bf16, MK, HID, valid_vocab, head_logits, ink2::GEMM_F32, 0, valid_vocab, st);
                 k_df2_top_sl<TOPK><<<MK, 1024, 0, st>>>(head_logits, valid_vocab, h2_cand);
                 k_df2_sort_top16_from_y<<<MK, 256, 0, st>>>(head_logits, valid_vocab, h2_cand, d_cands);
             }
