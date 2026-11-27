@@ -221,6 +221,7 @@ int main(int argc, char** argv)
     o.variant = variant;
     o.whole_image = true;
     o.use_graph = graph_opt;
+    o.need_full_logits = !eval_inkl.empty();
     // Image input (GR8_INK2_VISION, default 0, opt-in): with --serve the vision tower of the checkpoint is bound here, with
     // its workspace and a pool of image rows for one prefill step, so the ready memory counts it. Every rank runs the
     // tower on its own copy of the images. The head writes DIR/vision.s2 ("ink2"), so the shim's hello offers `vision`
