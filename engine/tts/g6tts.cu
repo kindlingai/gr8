@@ -55,6 +55,7 @@ struct CliOpts {
     std::string codec_path;
     std::string socket_path = "/run/g6/engine.sock";
     std::string model_name_override;
+    std::string voc_strides = "1,1,2,4";
     int streams = 8;
     int cap = 4096;
     bool verify_checksums = true;
@@ -66,14 +67,10 @@ void usage() {
     std::fprintf(stderr,
                  "usage: g6tts --model-dir DIR [--manifest NAME] [--socket PATH] [--model-name NAME]\n"
                  "             [--streams N] [--cap N] [--weight-mode ref|ref-fp16|native]\n"
-                 "             [--codec-path PATH] [--no-hash] [--dry-run-load]\n");
+                 "             [--codec-path PATH] [--voc-strides 1,1,2,4] [--no-hash] [--dry-run-load]\n");
 }
 
 bool parse_cli(int argc, char** argv, CliOpts& o) {
-    if (const char* env_s = std::getenv("GR8_TTS_STREAMS")) {
-        const int v = std::atoi(env_s);
-        if (v > 0) o.streams = v;
-    }
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char* f) -> const char* {
@@ -111,6 +108,10 @@ bool parse_cli(int argc, char** argv, CliOpts& o) {
             const char* v = need("--codec-path");
             if (!v) return false;
             o.codec_path = v;
+        } else if (a == "--voc-strides") {
+            const char* v = need("--voc-strides");
+            if (!v) return false;
+            o.voc_strides = v;
         } else if (a == "--weight-mode") {
             const char* v = need("--weight-mode");
             if (!v) return false;
@@ -140,9 +141,7 @@ bool parse_cli(int argc, char** argv, CliOpts& o) {
     return true;
 }
 
-std::vector<int> parse_voc_strides() {
-    const char* env = std::getenv("GR8_TTS_VOC_STRIDES");
-    std::string s = env ? env : "1,1,2,4";
+std::vector<int> parse_voc_strides(const std::string& s) {
     std::vector<int> out;
     std::stringstream ss(s);
     std::string tok;
@@ -216,7 +215,7 @@ struct TtsEngine {
         weights.cfg.cap = opts.cap;
         if (!opts.model_name_override.empty()) weights.cfg.model_name = opts.model_name_override;
 
-        voc_strides = parse_voc_strides();
+        voc_strides = parse_voc_strides(opts.voc_strides);
         TTS_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         bb.init(weights, opts.streams, opts.cap, 128);
         tower.init(weights, opts.streams, opts.cap, 128);
