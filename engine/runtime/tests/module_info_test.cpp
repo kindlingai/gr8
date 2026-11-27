@@ -47,6 +47,10 @@ int main()
     CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
     CHECK(m.caps == (G6_CAP_MTP0 | G6_CAP_KDA | G6_CAP_KV_STORE));
     CHECK(m.kv_row_bytes == ((G6_NR == 1 || G6_NR == 3) ? 2048 : 1024) && std::strcmp(m.kv_format, "bf16gqa256") == 0);
+#elif G6_MODEL_HY4
+    CHECK(m.model == G6_MODEL_ID_HY4 && std::strcmp(m.name, "hy4") == 0 && m.max_sessions == 8 && m.mtp_layers == 0);
+    CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
+    CHECK(m.caps == G6_CAP_MTP0);
 #elif G6_MODEL_FLASH
     CHECK(m.model == G6_MODEL_ID_GLM53F && std::strcmp(m.name, "glm-5.3-flash") == 0 && m.max_sessions == 8);
     CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);

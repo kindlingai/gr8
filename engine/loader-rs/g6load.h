@@ -58,6 +58,10 @@ void* g6l_ink2_plan_ex(const char* model_dir, uint32_t nr, uint32_t rank, const 
 void* g6l_ink2_plan_ex2(const char* model_dir, uint32_t nr, uint32_t rank, const char* variant, int with_mtp, const char* out_manifest, char* err, size_t errlen);
 // Plans rank `rank` of `nr` of a Qwen3.8-Flash-Next exlr8 v2 release directory (dense/exlr8-{dense,vocab,mtp},
 // experts/, index-slices/, width manifest `widths`, optional `layout`). Writes the g6pack-v1 manifest to out_manifest.
+void* g6l_hy4_plan(const char* release_dir, const char* widths, uint32_t nr, uint32_t rank,
+                   const char* out_manifest, char* err, size_t errlen);
+void* g6l_hy4_plan_part(const char* release_dir, const char* widths, uint32_t nr, uint32_t rank, uint32_t part,
+                        const char* out_manifest, char* err, size_t errlen);
 void* g6l_qw38_plan(const char* release_dir, const char* widths, uint32_t nr, uint32_t rank, int with_mtp,
                     const char* layout, const char* out_manifest, char* err, size_t errlen);
 // Fills dst with image bytes off .. off + n of a planned image, without a sink (one tensor at a time, for m4sim).

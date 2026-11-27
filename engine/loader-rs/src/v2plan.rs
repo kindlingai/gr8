@@ -420,6 +420,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
         (5120, 18) => nroute == 384,
         (2560, 5) => nroute == 512,
         (2304, 9) => nroute == 128,
+        (1536, 12) => nroute == 512,
         (256, 2) => nroute == 16,
         _ => false,
     };
@@ -467,7 +468,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
         Err(format!("layer {l}: expert {e} {} half at offset {off} of the K{k} width file is not inside its trellis \
                      tensor (the index slices and the width file disagree)", ["gate", "up", "down"][proj]))
     };
-    let bs = w.sdown > 0;
+    let bs = w.sdown > 0 || (hidden == 1536 && w.nh == 12);
     // the slice that holds unit (e, h) at width k
     let get = |k: u8, e: usize, h: usize| ls.get(&(k, (w.nh * e + h + l) % slices.nr)).ok_or(format!("layer {l}: no index slice at K{k}"));
     let row_of = |s: &LayerSlice, e: usize, h: usize| s.row.get(&(e, h)).copied().ok_or(format!("layer {l}: expert {e} half {h} not in the slice"));
@@ -497,7 +498,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
     let fc1_bytes: u64 = experts.iter().zip(&own).map(|(&e, hs)| hs.iter().map(|&h| hb(of(e).0[h]) + hb(of(e).1[h])).sum::<u64>()).sum();
     let fc1 = b.begin(format!("{p}.tr3.fc1"), "u8", vec![fc1_bytes as i64], fc1_bytes, Some(xf));
     let (mut off, mut row) = (0u64, 0usize);
-    let allow_uniform_matrix = hidden == 2304 && w.nh == 9;
+    let allow_uniform_matrix = (hidden == 2304 && w.nh == 9) || (hidden == 1536 && w.nh == 12);
     for (i, &e) in experts.iter().enumerate() {
         let (gw, uw, dk) = of(e);
         let hs = &own[i];
@@ -555,6 +556,142 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
     }
     b.mem(format!("{p}.tr3.table"), "i64", vec![ne as i64, 6], table.iter().flatten().flat_map(|v| v.to_le_bytes()).collect(), xf);
     b.mem(format!("{p}.tr3.kmix"), "i64", vec![ne as i64], kmix.iter().flat_map(|v| v.to_le_bytes()).collect(), xf);
+    Ok(())
+}
+
+
+fn shared_layer_slice(s: &Slice, l: usize) -> Result<Option<LayerSlice>, String> {
+    let p = format!("L{l:03}.shared.");
+    if !s.has(&format!("{p}units")) {
+        return Ok(None);
+    }
+    let (units, _) = s.get(&format!("{p}units"))?;
+    let (off, _) = s.get(&format!("{p}offset"))?;
+    let row = units.chunks(4).enumerate()
+        .map(|(j, u)| ((i16::from_le_bytes([u[0], u[1]]) as usize, i16::from_le_bytes([u[2], u[3]]) as usize), j))
+        .collect();
+    let (signs, signs_shape) = s.get(&format!("{p}signs"))?;
+    let hidden = signs_shape.get(1).copied().ok_or("bad shared signs shape")?;
+    Ok(Some(LayerSlice {
+        row,
+        offset: off.chunks(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect(),
+        chan: s.get(&format!("{p}chan"))?.0,
+        block: s.get(&format!("{p}block"))?.0,
+        signs,
+        hidden,
+    }))
+}
+
+/// Layer l's separate shared-expert v2 trellis tensors when the shared expert has a different input/output width
+/// than the routed experts (Hy4-flash: routed hidden=1536, shared hidden=3072, nh=12). Emits `Lnnn.sh_tr3.*`.
+pub(crate) fn v2_shared_layer(
+    b: &mut Builder,
+    l: usize,
+    w: &Widths,
+    nroute: usize,
+    expect_hidden: usize,
+    slices: &Slices,
+    wfile: &dyn Fn(usize, u8) -> String,
+    own: &[usize],
+) -> Result<(), String> {
+    let p = format!("L{l:03}");
+    let nh = w.nh;
+    if w.sdown == 0 {
+        return Err(format!("layer {l}: shared expert has no width in manifest"));
+    }
+    if !(2..=4).contains(&w.sdown) || w.sgate[..nh].iter().chain(&w.sup[..nh]).any(|k| !(2..=4).contains(k)) {
+        return Err(format!("layer {l}: invalid shared width"));
+    }
+    let mut ls: HashMap<(u8, usize), LayerSlice> = HashMap::new();
+    for (&k, s) in &slices.by {
+        if let Some(x) = shared_layer_slice(s, l)? {
+            ls.insert(k, x);
+        }
+    }
+    let hidden = ls.values().next().ok_or(format!("layer {l}: no shared layer slices"))?.hidden;
+    if hidden != expect_hidden || hidden % 128 != 0 {
+        return Err(format!("layer {l}: shared hidden {hidden} != expected {expect_hidden}"));
+    }
+    let blocks = hidden / 128;
+    for s in ls.values() {
+        let rows = s.row.len();
+        if s.hidden != hidden || s.signs.len() != 2 * hidden
+            || s.block.len() != 3 * blocks * 2
+            || s.offset.len() != rows * 3 || s.chan.len() != rows * 3 * 256 {
+            return Err(format!("layer {l}: inconsistent shared slice shapes"));
+        }
+    }
+    let mut ks: Vec<u8> = own.iter().flat_map(|&h| [w.sgate[h], w.sup[h], w.sdown]).collect();
+    ks.sort_unstable();
+    ks.dedup();
+    let (cb, tranges) = layer_codebook(l, &ks, wfile)?;
+    let xf = cb.map_or(codebook::UNCHECKED, Codebook::expert_format);
+    let inside = |k: u8, proj: usize, off: u64| -> Result<(), String> {
+        match tranges.get(&k) {
+            None => return Ok(()),
+            Some(r) if r.holds(true, proj, off, hidden as u64 * 16 * k as u64) => return Ok(()),
+            Some(_) => {}
+        }
+        Err(format!("layer {l}: shared {} half at offset {off} of K{k} is not inside shared.trellis", ["gate", "up", "down"][proj]))
+    };
+    let get = |k: u8, h: usize| ls.get(&(k, (nh * nroute + h + l) % slices.nr))
+        .ok_or(format!("layer {l}: no shared index slice at K{k}"));
+    let row_of = |s: &LayerSlice, h: usize| s.row.get(&(0, h)).copied()
+        .ok_or(format!("layer {l}: shared half {h} not in the slice"));
+    let hb = |k: u8| (hidden as u64 * 16) * k as u64;
+    let nblk = own.len();
+    let mut table = [[0i64; 6]; 1];
+    let km = kmix_word(&w.sgate, &w.sup, w.sdown, own, true)
+        .ok_or_else(|| format!("layer {l}: shared expert has {} blocks with non-uniform per-matrix widths", own.len()))?;
+    let mut v1 = vec![0u8; nblk * 2 * blocks * 2];
+    let mut v2 = vec![0u8; nblk * 3 * 128 * 2];
+    let mut v3 = vec![0u8; nblk * blocks * 2];
+
+    let fc1_bytes: u64 = own.iter().map(|&h| hb(w.sgate[h]) + hb(w.sup[h])).sum();
+    let fc1 = b.begin(format!("{p}.sh_tr3.fc1"), "u8", vec![fc1_bytes as i64], fc1_bytes, Some(xf));
+    table[0] = [0, 0, 0, nblk as i64, w.sdown as i64, *own.first().unwrap_or(&0) as i64];
+    let (mut off, mut row) = (0u64, 0usize);
+    for &h in own {
+        for (proj, k) in [(0usize, w.sgate[h]), (1, w.sup[h])] {
+            let s = get(k, h)?;
+            let j = row_of(s, h)?;
+            inside(k, proj, s.offset[j * 3 + proj] as u64)?;
+            let f = b.file(wfile(l, k));
+            b.seg(fc1 + off, hb(k), Op::Copy, f, s.offset[j * 3 + proj] as u64);
+            off += hb(k);
+            let blk = &s.block[proj * blocks * 2..(proj + 1) * blocks * 2];
+            v1[(row * 2 + proj) * blocks * 2..(row * 2 + proj + 1) * blocks * 2].copy_from_slice(blk);
+            v2[(row * 3 + proj) * 256..(row * 3 + proj + 1) * 256].copy_from_slice(&s.chan[(j * 3 + proj) * 256..(j * 3 + proj + 1) * 256]);
+        }
+        row += 1;
+    }
+
+    let fc2_bytes: u64 = nblk as u64 * hb(w.sdown);
+    let fc2 = b.begin(format!("{p}.sh_tr3.fc2"), "u8", vec![fc2_bytes as i64], fc2_bytes, Some(xf));
+    table[0][1] = 0;
+    let (mut off, mut row) = (0u64, 0usize);
+    for &h in own {
+        let s = get(w.sdown, h)?;
+        let j = row_of(s, h)?;
+        inside(w.sdown, 2, s.offset[j * 3 + 2] as u64)?;
+        let f = b.file(wfile(l, w.sdown));
+        b.seg(fc2 + off, hb(w.sdown), Op::Item128 { hidden }, f, s.offset[j * 3 + 2] as u64);
+        off += hb(w.sdown);
+        v2[(row * 3 + 2) * 256..(row * 3 + 3) * 256].copy_from_slice(&s.chan[(j * 3 + 2) * 256..(j * 3 + 3) * 256]);
+        let blk = &s.block[2 * blocks * 2..3 * blocks * 2];
+        v3[row * blocks * 2..(row + 1) * blocks * 2].copy_from_slice(blk);
+        row += 1;
+    }
+
+    let n = nblk as i64;
+    let s = ls.values().next().ok_or(format!("layer {l}: no shared index slice"))?;
+    let sg: Vec<u8> = s.signs.iter().flat_map(|&x| if (x as i8) < 0 { [0x00, 0xBC] } else { [0x00, 0x3C] }).collect();
+    b.mem(format!("{p}.sh_tr3.sg"), "f16", vec![2, hidden as i64], sg, xf);
+    b.mem(format!("{p}.sh_tr3.v1b"), "f16", vec![n, 2, blocks as i64], v1, xf);
+    b.mem(format!("{p}.sh_tr3.v2"), "f16", vec![n, 3, 128], v2, xf);
+    b.mem(format!("{p}.sh_tr3.v3b"), "f16", vec![n, blocks as i64], v3, xf);
+    b.mem(format!("{p}.sh_tr3.table"), "i64", vec![1, 6], table.iter().flatten().flat_map(|v| v.to_le_bytes()).collect(), xf);
+    b.mem(format!("{p}.sh_tr3.kmix"), "i64", vec![1], km.to_le_bytes().to_vec(), xf);
     Ok(())
 }
 

@@ -91,7 +91,7 @@ class SwitchTests(unittest.TestCase):
 
     def test_two_model_subset_and_incomplete_model(self):
         text = (ROOT / "config/switch.env.example").read_text()
-        text = "\n".join(l for l in text.splitlines() if not l.startswith(("DS41_", "INK2_", "QW38_")))
+        text = "\n".join(l for l in text.splitlines() if not l.startswith(("DS41_", "INK2_", "QW38_", "HY4_")))
         with tempfile.TemporaryDirectory() as t:
             p = Path(t) / "switch.env"
             p.write_text(text)
@@ -130,15 +130,15 @@ class SwitchTests(unittest.TestCase):
         calls = []
         lock = threading.Lock()
         def runner(box, command, timeout):
-            if command.endswith("down") and "deepseek" not in command and "qwen3.8" not in command:
+            if command.endswith("down") and "deepseek" not in command and "qwen3.8" not in command and "hy4-flash" not in command:
                 barrier.wait()
             with lock:
                 if command.endswith("up -d"):
-                    self.assertEqual(sum(c.endswith("down") for _, c in calls), 14)
+                    self.assertEqual(sum(c.endswith("down") for _, c in calls), 16)
                 calls.append((box, command))
         output = []
         sw.switch(self.config, "glm53f", runner, lambda *_: True, output.append)
-        self.assertEqual(len(calls), 16)
+        self.assertEqual(len(calls), 18)
         self.assertTrue(all("docker compose" in command for _, command in calls))
         self.assertTrue(any(line.startswith("total:") for line in output))
         self.assertTrue(any(line.startswith("health: ready") for line in output))

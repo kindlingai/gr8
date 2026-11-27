@@ -39,6 +39,7 @@ pub struct ModelGeom {
 impl ModelGeom {
     pub const GLM: ModelGeom = ModelGeom { nh: NH, heads: HEADS, dense: DENSE, vtiles: VTILES };
     pub const QW38: ModelGeom = ModelGeom { nh: 5, heads: 24, dense: 0, vtiles: 1940 };
+    pub const HY4: ModelGeom = ModelGeom { nh: 12, heads: 64, dense: 108, vtiles: 944 };
 }
 
 /// A set of interchangeable pieces.
@@ -152,14 +153,19 @@ impl Model {
             || man.get("model").and_then(Json::str) == Some("qw38")
             || man.get("nh").and_then(Json::int) == Some(5)
             || first_nh == Some(5);
-        let hidden = explicit_hidden.unwrap_or(if is_qw38 { 2560 } else { 6144 });
-        let geom = if is_qw38 { ModelGeom::QW38 } else { ModelGeom::GLM };
+        let is_hy4 = man.get("model").and_then(Json::str) == Some("hy4") || (explicit_hidden == Some(1536) && first_nh == Some(12));
+        let hidden = explicit_hidden.unwrap_or(if is_hy4 { 1536 } else if is_qw38 { 2560 } else { 6144 });
+        let geom = if is_hy4 { ModelGeom::HY4 } else if is_qw38 { ModelGeom::QW38 } else { ModelGeom::GLM };
         let mut groups = vec![(Group::Vocab, vec![0; geom.vtiles])];
         for l in 0..=last {
             if !is_qw38 || l % 4 == 3 {
                 groups.push((Group::Heads(l), vec![0; geom.heads]));
             }
-            if !is_qw38 && l < 3 {
+            if is_hy4 && l < 1 {
+                groups.push((Group::Dense(l), vec![0; geom.dense]));
+                continue;
+            }
+            if !is_qw38 && !is_hy4 && l < 3 {
                 groups.push((Group::Dense(l), vec![0; geom.dense]));
                 continue;
             }
@@ -173,7 +179,9 @@ impl Model {
                 groups.push((Group::Halves(l, e), half(&w.gate[e], &w.up[e], w.down[e])));
             }
             if w.sdown > 0 {
-                groups.push((Group::Halves(l, w.down.len()), half(&w.sgate, &w.sup, w.sdown)));
+                let sh_h = if is_hy4 { 3072u64 } else { hidden };
+                let sh_half: Vec<u64> = (0..geom.nh).map(|h| sh_h * 16 * (w.sgate[h] as u64 + w.sup[h] as u64 + w.sdown as u64)).collect();
+                groups.push((Group::Halves(l, w.down.len()), sh_half));
             }
         }
         Ok(Model { geom, groups })

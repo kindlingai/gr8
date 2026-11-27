@@ -33,6 +33,7 @@ pub mod json;
 pub mod layout;
 pub mod nvfp4;
 mod plan;
+pub mod hy4;
 pub mod qw38;
 pub mod records;
 pub mod release;
@@ -567,6 +568,60 @@ pub unsafe extern "C" fn g6l_qw38_plan(release_dir: *const c_char, widths: *cons
         let lp_str = lp.unwrap_or_default();
         let key_text = format!("qw38 dir={dir} widths={wd} nr={nr} rank={rank} mtp={with_mtp} layout={lp_str:?}\n{}\n{}",
                                img.manifest(), gencache::source_identity(&[&dir, &wd, &lp_str]));
+        img.cache = gencache::GenCache::from_env(&key_text);
+        Ok::<_, String>(img)
+    })();
+    match r {
+        Ok(img) => Box::into_raw(Box::new((img, t0))) as *mut c_void,
+        Err(e) => {
+            write_err(err, errlen, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Plans rank `rank` of `nr` of a Tencent Hy4-flash exlr8 v2 release directory.
+///
+/// # Safety
+/// Every C string pointer must be valid; `err` must hold `errlen` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_hy4_plan_part(release_dir: *const c_char, widths: *const c_char, nr: u32, rank: u32, part: u32,
+                                           out_manifest: *const c_char, err: *mut c_char, errlen: usize) -> *mut c_void {
+    let t0 = Instant::now();
+    let arg = |p: *const c_char, what: &str| cstr(p).ok_or_else(|| format!("g6l_hy4_plan_part: missing {what}"));
+    let r = (|| {
+        let dir = arg(release_dir, "release dir")?;
+        let wd = if part == 3 { String::new() } else { arg(widths, "width manifest")? };
+        let mut img = hy4::plan_part(&dir, &wd, nr as usize, rank as usize, part)?;
+        let out = arg(out_manifest, "output manifest")?;
+        std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
+        let key_text = format!("hy4 part={part} dir={dir} widths={wd} nr={nr} rank={rank}\n{}\n{}",
+                               img.manifest(), gencache::source_identity(&[&dir, &wd]));
+        img.cache = gencache::GenCache::from_env(&key_text);
+        Ok::<_, String>(img)
+    })();
+    match r {
+        Ok(img) => Box::into_raw(Box::new((img, t0))) as *mut c_void,
+        Err(e) => {
+            write_err(err, errlen, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn g6l_hy4_plan(release_dir: *const c_char, widths: *const c_char, nr: u32, rank: u32,
+                                      out_manifest: *const c_char, err: *mut c_char, errlen: usize) -> *mut c_void {
+    let t0 = Instant::now();
+    let arg = |p: *const c_char, what: &str| cstr(p).ok_or_else(|| format!("g6l_hy4_plan: missing {what}"));
+    let r = (|| {
+        let dir = arg(release_dir, "release dir")?;
+        let wd = arg(widths, "width manifest")?;
+        let mut img = hy4::plan(&dir, &wd, nr as usize, rank as usize)?;
+        let out = arg(out_manifest, "output manifest")?;
+        std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
+        let key_text = format!("hy4 dir={dir} widths={wd} nr={nr} rank={rank}\n{}\n{}",
+                               img.manifest(), gencache::source_identity(&[&dir, &wd]));
         img.cache = gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)
     })();
