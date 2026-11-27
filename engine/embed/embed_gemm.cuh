@@ -352,27 +352,40 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA
     unsigned char* sdec = sm + ST * C::STG;
     const uint8_t* tw_bx = tw + int64_t(bx) * sB;
 
+    // Precompute A and raw-tile load coordinates once outside the K-loop (zero int division/modulo per stage).
+    constexpr int NA_LOADS = (2 * BM * 32) / C::NTH; // BM=4:1, BM=8:2, BM=16:2
+    int a_j[NA_LOADS], a_mb[NA_LOADS], a_ch[NA_LOADS];
+    #pragma unroll
+    for (int i = 0; i < NA_LOADS; ++i) {
+        const int c = t + i * C::NTH;
+        a_j[i] = c / (BM * 32);
+        const int rem = c - a_j[i] * (BM * 32);
+        a_mb[i] = rem >> 5;
+        a_ch[i] = (rem & 31) * 16;
+    }
+    const int r_ti = t >> 3, r_j = r_ti >> 3, r_c = r_ti & 7, r_ch = (t & 7) * 16;
+
     auto loadAB = [&](int st) {
         unsigned char* a = sm + (st % ST) * C::STG;
         const int k16_0 = st * 2;
         if (full) {
             #pragma unroll
-            for (int c = t; c < 2 * BM * 32; c += C::NTH) {
-                const int j = c / (BM * 32), rem = c % (BM * 32), mb = rem >> 5, ch = rem & 31;
-                emb_cp16(a + c * 16, x_h16 + (size_t(rb0 + mb) * K16 + k16_0 + j) * 512 + ch * 16);
+            for (int i = 0; i < NA_LOADS; ++i) {
+                emb_cp16(a + (t + i * C::NTH) * 16,
+                         x_h16 + (size_t(rb0 + a_mb[i]) * K16 + k16_0 + a_j[i]) * 512 + a_ch[i]);
             }
         } else {
-            for (int c = t; c < 2 * BM * 32; c += C::NTH) {
-                const int j = c / (BM * 32), rem = c % (BM * 32), mb = rem >> 5, ch = rem & 31;
-                if (mb < nb) {
-                    emb_cp16(a + c * 16, x_h16 + (size_t(rb0 + mb) * K16 + k16_0 + j) * 512 + ch * 16);
+            #pragma unroll
+            for (int i = 0; i < NA_LOADS; ++i) {
+                if (a_mb[i] < nb) {
+                    emb_cp16(a + (t + i * C::NTH) * 16,
+                             x_h16 + (size_t(rb0 + a_mb[i]) * K16 + k16_0 + a_j[i]) * 512 + a_ch[i]);
                 }
             }
         }
         if (t < 128) {
-            const int ti = t >> 3;
-            const int ks = k16_0 + (ti >> 3);
-            emb_cp16(a + C::A + t * 16, tw_bx + int64_t(ks >> 3) * sG + int64_t((ks & 7) * 8 + (ti & 7)) * 128 + (t & 7) * 16);
+            const int ks = k16_0 + r_j;
+            emb_cp16(a + C::A + t * 16, tw_bx + int64_t(ks >> 3) * sG + int64_t((ks & 7) * 8 + r_c) * 128 + r_ch);
         }
     };
 
@@ -399,12 +412,9 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA
         }
     };
 
-    #pragma unroll
-    for (int p = 0; p < ST - 1; ++p) {
-        if (p < NST) loadAB(p);
-        emb_cp_commit();
-    }
-    emb_cp_wait<ST - 2>();
+    if (NST > 0) { loadAB(0); emb_cp_commit(); }
+    if (NST > 1) { loadAB(1); emb_cp_commit(); }
+    emb_cp_wait<1>();
     __syncthreads();
     if (NST > 0) decode(0);
 
@@ -420,10 +430,15 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA
     const int wm4 = wm * 4;
     const int mb_lim = min(4, max(0, nb - wm4));
 
+    // Single-barrier pipelined K-loop: loadAB(st+2) overlaps with decode(st+1) and mma(st).
     for (int st = 0; st < NST; ++st) {
-        if (st + ST - 1 < NST) loadAB(st + ST - 1);
-        emb_cp_commit();
+        emb_cp_wait<0>();
         __syncthreads();
+        if (st + 2 < NST) {
+            loadAB(st + 2);
+            emb_cp_commit();
+        }
+        if (st + 1 < NST) decode(st + 1);
         const unsigned char* a = sm + (st % ST) * C::STG;
         const unsigned char* b = sdec + (st & 1) * C::B;
         #pragma unroll
@@ -437,13 +452,18 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA
                             bf[2 * pr][0], bf[2 * pr][1], bf[2 * pr + 1][0], bf[2 * pr + 1][1]);
             }
             if (full) {
+                uint4 fa = *reinterpret_cast<const uint4*>(a + (j * BM + wm4) * 512 + lane * 16);
                 #pragma unroll
                 for (int mb = 0; mb < 4; ++mb) {
-                    const uint4 fa = *reinterpret_cast<const uint4*>(a + (j * BM + wm4 + mb) * 512 + lane * 16);
+                    uint4 fa_nx;
+                    if (mb + 1 < 4) {
+                        fa_nx = *reinterpret_cast<const uint4*>(a + (j * BM + wm4 + mb + 1) * 512 + lane * 16);
+                    }
                     #pragma unroll
                     for (int nt = 0; nt < NT; ++nt) {
                         emb_mma16816(acc[mb][nt], fa.x, fa.y, fa.z, fa.w, bf[nt][0], bf[nt][1]);
                     }
+                    if (mb + 1 < 4) fa = fa_nx;
                 }
             } else {
                 #pragma unroll
@@ -457,9 +477,6 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA
                 }
             }
         }
-        emb_cp_wait<ST - 2>();
-        __syncthreads();
-        if (st + 1 < NST) decode(st + 1);
     }
     emb_cp_wait<0>();
 
@@ -809,11 +826,8 @@ inline void launch_trellis_with_rot(const DevMatrix& W, const bf16* bias, bf16* 
     const int RB = (M + 15) / 16;
     const int NB = W.out / 128;
     const int ar = add_res ? 1 : 0;
-    if (M >= 256) {
-        const dim3 grid(NB, (RB + 15) / 16);
-        k_emb_tr_h16<16><<<grid, EmbTrH16Cfg<16>::NTH, EmbTrH16Cfg<16>::SMEM, st>>>(
-            ws.x_rot, W.data, W.svh, bias, Y, M, W.out, W.inp, W.sB, W.sG, ar);
-    } else if (M >= 96) {
+    // Prefer BM=8 (46 KiB SMEM, 2 CTAs/SM -> higher barrier overlap) once enough CTAs fill GB10's SMs.
+    if (M >= 128) {
         const dim3 grid(NB, (RB + 7) / 8);
         k_emb_tr_h16<8><<<grid, EmbTrH16Cfg<8>::NTH, EmbTrH16Cfg<8>::SMEM, st>>>(
             ws.x_rot, W.data, W.svh, bias, Y, M, W.out, W.inp, W.sB, W.sG, ar);
