@@ -782,24 +782,28 @@ impl Stash {
             .map(|e| (e.id, e.below()))
     }
 
-    // the longest grid-cell prefix of `st`, within `max_pages`, that a run still in the pool also holds: its rows
-    fn resident_prefix(&self, st: &Finished, max_pages: usize, resident: &[&[i32]]) -> u64 {
+    // the longest grid-cell prefix of `st`, within `max_pages`, that at least one run still in the pool also holds:
+    // (rows, count of matching resident runs)
+    fn resident_prefix(&self, st: &Finished, max_pages: usize, resident: &[&[i32]]) -> (u64, usize) {
         let g = self.grid;
         let mtp = usize::from(self.state_mtp);
         let top = (st.valid.max(0) as u64).min(st.history.len().saturating_sub(mtp) as u64).min(max_pages as u64 * PAGE);
         let mut s = top / g * g;
         while s >= g {
             let n = s as usize + mtp;
-            let shares = resident.iter().any(|r| {
-                let enough = if self.state_mtp { r.len() > n } else { r.len() >= n };
-                enough && r[..n] == st.history[..n]
-            });
-            if shares {
-                return s;
+            let count = resident
+                .iter()
+                .filter(|r| {
+                    let enough = if self.state_mtp { r.len() > n } else { r.len() >= n };
+                    enough && r[..n] == st.history[..n]
+                })
+                .count();
+            if count > 0 {
+                return (s, count);
             }
             s -= g;
         }
-        0
+        (0, 0)
     }
 
     fn store(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32], hits: u32, resident: &[&[i32]]) {
@@ -841,9 +845,13 @@ impl Stash {
         }
         let stock = namespace == crate::pool::STOCK_NAMESPACE;
         let mut base = if kind == Kind::Evicted && stock { self.shared_base(&st.history, pages.len()) } else { None };
-        if kind == Kind::Evicted && stock && base.is_none() && self.dedupe {
-            let s = self.resident_prefix(&st, pages.len(), resident);
-            if s > 0 {
+        if kind == Kind::Evicted && stock && self.dedupe {
+            let (s, count) = self.resident_prefix(&st, pages.len(), resident);
+            let sp = s.div_ceil(PAGE) as usize;
+            let bp = base.map_or(0, |b| b.1);
+            // Promote a longer resident prefix even when a shorter shared base exists whenever deduplicating the
+            // matching resident siblings saves more pages than rewriting the shorter prefix: count * (sp - bp) > bp.
+            if s > 0 && sp > bp && count.saturating_mul(sp - bp) > bp {
                 let fin = Finished {
                     history: st.history[..s as usize + 1].to_vec(),
                     valid: s as i32,
@@ -851,8 +859,12 @@ impl Stash {
                     pf_end: s as i32,
                 };
                 let key = prefix_key(&fin.history);
-                if let Some(id) = self.put(Kind::Prefix, key, fin, &pages[..s.div_ceil(PAGE) as usize], 0) {
-                    base = Some((id, s.div_ceil(PAGE) as usize));
+                let pin = std::mem::take(&mut self.pin);
+                self.pin = pin.iter().copied().chain(base.map(|b| b.0)).collect();
+                let put_id = self.put(Kind::Prefix, key, fin, &pages[..sp], 0);
+                self.pin = pin;
+                if let Some(id) = put_id {
+                    base = Some((id, sp));
                 }
             }
         }
@@ -1889,23 +1901,27 @@ impl Stash {
             }
         }
         let mut base = if stock { self.shared_base(&st.history, pages.len()) } else { None };
-        if stock && base.is_none() && self.dedupe {
-            let s = self.resident_prefix(&st, pages.len(), resident);
+        if stock && self.dedupe {
+            let (s, count) = self.resident_prefix(&st, pages.len(), resident);
             if s > 0 && s.is_multiple_of(PAGE) {
-                let hlen = (s as usize + usize::from(self.state_mtp)).min(st.history.len());
-                let fin = Finished {
-                    history: st.history[..hlen].to_vec(),
-                    valid: s as i32,
-                    written_end: s as i32,
-                    pf_end: s as i32,
-                };
-                let key = prefix_key(&fin.history);
                 let b_pages = (s / PAGE) as usize;
-                let saved_pin = self.pin_with_keep(&[], keep_id);
-                let put_id = self.put(Kind::Prefix, key, fin, &pages[..b_pages], 0);
-                self.pin = saved_pin;
-                if let Some(id) = put_id {
-                    base = Some((id, b_pages));
+                let bp = base.map_or(0, |b| b.1);
+                if b_pages > bp && count.saturating_mul(b_pages - bp) > bp {
+                    let hlen = (s as usize + usize::from(self.state_mtp)).min(st.history.len());
+                    let fin = Finished {
+                        history: st.history[..hlen].to_vec(),
+                        valid: s as i32,
+                        written_end: s as i32,
+                        pf_end: s as i32,
+                    };
+                    let key = prefix_key(&fin.history);
+                    let extra: Vec<u64> = base.map(|b| b.0).into_iter().collect();
+                    let saved_pin = self.pin_with_keep(&extra, keep_id);
+                    let put_id = self.put(Kind::Prefix, key, fin, &pages[..b_pages], 0);
+                    self.pin = saved_pin;
+                    if let Some(id) = put_id {
+                        base = Some((id, b_pages));
+                    }
                 }
             }
         }
@@ -2844,5 +2860,52 @@ mod tests {
         assert!(s.has_entry(id_a), "keep_id must protect claimed hit from LRU eviction");
         assert!(!s.has_entry(id_b));
         assert!(s.has_entry(id_c));
+    }
+
+    #[test]
+    fn evicted_dedupe_promotes_longer_resident_prefix_over_short_shared_base() {
+        let mut s = Stash::new(2, 64);
+        s.dedupe = true;
+        s.add_tier(64, Keep::All, None);
+
+        // Store a short 1-page (64-token) Kind::Shared system prefix.
+        let sys_hist: Vec<i32> = (0..65).collect();
+        let sys_fin = Finished { history: sys_hist.clone(), valid: 64, written_end: 64, pf_end: 64 };
+        s.store(Kind::Shared, prefix_key(&sys_hist), sys_fin, &[0], 0, &[]);
+        assert_eq!(s.take_pending_io().len(), 1);
+
+        // Two 10-page (640-token) runs share an 8-page (512-token + 1 MTP token) prefix (which includes the 1-page
+        // system prompt) and diverge past token 512.
+        let mut r1: Vec<i32> = (0..513).collect();
+        r1.extend(10_000..10_128); // 641 tokens -> valid 640
+        let mut r2: Vec<i32> = (0..513).collect();
+        r2.extend(20_000..20_128);
+
+        let f1 = Finished { history: r1.clone(), valid: 640, written_end: 640, pf_end: 640 };
+        let f2 = Finished { history: r2.clone(), valid: 640, written_end: 640, pf_end: 640 };
+        let p1: Vec<u32> = (10..20).collect();
+        let p2: Vec<u32> = (30..40).collect();
+
+        // Evict r1 while r2 is still resident: promotes an 8-page Kind::Prefix (base=None) + 2 own pages = 10 spills.
+        s.store(Kind::Evicted, 0, f1, &p1, 0, &[&r2]);
+        let io1 = s.take_pending_io();
+        assert_eq!(io1.len(), 10, "expected 8-page promoted Prefix + 2 delta pages");
+
+        // Evict r2: reuses the promoted 8-page Kind::Prefix and writes ONLY its 2 delta pages!
+        s.store(Kind::Evicted, 0, f2, &p2, 0, &[]);
+        let io2 = s.take_pending_io();
+        assert_eq!(io2.len(), 2, "second run must reuse promoted 8-page prefix (2 delta pages, not 9)");
+
+        // Guard against rewrite amplification: a 9-page shared prefix over an existing 8-page base with only 1
+        // resident sibling (count*(sp-bp) = 1*1 <= 8) must keep the 8-page base and spill only 2 own pages.
+        let mut r3: Vec<i32> = (0..577).collect();
+        r3.extend(30_000..30_064);
+        let mut r4: Vec<i32> = (0..577).collect();
+        r4.extend(40_000..40_064);
+        let f3 = Finished { history: r3, valid: 640, written_end: 640, pf_end: 640 };
+        let p3: Vec<u32> = (50..60).collect();
+        s.store(Kind::Evicted, 0, f3, &p3, 0, &[&r4]);
+        let io3 = s.take_pending_io();
+        assert_eq!(io3.len(), 2, "must not rewrite 9 pages when 1*(9-8) <= 8");
     }
 }
