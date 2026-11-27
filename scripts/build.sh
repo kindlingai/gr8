@@ -59,7 +59,7 @@ done
 # GR8_XGRAMMAR=DIR names a source tree instead (the image's engine stages), GR8_XGRAMMAR=0 builds without grammars.
 # Needs cmake; GLM-5.3 and Flash
 GR_OFF=""
-if [ "${MODEL:-glm}" = ds41 ] || [ "${MODEL:-glm}" = ink2 ] || [ "${MODEL:-glm}" = qw38 ]; then GR_OFF="MODEL=${MODEL}"
+if [ "${MODEL:-glm}" = ds41 ] || [ "${MODEL:-glm}" = ink2 ] || [ "${MODEL:-glm}" = qw38 ] || [ "${MODEL:-glm}" = hy4 ]; then GR_OFF="MODEL=${MODEL}"
 elif [ "${GR8_TESTS:-1}" = only ] || [ "${GR8_TESTS:-1}" = ship ]; then GR_OFF="GR8_TESTS=${GR8_TESTS} builds no engine"
 elif [ "${GR8_XGRAMMAR:-}" = 0 ]; then GR_OFF="GR8_XGRAMMAR=0"
 fi
@@ -132,6 +132,10 @@ flash ckpt share: now' ;;
       BUILD_ENGINE=g6m4_qw38 BUILD_SIM=m4sim_qw38 BUILD_WIDTHS='1 2 3 4'
       BUILD_DEFINE=G6_MODEL_QW38 BUILD_FC2GL=4 BUILD_INT4=0
       BUILD_WHAT_ENV=QW38_WHAT ;;
+    hy4)
+      BUILD_ENGINE=g6m4_hy4 BUILD_SIM=m4sim_hy4 BUILD_WIDTHS='1 2'
+      BUILD_DEFINE=G6_MODEL_HY4 BUILD_FC2GL=4 BUILD_INT4=0
+      BUILD_WHAT_ENV=HY4_WHAT ;;
     *)
       if command -v python3 >/dev/null 2>&1 && [ -f "$REPO/tools/launch/models.py" ]; then
         local metadata

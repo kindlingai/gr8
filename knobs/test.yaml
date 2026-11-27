@@ -296,3 +296,15 @@ knobs:
     legacy: ["G6_TOKENIZER_DIR", "GR8_TOKENIZER_DIR"]
     doc: >-
       The tokenizer directory the front end tests need, unset skips them.
+  GR8_TEST_HY4_ENGRAM_COMPACT_DIR:
+    kind: path
+    unset: "unset"
+    legacy: ["GR8_HY4_ENGRAM_COMPACT_DIR"]
+    doc: >-
+      m4sim_hy4 eval: directory containing pre-extracted compact Engram rows for held-out KLD sweeps.
+  GR8_TEST_HY4_DUMP_FULL_LOGITS:
+    kind: flag
+    default: "0"
+    legacy: ["GR8_HY4_DUMP_FULL_LOGITS"]
+    doc: >-
+      m4sim_hy4 eval: dump full vocabulary BF16 log-probabilities to --eval-out.

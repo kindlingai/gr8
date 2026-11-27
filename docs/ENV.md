@@ -241,6 +241,10 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_GLM53F_STATE_BUDGET_MIB` | int | `8192` |  | With GR8_FLASH_CACHE and no --kv-store, the size in MiB of each rank's in-memory checkpoint store. |
 | `GR8_GLM53F_VISION` | flag | `0` | 0\|1 | 1 = with --serve and --prefill, a release that has dense/vision-bf16.safetensors loads the vision tower at boot, before the KV pool is sized, and the engine takes requests with images (hello `vision`, docs/FLASH-VISION.md). The launcher then fetches that file too. Without it the engine serves text only. 0 (the default) never loads the tower and the engine runs the text-only code. The tower costs about 1.1 GB of weights and its workspace on every rank, so image input is opt-in. |
 | `GR8_GV_MULTI` | flag | `1` |  | Steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch. 0 = one launch each. Same bits. |
+| `GR8_HY4_DFLY` | flag | `1` |  | Enable the built-in 0.85B DFly2 speculative drafter (5 layers reusing target DSA KV and top-2048 indices) when dense/exlr8-dfly.safetensors is present in the release directory. Set 0 to disable drafting. |
+| `GR8_HY4_DFLY_TOKENS` | int | `5` | 1.. | Number of speculative tokens drafted per DFly2 block (>= 1; target verifies tokens + 1 anchor; S2 serving caps at the wire block width). |
+| `GR8_HY4_KV_FORMAT` | text | `fp8` | bf16\|fp8\|int4 | DSA paged KV cache format for Hy4-flash: bf16 (lossless, 14.25 GiB/1M), fp8 (E4M3 per-32 block scales + FP8 indexer keys, 7.91 GiB/1M, default), or int4 (KV4 per-32 block scales + FP8 indexer keys, 5.05 GiB/1M). |
+| `GR8_HY4_MX8_DENSE` | flag | `1` |  | Quantize Hy4-flash dense BF16 linear projections to Blackwell MXFP8 (E4M3 + UE8M0 1x32 scales) at boot and free the BF16 dense staging slab before KV pool allocation, saving ~5.1 GiB VRAM and halving decode dense bandwidth. Set 0 to keep all dense weights in BF16. |
 | `GR8_IDXQ_SPLIT` | flag | g6m4: 1 when TP>1 on GLM, else 0; m4sim: 0 | 0\|1 | Splits the indexer's replicated wq_b GEMV by output tiles across the ranks and all-gathers it on the split-GEMV fabric, with the same bits as the full GEMV. |
 | `GR8_IDX_GRP` | int | `0` | 0..64 | In S2 batched decode steps the per-row indexer reads each key tile once for up to this many rows of one session, with the same bits. 0 is off. |
 | `GR8_IDX_VEC` | flag | `0` | 0\|1 | The per-row decode index_scores loads its key tile with 16 B vector loads (page size 32 or more), with the same bytes. Read once before graph capture. |
@@ -446,6 +450,11 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_GLM53F_PF_XTRACE` | flag | `0` | 0\|1 | Measurement: Flash prefill stamps GPU timestamps around each layer's fabric wait and copy for a trace. |
 | `GR8_GLM53F_RESET_ALL` | flag | `0` |  | Flash serve clears every attention cache page per request instead of only the pages the last request wrote. |
 | `GR8_GLM53F_RESET_CHECK` | flag | `0` |  | Flash serve stops if any cache page past the cleared ones is not zero. It reads every cache, so it is for tests. |
+| `GR8_HY4_ENGRAM_CACHE_MB` | int | use --engram-cache-mb CLI flag (default 2048 MiB) | 0.. | Override the Hy4-flash Engram RAM LRU cache budget in MiB (0 disables the RAM cache). |
+| `GR8_HY4_ENGRAM_DIRECT` | flag | `1` |  | Open Hy4-flash Engram table files with O_DIRECT when not memory-mapped. |
+| `GR8_HY4_ENGRAM_MMAP` | flag | `0` |  | Memory-map the Hy4-flash Engram table files instead of using O_DIRECT + io_uring. |
+| `GR8_HY4_GRAPHS` | flag | `1` |  | Capture and replay 5-segment CUDA Graphs for small-batch decode and DFly2 verify steps (split at the 4 Engram layers so async NVMe io_uring prefetching overlaps GPU graph execution). Set 0 for eager kernel launches. |
+| `GR8_HY4_PROFILE` | flag | `0` |  | Print per-stage Hy4-flash kernel timing summaries (hc, engram I/O, engram GPU, attn, moe, ar, dfly, head). |
 | `GR8_IMG_VMM` | int | `0` |  | Builds the device weight image from cuMemCreate chunks mapped into one range, 1 = the recommended granularity, N = N MB chunks. Same bytes. Falls back to cudaMalloc and says why. |
 | `GR8_INK2_BATCH_COMMIT` | flag | `1` | 0\|1 | 1 (the default) = commit KV cache and short-conv history across all layers in a single batched kernel launch. 0 = launch per-layer commit kernels. |
 | `GR8_INK2_DEC_FAST_ATTN` | flag | `1` | 0\|1 | 1 (the default) = use the coalesced warp-per-head decode/verify attention kernel with transposed rel_proj_t for head_dim == 128. 0 = stock decode attention kernel. |
@@ -592,6 +601,8 @@ Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start wh
 | `GR8_TEST_DS41_MGATE_DIAG` | flag | `0` |  | ds41_attn_test --mgate: 1 prints, for a kv compare that differs, up to 8 differing elements of the chunk and of the single-row calls, before and after kv prep. |
 | `GR8_TEST_DS41_TOKENIZER_DIR` | path | unset |  | The DeepSeek-V4.1-Flash tokenizer directory (tokenizer.json, tokenizer_config.json) the front end's ds41 dialect test reads; unset skips it. |
 | `GR8_TEST_FUZZ_ROUNDS` | int | `40` |  | Rounds of the front end tokenizer fuzz test. |
+| `GR8_TEST_HY4_DUMP_FULL_LOGITS` | flag | `0` |  | m4sim_hy4 eval: dump full vocabulary BF16 log-probabilities to --eval-out. |
+| `GR8_TEST_HY4_ENGRAM_COMPACT_DIR` | path | unset |  | m4sim_hy4 eval: directory containing pre-extracted compact Engram rows for held-out KLD sweeps. |
 | `GR8_TEST_IDX_DUMP` | path | unset |  | m4sim writes rank 0's selected key ids of the first --layers layer to this file for each main step from GR8_LOGIT_DUMP_FROM on. |
 | `GR8_TEST_INK2_METADATA_DIR` | path | unset |  | A directory with the Inkling-2-Small checkpoint's metadata (config.json, hf_quant_config.json, model.safetensors.index.json, _tensor_shapes.json), for the loader test that plans every tensor of the full-size checkpoint from its names, dtypes and shapes; unset skips it. |
 | `GR8_TEST_KVMAN_LEDGER` | path | `kvman-ledger` |  | flash_kv_chunks_test: the kvman-ledger binary. |

@@ -19,6 +19,9 @@
 #ifndef G6_MODEL_QW38
 #define G6_MODEL_QW38 0
 #endif
+#ifndef G6_MODEL_HY4
+#define G6_MODEL_HY4 0
+#endif
 #if G6_MODEL_DS41 && G6_MODEL_FLASH
 #error "G6_MODEL_DS41 and G6_MODEL_FLASH name two different models: build one"
 #endif
@@ -28,6 +31,9 @@
 #if G6_MODEL_QW38 && (G6_MODEL_DS41 || G6_MODEL_FLASH || G6_MODEL_INK2)
 #error "G6_MODEL_QW38 with another G6_MODEL_* names two different models: build one"
 #endif
+#if G6_MODEL_HY4 && (G6_MODEL_DS41 || G6_MODEL_FLASH || G6_MODEL_INK2 || G6_MODEL_QW38)
+#error "G6_MODEL_HY4 with another G6_MODEL_* names two different models: build one"
+#endif
 
 #if G6_MODEL_DS41
 #include "model_geom_ds41.h"
@@ -35,6 +41,8 @@
 #include "model_geom_ink2.h"
 #elif G6_MODEL_QW38
 #include "model_geom_qw38.h"
+#elif G6_MODEL_HY4
+#include "model_geom_hy4.h"
 #else
 namespace geom
 {

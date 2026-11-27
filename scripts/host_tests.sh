@@ -245,7 +245,8 @@ run_job s2_dsel_table 'python3 "$REPO/tools/s2_dsel_table.py" --selftest'
 # module_info_test in each model's shape
 i=0
 for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48" \
-         "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=6" "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=1"; do
+         "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=6" "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=1" \
+         "-DG6_MODEL_HY4=1 -DDEC_S2 -DG6_NR=1" "-DG6_MODEL_HY4=1 -DDEC_S2 -DG6_NR=2"; do
   run_job "module_info_$i" "
     g++ -std=c++17 -O2 -Wall -Wextra $f -I \"\$REPO/engine/runtime\" \"\$REPO/engine/runtime/tests/module_info_test.cpp\" -o \"\$D/module_info_test\" \"\${KVLIB[@]}\"
     \"\$D/module_info_test\"
@@ -698,6 +699,14 @@ run_job ptab_delta_test '
 run_job ptab_compact_test '
   g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined "$REPO/engine/kernels/tests/ptab_compact_test.cpp" -o "$D/ptab_compact_test"
   "$D/ptab_compact_test"
+'
+
+# Tencent Hy4-flash geometry, math, Engram hash/PCG64, and DFly2 spec-decode host unit tests
+run_job hy4_unit_tests '
+  g++ -std=c++20 -O2 -Wall -Wextra -DG6_MODEL_HY4=1 -I "$REPO/engine" "$REPO/engine/tests/test_hy4_geom.cpp" -o "$D/test_hy4_geom" && "$D/test_hy4_geom"
+  g++ -std=c++20 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_hy4_math.cpp" -o "$D/test_hy4_math" && "$D/test_hy4_math"
+  g++ -std=c++20 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_hy4_engram.cpp" -o "$D/test_hy4_engram" && "$D/test_hy4_engram"
+  g++ -std=c++20 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_hy4_dfly.cpp" -o "$D/test_hy4_dfly" && "$D/test_hy4_dfly"
 '
 
 wait

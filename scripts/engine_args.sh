@@ -20,7 +20,7 @@ _model_registry=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/launch" && pwd)/mo
 model_field() { python3 "$_model_registry" get "${GR8_MODEL:-glm53}" "$@"; }
 _engine_profile=$(model_field engine_profile) || return 2
 _engine_binary=$(model_field engine) || return 2
-case $_engine_profile in glm|flash|ds41|ink2|qw38|pseudo) ;;
+case $_engine_profile in glm|flash|ds41|ink2|qw38|hy4|pseudo) ;;
   *) echo "unknown engine profile: $_engine_profile" >&2; return 2 ;;
 esac
 
@@ -364,6 +364,7 @@ engine_defaults() {
   [ "$_engine_profile" = ds41 ] && { ds41_defaults; return; }
   [ "$_engine_profile" = ink2 ] && { ink2_defaults; return; }
   [ "$_engine_profile" = qw38 ] && { qw38_defaults; return; }
+  [ "$_engine_profile" = hy4 ] && { hy4_defaults; return; }
   [ "$_engine_profile" = pseudo ] && { pseudo_defaults; return; }
   local _cap_set=${CAP:+1} _base_p=0; DISPRAM_MIN_BYTES=0
   case $TP in
@@ -554,6 +555,23 @@ ink2_env() {
   ENGINE_ENV="${EXTRA_ENV:-}"
 }
 
+# Tencent Hy4-flash: text-only 1M-context DSA+SWA gated MLA + 4-stream iHC + NVMe Engram + pmcgx MoE.
+hy4_defaults() {
+  case $TP in 1|2) ;; *) echo "engine_defaults: TP=$TP; Hy4-flash wants TP=1 or TP=2" >&2; return 2 ;; esac
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-1048576}; READY_TMO=${READY_TMO:-1800}; MTP=0
+  case $TP in
+    1) SESS=${SESS:-4} ;;
+    2) SESS=${SESS:-8} ;;
+  esac
+  CHUNK=${CHUNK:-8}; EAGER=${EAGER:-0}
+  S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-0}
+}
+
+hy4_env() {
+  ENGINE_BIN=$_engine_binary
+  ENGINE_ENV="${KV_FORMAT:+GR8_HY4_KV_FORMAT=$KV_FORMAT }${EXTRA_ENV:-}"
+}
+
 # Qwen3.8-Flash-Next: passes PTAB (GR8_PTAB=0|1|2) and EXTRA_ENV through.
 qw38_env() {
   ENGINE_BIN=$_engine_binary
@@ -568,6 +586,7 @@ engine_env() {
   [ "$_engine_profile" = ds41 ] && { ds41_env; return 0; }
   [ "$_engine_profile" = ink2 ] && { ink2_env; return 0; }
   [ "$_engine_profile" = qw38 ] && { qw38_env; return 0; }
+  [ "$_engine_profile" = hy4 ] && { hy4_env; return 0; }
   [ "$_engine_profile" = pseudo ] && { ENGINE_BIN=$_engine_binary; ENGINE_ENV=""; return 0; }
   ENGINE_BIN=$_engine_binary; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=$_engine_binary-int4
   local _pf_dense=8192 _pf_streams=2 _pf_attn=1024 _pf_blas=1024
@@ -766,6 +785,15 @@ engine_args() {
       [ -n "${KV_SYSTEM_AFTER:-}" ] && a="$a --kv-system-after $KV_SYSTEM_AFTER"
       [ -n "${KV_WRITE_LIMIT:-}" ] && a="$a --kv-write-limit $KV_WRITE_LIMIT"
     fi
+    (set -f; echo $a)
+    return
+  fi
+  # Tencent Hy4-flash: exlr8 v2 indexed release (--packs), width manifest (--widths), lossless FP8 Engram (--engram).
+  if [ "$_engine_profile" = hy4 ]; then
+    a="--packs ${V2_DENSE:-${V2:-$rp}} ${V2_WIDTHS:+--widths $V2_WIDTHS} ${ENGRAM_DIR:+--engram $ENGRAM_DIR} ${ENGRAM_CACHE_MB:+--engram-cache-mb $ENGRAM_CACHE_MB} --top-p-cands 256 --chunk $CHUNK --prefill ${PREFILL:-512} --temp ${TEMP:-0.7} --cap $CAP ${POOL_ROWS:+--pool-rows $POOL_ROWS} --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
+    [ "${EAGER:-0}" = 1 ] && a="$a --no-graph"
+    [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    a="$a ${EXTRA_ARGS:-}"
     (set -f; echo $a)
     return
   fi

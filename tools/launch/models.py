@@ -146,7 +146,21 @@ QW38 = Model('qw38', 'Qwen3.8-Flash-Next', 'https://huggingface.co/kindlingai/Qw
 PSEUDO = Model('pseudo', 'the pseudo engine', '', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo',
                'GlmMoeDsaForCausalLM', False, False, False, fabric=False, shim_legacy=True, engine_profile='pseudo', simulator='', second_rail='prefill',
                vocab=154880, eos_ids=(154820, 154827, 154829), scalable=True)
-MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, INK2, QW38, PSEUDO)}
+# Tencent Hy4-flash: hybrid 12 DSA (compressed group indexer, 1M context) + 30 SWA (512-tok ring) gated MLA,
+# 4-stream non-combined iHC, 4-layer lossless FP8 Engram NVMe row store, 512 latent pmcgx routed experts (top-16)
+# + pmcgx shared expert (K3/K4). Built-in 0.85B DFly2 drafter, MXFP8 dense linears, FP8/INT4 KV.
+HY4 = Model('hy4', 'Hy4-flash', 'https://huggingface.co/tencent/Hy4-flash',
+            'g6m4_hy4', 'hy4', ('1', '2'),
+            {'k2': 2.0, 'bit250': 2.5, 'bit275': 2.75, 'k3-sh3': 3.0, 'k3': 3.0, 'bit325': 3.25, 'bit350': 3.5, 'bit375': 3.75, 'k4': 4.0},
+            {1: ('k4', 'bit375', 'bit350', 'bit325', 'k3'), 2: ('k4', 'bit375', 'bit350', 'k3')},
+            'gr8-hy4', 'HYV4FlashForCausalLM', False, False, True,
+            dialect='hf', served=('hy4-flash', 'hy4'), vocab=120832, eos_ids=(120025,),
+            max_positions=1048576, per_slot_pool=False, stage_relay=True,
+            engine_profile='hy4', simulator='m4sim_hy4', smoke_script='smoketest/hy4.sh',
+            serve_options=('CHUNK', 'EAGER'), engine_prefixes=('GR8_HY4_',),
+            min_free_gib=8, checkpoint_cache=False,
+            build_widths=('1', '2'), build_define='G6_MODEL_HY4', build_fc2gl=4, build_what_env='HY4_WHAT')
+MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, INK2, QW38, HY4, PSEUDO)}
 
 
 # The models a runner names. pseudo, the test engine, is served when named but left out of the lists.

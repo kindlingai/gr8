@@ -248,6 +248,16 @@ RUN --mount=type=cache,id=gr8-nvcc-qw38-${TARGETARCH},target=/var/cache/gr8-nvcc
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_qw38 ! -name m4sim_qw38 -exec rm -rf {} +
 
+# Tencent Hy4-flash: g6m4_hy4 and m4sim_hy4 (MODEL=hy4), TP 1 and 2, without request grammars
+FROM engine-src AS engine-hy4
+ARG TARGETARCH
+ARG GR8_WIDTHS=
+RUN --mount=type=cache,id=gr8-nvcc-hy4-${TARGETARCH},target=/var/cache/gr8-nvcc \
+    touch "$GR8_NVCC_CACHE_DIR/.start" \
+ && GR8_WIDTHS="$GR8_WIDTHS" MODEL=hy4 scripts/build.sh /out/bin \
+ && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
+ && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_hy4 ! -name m4sim_hy4 -exec rm -rf {} +
+
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
 FROM engine-src-glm AS engine-int4
@@ -290,6 +300,9 @@ COPY --from=engine-ink2 /out/bin/g6m4_ink2 /out/bin/m4sim_ink2 /bin/
 FROM scratch AS dist-qw38
 COPY --from=engine-qw38 /out/bin/g6m4_qw38 /out/bin/m4sim_qw38 /bin/
 
+FROM scratch AS dist-hy4
+COPY --from=engine-hy4 /out/bin/g6m4_hy4 /out/bin/m4sim_hy4 /bin/
+
 FROM scratch AS dist-tests
 COPY --from=engine-tests-ship /out/bin/gpuprobe /out/bin/tr3_e4m3_test /bin/
 
@@ -302,6 +315,7 @@ COPY --from=dist-flash-int4 / /
 COPY --from=dist-ds41 / /
 COPY --from=dist-ink2 / /
 COPY --from=dist-qw38 / /
+COPY --from=dist-hy4 / /
 COPY --from=dist-tests / /
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime

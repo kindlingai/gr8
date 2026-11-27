@@ -1,0 +1,75 @@
+# Tencent Hy4-flash runtime settings. knobs/README.md describes the fields.
+prefix: "GR8_HY4_"
+knobs:
+  GR8_HY4_KV_FORMAT:
+    scope: agree
+    kind: text
+    default: "fp8"
+    values: "bf16|fp8|int4"
+    legacy: []
+    doc: >-
+      DSA paged KV cache format for Hy4-flash: bf16 (lossless, 14.25 GiB/1M), fp8 (E4M3 per-32 block scales + FP8
+      indexer keys, 7.91 GiB/1M, default), or int4 (KV4 per-32 block scales + FP8 indexer keys, 5.05 GiB/1M).
+  GR8_HY4_MX8_DENSE:
+    scope: agree
+    kind: flag
+    default: "1"
+    legacy: []
+    doc: >-
+      Quantize Hy4-flash dense BF16 linear projections to Blackwell MXFP8 (E4M3 + UE8M0 1x32 scales) at boot and free
+      the BF16 dense staging slab before KV pool allocation, saving ~5.1 GiB VRAM and halving decode dense bandwidth.
+      Set 0 to keep all dense weights in BF16.
+  GR8_HY4_DFLY:
+    scope: agree
+    kind: flag
+    default: "1"
+    legacy: []
+    doc: >-
+      Enable the built-in 0.85B DFly2 speculative drafter (5 layers reusing target DSA KV and top-2048 indices) when
+      dense/exlr8-dfly.safetensors is present in the release directory. Set 0 to disable drafting.
+  GR8_HY4_DFLY_TOKENS:
+    scope: agree
+    kind: int
+    default: "5"
+    values: "1.."
+    legacy: []
+    doc: >-
+      Number of speculative tokens drafted per DFly2 block (>= 1; target verifies tokens + 1 anchor; S2 serving caps at
+      the wire block width).
+  GR8_HY4_GRAPHS:
+    scope: local
+    kind: flag
+    default: "1"
+    legacy: []
+    doc: >-
+      Capture and replay 5-segment CUDA Graphs for small-batch decode and DFly2 verify steps (split at the 4 Engram
+      layers so async NVMe io_uring prefetching overlaps GPU graph execution). Set 0 for eager kernel launches.
+  GR8_HY4_ENGRAM_CACHE_MB:
+    scope: local
+    kind: int
+    unset: "use --engram-cache-mb CLI flag (default 2048 MiB)"
+    values: "0.."
+    legacy: []
+    doc: >-
+      Override the Hy4-flash Engram RAM LRU cache budget in MiB (0 disables the RAM cache).
+  GR8_HY4_ENGRAM_MMAP:
+    scope: local
+    kind: flag
+    default: "0"
+    legacy: []
+    doc: >-
+      Memory-map the Hy4-flash Engram table files instead of using O_DIRECT + io_uring.
+  GR8_HY4_ENGRAM_DIRECT:
+    scope: local
+    kind: flag
+    default: "1"
+    legacy: []
+    doc: >-
+      Open Hy4-flash Engram table files with O_DIRECT when not memory-mapped.
+  GR8_HY4_PROFILE:
+    scope: local
+    kind: flag
+    default: "0"
+    legacy: []
+    doc: >-
+      Print per-stage Hy4-flash kernel timing summaries (hc, engram I/O, engram GPU, attn, moe, ar, dfly, head).

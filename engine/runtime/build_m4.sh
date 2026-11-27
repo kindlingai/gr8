@@ -130,10 +130,13 @@ job() {   # job <log> <command..>: in the background, at most J at once; a failu
 if [ "$WHAT" != sim ]; then job $O/fabric.log $NVCC -O2 -std=c++17 $GEN -c ../comms/fabric.cpp -o $O/fabric.o; fi
 INK2=0
 QW38=0
+HY4=0
 case " $EXTRA " in *" -DG6_MODEL_INK2=1 "*) INK2=1 ;; esac
 case " $EXTRA " in *" -DG6_MODEL_QW38=1 "*) QW38=1 ;; esac
+case " $EXTRA " in *" -DG6_MODEL_HY4=1 "*) HY4=1 ;; esac
 if [ "$INK2" = 1 ] && [ -z "$RSDEF" ]; then echo "build_m4.sh: Inkling-2-Small needs the Rust loader ($RSLIB): it plans the image from the checkpoint"; exit 1; fi
 if [ "$QW38" = 1 ] && [ -z "$RSDEF" ]; then echo "build_m4.sh: Qwen3.8-Flash-Next needs the Rust loader ($RSLIB): it plans the image from the release"; exit 1; fi
+if [ "$HY4" = 1 ] && [ -z "$RSDEF" ]; then echo "build_m4.sh: Hy4-flash needs the Rust loader ($RSLIB): it plans the image from the release"; exit 1; fi
 for n in $WIDTHS; do
   F="$GEN $(wflags $n) -Xcompiler -fno-gnu-unique"
   if [ "$INK2" = 1 ]; then   # Inkling-2-Small: its own drivers (ink2_sim.cu, ink2_m4.cu) hold every kernel; no attn objects
@@ -144,6 +147,11 @@ for n in $WIDTHS; do
   if [ "$QW38" = 1 ]; then   # Qwen3.8-Flash-Next: its own drivers (qw38_sim.cu, qw38_m4.cu) hold every kernel; no attn objects
     if [ "$WHAT" != g6 ]; then job $O/m4sim.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF -c qw38_sim.cu -o $O/m4sim.w$n.o; fi
     if [ "$WHAT" != sim ]; then job $O/g6m4.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF -c qw38_m4.cu -o $O/g6m4.w$n.o; fi
+    continue
+  fi
+  if [ "$HY4" = 1 ]; then    # Tencent Hy4-flash: its own drivers (hy4_sim.cu, hy4_m4.cu) hold every kernel; no attn objects
+    if [ "$WHAT" != g6 ]; then job $O/m4sim.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF -c hy4_sim.cu -o $O/m4sim.w$n.o; fi
+    if [ "$WHAT" != sim ]; then job $O/g6m4.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF -c hy4_m4.cu -o $O/g6m4.w$n.o; fi
     continue
   fi
   job $O/attn.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_CU -o $O/attn.w$n.o
@@ -162,7 +170,7 @@ nm --defined-only -g $SHARED 2> /dev/null | awk 'NF == 3 { print $3 }' | sort -u
 inst() {   # inst <bin> <width>: $O/<bin>.w<width>.i.o, the width's instance of <bin>
   local b=$O/$1.w$2
   local attn="$O/attn.w$2.o $O/attn_bind.w$2.o $O/attn_ops.w$2.o"
-  [ "$INK2" = 1 ] || [ "$QW38" = 1 ] && attn=""
+  [ "$INK2" = 1 ] || [ "$QW38" = 1 ] || [ "$HY4" = 1 ] && attn=""
   ld -r --force-group-allocation -o $b.r.o $b.o $attn
   objcopy --redefine-sym main=g6w$2_main --redefine-sym g6_width_create=g6w$2_create $b.r.o
   nm --defined-only -g $b.r.o | awk 'NF == 3 { print $3 }' | sort -u | comm -12 - $O/shared.syms > $b.weak
