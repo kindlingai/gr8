@@ -15,13 +15,15 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Notify};
 
-use crate::wire::{self, EmbedParams, FrameReader, GenParams};
+use crate::wire::{self, EmbedParams, FrameReader, GenParams, SpeechParams};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Tokens,
     PromptLogprobs,
     Embedding,
+    Audio,
+    Codes,
     Finish,
 }
 
@@ -181,6 +183,22 @@ impl Engine {
     pub fn embedding_dim(&self) -> Option<usize> {
         self.hello().and_then(|h| h.get("embedding_dim").and_then(Value::as_u64)).map(|d| d as usize)
     }
+    /// The engine supports speech synthesis and codec encoding (its hello says `"speech": true`).
+    pub fn speech(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("speech") == Some(&Value::Bool(true)))
+    }
+    /// The engine's audio sample rate in Hz (default 44100).
+    pub fn sample_rate(&self) -> u32 {
+        self.hello().and_then(|h| h.get("sample_rate").and_then(Value::as_u64)).map_or(44_100, |r| r as u32)
+    }
+    /// The engine's codec codebook count (default 10).
+    pub fn codebooks(&self) -> usize {
+        self.hello().and_then(|h| h.get("codebooks").and_then(Value::as_u64)).map_or(10, |c| c as usize)
+    }
+    /// The engine's PCM samples per audio frame (default 2048).
+    pub fn frame_samples(&self) -> usize {
+        self.hello().and_then(|h| h.get("frame_samples").and_then(Value::as_u64)).map_or(2048, |s| s as usize)
+    }
 
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();
@@ -263,6 +281,8 @@ impl Engine {
             "tokens" => Kind::Tokens,
             "prompt_logprobs" => Kind::PromptLogprobs,
             "embedding" => Kind::Embedding,
+            "audio" => Kind::Audio,
+            "codes" => Kind::Codes,
             "finish" => Kind::Finish,
             "metrics" => {
                 if let Some(seq) = h.seq {
@@ -313,6 +333,18 @@ impl Engine {
     /// Start an embedding request. Expects one `embedding` frame followed by `finish`.
     pub fn embed(self: &Arc<Self>, id: String, prompt: &[u32], p: &EmbedParams) -> Result<Stream, EngineError> {
         let frame = wire::embed(&id, prompt, p);
+        self.start_stream(id, frame)
+    }
+
+    /// Start a speech synthesis request. Expects zero or more `audio` frames followed by `finish`.
+    pub fn speech_stream(self: &Arc<Self>, id: String, rows: &[i32], p: &SpeechParams) -> Result<Stream, EngineError> {
+        let frame = wire::speech(&id, rows, p);
+        self.start_stream(id, frame)
+    }
+
+    /// Start an audio encoding request. Expects one `codes` frame followed by `finish`.
+    pub fn encode_audio(self: &Arc<Self>, id: String, pcm_b64: &str) -> Result<Stream, EngineError> {
+        let frame = wire::encode_audio(&id, pcm_b64);
         self.start_stream(id, frame)
     }
 
