@@ -95,6 +95,7 @@ pub enum DenseProfile {
     Glm,
     EmbeddingGemma2,
     Qwen3Vl,
+    FishOmni,
 }
 
 impl DenseProfile {
@@ -104,6 +105,7 @@ impl DenseProfile {
             None | Some("") | Some("glm") => Ok(DenseProfile::Glm),
             Some("embedding_gemma2") => Ok(DenseProfile::EmbeddingGemma2),
             Some("qwen3_vl") => Ok(DenseProfile::Qwen3Vl),
+            Some("fish_omni") => Ok(DenseProfile::FishOmni),
             Some(other) => Err(format!("unknown exlr8 dense model_profile {other:?}")),
         }
     }
@@ -113,6 +115,7 @@ impl DenseProfile {
             DenseProfile::Glm => "glm",
             DenseProfile::EmbeddingGemma2 => "embedding_gemma2",
             DenseProfile::Qwen3Vl => "qwen3_vl",
+            DenseProfile::FishOmni => "fish_omni",
         }
     }
 
@@ -122,6 +125,7 @@ impl DenseProfile {
             DenseProfile::Glm => &["layers"],
             DenseProfile::EmbeddingGemma2 => &["text", "vision", "audio", "global"],
             DenseProfile::Qwen3Vl => &["text", "vision", "global"],
+            DenseProfile::FishOmni => &["gdn", "attn", "mtp_shared", "mtp", "global", "experts"],
         }
     }
 
@@ -136,6 +140,10 @@ impl DenseProfile {
             (DenseProfile::Qwen3Vl, "text") => Ok(format!("model.language_model.layers.{layer}.")),
             (DenseProfile::Qwen3Vl, "vision") => Ok(format!("model.visual.blocks.{layer}.")),
             (DenseProfile::Qwen3Vl, "global") => Ok(String::new()),
+            (DenseProfile::FishOmni, "gdn" | "attn" | "experts") => Ok(format!("model.language_model.layers.{layer}.")),
+            (DenseProfile::FishOmni, "mtp_shared") => Ok(format!("audio_decoder_mtp_shared.layers.{layer}.")),
+            (DenseProfile::FishOmni, "mtp") => Ok(format!("audio_decoder_mtp.layers.{layer}.")),
+            (DenseProfile::FishOmni, "global") => Ok(String::new()),
             _ => Err(format!("unknown dense group {group:?} for profile {:?}", self.name())),
         }
     }
@@ -147,9 +155,9 @@ impl DenseProfile {
             (DenseProfile::Glm, "lm_head") => "lm_head",
             (DenseProfile::Glm, "norm.weight") => "model.norm.weight",
             (DenseProfile::EmbeddingGemma2, "embed_tokens") => "language_model.embed_tokens",
-            (DenseProfile::Qwen3Vl, "embed_tokens") => "model.language_model.embed_tokens",
-            (DenseProfile::Qwen3Vl, "norm.weight") => "model.language_model.norm.weight",
-            (DenseProfile::Qwen3Vl, "lm_head") => "lm_head",
+            (DenseProfile::Qwen3Vl | DenseProfile::FishOmni, "embed_tokens") => "model.language_model.embed_tokens",
+            (DenseProfile::Qwen3Vl | DenseProfile::FishOmni, "norm.weight") => "model.language_model.norm.weight",
+            (DenseProfile::Qwen3Vl | DenseProfile::FishOmni, "lm_head") => "lm_head",
             (_, other) => other,
         };
         if is_matrix && !mapped.ends_with(".weight") {
@@ -684,6 +692,53 @@ fn e8m0_to_f32(code: u8) -> f32 {
     if e >= -126 { f32::from_bits(((e + 127) as u32) << 23) } else { f32::from_bits(1u32 << (e + 149)) }
 }
 
+/// f32 -> IEEE-754 binary16 (fp16) bits, round to nearest even, saturating finite values to +/-65504.
+pub fn f16_bits(x: f32) -> u16 {
+    if x.is_nan() {
+        return 0x7e00;
+    }
+    let sign = ((x.to_bits() >> 16) & 0x8000) as u16;
+    let ax = x.abs();
+    if ax >= 65504.0 {
+        return sign | 0x7bff;
+    }
+    if ax == 0.0 {
+        return sign;
+    }
+    let b = ax.to_bits();
+    let exp = ((b >> 23) & 0xff) as i32 - 127;
+    let mant = b & 0x007f_ffff;
+    if exp < -14 {
+        // Subnormal or underflow to zero: values < 2^-25 always round to 0 in fp16.
+        let shift = -14 - exp;
+        if shift > 11 {
+            return sign;
+        }
+        let full = 0x0080_0000u32 | mant;
+        let round_shift = (shift + 13) as u32;
+        let halfway = 1u32 << (round_shift - 1);
+        let rem_mask = (1u32 << round_shift) - 1;
+        let q = full >> round_shift;
+        let rem = full & rem_mask;
+        let rounded = if rem > halfway || (rem == halfway && (q & 1) != 0) { q + 1 } else { q };
+        return sign | (rounded as u16);
+    }
+    // Normal fp16: round 23-bit mantissa down to 10 bits (shift 13), round to nearest even
+    let q = mant >> 13;
+    let rem = mant & 0x1fff;
+    let rounded = if rem > 0x1000 || (rem == 0x1000 && (q & 1) != 0) { q + 1 } else { q };
+    let mut he = (exp + 15) as u32;
+    let mut hm = rounded;
+    if hm == 0x0400 {
+        hm = 0;
+        he += 1;
+        if he >= 31 {
+            return sign | 0x7bff;
+        }
+    }
+    sign | ((he as u16) << 10) | (hm as u16)
+}
+
 /// f32 -> BF16 bits, round to nearest even (torch's `.to(torch.bfloat16)`). Finite inputs.
 pub fn bf16_bits(x: f32) -> u16 {
     let b = x.to_bits();
@@ -768,12 +823,17 @@ pub fn decode_tile_cb(raw: &[u8], k: usize, cb: Codebook, out: &mut [f32; 256]) 
 
 /// Tiles stored [k16][c = 0..7], as in gate/up halves and dense entries on the output side -> T (rows, 128), row-major.
 pub fn tiles_out_major(raw: &[u8], k: usize, rows: usize) -> Vec<f32> {
+    tiles_out_major_cb(raw, k, rows, Codebook::Mcg)
+}
+
+/// Same as `tiles_out_major`, decoding tiles with codebook `cb`.
+pub fn tiles_out_major_cb(raw: &[u8], k: usize, rows: usize, cb: Codebook) -> Vec<f32> {
     let tb = 32 * k;
     let mut t = vec![0f32; rows * 128];
     let mut tile = [0f32; 256];
     for k16 in 0..rows / 16 {
         for c in 0..8 {
-            decode_tile(&raw[(k16 * 8 + c) * tb..][..tb], k, &mut tile);
+            decode_tile_cb(&raw[(k16 * 8 + c) * tb..][..tb], k, cb, &mut tile);
             for r in 0..16 {
                 t[(16 * k16 + r) * 128 + 16 * c..][..16].copy_from_slice(&tile[16 * r..16 * r + 16]);
             }
@@ -785,13 +845,18 @@ pub fn tiles_out_major(raw: &[u8], k: usize, rows: usize) -> Vec<f32> {
 /// Tiles stored [b][r = 0..7][c = 0..7], as in down halves and dense entries on the input side -> T (128, cols),
 /// row-major.
 pub fn tiles_in_major(raw: &[u8], k: usize, cols: usize) -> Vec<f32> {
+    tiles_in_major_cb(raw, k, cols, Codebook::Mcg)
+}
+
+/// Same as `tiles_in_major`, decoding tiles with codebook `cb`.
+pub fn tiles_in_major_cb(raw: &[u8], k: usize, cols: usize, cb: Codebook) -> Vec<f32> {
     let tb = 32 * k;
     let mut t = vec![0f32; 128 * cols];
     let mut tile = [0f32; 256];
     for b in 0..cols / 128 {
         for r in 0..8 {
             for c in 0..8 {
-                decode_tile(&raw[(64 * b + 8 * r + c) * tb..][..tb], k, &mut tile);
+                decode_tile_cb(&raw[(64 * b + 8 * r + c) * tb..][..tb], k, cb, &mut tile);
                 for i in 0..16 {
                     t[(16 * r + i) * cols + 128 * b + 16 * c..][..16].copy_from_slice(&tile[16 * i..16 * i + 16]);
                 }
@@ -811,7 +876,7 @@ fn hadamard() -> &'static [f32] {
 }
 
 /// X = (Hb T) * suh[row]: T (rows, cols) row-major, rows a multiple of 128; suh one value per row.
-fn had_left(t: &[f32], rows: usize, cols: usize, suh: &[f32]) -> Vec<f32> {
+pub(crate) fn had_left(t: &[f32], rows: usize, cols: usize, suh: &[f32]) -> Vec<f32> {
     let h = hadamard();
     let mut x = vec![0f32; rows * cols];
     let mut acc = vec![0f32; cols];
@@ -835,7 +900,7 @@ fn had_left(t: &[f32], rows: usize, cols: usize, suh: &[f32]) -> Vec<f32> {
 }
 
 /// W = (X Hb) * svh[col]: X (rows, cols) row-major, cols a multiple of 128; svh one value per column.
-fn had_right(x: &mut [f32], rows: usize, cols: usize, svh: &[f32]) {
+pub(crate) fn had_right(x: &mut [f32], rows: usize, cols: usize, svh: &[f32]) {
     let h = hadamard();
     let mut acc = [0f32; 128];
     for r in 0..rows {
