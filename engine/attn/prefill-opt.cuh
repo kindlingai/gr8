@@ -7,6 +7,7 @@
 //                             candidates + CUB BlockRadixSort, 2 CTAs/SM (86 regs, 0 spill)
 //   - prepass_opt<FOLD>     : vectorized INT4 KV -> FP16 [576] table prepass (37 regs, 0 spill)
 // Takes precedence over GR8_PF_ISGRT_CLEAN when both are enabled. QO core_b_half is untouched.
+#include "../kernels/sm70_compat.cuh"
 
 namespace pf_attn_opt {
 
@@ -20,19 +21,12 @@ __device__ __forceinline__ uint32_t saddr(const void* p) {
 __device__ __forceinline__ void mma16816(
     float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1)
 {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    // SM80+: identical m16n8k16 PTX; Volta: gr8_sm70's m8n8k4 path (bit-exact FP32 accumulate)
+    gr8_sm70::mma16816_f16(*reinterpret_cast<float (*)[4]>(c), a0, a1, a2, a3, b0, b1);
 }
 
 __device__ __forceinline__ void ldsm4(uint32_t* r, uint32_t a) {
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-        : "r"(a)
-        : "memory");
+    gr8_sm70::ldmatrix_x4_addr(r[0], r[1], r[2], r[3], a);
 }
 
 // ============================================================================
@@ -189,17 +183,40 @@ static inline cudaError_t launch_idx_n64(
 __device__ __forceinline__ void mma16832_e4(
     float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    // unreachable: launch_idx_n64_e4m3 refuses sub-8.9 GPUs (e4_mma_supported); the FP16
+    // indexer variant runs instead. Kept compilable, traps loudly if ever reached.
+    asm volatile("trap;");
+#endif
 }
 
 __device__ __forceinline__ uint32_t f2_e4m3x2_idx(float a, float b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     uint32_t r;
     asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, %2, %1; cvt.u32.u16 %0, t; }" : "=r"(r) : "f"(a), "f"(b));
+#else
+    // same packing (low byte = a, high byte = b) through the emulated FP8 conversion
+    const uint32_t r = uint32_t(__nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3));
+#endif
     return r;
+}
+
+// E4M3-native MMA (mma.m16n8k32) is SM89+; older GPUs use the FP16 indexer variant instead.
+inline bool e4_mma_supported()
+{
+    static const bool ok = [] {
+        int mj = 0, mn = 0;
+        if (cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess) return false;
+        if (cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, 0) != cudaSuccess) return false;
+        return (mj > 8) || (mj == 8 && mn >= 9);
+    }();
+    return ok;
 }
 
 // Quantize q [n, 32, 128] FP16 -> q_e4 [n, 32, 128] E4M3 + w_eff [n, 32] = weight * (amax / 448).

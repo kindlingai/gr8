@@ -288,6 +288,30 @@ __device__ __forceinline__ __half2 hmax2(__half2 a, __half2 b)
 #endif
 }
 
+// ---------------------------------------------------------------------------------------------- warp reductions
+// redux.sync intrinsics are SM80+; the shuffle tree needs the same full-mask participation.
+__device__ __forceinline__ unsigned reduce_add_sync(unsigned mask, unsigned v)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __reduce_add_sync(mask, v);
+#else
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(mask, v, o);
+    return v;
+#endif
+}
+
+__device__ __forceinline__ unsigned reduce_or_sync(unsigned mask, unsigned v)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __reduce_or_sync(mask, v);
+#else
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) v |= __shfl_xor_sync(mask, v, o);
+    return v;
+#endif
+}
+
 // ---------------------------------------------------------------------------------------------- FP8 / FP4 conversions
 // Bit-exact E2M1 nibble -> FP16 bits (0..7 -> {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}, bit 3 = sign)
 __device__ __forceinline__ uint32_t e2m1_nib_to_f16(uint32_t nib)

@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include "../kernels/sm70_compat.cuh"
 #include <cuda_fp8.h>
 #include <cstdint>
 #include <cmath>
@@ -53,23 +54,19 @@ __device__ __forceinline__ uint32_t saddr(const void* p){return (uint32_t)__cvta
 // Byte offset of 16-B chunk ch of row r: chunk ch^(r&7), so 8 consecutive rows hit 8 distinct bank groups.
 __device__ __forceinline__ uint32_t sw(int r,int ch){return uint32_t(r*CHUNKS16+(ch^(r&7)))*16u;}
 __device__ __forceinline__ void mma(float* c,uint32_t a0,uint32_t a1,uint32_t a2,uint32_t a3,uint32_t b0,uint32_t b1){
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3])
-        : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+    gr8_sm70::mma16816_f16(*reinterpret_cast<float (*)[4]>(c), a0, a1, a2, a3, b0, b1);
 }
 __device__ __forceinline__ void ldsm4(uint32_t* r,uint32_t a){
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-        : "=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]) : "r"(a) : "memory");
+    gr8_sm70::ldmatrix_x4_addr(r[0],r[1],r[2],r[3],a);
 }
 __device__ __forceinline__ void ldsm4t(uint32_t* r,uint32_t a){
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-        : "=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]) : "r"(a) : "memory");
+    gr8_sm70::ldmatrix_x4_trans_addr(r[0],r[1],r[2],r[3],a);
 }
 __device__ __forceinline__ void cp16(uint32_t dst,const void* src,int bytes){
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst),"l"(src),"r"(bytes) : "memory");
+    gr8_sm70::cp_async_cg_16_addr(dst,src,bytes);
 }
-__device__ __forceinline__ void commit(){asm volatile("cp.async.commit_group;" ::: "memory");}
-__device__ __forceinline__ void wait1(){asm volatile("cp.async.wait_group 1;" ::: "memory");}
+__device__ __forceinline__ void commit(){gr8_sm70::cp_async_commit();}
+__device__ __forceinline__ void wait1(){gr8_sm70::cp_async_wait<1>();}
 
 // 288 threads = 4 keys x 72 16-B output chunks.
 __global__ __launch_bounds__(288) void prepass_b(const uint8_t* __restrict__ records,half* __restrict__ table,uint8_t* __restrict__ bad,int tokens){

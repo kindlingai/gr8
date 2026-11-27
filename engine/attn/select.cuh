@@ -117,7 +117,7 @@ __global__ void __launch_bounds__(256) rank_selected(Input input,int start,const
     for(int u=0;u<TOP/256;u++){const int j=u*256+t;
         if constexpr(MODE==0){const uint32_t s=j<a.context?ordered_score(scores[(int64_t)row*a.context+j]):0u;s32[j]=s;nz+=s!=0;}
         else{const uint64_t k=selected[(int64_t)row*TOP+j];k64[j]=k;nz+=k!=0;}}
-    nz=__reduce_add_sync(0xffffffffu,nz);if(lane==0)nzw[warp]=nz;
+    nz=gr8_sm70::reduce_add_sync(0xffffffffu,nz);if(lane==0)nzw[warp]=nz;
     __syncthreads();
     int nnz=0;
     #pragma unroll

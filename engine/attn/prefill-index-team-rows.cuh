@@ -51,7 +51,7 @@ extern "C" int g6a_bind_prefill_index_rows(G6AttnPrefill* p,G6AttnBinding* b,
     auto w=gp::index_workspace(a,p->indexwork,true);if(!w.total)return int(cudaErrorInvalidValue);
     int expanded=(a.context+31)&~31;
     const bool opt=knob::pf_attn_opt();
-    const bool use_e4_mma=opt&&a.page_size>=64&&(a.page_size&63)==0&&!out_scores&&(size_t)p->C>=32*(size_t)p->R;
+    const bool use_e4_mma=opt&&a.page_size>=64&&(a.page_size&63)==0&&!out_scores&&(size_t)p->C>=32*(size_t)p->R&&pf_attn_opt::e4_mma_supported();
     if(!use_e4_mma){
         if(opt)pf_attn_opt::expand_index_rows_opt<<<(expanded+7)/8,256,0,st>>>(a,p->ikey,p->kscale,expanded);
         else gp::expand_index_rows<<<(expanded+7)/8,256,0,st>>>(a,p->ikey,p->kscale,expanded);

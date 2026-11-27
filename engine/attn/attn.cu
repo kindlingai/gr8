@@ -19,6 +19,7 @@
 #include <float.h>
 #include <limits.h>
 #include <algorithm>
+#include "../kernels/sm70_compat.cuh"
 #include <cmath>
 #include <type_traits>
 // profile hook (g6m4 GR8_DEC_EVPROF / GR8_DEC_PROF): called between the decode attention kernels with the stage just ended

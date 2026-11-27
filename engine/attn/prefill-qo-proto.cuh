@@ -33,9 +33,7 @@ static_assert(sizeof(Shared)<=101376,"one-CTA shared memory limit");
 __device__ __forceinline__ uint32_t word(const half* p){return *reinterpret_cast<const uint32_t*>(p);}
 __device__ __forceinline__ uint32_t pair(half a,half b){return uint32_t(__half_as_ushort(a))|(uint32_t(__half_as_ushort(b))<<16);}
 __device__ __forceinline__ void mma(float* c,uint32_t a0,uint32_t a1,uint32_t a2,uint32_t a3,uint32_t b0,uint32_t b1){
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3])
-        : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+    gr8_sm70::mma16816_f16(*reinterpret_cast<float (*)[4]>(c), a0, a1, a2, a3, b0, b1);
 }
 __global__ __launch_bounds__(THREADS) void core(Args a){
     extern __shared__ __align__(16) unsigned char storage[];

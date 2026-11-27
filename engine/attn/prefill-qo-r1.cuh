@@ -2,6 +2,7 @@
 // Standalone R1 only: async 16B record gather and packed exact dequantization.
 // Math/chunk/softmax/MMA order remains the frozen v1 implementation.
 #include "prefill-qo-proto.cuh"
+#include "../kernels/sm70_compat.cuh"
 #include <cstddef>
 namespace gqo_r1 {
 using gqo::Args;
@@ -31,12 +32,10 @@ __device__ __forceinline__ void gather(uint8_t* raw,const uint8_t* __restrict__ 
     for(int n=0;n<6;n++){
         const int byte=(n*8+lane)*16;
         if(byte<656){
-            const unsigned dst=unsigned(__cvta_generic_to_shared(raw+record*656+byte));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
-                :: "r"(dst),"l"(src+byte),"r"(valid?16:0):"memory");
+            gr8_sm70::cp_async_cg_16_addr(unsigned(__cvta_generic_to_shared(raw+record*656+byte)), src+byte, valid?16:0);
         }
     }
-    asm volatile("cp.async.commit_group;" ::: "memory");
+    gr8_sm70::cp_async_commit();
 }
 __device__ __forceinline__ void store_pair(half* dst,half2 value,unsigned& errors){
     const __half2_raw raw=value;
@@ -101,7 +100,7 @@ __global__ __launch_bounds__(THREADS) void core(Args a){
     for(int base=0;base<s.end;base+=KEYS){
         // CURRENT IDs stay live until softmax. NEXT IDs are only gather registers.
         if(t<KEYS)s.ids[t]=selected[(int64_t)row*TOP+base+t];
-        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        gr8_sm70::cp_async_wait<0>();
         __syncthreads();
         dequant(s,errors);
         // All raw reads complete before the next gather can overwrite the stage.
@@ -168,7 +167,7 @@ __global__ __launch_bounds__(THREADS) void core(Args a){
         }
     }
     // Error tracking is thread-local in the hot loops; one CTA-end atomic only.
-    errors=__reduce_or_sync(0xffffffff,errors);
+    errors=gr8_sm70::reduce_or_sync(0xffffffff,errors);
     if(l==0)s.last[w]=int(errors);
     __syncthreads();
     if(t==0){unsigned all=0;for(int i=0;i<8;i++)all|=unsigned(s.last[i]);if(all)atomicOr(a.error,all);}
