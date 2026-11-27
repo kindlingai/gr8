@@ -239,6 +239,25 @@ inline void bf16_to_mx8_a(const __nv_bfloat16* src, uint8_t* dst, int M, int K, 
     k_ernie55_bf16_to_mx8_a<<<RB * ST, 256, 0, st>>>(src, dst, M, K);
 }
 
+template <int MAX_M, bool EXACT_M>
+__device__ __forceinline__ void mx8_gemv_step_u4(
+    const __nv_bfloat16* __restrict__ X,
+    uint4 wv, uint8_t sv, int i, int M, int K, float (&acc)[MAX_M]) {
+    const float sc = __uint_as_float(static_cast<uint32_t>(sv) << 23);
+    float2 wf[8];
+    fp8x4_unpack(wv.x, wf[0], wf[1]);
+    fp8x4_unpack(wv.y, wf[2], wf[3]);
+    fp8x4_unpack(wv.z, wf[4], wf[5]);
+    fp8x4_unpack(wv.w, wf[6], wf[7]);
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (EXACT_M || m < M) {
+            const uint4* xm = reinterpret_cast<const uint4*>(X + static_cast<size_t>(m) * K);
+            acc[m] = fmaf(sc, dot_bf16x16(__ldg(xm + 2 * i), __ldg(xm + 2 * i + 1), wf), acc[m]);
+        }
+    }
+}
+
 template <int MAX_M, bool EXACT_M, bool OUT_F32 = false, bool HAS_BIAS = false>
 __global__ void __launch_bounds__(128) k_ernie55_mx8_gemv(
     const __nv_bfloat16* __restrict__ X,
@@ -247,9 +266,9 @@ __global__ void __launch_bounds__(128) k_ernie55_mx8_gemv(
     const __nv_bfloat16* __restrict__ bias,
     void* __restrict__ C,
     int M, int N, int K) {
-    const int hwarp = threadIdx.x >> 4;
-    const int hlane = threadIdx.x & 15;
-    const int o = blockIdx.x * 8 + hwarp;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int o = blockIdx.x * 4 + warp;
     if (o >= N) return;
 
     const int K16 = K >> 4;
@@ -261,40 +280,40 @@ __global__ void __launch_bounds__(128) k_ernie55_mx8_gemv(
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
 
-    int i = hlane;
-    uint4 wv = (i < K16) ? __ldg(qrow + i) : make_uint4(0, 0, 0, 0);
-    uint8_t sv = (i < K16) ? __ldg(srow + (i >> 1)) : 127u;
-    for (; i < K16; i += 16) {
-        const int ni = i + 16;
-        uint4 wv_next;
-        uint8_t sv_next = 127u;
-        if (ni < K16) {
-            wv_next = __ldg(qrow + ni);
-            sv_next = __ldg(srow + (ni >> 1));
-        }
-        const float sc = __uint_as_float(static_cast<uint32_t>(sv) << 23);
-        float2 wf[8];
-        fp8x4_unpack(wv.x, wf[0], wf[1]);
-        fp8x4_unpack(wv.y, wf[2], wf[3]);
-        fp8x4_unpack(wv.z, wf[4], wf[5]);
-        fp8x4_unpack(wv.w, wf[6], wf[7]);
-
-        #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (EXACT_M || m < M) {
-                const uint4* xm = reinterpret_cast<const uint4*>(X + static_cast<size_t>(m) * K);
-                acc[m] = fmaf(sc, dot_bf16x16(__ldg(xm + 2 * i), __ldg(xm + 2 * i + 1), wf), acc[m]);
-            }
-        }
-        wv = wv_next;
-        sv = sv_next;
+    int i = lane;
+    for (; i + 96 < K16; i += 128) {
+        const uint4 w0 = __ldg(qrow + i);
+        const uint4 w1 = __ldg(qrow + i + 32);
+        const uint4 w2 = __ldg(qrow + i + 64);
+        const uint4 w3 = __ldg(qrow + i + 96);
+        const uint8_t s0 = __ldg(srow + (i >> 1));
+        const uint8_t s1 = __ldg(srow + ((i + 32) >> 1));
+        const uint8_t s2 = __ldg(srow + ((i + 64) >> 1));
+        const uint8_t s3 = __ldg(srow + ((i + 96) >> 1));
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w0, s0, i,      M, K, acc);
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w1, s1, i + 32, M, K, acc);
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w2, s2, i + 64, M, K, acc);
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w3, s3, i + 96, M, K, acc);
+    }
+    for (; i + 32 < K16; i += 64) {
+        const uint4 w0 = __ldg(qrow + i);
+        const uint4 w1 = __ldg(qrow + i + 32);
+        const uint8_t s0 = __ldg(srow + (i >> 1));
+        const uint8_t s1 = __ldg(srow + ((i + 32) >> 1));
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w0, s0, i,      M, K, acc);
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w1, s1, i + 32, M, K, acc);
+    }
+    for (; i < K16; i += 32) {
+        const uint4 w0 = __ldg(qrow + i);
+        const uint8_t s0 = __ldg(srow + (i >> 1));
+        mx8_gemv_step_u4<MAX_M, EXACT_M>(X, w0, s0, i, M, K, acc);
     }
     const float bv = HAS_BIAS ? __bfloat162float(bias[o]) : 0.0f;
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
         if (EXACT_M || m < M) {
-            const float tot = h16_sum(acc[m]) + bv;
-            if (hlane == 0) {
+            const float tot = warp_sum(acc[m]) + bv;
+            if (lane == 0) {
                 if constexpr (OUT_F32) static_cast<float*>(C)[static_cast<size_t>(m) * N + o] = tot;
                 else static_cast<__nv_bfloat16*>(C)[static_cast<size_t>(m) * N + o] = __float2bfloat16(tot);
             }
@@ -579,7 +598,7 @@ template <bool OUT_F32 = false, bool HAS_BIAS = false>
 inline void gemm_mx8_impl(const __nv_bfloat16* X, const uint8_t* x8, const Mx8Mat& B,
                           const __nv_bfloat16* bias, void* C, int M, cudaStream_t st) {
     if (M <= 15 && X != nullptr) {
-        const unsigned g = static_cast<unsigned>((B.N + 7) / 8);
+        const unsigned g = static_cast<unsigned>((B.N + 3) / 4);
         if (M == 1)      k_ernie55_mx8_gemv<1, true,  OUT_F32, HAS_BIAS><<<g, 128, 0, st>>>(X, B.q, B.sc, bias, C, 1, B.N, B.K);
         else if (M == 2) k_ernie55_mx8_gemv<2, true,  OUT_F32, HAS_BIAS><<<g, 128, 0, st>>>(X, B.q, B.sc, bias, C, 2, B.N, B.K);
         else if (M == 4) k_ernie55_mx8_gemv<4, true,  OUT_F32, HAS_BIAS><<<g, 128, 0, st>>>(X, B.q, B.sc, bias, C, 4, B.N, B.K);

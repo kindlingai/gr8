@@ -129,6 +129,7 @@ struct HcaWeights {
     const float*         sinks      = nullptr;    // [nh_loc] F32
     const float*         vha_mix    = nullptr;    // [64, 64] F32 (precomputed I + V @ U^T)
     mx8::LinW            wo_a[geom::HCA_O_GROUPS]{}; // ng_loc matrices of [1024, 4096]
+    mx8::LinW            wo_a_flat{};                // contiguous [ng_loc * 1024, 4096] view (MXFP8)
     mx8::LinW            gate_proj{};             // [ng_loc * 1024, 1024]
     mx8::LinW            o_proj{};                // [4096, ng_loc * 1024]
 };
@@ -747,7 +748,7 @@ struct HcaWoaPtrs {
 };
 
 // Fused q_down(1024) + kv_proj(512) + comp_wkv(512, F32) + comp_wgate(512, F32) on shared x_norm [M, 4096].
-// Grid: 320 (2560 / 8), Block: 128.
+// Grid: 640 (2560 / 4), Block: 128 (32-lane/row, 4x-unrolled uint4 loads).
 template <int MAX_M, bool EXACT_M>
 __global__ void __launch_bounds__(128) k_ernie55_hca_qkv_comp_mx8(
     const __nv_bfloat16* __restrict__ X,
@@ -760,9 +761,9 @@ __global__ void __launch_bounds__(128) k_ernie55_hca_qkv_comp_mx8(
     float* __restrict__ c_kv,
     float* __restrict__ c_sc,
     int M, int m_off) {
-    const int hwarp = threadIdx.x >> 4;
-    const int hlane = threadIdx.x & 15;
-    const int o = blockIdx.x * 8 + hwarp;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int o = blockIdx.x * 4 + warp;
     constexpr int N0 = geom::HCA_Q_LORA;              // 1024
     constexpr int N1 = N0 + geom::HCA_HD;             // 1536
     constexpr int N2 = N1 + geom::HCA_HD;             // 2048
@@ -778,47 +779,36 @@ __global__ void __launch_bounds__(128) k_ernie55_hca_qkv_comp_mx8(
     else             { Bq = csc_q; Bsc = csc_sc; row = o - N2; kind = 3; }
 
     constexpr int K = geom::HID;
-    constexpr int K16 = K >> 4;
-    constexpr int NB = K >> 5;
+    constexpr int K16 = K >> 4; // 256
+    constexpr int NB = K >> 5;  // 128
     const uint4* qrow = reinterpret_cast<const uint4*>(Bq + static_cast<size_t>(row) * K);
     const uint8_t* srow = Bsc + static_cast<size_t>(row) * NB;
+    const __nv_bfloat16* Xm0 = X + static_cast<size_t>(m_off) * K;
 
     float acc[MAX_M];
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
 
-    int i = hlane;
-    uint4 wv = __ldg(qrow + i);
-    uint8_t sv = __ldg(srow + (i >> 1));
-    for (; i < K16; i += 16) {
-        const int ni = i + 16;
-        uint4 wv_next;
-        uint8_t sv_next = 127u;
-        if (ni < K16) {
-            wv_next = __ldg(qrow + ni);
-            sv_next = __ldg(srow + (ni >> 1));
-        }
-        const float sc = __uint_as_float(static_cast<uint32_t>(sv) << 23);
-        float2 wf[8];
-        mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
-        mx8::fp8x4_unpack(wv.y, wf[2], wf[3]);
-        mx8::fp8x4_unpack(wv.z, wf[4], wf[5]);
-        mx8::fp8x4_unpack(wv.w, wf[6], wf[7]);
-        #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (EXACT_M || m < M) {
-                const uint4* xm = reinterpret_cast<const uint4*>(X + static_cast<size_t>(m_off + m) * K);
-                acc[m] = fmaf(sc, mx8::dot_bf16x16(__ldg(xm + 2 * i), __ldg(xm + 2 * i + 1), wf), acc[m]);
-            }
-        }
-        wv = wv_next;
-        sv = sv_next;
+    #pragma unroll
+    for (int i = lane; i < K16; i += 128) {
+        const uint4 w0 = __ldg(qrow + i);
+        const uint4 w1 = __ldg(qrow + i + 32);
+        const uint4 w2 = __ldg(qrow + i + 64);
+        const uint4 w3 = __ldg(qrow + i + 96);
+        const uint8_t s0 = __ldg(srow + (i >> 1));
+        const uint8_t s1 = __ldg(srow + ((i + 32) >> 1));
+        const uint8_t s2 = __ldg(srow + ((i + 64) >> 1));
+        const uint8_t s3 = __ldg(srow + ((i + 96) >> 1));
+        mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w0, s0, i,      M, K, acc);
+        mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w1, s1, i + 32, M, K, acc);
+        mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w2, s2, i + 64, M, K, acc);
+        mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Xm0, w3, s3, i + 96, M, K, acc);
     }
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
         if (EXACT_M || m < M) {
-            const float tot = mx8::h16_sum(acc[m]);
-            if (hlane == 0) {
+            const float tot = warp_sum(acc[m]);
+            if (lane == 0) {
                 const size_t gm = static_cast<size_t>(m_off + m);
                 if (kind == 0)      q_lora[gm * geom::HCA_Q_LORA + row] = __float2bfloat16(tot);
                 else if (kind == 1) kv_raw[gm * geom::HCA_HD + row]     = __float2bfloat16(tot);
@@ -933,6 +923,7 @@ __global__ void __launch_bounds__(512) k_ernie55_hca_prep_smallm(
 }
 
 // Fused q_up [nh_loc*512, 1024] + gate_proj [ng_loc*1024, 1024] on shared q_lora [M, 1024].
+// 32-lane/row, 2x-unrolled (K=1024 -> K16=64 -> single unrolled step, zero loop overhead).
 template <int MAX_M, bool EXACT_M>
 __global__ void __launch_bounds__(128) k_ernie55_hca_qup_gate_mx8(
     const __nv_bfloat16* __restrict__ q_lora,
@@ -941,9 +932,9 @@ __global__ void __launch_bounds__(128) k_ernie55_hca_qup_gate_mx8(
     __nv_bfloat16* __restrict__ q_raw,
     __nv_bfloat16* __restrict__ gate,
     int M, int m_off, int N_q, int N_g) {
-    const int hwarp = threadIdx.x >> 4;
-    const int hlane = threadIdx.x & 15;
-    const int o = blockIdx.x * 8 + hwarp;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int o = blockIdx.x * 4 + warp;
     if (o >= N_q + N_g) return;
 
     const bool is_q = (o < N_q);
@@ -952,47 +943,27 @@ __global__ void __launch_bounds__(128) k_ernie55_hca_qup_gate_mx8(
     const uint8_t* Bsc = is_q ? qup_sc : gate_sc;
 
     constexpr int K = geom::HCA_Q_LORA; // 1024
-    constexpr int K16 = K >> 4;         // 64
     constexpr int NB = K >> 5;          // 32
     const uint4* qrow = reinterpret_cast<const uint4*>(Bq + static_cast<size_t>(row) * K);
     const uint8_t* srow = Bsc + static_cast<size_t>(row) * NB;
+    const __nv_bfloat16* Qm0 = q_lora + static_cast<size_t>(m_off) * K;
 
     float acc[MAX_M];
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
 
-    int i = hlane;
-    uint4 wv = __ldg(qrow + i);
-    uint8_t sv = __ldg(srow + (i >> 1));
-    for (; i < K16; i += 16) {
-        const int ni = i + 16;
-        uint4 wv_next;
-        uint8_t sv_next = 127u;
-        if (ni < K16) {
-            wv_next = __ldg(qrow + ni);
-            sv_next = __ldg(srow + (ni >> 1));
-        }
-        const float sc = __uint_as_float(static_cast<uint32_t>(sv) << 23);
-        float2 wf[8];
-        mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
-        mx8::fp8x4_unpack(wv.y, wf[2], wf[3]);
-        mx8::fp8x4_unpack(wv.z, wf[4], wf[5]);
-        mx8::fp8x4_unpack(wv.w, wf[6], wf[7]);
-        #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (EXACT_M || m < M) {
-                const uint4* xm = reinterpret_cast<const uint4*>(q_lora + static_cast<size_t>(m_off + m) * K);
-                acc[m] = fmaf(sc, mx8::dot_bf16x16(__ldg(xm + 2 * i), __ldg(xm + 2 * i + 1), wf), acc[m]);
-            }
-        }
-        wv = wv_next;
-        sv = sv_next;
-    }
+    const uint4 w0 = __ldg(qrow + lane);
+    const uint4 w1 = __ldg(qrow + lane + 32);
+    const uint8_t s0 = __ldg(srow + (lane >> 1));
+    const uint8_t s1 = __ldg(srow + ((lane + 32) >> 1));
+    mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Qm0, w0, s0, lane,      M, K, acc);
+    mx8::mx8_gemv_step_u4<MAX_M, EXACT_M>(Qm0, w1, s1, lane + 32, M, K, acc);
+
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
         if (EXACT_M || m < M) {
-            const float tot = mx8::h16_sum(acc[m]);
-            if (hlane == 0) {
+            const float tot = warp_sum(acc[m]);
+            if (lane == 0) {
                 const size_t gm = static_cast<size_t>(m_off + m);
                 if (is_q) q_raw[gm * N_q + row] = __float2bfloat16(tot);
                 else      gate[gm * N_g + row]  = __float2bfloat16(tot);
@@ -1001,18 +972,19 @@ __global__ void __launch_bounds__(128) k_ernie55_hca_qup_gate_mx8(
     }
 }
 
-// Fused grouped wo_a[0..ng_loc-1] + sigmoid(gate) -> z_cat directly from post_o!
-// Replaces 24 sequential kernels (8x gather + 8x mx8_gemv + 8x scatter_gate) with 1 launch (1024 CTAs)!
+// Fused grouped wo_a [ng_loc*1024, 4096] + sigmoid(gate) -> z_cat directly from post_o!
+// Uses contiguous wo_a_flat (zero pointer table) + 32-lane/row 4x-unrolled uint4 loads (2048 CTAs).
 template <int MAX_M, bool EXACT_M>
 __global__ void __launch_bounds__(128) k_ernie55_hca_woa_gate_mx8(
     const __nv_bfloat16* __restrict__ post_o, // [M, ng_loc, 4096]
-    HcaWoaPtrs ptrs,
+    const uint8_t* __restrict__ woa_q,        // [ng_loc * 1024, 4096]
+    const uint8_t* __restrict__ woa_sc,       // [ng_loc * 1024, 128]
     const __nv_bfloat16* __restrict__ gate,   // [M, ng_loc, 1024]
     __nv_bfloat16* __restrict__ z_cat,        // [M, ng_loc, 1024]
     int M, int m_off, int ng_loc) {
-    const int hwarp = threadIdx.x >> 4;
-    const int hlane = threadIdx.x & 15;
-    const int idx = blockIdx.x * 8 + hwarp;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int idx = blockIdx.x * 4 + warp;
     const int g = idx >> 10;
     const int ol = idx & 1023;
     if (g >= ng_loc) return;
@@ -1020,24 +992,14 @@ __global__ void __launch_bounds__(128) k_ernie55_hca_woa_gate_mx8(
     constexpr int K = geom::HCA_HPG * geom::HCA_HD; // 4096
     constexpr int K16 = K >> 4;                     // 256
     constexpr int NB = K >> 5;                      // 128
-    const uint4* qrow = reinterpret_cast<const uint4*>(ptrs.q[g] + static_cast<size_t>(ol) * K);
-    const uint8_t* srow = ptrs.sc[g] + static_cast<size_t>(ol) * NB;
+    const uint4* qrow = reinterpret_cast<const uint4*>(woa_q + static_cast<size_t>(idx) * K);
+    const uint8_t* srow = woa_sc + static_cast<size_t>(idx) * NB;
 
     float acc[MAX_M];
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
 
-    int i = hlane;
-    uint4 wv = __ldg(qrow + i);
-    uint8_t sv = __ldg(srow + (i >> 1));
-    for (; i < K16; i += 16) {
-        const int ni = i + 16;
-        uint4 wv_next;
-        uint8_t sv_next = 127u;
-        if (ni < K16) {
-            wv_next = __ldg(qrow + ni);
-            sv_next = __ldg(srow + (ni >> 1));
-        }
+    auto step_g = [&](uint4 wv, uint8_t sv, int i) {
         const float sc = __uint_as_float(static_cast<uint32_t>(sv) << 23);
         float2 wf[8];
         mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
@@ -1052,14 +1014,28 @@ __global__ void __launch_bounds__(128) k_ernie55_hca_woa_gate_mx8(
                 acc[m] = fmaf(sc, mx8::dot_bf16x16(__ldg(xm + 2 * i), __ldg(xm + 2 * i + 1), wf), acc[m]);
             }
         }
-        wv = wv_next;
-        sv = sv_next;
+    };
+
+    #pragma unroll
+    for (int i = lane; i < K16; i += 128) {
+        const uint4 w0 = __ldg(qrow + i);
+        const uint4 w1 = __ldg(qrow + i + 32);
+        const uint4 w2 = __ldg(qrow + i + 64);
+        const uint4 w3 = __ldg(qrow + i + 96);
+        const uint8_t s0 = __ldg(srow + (i >> 1));
+        const uint8_t s1 = __ldg(srow + ((i + 32) >> 1));
+        const uint8_t s2 = __ldg(srow + ((i + 64) >> 1));
+        const uint8_t s3 = __ldg(srow + ((i + 96) >> 1));
+        step_g(w0, s0, i);
+        step_g(w1, s1, i + 32);
+        step_g(w2, s2, i + 64);
+        step_g(w3, s3, i + 96);
     }
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
         if (EXACT_M || m < M) {
-            const float tot = mx8::h16_sum(acc[m]);
-            if (hlane == 0) {
+            const float tot = warp_sum(acc[m]);
+            if (lane == 0) {
                 const size_t cat_idx = (static_cast<size_t>(m_off + m) * ng_loc + g) * geom::HCA_O_LORA + ol;
                 const float zv = __bfloat162float(__float2bfloat16(tot));
                 const float gv = sigmoid_f(__bfloat162float(gate[cat_idx]));
@@ -1096,7 +1072,7 @@ inline void hca_forward(
     const bool small_mx8 = (M <= 15 && w.q_down.is_mx8());
     if (small_mx8) {
         auto launch_qkv = [&](int cnt, int m_off) {
-            constexpr unsigned G = (geom::HCA_Q_LORA + 3 * geom::HCA_HD) / 8; // 320
+            constexpr unsigned G = (geom::HCA_Q_LORA + 3 * geom::HCA_HD) / 4; // 640
             auto go = [&](auto tag_m, auto tag_ex) {
                 k_ernie55_hca_qkv_comp_mx8<decltype(tag_m)::value, decltype(tag_ex)::value><<<G, 128, 0, st>>>(
                     x_norm,
@@ -1133,7 +1109,7 @@ inline void hca_forward(
 
         const int N_q = w.nh_loc * geom::HCA_HD;
         const int N_g = w.ng_loc * geom::HCA_O_LORA;
-        const unsigned G_qg = static_cast<unsigned>((N_q + N_g + 7) / 8);
+        const unsigned G_qg = static_cast<unsigned>((N_q + N_g + 3) / 4);
         auto launch_qg = [&](int cnt, int m_off) {
             auto go = [&](auto tag_m, auto tag_ex) {
                 k_ernie55_hca_qup_gate_mx8<decltype(tag_m)::value, decltype(tag_ex)::value><<<G_qg, 128, 0, st>>>(
@@ -1236,17 +1212,12 @@ inline void hca_forward(
     if (pd) pd->mark(pd->vha_invrope_ms, st);
 
     // 7. Grouped wo_a (ng_loc groups of [1024, 4096]) * sigmoid(gate) -> o_proj
-    if (small_mx8 && w.wo_a[0].is_mx8()) {
-        HcaWoaPtrs ptrs{};
-        for (int g = 0; g < w.ng_loc; ++g) {
-            ptrs.q[g]  = w.wo_a[g].mx8.q;
-            ptrs.sc[g] = w.wo_a[g].mx8.sc;
-        }
-        const unsigned G_woa = static_cast<unsigned>((w.ng_loc * geom::HCA_O_LORA + 7) / 8);
+    if (small_mx8 && w.wo_a_flat.is_mx8()) {
+        const unsigned G_woa = static_cast<unsigned>((w.ng_loc * geom::HCA_O_LORA + 3) / 4);
         auto launch_woa = [&](int cnt, int m_off) {
             auto go = [&](auto tag_m, auto tag_ex) {
                 k_ernie55_hca_woa_gate_mx8<decltype(tag_m)::value, decltype(tag_ex)::value><<<G_woa, 128, 0, st>>>(
-                    sc.post_o, ptrs, sc.gate, sc.z_cat, cnt, m_off, w.ng_loc);
+                    sc.post_o, w.wo_a_flat.mx8.q, w.wo_a_flat.mx8.sc, sc.gate, sc.z_cat, cnt, m_off, w.ng_loc);
             };
             if (cnt == 1)      go(std::integral_constant<int, 1>{}, std::true_type{});
             else if (cnt == 2) go(std::integral_constant<int, 2>{}, std::true_type{});

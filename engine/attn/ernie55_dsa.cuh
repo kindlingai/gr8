@@ -255,8 +255,8 @@ __global__ void __launch_bounds__(128) k_ernie55_dsa_q_absorb_rope_mx8(
 
     if (hlane < 12) {
         const size_t row_id = static_cast<size_t>(h) * geom::KV_LORA + c;
-        const uint4 wv = __ldcs(reinterpret_cast<const uint4*>(wq + row_id * geom::QK_NOPE) + hlane);
-        const float sc = __uint_as_float(static_cast<uint32_t>(__ldcs(wsc + row_id * 6 + (hlane >> 1))) << 23);
+        const uint4 wv = __ldg(reinterpret_cast<const uint4*>(wq + row_id * geom::QK_NOPE) + hlane);
+        const float sc = __uint_as_float(static_cast<uint32_t>(__ldg(wsc + row_id * 6 + (hlane >> 1))) << 23);
         float2 wf[8];
         mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
         mx8::fp8x4_unpack(wv.y, wf[2], wf[3]);
@@ -1292,6 +1292,43 @@ __global__ void __launch_bounds__(256) k_ernie55_dsa_split_reduce(
     dst[tid + 256] = __float2bfloat16(o1 * inv_l);
 }
 
+// Direct Small-M MXFP8 V-expand: v_h[h, m, 256] = u_h[h, m, 512] @ w_uv[h, 256, 512]^T.
+// Eliminates on-the-fly BF16 GMEM dequant (16 MB write+read) and cuBLAS strided batched launch on decode!
+// Grid: dim3(nh_loc, V_HEAD / 4), Block: 128 (4 warps = 4 output dims, 32 lanes cover K=512 in 1 uint4!).
+template <int MAX_M>
+__global__ void __launch_bounds__(128) k_ernie55_dsa_v_expand_mx8(
+    const __nv_bfloat16* __restrict__ u_h, // [nh_loc, M, 512]
+    const uint8_t* __restrict__ wq,        // [nh_loc * 256, 512]
+    const uint8_t* __restrict__ wsc,       // [nh_loc * 256, 16]
+    __nv_bfloat16* __restrict__ v_h,       // [nh_loc, M, 256]
+    int M, int nh) {
+    const int h = blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int v = blockIdx.y * 4 + warp;
+    if (h >= nh || v >= geom::V_HEAD) return;
+
+    const size_t row_id = static_cast<size_t>(h) * geom::V_HEAD + v;
+    const uint4 wv = __ldg(reinterpret_cast<const uint4*>(wq + row_id * geom::KV_LORA) + lane);
+    const float sc = __uint_as_float(static_cast<uint32_t>(__ldg(wsc + row_id * (geom::KV_LORA >> 5) + (lane >> 1))) << 23);
+    float2 wf[8];
+    mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
+    mx8::fp8x4_unpack(wv.y, wf[2], wf[3]);
+    mx8::fp8x4_unpack(wv.z, wf[4], wf[5]);
+    mx8::fp8x4_unpack(wv.w, wf[6], wf[7]);
+
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            const uint4* um = reinterpret_cast<const uint4*>(
+                u_h + (static_cast<size_t>(h) * M + m) * geom::KV_LORA);
+            const float partial = sc * mx8::dot_bf16x16(__ldg(um + 2 * lane), __ldg(um + 2 * lane + 1), wf);
+            const float s = warp_sum(partial);
+            if (lane == 0) v_h[(static_cast<size_t>(h) * M + m) * geom::V_HEAD + v] = __float2bfloat16(s);
+        }
+    }
+}
+
 // Fused VHAPostMix + sigmoid(gate) on v_h [nh, M, 256] -> attn_out [M, nh * 256].
 // Grid: (M * nh), Block: 256 (1 thread per V_HEAD=256 dim).
 __global__ void __launch_bounds__(256) k_ernie55_dsa_vha_gate(
@@ -1453,20 +1490,29 @@ inline void dsa_forward(
     }
 
     // 7. V expand: v_h[h, m, 256] = u_h[h, m, 512] @ w_uv[h, 256, 512]^T
-    const __nv_bfloat16* wuv_bf16 = w.w_uv.bf16;
-    if (w.w_uv.is_mx8()) {
-        mx8::dequant_to_bf16(w.w_uv.mx8, sc.kv_b_tmp, st);
-        wuv_bf16 = sc.kv_b_tmp;
+    if (M <= 12 && w.w_uv.is_mx8()) {
+        const dim3 gv(w.nh_loc, geom::V_HEAD / 4);
+        if (M <= 1)      k_ernie55_dsa_v_expand_mx8<1> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
+        else if (M <= 2) k_ernie55_dsa_v_expand_mx8<2> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
+        else if (M <= 4) k_ernie55_dsa_v_expand_mx8<4> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
+        else if (M <= 8) k_ernie55_dsa_v_expand_mx8<8> <<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
+        else             k_ernie55_dsa_v_expand_mx8<12><<<gv, 128, 0, st>>>(sc.u_h, w.w_uv.mx8.q, w.w_uv.mx8.sc, sc.v_h, M, w.nh_loc);
+    } else {
+        const __nv_bfloat16* wuv_bf16 = w.w_uv.bf16;
+        if (w.w_uv.is_mx8()) {
+            mx8::dequant_to_bf16(w.w_uv.mx8, sc.kv_b_tmp, st);
+            wuv_bf16 = sc.kv_b_tmp;
+        }
+        cublasSetStream(blas, st);
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasGemmStridedBatchedEx(
+            blas, CUBLAS_OP_T, CUBLAS_OP_N,
+            geom::V_HEAD, M, geom::KV_LORA,
+            &alpha, wuv_bf16, CUDA_R_16BF, geom::KV_LORA, static_cast<long long>(geom::V_HEAD) * geom::KV_LORA,
+            sc.u_h, CUDA_R_16BF, geom::KV_LORA, static_cast<long long>(M) * geom::KV_LORA,
+            &beta, sc.v_h, CUDA_R_16BF, geom::V_HEAD, static_cast<long long>(M) * geom::V_HEAD,
+            w.nh_loc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     }
-    cublasSetStream(blas, st);
-    const float alpha = 1.0f, beta = 0.0f;
-    cublasGemmStridedBatchedEx(
-        blas, CUBLAS_OP_T, CUBLAS_OP_N,
-        geom::V_HEAD, M, geom::KV_LORA,
-        &alpha, wuv_bf16, CUDA_R_16BF, geom::KV_LORA, static_cast<long long>(geom::V_HEAD) * geom::KV_LORA,
-        sc.u_h, CUDA_R_16BF, geom::KV_LORA, static_cast<long long>(M) * geom::KV_LORA,
-        &beta, sc.v_h, CUDA_R_16BF, geom::V_HEAD, static_cast<long long>(M) * geom::V_HEAD,
-        w.nh_loc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
     // 8. VHAPostMix + * sigmoid(gate) -> o_proj -> out_part [M, 4096]
     k_ernie55_dsa_vha_gate<<<M * w.nh_loc, 256, 0, st>>>(sc.v_h, w.vha_mix, sc.gate, sc.attn_out, M, w.nh_loc, w.h_off);

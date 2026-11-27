@@ -786,7 +786,7 @@ struct Engine {
                         ar.reserve(geom::HCA_HD, geom::HID);
                         ar.reserve(geom::HCA_HD, geom::HID);
                         ar.reserve(geom::HCA_HD, geom::HID);
-                        for (int g = 0; g < ng_loc; ++g) ar.reserve(geom::HCA_O_LORA, geom::HCA_HPG * geom::HCA_HD);
+                        ar.reserve(ng_loc * geom::HCA_O_LORA, geom::HCA_HPG * geom::HCA_HD);
                         ar.reserve(ng_loc * geom::HCA_O_LORA, geom::HCA_Q_LORA);
                         ar.reserve(geom::HID, ng_loc * geom::HCA_O_LORA);
                     }
@@ -834,10 +834,20 @@ struct Engine {
                     rl.hca_w.comp_wkv   = bind_w(dim.get<__nv_bfloat16>(lname(l, "attn.comp_wkv")),   geom::HCA_HD, geom::HID);
                     rl.hca_w.comp_wgate = bind_w(dim.get<__nv_bfloat16>(lname(l, "attn.comp_wgate")), geom::HCA_HD, geom::HID);
                     const __nv_bfloat16* woa_all = dim.get<__nv_bfloat16>(lname(l, "attn.wo_a"));
+                    rl.hca_w.wo_a_flat = bind_w(woa_all, ng_loc * geom::HCA_O_LORA, geom::HCA_HPG * geom::HCA_HD);
                     for (int g = 0; g < ng_loc; ++g) {
-                        rl.hca_w.wo_a[g] = bind_w(
-                            woa_all + static_cast<size_t>(g) * geom::HCA_O_LORA * (geom::HCA_HPG * geom::HCA_HD),
-                            geom::HCA_O_LORA, geom::HCA_HPG * geom::HCA_HD);
+                        if (rl.hca_w.wo_a_flat.is_mx8()) {
+                            ernie55::mx8::Mx8Mat sub{};
+                            sub.N  = geom::HCA_O_LORA;
+                            sub.K  = geom::HCA_HPG * geom::HCA_HD;
+                            sub.q  = rl.hca_w.wo_a_flat.mx8.q  + static_cast<size_t>(g) * sub.N * sub.K;
+                            sub.sc = rl.hca_w.wo_a_flat.mx8.sc + static_cast<size_t>(g) * sub.N * (sub.K >> 5);
+                            rl.hca_w.wo_a[g] = ernie55::mx8::LinW::from_mx8(sub);
+                        } else {
+                            rl.hca_w.wo_a[g] = ernie55::mx8::LinW::from_bf16(
+                                woa_all + static_cast<size_t>(g) * geom::HCA_O_LORA * (geom::HCA_HPG * geom::HCA_HD),
+                                geom::HCA_O_LORA, geom::HCA_HPG * geom::HCA_HD);
+                        }
                     }
                     rl.hca_w.gate_proj = bind_w(dim.get<__nv_bfloat16>(lname(l, "attn.gate_proj")), ng_loc * geom::HCA_O_LORA, geom::HCA_Q_LORA);
                     rl.hca_w.o_proj    = bind_w(dim.get<__nv_bfloat16>(lname(l, "attn.o_proj")),    geom::HID, ng_loc * geom::HCA_O_LORA);
@@ -979,6 +989,8 @@ struct Engine {
         moe_sc.fc1_act_r     = dalloc<__half>(size_t(Mmax) * geom::TOPK * eb_loc * 128);
         moe_sc.fc1_act_s     = dalloc<__half>(size_t(Mmax) * eb_loc * 128);
         moe_sc.fc2_part_r    = dalloc<float>(size_t(Mmax) * geom::TOPK * geom::EH);
+        moe_sc.sh_fc1_part   = dalloc<float>(size_t(16) * eb_loc * 4 * 2 * 128);
+        moe_sc.sh_fc2_part   = dalloc<float>(size_t(16) * geom::HB * 2 * 128);
 
         head_logits     = dalloc<float>(size_t(Mmax) * max_vr);
         head_argmax_val = dalloc<float>(size_t(Mmax) * ink2::HEAD_ARGMAX_NG);
@@ -1038,8 +1050,11 @@ struct Engine {
         if (!capture_mode) prof_mark(prof.mhc_ms);
 
         // 2. HCA C128 or Sparse MLA-DSA Attention
-        const int g_ns = capture_mode
-            ? ((max_pos + 1 < 256) ? 1 : std::max(1, 8 / M))
+        const int hca_g_ns = capture_mode
+            ? ((max_pos + 1 < 256) ? 1 : std::max(1, 4 / M))
+            : 0;
+        const int dsa_g_ns = capture_mode
+            ? ((max_pos + 1 < 256) ? 1 : std::max(1, 12 / M))
             : 0;
         for (int i = 0; i < o.nloc; ++i) {
             const int r = o.rank0 + i;
@@ -1048,11 +1063,11 @@ struct Engine {
             if (y.is_dsa) {
                 ernie55::dsa_forward(blas, rl.dsa_w, dsa_sc, rl.dsa_kv, mixed_ln, p_dst,
                                      segs, nsegs, d_slot, d_pos, d_page_table,
-                                     M, max_pps, o.cap, max_pos, mx8_x8, stream, graph_idx_cap, g_ns);
+                                     M, max_pps, o.cap, max_pos, mx8_x8, stream, graph_idx_cap, dsa_g_ns);
             } else {
                 ernie55::hca_forward(blas, rl.hca_w, hca_sc, rl.hca_kv, mixed_ln, p_dst,
                                      segs, nsegs, d_slot, d_pos, d_yarn_inv_freq,
-                                     M, max_pos, mx8_x8, stream, g_ns,
+                                     M, max_pos, mx8_x8, stream, hca_g_ns,
                                      (!capture_mode && o.profile) ? &prof.hca_d : nullptr);
             }
         }
