@@ -6,6 +6,14 @@ for versioning, release gates, and optional machine-readable specs in [`releases
 
 ---
 
+## [1.4.0](https://github.com/kindlingai/gr8/compare/v1.3.1...v1.4.0) (2026-11-27)
+
+
+### Features
+
+* **embed:** add native CUDA dense embedding engine (g6embed) for Qwen3-VL-Embedding ([#633](https://github.com/kindlingai/gr8/issues/633)) ([5f4f035](https://github.com/kindlingai/gr8/commit/5f4f03568d0beada264d60ee21433024bd47d8e5))
+* **hy4:** add Tencent Hy4-flash 1M-context engine (MXFP8, FP8/INT4 KV, DFly2, CUDA graphs) ([#635](https://github.com/kindlingai/gr8/issues/635)) ([958c4e3](https://github.com/kindlingai/gr8/commit/958c4e32b9c9661f42c19eca2d8a034fa2342947))
+
 ## [1.3.1](https://github.com/kindlingai/gr8/compare/v1.3.0...v1.3.1) (2026-11-26)
 
 
