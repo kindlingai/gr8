@@ -58,12 +58,19 @@ Measured live on 2026-11-25 on one NVIDIA GeForce RTX 5090 (32 GB, `sm_120a`), `
 | **`bit225-fast`** | `13.37 GB` | **`354.4`** | `394.0` | `376.5` | `278.6` | `190.4` | `506.2` | **`768.3`** | **`528.1`** | **`3.76 s`** | `327K` (`80K×4`) / `385K` |
 | `k2-fast` | `12.60 GB` | `244.5` | `418.7` | `360.6` | `336.9` | **`218.4`** | `510.8` | `608.4` | `516.5` | `3.76 s` | `360K` (`88K×4`) / `401K` |
 
-### Cold prefill sweep (1× RTX 5090, `GR8_INK2_PF_MX8_MOE=0`)
+### Cold prefill sweep (1× RTX 5090, `GR8_INK2_MX8_DENSE=2`, `bit325`)
 
-| Prefill chunk | 4K | 8K | 32K | 64K | 128K |
+With layer-wise streaming MXFP8 MoE prefill (`GR8_INK2_PF_MX8_MOE=3` 1-slot `0.98 GiB` scratch or `=4` 2-slot `1.96 GiB` ping-pong) and shared prefill buffers (`0.27 MiB/row` vs `5.06 MiB/row`), a 32 GB RTX 5090 runs `PREFILL=4096` alongside `262K` KV (`65536×4`) and bundled DFlash in `28.75 GiB` (`3.10 GiB` free at boot; leaves `~2.2 GiB` free even after `~0.9 GiB` lazy CUDA graph capture growth at long context — `0.96 GiB` less than v1.3.1 at `PREFILL=512`), doubling cold prefill across 4K–128K with `8/8` exact DFlash greedy parity (`C=4` `777.0 tok/s`):
+
+| Mode / prefill chunk | 4K | 8K | 32K | 64K | 128K |
 |---|---:|---:|---:|---:|---:|
-| **`PREFILL=512` (default)** | **`5,033.5`** (`0.81 s`) | **`4,990.9`** (`1.64 s`) | **`4,448.8`** (`7.37 s`) | **`3,851.5`** (`17.02 s`) | **`3,031.7`** (`43.23 s`) |
-| `PREFILL=256` (`long`, `bit325`) | `3,516.3` (`1.16 s`) | `3,426.8` (`2.39 s`) | `2,902.1` (`11.29 s`) | `2,407.5` (`27.22 s`) | `1,798.1` (`72.89 s`) |
+| **`PF_MX8_MOE=3`, `PREFILL=4096` (default, 0.98 GiB)** | **`10,076.1`** (`0.41 s`) | **`9,579.9`** (`0.86 s`) | **`8,728.5`** (`3.75 s`) | **`7,636.6`** (`8.58 s`) | **`6,056.6`** (`21.64 s`) |
+| `PF_MX8_MOE=4`, `PREFILL=4096` (2-slot, 1.96 GiB) | **`10,395.5`** (`0.39 s`) | **`9,851.5`** (`0.83 s`) | **`9,010.7`** (`3.64 s`) | **`7,882.8`** (`8.31 s`) | `6,257.5`* (`20.95 s`) |
+| `PF_MX8_MOE=3`, `PREFILL=2048` | `7,239.8` (`0.57 s`) | `6,964.6` (`1.18 s`) | `6,536.8` (`5.01 s`) | `5,927.3` (`11.06 s`) | `4,951.1` (`26.47 s`) |
+| `PF_MX8_MOE=0`, `PREFILL=512` *(v1.3.1 baseline)* | `5,033.5` (`0.81 s`) | `4,990.9` (`1.64 s`) | `4,448.8` (`7.37 s`) | `3,851.5` (`17.02 s`) | `3,031.7` (`43.23 s`) |
+| `PF_MX8_MOE=0`, `PREFILL=256` *(v1.3.1 `long`)* | `3,516.3` (`1.16 s`) | `3,426.8` (`2.39 s`) | `2,902.1` (`11.29 s`) | `2,407.5` (`27.22 s`) | `1,798.1` (`72.89 s`) |
+
+*\*`PF_MX8_MOE=4` 128K measured on `k2` (`10,453.6` @ 4K, `6,257.5` @ 128K; `k2` `PF_MX8_MOE=3` matches `bit325` within 0.4%: `10,107.8` @ 4K, `6,074.2` @ 128K).*
 
 ## Quality & verification
 
@@ -77,7 +84,7 @@ Measured live on 2026-11-25 on one NVIDIA GeForce RTX 5090 (32 GB, `sm_120a`), `
   - `exlr8 bit325` (default): **`92.80%`** (`1264/1362`) — nearly matches 4-bit on coding (`91.46%` HE+) and math (`97.80%` MATH-500), with the gap concentrated in graduate-level science (GPQA `72.22%`).
   - `exlr8 k4` (higher quality): **`93.54%`** (`1274/1362`) — statistical tie with Official NVFP4+MXFP8 W4A4 (`93.83%`, exact McNemar `p=0.6655`, exact tie on MATH-500 `98.00%`); recommended for maximum quality / GPQA.
 - **DFlash exact greedy parity (`bit325`, `--mtp 7` vs `--mtp 0`):** **8/8 exact token-for-token** across all 8 domains on both 1× DGX Spark (`1.41×–5.18×`) and 1× RTX 5090 (`1.90×–6.61×`).
-- **Live needle recall:** PASS on 1× DGX Spark (`bit325` `144K × 8` at `35.4K`; `k4` `256K × 4` at `36.6K` and `146.4K`) and on 1× RTX 5090 (`bit325` at `35.4K` and `70.9K`).
+- **Live needle recall:** PASS on 1× DGX Spark (`bit325` `144K × 8` at `35.4K`; `k4` `256K × 4` at `36.6K` and `146.4K`) and on 1× RTX 5090 (`bit325` `PF_MX8_MOE=3` `PREFILL=4096` PASS at `35.4K` `8,328 tok/s`, `70.9K` `7,287 tok/s`, and `127.3K` `6,036 tok/s`; `k2` `262K` PASS at `243.7K` `3,851 tok/s`).
 
 ## Build and run
 
@@ -128,7 +135,7 @@ Every `GR8_INK2_*` knob is registered in `knobs/ink2.yaml` (documented in [ENV.m
 
 | Knob | Default | Purpose / rollback |
 |---|---|---|
-| `GR8_INK2_PF_MX8_MOE` | `2` | Blackwell cached MXFP8 MoE prefill: `2` = all 24 physical layers (`~23.5 GiB` extra memory, ideal for 128 GB Spark), `1` = looped core only (`1.57M` KV pool on Spark), `0` = off (required on 32 GB GPUs; unlocks `2.10M` KV pool on Spark). |
+| `GR8_INK2_PF_MX8_MOE` | `2` | Blackwell grouped MXFP8 MoE prefill: `4` = layer-wise 2-slot double-buffered scratch (`~1.96 GiB`, overlapped with MoE GEMM & attention), `3` = layer-wise 1-slot streaming scratch (`~0.98 GiB`, overlapped with attention; ideal for 32 GB RTX 5090), `2` = cached MXFP8 on all 24 physical layers (`~23.5 GiB`, ideal for 128 GB Spark), `1` = cached looped core only (`1.57M` KV pool on Spark), `0` = off (`2.10M` KV pool on Spark). |
 | `GR8_INK2_MX8_DENSE` | `2` | Blackwell MXFP8 dense projections: `2` = MXFP8 on prefill (`M>=64`) and BF16 on decode (`0.000000` decode KL delta), `1` = MXFP8 at all `M` (speed preset), `0` = BF16 always. |
 | `GR8_INK2_MX8_LM_HEAD` | `0` | Blackwell MXFP8 LM head: `0` = BF16 always, `1` = MXFP8 at all `M` (speed preset), `2` = MXFP8 on prefill only. |
 | `GR8_INK2_CUBLAS_PREFILL` | `0` | `1` = cuBLAS tensor-core GEMM for BF16 prompt projections (`M>=32`). Enabled in recipes. |
