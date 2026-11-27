@@ -808,6 +808,170 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA
     }
 }
 
+// Small-M Split-K Trellis K4 GEMM (BM = 4, M <= 64): splits K across `ks` CTAs per 128-col output block so
+// narrow-N projections (e.g. o_proj / down_proj with NB=16 on M=64) saturate all Blackwell SMs.
+// Writes FP32 partials[bx][kp][row][128] for deterministic reduction in k_emb_splitk_reduce_epi.
+__global__ void __launch_bounds__(EmbTrH16Cfg<4>::NTH, EmbTrH16Cfg<4>::MIN_CTA) k_emb_tr_h16_splitk(
+    const uint8_t* __restrict__ x_h16,
+    const uint8_t* __restrict__ tw,
+    float* __restrict__ partials,
+    int M, int K, int64_t sB, int64_t sG, int ks_parts) {
+    using C = EmbTrH16Cfg<4>;
+    constexpr int BM = 4, NT = C::NT, ST = C::ST;
+    extern __shared__ __align__(16) unsigned char sm[];
+
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int wm = warp / C::WN, wn = warp % C::WN;
+    const int bx = blockIdx.x, kp = blockIdx.y;
+    const int K16 = K >> 4, NST = K >> 5, RB = (M + 15) >> 4;
+    const int st_per = (NST + ks_parts - 1) / ks_parts;
+    const int st_lo = kp * st_per;
+    const int st_hi = min(NST, st_lo + st_per);
+    const int nst_loc = st_hi - st_lo;
+    if (nst_loc <= 0) return;
+
+    const int nb = min(BM, RB);
+    const int colw = wn * C::WC;
+    const bool full = (nb == BM);
+    unsigned char* sdec = sm + ST * C::STG;
+    const uint8_t* tw_bx = tw + int64_t(bx) * sB;
+
+    const int a_j = t / (BM * 32);
+    const int a_rem = t - a_j * (BM * 32);
+    const int a_mb = a_rem >> 5;
+    const int a_ch = (a_rem & 31) * 16;
+    const int r_ti = t >> 3, r_j = r_ti >> 3, r_c = r_ti & 7, r_ch = (t & 7) * 16;
+
+    auto loadAB = [&](int st_rel) {
+        const int st = st_lo + st_rel;
+        unsigned char* a = sm + (st_rel % ST) * C::STG;
+        const int k16_0 = st * 2;
+        if (full || a_mb < nb) {
+            emb_cp16(a + t * 16, x_h16 + (size_t(a_mb) * K16 + k16_0 + a_j) * 512 + a_ch);
+        }
+        if (t < 128) {
+            const int ks = k16_0 + r_j;
+            emb_cp16(a + C::A + t * 16, tw_bx + int64_t(ks >> 3) * sG + int64_t((ks & 7) * 8 + r_c) * 128 + r_ch);
+        }
+    };
+
+    const int r8 = lane >> 2, kc = 2 * (lane & 3);
+    EmbTr3Lane4<true> tl;
+    tl.init(lane);
+    auto at = [&](int n, int k) { return n * 64 + (((k >> 3) ^ ((n >> 1) & 3)) << 4) + ((k & 7) << 1); };
+
+    auto decode = [&](int st_rel) {
+        const unsigned char* raw = sm + (st_rel % ST) * C::STG + C::A;
+        unsigned char* d = sdec + (st_rel & 1) * C::B;
+        #pragma unroll
+        for (int u = 0; u < 16 / C::NW; ++u) {
+            const int ti = warp + u * C::NW;
+            const int j = ti >> 3, c = ti & 7;
+            const int nd = c * 16 + r8, kd = j * 16 + kc;
+            const u32* tile = reinterpret_cast<const u32*>(raw + ti * 128);
+            u32 f0[2], f1[2];
+            tl.decode(tile[tl.i0], tile[tl.i1], f0, f1);
+            *reinterpret_cast<u32*>(d + at(nd, kd)) = f0[0];
+            *reinterpret_cast<u32*>(d + at(nd, kd + 8)) = f0[1];
+            *reinterpret_cast<u32*>(d + at(nd + 8, kd)) = f1[0];
+            *reinterpret_cast<u32*>(d + at(nd + 8, kd + 8)) = f1[1];
+        }
+    };
+
+    if (nst_loc > 0) { loadAB(0); emb_cp_commit(); }
+    if (nst_loc > 1) { loadAB(1); emb_cp_commit(); }
+    emb_cp_wait<1>();
+    __syncthreads();
+    decode(0);
+
+    float acc[4][NT][4];
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb)
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mb][nt][i] = 0.f;
+
+    const int mat = lane >> 3, lr = lane & 7;
+    const int wm4 = wm * 4;
+    const int mb_lim = min(4, max(0, nb - wm4));
+
+    for (int st_rel = 0; st_rel < nst_loc; ++st_rel) {
+        emb_cp_wait<0>();
+        __syncthreads();
+        if (st_rel + 2 < nst_loc) { loadAB(st_rel + 2); emb_cp_commit(); }
+        if (st_rel + 1 < nst_loc) decode(st_rel + 1);
+        const unsigned char* a = sm + (st_rel % ST) * C::STG;
+        const unsigned char* b = sdec + (st_rel & 1) * C::B;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            u32 bf[NT][2];
+            #pragma unroll
+            for (int pr = 0; pr < NT / 2; ++pr) {
+                const int n = colw + (pr * 2 + (mat >> 1)) * 8 + lr;
+                const int ch = j * 2 + (mat & 1);
+                emb_ldsm_x4(b + n * 64 + ((ch ^ ((n >> 1) & 3)) << 4),
+                            bf[2 * pr][0], bf[2 * pr][1], bf[2 * pr + 1][0], bf[2 * pr + 1][1]);
+            }
+            #pragma unroll
+            for (int mb = 0; mb < 4; ++mb) {
+                if (!full && mb >= mb_lim) break;
+                const uint4 fa = *reinterpret_cast<const uint4*>(a + (j * BM + wm4 + mb) * 512 + lane * 16);
+                #pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    emb_mma16816(acc[mb][nt], fa.x, fa.y, fa.z, fa.w, bf[nt][0], bf[nt][1]);
+                }
+            }
+        }
+    }
+    emb_cp_wait<0>();
+
+    // Store partial[bx][kp][row][128] directly to global FP32 buffer
+    float* dst_p = partials + (size_t(bx) * ks_parts + kp) * size_t(M) * 128;
+    const int c = lane & 3, r = lane >> 2;
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb) {
+        if (mb >= nb) break;
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const int row0 = mb * 16 + r, row1 = row0 + 8;
+            const int col = colw + nt * 8 + 2 * c;
+            if (row0 < M) *reinterpret_cast<float2*>(dst_p + size_t(row0) * 128 + col) = make_float2(acc[mb][nt][0], acc[mb][nt][1]);
+            if (row1 < M) *reinterpret_cast<float2*>(dst_p + size_t(row1) * 128 + col) = make_float2(acc[mb][nt][2], acc[mb][nt][3]);
+        }
+    }
+}
+
+// Deterministic Split-K reducer + H128 * svh (+ optional bias/residual) epilogue.
+// Grid: (NB, ceil(M / 8)), Block: 256 (8 warps, 1 warp per output row).
+__global__ void __launch_bounds__(256) k_emb_splitk_reduce_epi(
+    const float* __restrict__ partials,
+    const __half* __restrict__ svh,
+    const bf16* __restrict__ bias,
+    bf16* __restrict__ y,
+    int M, int N, int ks_parts, int add_res) {
+    const int bx = blockIdx.x;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.y * 8 + warp;
+    if (row >= M) return;
+
+    const int c0 = bx * 128;
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    const float* base = partials + size_t(bx) * ks_parts * size_t(M) * 128 + size_t(row) * 128 + lane * 4;
+    for (int kp = 0; kp < ks_parts; ++kp) {
+        const float4 p = *reinterpret_cast<const float4*>(base + size_t(kp) * size_t(M) * 128);
+        v[0] += p.x; v[1] += p.y; v[2] += p.z; v[3] += p.w;
+    }
+    emb_had128(v, lane);
+    const uint2 sr = *reinterpret_cast<const uint2*>(svh + c0 + lane * 4);
+    const float2 s01 = __half22float2(emb_as_h2(sr.x)), s23 = __half22float2(emb_as_h2(sr.y));
+    v[0] = __fmul_rn(v[0], s01.x);
+    v[1] = __fmul_rn(v[1], s01.y);
+    v[2] = __fmul_rn(v[2], s23.x);
+    v[3] = __fmul_rn(v[3], s23.y);
+    store_bf16x4(y + size_t(row) * N, bias, add_res != 0, c0 + lane * 4, v);
+}
+
 // ------------------------------------------------------------------------------------------------ FP8_ROW & INT4 kernels
 
 // Fused FP8_ROW token embedding lookup: out[m, d] = bf16(e4m3(fp8[tok[m], d]) * scale[tok[m]]).
@@ -1076,6 +1240,7 @@ struct GemmWorkspace {
         EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_multi<8, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<8>::SMEM));
         EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_multi<4, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<4>::SMEM));
         EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_multi<8, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<8>::SMEM));
+        EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_splitk, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<4>::SMEM));
     }
 
     void ensure_rot(int M, int K) {
@@ -1119,6 +1284,21 @@ inline void launch_trellis_with_rot(const DevMatrix& W, const bf16* bias, bf16* 
     const int RB = (M + 15) / 16;
     const int NB = W.out / 128;
     const int ar = add_res ? 1 : 0;
+    // Small-M Split-K: when M <= 64 and NB < 48 (e.g. o_proj / down_proj on b1_l64), split K to saturate all SMs.
+    if (M <= 64 && NB < 48 && W.inp >= 1024) {
+        int ks = (W.inp >= 4096) ? 6 : 4;
+        if (NB * ks > 128) ks = std::max(2, 96 / NB);
+        const int nst = W.inp / 32;
+        ks = std::min(ks, std::max(1, nst / 4));
+        const size_t need_floats = size_t(NB) * size_t(ks) * size_t(M) * 128;
+        if (ks > 1 && need_floats <= ws.acc_floats) {
+            k_emb_tr_h16_splitk<<<dim3(NB, ks), EmbTrH16Cfg<4>::NTH, EmbTrH16Cfg<4>::SMEM, st>>>(
+                ws.x_rot, W.data, ws.f32_acc, M, W.inp, W.sB, W.sG, ks);
+            k_emb_splitk_reduce_epi<<<dim3(NB, (M + 7) / 8), 256, 0, st>>>(
+                ws.f32_acc, W.svh, bias, Y, M, W.out, ks, ar);
+            return;
+        }
+    }
     // Prefer BM=8 (46 KiB SMEM, 2 CTAs/SM -> higher barrier overlap) once enough CTAs fill GB10's SMs.
     if (M >= 128) {
         const dim3 grid(NB, (RB + 7) / 8);
