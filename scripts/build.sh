@@ -313,6 +313,9 @@ build sampler_u01_test $NVCC -O2 -std=c++17 $GEN -I "$REPO/engine/kernels" -o "$
   "$REPO/engine/kernels/tests/sampler_u01_test.cu"
 # the DFlash2 selector's top-16 ids (dfl_topk.h: a row with no orderable logit sends no id outside the vocabulary): host only
 build dfl_topk_test $NVCC -O2 -std=c++17 $GEN -o "$OUT/dfl_topk_test" "$REPO/engine/runtime/tests/dfl_topk_test.cu"
+# native exlr8 int8 gG dense decode GEMV, prefill GEMM, and K1 dense MLP parity test
+build int8_dense_test $NVCC -O2 -std=c++17 $GEN -DG6_NR=4 -DDEC_S2 -DDEC_I4PAIR=1 -I "$REPO/engine/kernels" \
+  -o "$OUT/int8_dense_test" "$REPO/engine/kernels/tests/int8_dense_test.cu" -lcublas "${KNOBS[@]}"
 # flat reduce-scatter slices (Fabric::Rs::flat) over real verbs, mesh or ring: built here, run on the cluster (see its header)
 build fabric_rs_flat_test $NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_rs_flat_test" \
   "$REPO/engine/comms/tests/fabric_rs_flat_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs "${KNOBS[@]}"
@@ -323,6 +326,7 @@ check sampler_u01_test
 check dfl_topk_test
 if nvidia-smi -L > /dev/null 2>&1; then
   check tr3_e4m3_test
+  check int8_dense_test
   for test in $STEERING; do "$OUT/$test"; done
 else
   echo "tr3_e4m3_test and the steering tests ($STEERING): compiled; no GPU visible, not run"

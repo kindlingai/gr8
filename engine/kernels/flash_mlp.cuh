@@ -170,6 +170,15 @@ template <class F> inline const char* load(int layer, F find, Weights& out)
         if (!out.experts.sh_trellis) return "Flash MoE needs the W1 trellis shared expert at index NEXP";
         return nullptr;
     }
+    if (get("dense.gate.i8.gv").p)
+    {
+        if (!out.experts.t[bind::T_D_GATE_I8].p || !out.experts.t[bind::T_D_UP_I8].p || !out.experts.t[bind::T_D_DOWN_I8].p)
+            return "Flash dense int8 gG MLP requires dense.gate/up/down.i8.gv";
+        out.I = static_cast<int>(out.experts.t[bind::T_D_GATE_I8].shape[0]) * 16;
+        if (out.I != g6nr::DENSE_CH)
+            return "Flash dense int8 gG gate/up width does not match DENSE_CH";
+        return nullptr;
+    }
     if (get("dense.gate.trellis").p)
     {
         if (const char* e = dtr::make_mat(get("dense.gate.trellis"), get("dense.gate.suh"), get("dense.gate.svh"), dtr::SIDE_OUT, out.gate_t)) return e;
@@ -237,6 +246,12 @@ inline const char* make(const Weights& w, int M, const float* x, uint16_t* out, 
     const __half* x_half = xh ? xh : ws.xhalf;
     if (!w.moe)
     {
+        if (w.experts.t[bind::T_D_GATE_I8].p)
+        {
+            b.xf.on = 1; b.xf.src = x_half; b.xf.ld = b.xf.K = HID; b.xf.M = M; b.xf.f16 = ws.xfrag;
+            bind::Tensor unused[3];
+            return bind::make_k1(w.experts, M, sc, x_half, ws.xfrag, bind::PlanPtrs{}, out, 1, b.k1, unused, 0);
+        }
         if (!w.gate_t.w) return nullptr;
         if (const char* e = dtr::make_glu(w.gate_t, w.up_t, w.down_t, M, x_half, HID, sc.dxd, sc.dt, 128, 0, 1, b.glu_t)) return e;
         return dtr::make_out(w.down_t, M, nullptr, 0, sc.dxd, out, HID, dtr::O_BF16, sc.dt, 192, 0, 1, b.down_t);
@@ -306,6 +321,15 @@ inline void launch(const Block& b, cudaStream_t st)
         }
         bind::launch_k1_fin(b.k1, st);
         FMARK(FM_K1_FIN, st);
+    }
+    else if (b.k1.on)
+    {
+        if (!b.xh) k_to_half<<<(b.M * HID + 255) / 256, 256, 0, st>>>(b.x, b.scratch.xhalf, b.M * HID);
+        bind::launch(b.xf, st);
+        bind::launch_k1_fc1(b.k1, st);
+        FMARK(FM_D_GATE, st);
+        bind::launch_k1_fc2(b.k1, st);
+        FMARK(FM_D_DOWN, st);
     }
     else if (b.glu_t.on)
     {

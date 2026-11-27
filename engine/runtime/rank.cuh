@@ -999,7 +999,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         if (const char* e = bind::check_shared_signs(y.T, st)) die("layer " + std::to_string(y.l) + ": " + e);
 
         y.moe = y.T.t[bind::T_TR3_TAB].p != nullptr;
-        y.indexer = y.T.t[bind::T_IDX_WQ_B].p != nullptr;
+        y.indexer = y.T.t[bind::T_IDX_WQ_B].p != nullptr || y.T.t[bind::T_IDX_WQ_B_I8].p != nullptr;
         if (y.indexer) last_index = i;
         else if (last_index < 0) die("layer " + std::to_string(y.l) + " shares an index list but no full-index layer precedes it");
         else y.index_src = last_index;
@@ -1221,16 +1221,16 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     {
         // the decode forms of q_b, o_proj and the dense MLP (bind::make_layer's choice; GR8_DTR=0 turns trellis off)
         const bool dt = knob::dtr();
-        int q[3] = {}, o[3] = {}, d[3] = {};      // trellis, int4 g32, MXFP8
+        int q[4] = {}, o[4] = {}, d[4] = {};      // trellis, int8 gG, int4 g32, MXFP8
         for (const Layer& y : m.layers)
         {
             const bind::LayerTensors& T = y.T;
-            ++q[dt && T.mats.q_b.w ? 0 : T.t[bind::T_Q_B_I4].p ? 1 : 2];
-            ++o[dt && T.mats.o_proj.w ? 0 : T.t[bind::T_O_PROJ].p ? 1 : 2];
-            if (!y.moe) ++d[dt && T.mats.gate.w ? 0 : T.t[bind::T_D_FC1].p ? 1 : 2];
+            ++q[dt && T.mats.q_b.w ? 0 : T.t[bind::T_Q_B_I8].p ? 1 : T.t[bind::T_Q_B_I4].p ? 2 : 3];
+            ++o[dt && T.mats.o_proj.w ? 0 : T.t[bind::T_O_PROJ_I8].p ? 1 : T.t[bind::T_O_PROJ].p ? 2 : 3];
+            if (!y.moe) ++d[dt && T.mats.gate.w ? 0 : T.t[bind::T_D_GATE_I8].p ? 1 : T.t[bind::T_D_FC1].p ? 2 : 3];
         }
-        fprintf(stderr, "# rank %d: dense decode weights (trellis / int4 g32 / MXFP8): q_b %d / %d / %d, o_proj %d / %d / %d, dense MLP %d / %d / %d\n",
-                rank, q[0], q[1], q[2], o[0], o[1], o[2], d[0], d[1], d[2]);
+        fprintf(stderr, "# rank %d: dense decode weights (trellis / int8 gG / int4 g32 / MXFP8): q_b %d / %d / %d / %d, o_proj %d / %d / %d / %d, dense MLP %d / %d / %d / %d\n",
+                rank, q[0], q[1], q[2], q[3], o[0], o[1], o[2], o[3], d[0], d[1], d[2], d[3]);
     }
     {
         const TensorRef er = find("G.embed");
@@ -1239,7 +1239,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     }
     m.final_norm = (const __nv_bfloat16*)need(find, "G.final_norm");
     m.head_t = bind::head_tensors([&](const char* n) { return as_bind(find(n)); });
-    if (!m.head_t.lm_head.p) die("pack has no G.lm_head.mx.gv");
+    if (!m.head_t.lm_head.p && !m.head_t.lm_head_i8.p) die("pack has no G.lm_head.mx.gv or G.lm_head.i8.gv");
     if (!bind::vocab_slice(rank, m.vlo, m.vn)) die("rank must be 0.." + std::to_string(g6nr::NR - 1));
     m.hlog = dmalloc<float>((size_t)MX * m.vn);
     G6RT_CK(dec_dense_opt::setup(m.ddo, m.nl));
@@ -2165,7 +2165,8 @@ inline const bind::Head& head_for(Model& m, int M)
     if(m.resid4 || m.flash_draft) {
         if(!H.M) {
             H.M=M; H.vlo=m.vlo; H.vn=m.vn;
-            const int codec = m.head_t.lm_head_scale.p ? bind::FP8R : (m.head_t.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W);
+            const int i8g = bind::int8_grp_of_bytes(m.head_t.lm_head.shape[2]);
+            const int codec = m.head_t.lm_head_scale.p ? bind::FP8R : (i8g > 0 ? bind::int8_codec_of(i8g) : (m.head_t.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W));
             const float* rscale = static_cast<const float*>(m.head_t.lm_head_scale.p);
             if(const char* e=bind::make_gv(m.head_t.lm_head,codec,1,32,M,m.sc.xf_head,m.hlog,gv::O_F32,H.lm_head,rscale)) die(e);
             if(!H.lm_head.on || H.lm_head.K!=HID || H.lm_head.O!=m.vn) die("Flash head: bad G.lm_head shape");
@@ -2177,7 +2178,8 @@ inline const bind::Head& head_for(Model& m, int M)
     if(m.ds41) {   // the lm_head is BF16 (record shape[2] 512) in the checkpoint pack: the Flash branch's GEMV; ds_mhc::finish writes the fragments
         if(!H.M) {
             H.M=M; H.vlo=m.vlo; H.vn=m.vn;
-            const int codec = m.head_t.lm_head_scale.p ? bind::FP8R : (m.head_t.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W);
+            const int i8g = bind::int8_grp_of_bytes(m.head_t.lm_head.shape[2]);
+            const int codec = m.head_t.lm_head_scale.p ? bind::FP8R : (i8g > 0 ? bind::int8_codec_of(i8g) : (m.head_t.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W));
             const float* rscale = static_cast<const float*>(m.head_t.lm_head_scale.p);
             const bool wide = codec == bind::BF16W && M > 8;     // measured: (2,16) is 1.35 ms vs 1.52 ms at M=32
             if(const char* e=bind::make_gv(m.head_t.lm_head,codec,wide?2:1,wide?16:32,M,m.sc.xf_head,m.hlog,gv::O_F32,H.lm_head,rscale)) die(e);
@@ -2458,7 +2460,7 @@ inline void launch_head_local(Model& m, int M, cudaStream_t st)
 #if G6_MODEL_FLASH
     if(m.resid4 || m.flash_draft) {
         if(m.flash_draft) {
-            const bool f16_in = H.lm_head.codec == bind::MXFP8 || H.lm_head.codec == bind::FP8R;
+            const bool f16_in = H.lm_head.codec == bind::MXFP8 || H.lm_head.codec == bind::FP8R || bind::is_int8_codec(H.lm_head.codec);
             flash_mhc::fragments(m.xn,M,HID,f16_in?m.sc.xf_head:nullptr,f16_in?nullptr:m.sc.xf_head,st);
         }
     } else

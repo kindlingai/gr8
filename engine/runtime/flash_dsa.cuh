@@ -110,16 +110,25 @@ inline const char* make_dsa(Model& m, int i, int M, const Find& find, bind::Laye
     dtr::Mat qbm, opm;
     if ((e = dtr::make_mat(T("q_b.trellis"), T("q_b.suh"), T("q_b.svh"), dtr::SIDE_OUT, qbm))) return e;
     if ((e = dtr::make_mat(T("o_proj.trellis"), T("o_proj.suh"), T("o_proj.svh"), dtr::SIDE_IN, opm))) return e;
-    const bool qa_mx = T("q_a.mx.gv").p != nullptr, kva_mx = T("kv_a.mx.gv").p != nullptr;
-    const bool wk_mx = T("idx.wk.mx.gv").p != nullptr, wqb_mx = T("idx.wq_b.mx.gv").p != nullptr;
+    const int qa_i8 = bind::int8_codec_of(T("q_a.i8.gv")), kva_i8 = bind::int8_codec_of(T("kv_a.i8.gv"));
+    const int wk_i8 = bind::int8_codec_of(T("idx.wk.i8.gv")), wqb_i8 = bind::int8_codec_of(T("idx.wq_b.i8.gv"));
+    const int qb_i8 = qbm.w ? -1 : bind::int8_codec_of(T("q_b.i8.gv")), op_i8 = opm.w ? -1 : bind::int8_codec_of(T("o_proj.i8.gv"));
+    const bool qa_mx = qa_i8 < 0 && T("q_a.mx.gv").p != nullptr, kva_mx = kva_i8 < 0 && T("kv_a.mx.gv").p != nullptr;
+    const bool wk_mx = wk_i8 < 0 && T("idx.wk.mx.gv").p != nullptr, wqb_mx = wqb_i8 < 0 && T("idx.wq_b.mx.gv").p != nullptr;
     const bool xin_ord = knob::glm53f_dsa_xin_order();
     const bool qb_rot  = knob::glm53f_dsa_qb_rot();
     const bool op_rot  = knob::glm53f_dsa_oproj_rot().value_or(M > 1);
     const int iq_tpc   = (int)knob::glm53f_dsa_idxq_tpc();
     //                       tensor                                                 codec  tpc ks  M  fragments  output          dtype
-    if ((e = bind::make_gv(T(qa_mx ? "q_a.mx.gv" : "q_a.gv"),                       qa_mx ? MXFP8 : BF16W,  2, 16, M, qa_mx ? sc.xf_x : sc.xb_x,  m.q_a,   gv::O_F16, L.q_a))) return e;
-    if ((e = bind::make_gv(T(kva_mx ? "kv_a.mx.gv" : "kv_a.gv"),                    kva_mx ? MXFP8 : BF16W, 1, 32, M, kva_mx ? sc.xf_x : sc.xb_x, m.kv_a,  gv::O_F16, L.kv_a))) return e;
-    if ((e = bind::make_gv(T(wk_mx ? "idx.wk.mx.gv" : "idx.wk.gv"),                 wk_mx ? MXFP8 : BF16W,  1, 32, M, wk_mx ? sc.xf_x : sc.xb_x,  m.idx_k, gv::O_F16, L.idx_k))) return e;
+    if (qa_i8 >= 0) e = bind::make_gv(T("q_a.i8.gv"), qa_i8, 2, 16, M, sc.xf_x, m.q_a, gv::O_F16, L.q_a);
+    else            e = bind::make_gv(T(qa_mx ? "q_a.mx.gv" : "q_a.gv"), qa_mx ? MXFP8 : BF16W, 2, 16, M, qa_mx ? sc.xf_x : sc.xb_x, m.q_a, gv::O_F16, L.q_a);
+    if (e) return e;
+    if (kva_i8 >= 0) e = bind::make_gv(T("kv_a.i8.gv"), kva_i8, 1, 32, M, sc.xf_x, m.kv_a, gv::O_F16, L.kv_a);
+    else             e = bind::make_gv(T(kva_mx ? "kv_a.mx.gv" : "kv_a.gv"), kva_mx ? MXFP8 : BF16W, 1, 32, M, kva_mx ? sc.xf_x : sc.xb_x, m.kv_a, gv::O_F16, L.kv_a);
+    if (e) return e;
+    if (wk_i8 >= 0) e = bind::make_gv(T("idx.wk.i8.gv"), wk_i8, 1, 32, M, sc.xf_x, m.idx_k, gv::O_F16, L.idx_k);
+    else            e = bind::make_gv(T(wk_mx ? "idx.wk.mx.gv" : "idx.wk.gv"), wk_mx ? MXFP8 : BF16W, 1, 32, M, wk_mx ? sc.xf_x : sc.xb_x, m.idx_k, gv::O_F16, L.idx_k);
+    if (e) return e;
     if ((e = bind::make_gv(T("idx.weights_proj.gv"),                                BF16W,                  1, 32, M, sc.xb_x,                    m.idx_w, gv::O_F16, L.idx_w))) return e;
     if ((e = bind::make_gv(T("self_attn.indexer.index_kpool_compress_gate.gv"),     BF16W,                  1, 32, M, sc.xb_x,                    m.idx_g, gv::O_F16, L.idx_g))) return e;
     if (qbm.w)
@@ -131,8 +140,12 @@ inline const char* make_dsa(Model& m, int i, int M, const Find& find, bind::Laye
         }
         else if ((e = dtr::make_out(qbm, M, m.q_a_n, QA, nullptr, m.q_b, h * 256, dtr::O_F16, sc.dt, 0, 0, 1, L.q_b_t))) return e;
     }
-    else if ((e = bind::make_gv(T("q_b.gv"),                                        BF16W,                  1, 16, M, sc.xf_qa,                   m.q_b,   gv::O_F16, L.q_b))) return e;
-    if ((e = bind::make_gv(T(wqb_mx ? "idx.wq_b.mx.gv" : "idx.wq_b.gv"),            wqb_mx ? MXFP8 : BF16W, iq_tpc, 32, M, sc.xf_qa,              m.idx_q, gv::O_F16, L.idx_q))) return e;
+    else if (qb_i8 >= 0) e = bind::make_gv(T("q_b.i8.gv"), qb_i8, 1, 16, M, sc.xf_qa, m.q_b, gv::O_F16, L.q_b);
+    else                 e = bind::make_gv(T("q_b.gv"),    BF16W, 1, 16, M, sc.xf_qa, m.q_b, gv::O_F16, L.q_b);
+    if (e) return e;
+    if (wqb_i8 >= 0) e = bind::make_gv(T("idx.wq_b.i8.gv"), wqb_i8, iq_tpc, 32, M, sc.xf_qa, m.idx_q, gv::O_F16, L.idx_q);
+    else             e = bind::make_gv(T(wqb_mx ? "idx.wq_b.mx.gv" : "idx.wq_b.gv"), wqb_mx ? MXFP8 : BF16W, iq_tpc, 32, M, sc.xf_qa, m.idx_q, gv::O_F16, L.idx_q);
+    if (e) return e;
     if (opm.w)
     {
         if (op_rot)
@@ -144,7 +157,9 @@ inline const char* make_dsa(Model& m, int i, int M, const Find& find, bind::Laye
         }
         else if ((e = dtr::make_out(opm, M, (const __half*)y.ab.args.output, h * 256, nullptr, m.sc.part[0], HID, dtr::O_BF16, sc.dt, 64, 0, 1, L.o_proj_t))) return e;
     }
-    else if ((e = bind::make_gv(T("o_proj.gv"),                                     BF16W,                  2, 8,  M, sc.xf_attn,                 m.sc.part[0], gv::O_BF16, L.o_proj))) return e;
+    else if (op_i8 >= 0) e = bind::make_gv(T("o_proj.i8.gv"), op_i8, 2, 8, M, sc.xf_attn, m.sc.part[0], gv::O_BF16, L.o_proj);
+    else                 e = bind::make_gv(T("o_proj.gv"),    BF16W, 2, 8, M, sc.xf_attn, m.sc.part[0], gv::O_BF16, L.o_proj);
+    if (e) return e;
     const int qbK = qbm.w ? qbm.K : L.q_b.K, qbO = qbm.w ? qbm.N : L.q_b.O;
     const int opK = opm.w ? opm.K : L.o_proj.K, opO = opm.w ? opm.N : L.o_proj.O;
     if (!L.q_a.on || !L.kv_a.on || !L.idx_k.on || !L.idx_w.on || !L.idx_g.on || !(L.q_b.on || L.q_b_t.on) || !L.idx_q.on || !(L.o_proj.on || L.o_proj_t.on))
@@ -161,10 +176,13 @@ inline const char* make_dsa(Model& m, int i, int M, const Find& find, bind::Laye
         else         bind::make_gv_multi({&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w, &L.idx_g}, M, L.x_in);
     }
     L.xf_qa.on = L.q_b.on || L.idx_q.on; L.xf_qa.src = m.q_a_n; L.xf_qa.ld = QA; L.xf_qa.K = QA; L.xf_qa.M = M;
-    L.xf_qa.f16 = wqb_mx ? sc.xf_qa : nullptr;
-    L.xf_qa.bf16 = wqb_mx ? nullptr : sc.xf_qa;
+    const bool qa_f16 = wqb_mx || wqb_i8 >= 0 || qb_i8 >= 0;
+    L.xf_qa.f16 = qa_f16 ? sc.xf_qa : nullptr;
+    L.xf_qa.bf16 = qa_f16 ? nullptr : sc.xf_qa;
     L.xf_attn.on = L.o_proj.on; L.xf_attn.src = (const __half*)y.ab.args.output; L.xf_attn.ld = h * 256; L.xf_attn.K = h * 256;
-    L.xf_attn.bf16 = sc.xf_attn; L.xf_attn.M = M;
+    L.xf_attn.f16 = (op_i8 >= 0) ? sc.xf_attn : nullptr;
+    L.xf_attn.bf16 = (op_i8 >= 0) ? nullptr : sc.xf_attn;
+    L.xf_attn.M = M;
     return nullptr;
 }
 

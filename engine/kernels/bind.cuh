@@ -88,6 +88,8 @@ enum
     T_TR3_SG, T_TR3_V1B, T_TR3_V3B,                                     // exlr8 v2 layers with the trellis shared expert: hidden-
                                                                         // side vectors as signs + block scales (no tr3.v1 / v3)
     T_Q_B_I4,                                                           // exlr8 int4 g32 q_b (layers where int4 won the encode)
+    T_Q_A_I8, T_KV_A_I8, T_Q_B_I8, T_O_PROJ_I8, T_IDX_WQ_B_I8,         // native exlr8 int8 gG records ([O/16][K/G][GR])
+    T_D_GATE_I8, T_D_UP_I8, T_D_DOWN_I8,                               // native exlr8 int8 gG dense MLP records
     NT
 };
 static const char* const NAMES[NT] = {
@@ -95,7 +97,9 @@ static const char* const NAMES[NT] = {
     "shared.gptq.fc1", "shared.gptq.fc2", "dense.gptq.fc1", "dense.gptq.fc2",
     "tr3.fc1", "tr3.fc2", "tr3.v1", "tr3.v2", "tr3.v3", "tr3.table",
     "q_a.mx.gv", "o_proj.mx.gv", "shared.gate.mx.gv", "shared.up.mx.gv", "shared.down.mx.gv", "tr3.kmix", "tr3.sg", "tr3.v1b",
-    "tr3.v3b", "q_b.gptq"};
+    "tr3.v3b", "q_b.gptq",
+    "q_a.i8.gv", "kv_a.i8.gv", "q_b.i8.gv", "o_proj.i8.gv", "idx.wq_b.i8.gv",
+    "dense.gate.i8.gv", "dense.up.i8.gv", "dense.down.i8.gv"};
 
 struct LayerTensors
 {
@@ -547,7 +551,36 @@ inline void launch(const Xfrag& a, cudaStream_t st)
 }
 
 // ------------------------------------------------------------------------------------------ K2 + dense GEMVs
-enum { INT4 = 0, MXFP8 = 1, BF16W = 2, FP8R = 3 };
+enum { INT4 = 0, MXFP8 = 1, BF16W = 2, FP8R = 3, INT8_G16 = 4, INT8_G32 = 5, INT8_G64 = 6, INT8_G128 = 7 };
+
+inline bool is_int8_codec(int c) { return c >= INT8_G16 && c <= INT8_G128; }
+inline int int8_grp_of_bytes(long long gr) { return gr == 288 ? 1 : gr == 544 ? 2 : gr == 1056 ? 4 : gr == 2080 ? 8 : 0; }
+inline int int8_codec_of(int grp)
+{
+    return grp == 1 ? INT8_G16 : grp == 2 ? INT8_G32 : grp == 4 ? INT8_G64 : grp == 8 ? INT8_G128 : -1;
+}
+inline int int8_codec_of(const Tensor& t)
+{
+    if (!t.p || t.nd != 3) return -1;
+    return int8_codec_of(int8_grp_of_bytes(t.shape[2]));
+}
+inline int codec_gr(int c)
+{
+    if (c == INT4) return 288;
+    if (c == MXFP8) return 528;
+    if (c == INT8_G16) return Int8v<1>::GR;
+    if (c == INT8_G32) return Int8v<2>::GR;
+    if (c == INT8_G64) return Int8v<4>::GR;
+    if (c == INT8_G128) return Int8v<8>::GR;
+    return 512;
+}
+inline int codec_gk(int c)
+{
+    if (c == BF16W || c == INT8_G16) return 16;
+    if (c == INT8_G64) return 64;
+    if (c == INT8_G128) return 128;
+    return 32;
+}
 
 struct Gv
 {
@@ -589,6 +622,7 @@ inline void launch(const Gv& g, cudaStream_t st)
         {
             if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv_slot<Int4v, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Int4v, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int4v, NTv>, g.ld, g.slot); }
             else if (g.codec == BF16W) { if constexpr (NTv == 1) go(gv_gemv_slot<Bf16w, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Bf16w, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Bf16w, NTv>, g.ld, g.slot); }
+            else if (is_int8_codec(g.codec)) { const int grp = 1 << (g.codec - INT8_G16); if constexpr (NTv == 1) go(gv_gemv_slot_i8<1>, g.ld, g.slot, grp); else if (b512) go(gv_gemv_slot_i8_lb512<NTv>, g.ld, g.slot, grp); else go(gv_gemv_slot_i8_lb<NTv>, g.ld, g.slot, grp); }
             else { if constexpr (NTv == 1) go(gv_gemv_slot<Mxfp8, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Mxfp8, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Mxfp8, NTv>, g.ld, g.slot); }
             return;
         }
@@ -596,6 +630,7 @@ inline void launch(const Gv& g, cudaStream_t st)
         if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); }
         else if (g.codec == MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); }
         else if (g.codec == FP8R) { if constexpr (NTv == 1) go(gv_gemv<Fp8r, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); }
+        else if (is_int8_codec(g.codec)) { const int grp = 1 << (g.codec - INT8_G16); if constexpr (NTv == 1) go(gv_gemv_i8<1>, g.y, g.ld, g.odt, grp); else if (b512) go(gv_gemv_i8_lb512<NTv>, g.y, g.ld, g.odt, grp); else go(gv_gemv_i8_lb<NTv>, g.y, g.ld, g.odt, grp); }
         else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); }
     });
 }
@@ -619,7 +654,8 @@ inline void make_gv_multi(std::initializer_list<const Gv*> gs, int M, GvMulti& o
     }
     out.M = M;
 }
-static_assert(INT4 == 0 && MXFP8 == 1 && BF16W == 2, "gv_multi dispatches on these codec numbers");
+static_assert(INT4 == 0 && MXFP8 == 1 && BF16W == 2 && INT8_G16 == 4 && INT8_G32 == 5 && INT8_G64 == 6 && INT8_G128 == 7,
+              "gv_multi dispatches on these codec numbers");
 inline void launch(const GvMulti& a, cudaStream_t st) { gv_multi<<<a.ctas, 1024, 0, st>>>(a); }
 
 // tpc (output tiles per CTA) and ks (k parts per tile, one warp each): best split per shape on the GB10
@@ -629,7 +665,7 @@ inline const char* make_gv(const Tensor& t, int codec, int tpc, int ks, int M, c
 {
     g = Gv();
     if (!t.p) return nullptr;
-    const int GR = codec == INT4 ? 288 : codec == MXFP8 ? 528 : 512, gk = codec == BF16W ? 16 : 32;
+    const int GR = codec_gr(codec), gk = codec_gk(codec);
     if (t.nd != 3 || t.shape[2] != GR) return "GEMV tensor is not a [O/16][NG][GR] record of its codec";
     if (codec == FP8R && !rscale) return "FP8R GEMV requires row scales";
     const int ng = static_cast<int>(t.shape[1]);
@@ -653,7 +689,7 @@ inline void narrow(Gv& g, int t0, int nt, int tpc)
 {
     if (!g.on) return;
     if (nt <= 0) { g.on = 0; return; }
-    const int GR = g.codec == INT4 ? 288 : g.codec == MXFP8 ? 528 : 512, gk = g.codec == BF16W ? 16 : 32;
+    const int GR = codec_gr(g.codec), gk = codec_gk(g.codec);
     const int esz = g.odt == gv::O_F32 ? 4 : 2;
     g.w += static_cast<size_t>(t0) * (g.K / gk) * GR;
     g.y = static_cast<char*>(g.y) + static_cast<size_t>(t0) * 16 * esz;
@@ -713,6 +749,7 @@ template <bool E4, bool K2, bool SH, int CB> inline const void* k1_fn_fused()
 inline void launch_k1_fc1(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
+    if (k.a.s_i8_fc1) { k1_dense_i8_fc1<<<k.g1, k.b1, k.sm1, st>>>(k.a); return; }
     k1_pick(k, [&](auto E4, auto K2, auto SH, auto CB) {
         if constexpr (g6mx::NT > 1)
         {
@@ -724,6 +761,7 @@ inline void launch_k1_fc1(const K1& k, cudaStream_t st)
 inline void launch_k1_fc2(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
+    if (k.a.s_i8_fc2) { k1_dense_i8_fc2<<<k.g2, k.b2, k.sm2, st>>>(k.a); return; }
     k1_pick(k, [&](auto E4, auto K2, auto SH, auto CB) {
         if constexpr (g6mx::NT > 1)
         {
@@ -735,6 +773,12 @@ inline void launch_k1_fc2(const K1& k, cudaStream_t st)
 inline void launch_k1_fused(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
+    if (k.a.s_i8_fc1)
+    {
+        k1_dense_i8_fc1<<<k.g1, k.b1, k.sm1, st>>>(k.a);
+        k1_dense_i8_fc2<<<k.g2, k.b2, k.sm2, st>>>(k.a);
+        return;
+    }
     if (k.fuse_w4)
     {
         tr3_cb_dispatch(k.cb, [&](auto CB) {
@@ -1073,17 +1117,30 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     const bool moe = T.t[T_TR3_TAB].p != nullptr;
     const bool sh = moe && T.sh_trellis;                                 // shared expert = trellis row 256
     const bool mx = moe && !sh && !T.t[T_S_FC1].p && T.t[T_S_GATE_MX].p; // shared expert in MXFP8 records (draft layer)
+    const bool di8 = !moe && !T.t[T_D_FC1].p && T.t[T_D_GATE_I8].p;      // dense MLP in native exlr8 int8 gG records
     static const Tensor none;
-    const Tensor& f1 = sh ? none : T.t[mx ? T_S_GATE_MX : moe ? T_S_FC1 : T_D_FC1];
-    const Tensor& f2 = sh ? none : T.t[mx ? T_S_DOWN_MX : moe ? T_S_FC2 : T_D_FC2];
-    const Tensor& fu = T.t[T_S_UP_MX];
-    if (sh) { sh_out[0] = sh_out[1] = sh_out[2] = none; }
-    else if (!f1.p || !f2.p || (mx && !fu.p))
-        return mx ? "MoE layer with shared.gate.mx.gv but without shared.up.mx.gv / shared.down.mx.gv"
-             : moe ? "MoE layer with neither shared.gptq.fc1/fc2 nor shared.gate/up/down.mx.gv" : "layer has neither tr3.table nor dense.gptq.fc1/fc2";
-    if (!sh) { sh_out[0] = f1; sh_out[1] = fu; sh_out[2] = f2; }
+    const Tensor& f1 = sh ? none : T.t[di8 ? T_D_GATE_I8 : mx ? T_S_GATE_MX : moe ? T_S_FC1 : T_D_FC1];
+    const Tensor& f2 = sh ? none : T.t[di8 ? T_D_DOWN_I8 : mx ? T_S_DOWN_MX : moe ? T_S_FC2 : T_D_FC2];
+    const Tensor& fu = T.t[di8 ? T_D_UP_I8 : T_S_UP_MX];
+    if (sh) { if (sh_out) sh_out[0] = sh_out[1] = sh_out[2] = none; }
+    else if (!f1.p || !f2.p || ((mx || di8) && !fu.p))
+        return di8 ? "dense MLP with dense.gate.i8.gv but without dense.up.i8.gv / dense.down.i8.gv"
+             : mx ? "MoE layer with shared.gate.mx.gv but without shared.up.mx.gv / shared.down.mx.gv"
+             : moe ? "MoE layer with neither shared.gptq.fc1/fc2 nor shared.gate/up/down.mx.gv" : "layer has neither tr3.table nor dense MLP records";
+    if (!sh && sh_out) { sh_out[0] = f1; sh_out[1] = fu; sh_out[2] = f2; }
     const int s_nch = sh ? 0 : static_cast<int>(f1.shape[0]);
+    int s_i8_fc1 = 0, s_i8_fc2 = 0;
     if (sh) {}
+    else if (di8)
+    {
+        s_i8_fc1 = int8_grp_of_bytes(f1.shape[2]);
+        const int grp_u = int8_grp_of_bytes(fu.shape[2]);
+        s_i8_fc2 = int8_grp_of_bytes(f2.shape[2]);
+        if (!s_i8_fc1 || s_i8_fc1 != grp_u || !s_i8_fc2 || f1.nd != 3 || fu.nd != 3 || f2.nd != 3 ||
+            f1.shape[1] != KSH / s_i8_fc1 || fu.shape[0] != s_nch || fu.shape[1] != KSH / s_i8_fc1 ||
+            f2.shape[0] != KSH || (s_nch % s_i8_fc2) != 0 || f2.shape[1] != s_nch / s_i8_fc2 || s_nch * 16 > SACTW)
+            return "dense int8 gG MLP records do not match gate, up [I/16][HID/G][GR] + down [HID/16][I/G][GR]";
+    }
     else if (mx)
     {
         if (f1.nd != 3 || f1.shape[1] != HID / 32 || f1.shape[2] != 528 || fu.nd != 3 || fu.shape[0] != s_nch || fu.shape[1] != HID / 32 ||
@@ -1146,6 +1203,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         {
             if (const char* e = k1_bind_split(M, split_m, T.k2, sh, fuse, s, v)) return e;
         }
+        else if (di8) fuse = 0;
         else if (fuse)                                         // dense layers: the fused remap of K1_DENSE_SPLIT (4 x 2)
             if (const char* e = k1_fuse_split(s)) return e;
     }
@@ -1164,8 +1222,10 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     // A value that is not a power of two fails the bind.
     if (v.tlbw_kb & (v.tlbw_kb - 1)) return "GR8_K1_TLBW must be a power of 2 KB (1 .. 1048576)";
     if (moe && v.tlbw_kb) a.tlbw = 10 + __builtin_ctzl(static_cast<unsigned long>(v.tlbw_kb));
+    if (di8) { while (s.s_ks > 1 && (KSH / s_i8_fc1) % s.s_ks) s.s_ks >>= 1; }
     a.s_fc1 = static_cast<const uint8_t*>(f1.p); a.s_fc2 = static_cast<const uint8_t*>(f2.p);
-    a.s_up = mx ? static_cast<const uint8_t*>(fu.p) : nullptr; a.s_mx = mx;
+    a.s_up = (mx || di8) ? static_cast<const uint8_t*>(fu.p) : nullptr; a.s_mx = mx;
+    a.s_i8_fc1 = s_i8_fc1; a.s_i8_fc2 = s_i8_fc2;
     a.s_nch = s_nch; a.s_ks = s.s_ks; a.s_cw = w1 / s.s_ks; a.s_ns2 = s.s_ns2;
     a.gpart = sc.gpart; a.z = sc.z; a.act = sc.act; a.ypart = sc.ypart; a.fctl = sc.fctl;
     a.smax = sc.smax; a.ysh = sc.ysh;
@@ -1383,7 +1443,7 @@ inline size_t rec_bytes(const Tensor& t)
 }
 inline size_t gv_bytes(const Gv& g)
 {
-    const int GR = g.codec == INT4 ? 288 : g.codec == MXFP8 ? 528 : 512, gk = g.codec == BF16W ? 16 : 32;
+    const int GR = codec_gr(g.codec), gk = codec_gk(g.codec);
     return g.on ? static_cast<size_t>(g.O / 16) * (g.K / gk) * GR : 0;
 }
 inline void warm(const Gv& g, cudaStream_t st) { if (g.on) launch_warm(g.w, gv_bytes(g), st); }
@@ -1414,7 +1474,7 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     if (M < 1 || M > G6_MX) return "M must be 1..G6_MX (8, or 32 under DEC_S2)";
     L.M = M;
     L.moe = T.t[T_TR3_TAB].p != nullptr;
-    L.indexer = T.t[T_IDX_WQ_B].p != nullptr;
+    L.indexer = T.t[T_IDX_WQ_B].p != nullptr || T.t[T_IDX_WQ_B_I8].p != nullptr;
     const char* e = nullptr;
     // GR8_DTR (default 1): the dense trellis matrices of the exlr8 release form (dtr.cuh) where the layer has them;
     // 0 binds the int4 / MXFP8 records instead (a layer must then have them). The int4 record wins over MXFP8 when a
@@ -1424,32 +1484,43 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     if (dtr_on && T.mats_err) return T.mats_err;
     const dtr::LayerMats& D = T.mats;
     const bool tq = dtr_on && D.q_b.w, to = dtr_on && D.o_proj.w, tm = dtr_on && D.gate.w;
-    const bool qmx = !T.t[T_Q_A].p && T.t[T_Q_A_MX].p, omx = !T.t[T_O_PROJ].p && T.t[T_O_PROJ_MX].p;
-    const bool qi4 = !tq && T.t[T_Q_B_I4].p;
+    const int qa_i8 = int8_codec_of(T.t[T_Q_A_I8]), kva_i8 = int8_codec_of(T.t[T_KV_A_I8]);
+    const int qb_i8 = !tq ? int8_codec_of(T.t[T_Q_B_I8]) : -1, op_i8 = !to ? int8_codec_of(T.t[T_O_PROJ_I8]) : -1;
+    const int iq_i8 = int8_codec_of(T.t[T_IDX_WQ_B_I8]);
+    const bool qmx = qa_i8 < 0 && !T.t[T_Q_A].p && T.t[T_Q_A_MX].p, omx = op_i8 < 0 && !T.t[T_O_PROJ].p && T.t[T_O_PROJ_MX].p;
+    const bool qi4 = !tq && qb_i8 < 0 && T.t[T_Q_B_I4].p;
     //                 tensor             codec  tpc ks      fragments   output       dtype
-    if (qmx) e = make_gv(T.t[T_Q_A_MX], MXFP8, 2,  16, M, sc.xf_x,    io.q_a,       gv::O_F16,  L.q_a);
-    else     e = make_gv(T.t[T_Q_A],    INT4,  4,  8,  M, sc.xf_x,    io.q_a,       gv::O_F16,  L.q_a);
+    if (qa_i8 >= 0) e = make_gv(T.t[T_Q_A_I8], qa_i8, 2, 16, M, sc.xf_x,    io.q_a,       gv::O_F16,  L.q_a);
+    else if (qmx)   e = make_gv(T.t[T_Q_A_MX], MXFP8, 2, 16, M, sc.xf_x,    io.q_a,       gv::O_F16,  L.q_a);
+    else            e = make_gv(T.t[T_Q_A],    INT4,  4,  8, M, sc.xf_x,    io.q_a,       gv::O_F16,  L.q_a);
     if (e) return e;
-    if ((e = make_gv(T.t[T_KV_A],      MXFP8, 2,  16, M, sc.xf_x,    io.kv_a,      gv::O_F16,  L.kv_a))) return e;
-    if (qi4) e = make_gv(T.t[T_Q_B_I4], INT4,  2,  8,  M, sc.xf_qa,   io.q_b,       gv::O_F16,  L.q_b);
-    else if (!tq) e = make_gv(T.t[T_Q_B], MXFP8, 1, 16, M, sc.xf_qa,  io.q_b,       gv::O_F16,  L.q_b);
+    if (kva_i8 >= 0) e = make_gv(T.t[T_KV_A_I8], kva_i8, 2, 16, M, sc.xf_x, io.kv_a,      gv::O_F16,  L.kv_a);
+    else             e = make_gv(T.t[T_KV_A],    MXFP8,  2, 16, M, sc.xf_x, io.kv_a,      gv::O_F16,  L.kv_a);
     if (e) return e;
-    if ((e = make_gv(T.t[T_IDX_WQ_B],  MXFP8, 1,  32, M, sc.xf_qa,   io.idx_q,     gv::O_F16,  L.idx_q))) return e;
+    if (qb_i8 >= 0)     e = make_gv(T.t[T_Q_B_I8], qb_i8, 1, 16, M, sc.xf_qa, io.q_b,     gv::O_F16,  L.q_b);
+    else if (qi4)       e = make_gv(T.t[T_Q_B_I4], INT4,  2,  8, M, sc.xf_qa, io.q_b,     gv::O_F16,  L.q_b);
+    else if (!tq)       e = make_gv(T.t[T_Q_B],    MXFP8, 1, 16, M, sc.xf_qa, io.q_b,     gv::O_F16,  L.q_b);
+    if (e) return e;
+    if (iq_i8 >= 0)     e = make_gv(T.t[T_IDX_WQ_B_I8], iq_i8, 1, 32, M, sc.xf_qa, io.idx_q, gv::O_F16, L.idx_q);
+    else                e = make_gv(T.t[T_IDX_WQ_B],    MXFP8, 1, 32, M, sc.xf_qa, io.idx_q, gv::O_F16, L.idx_q);
+    if (e) return e;
     if ((e = make_gv(T.t[T_IDX_WK],    BF16W, 1,  32, M, sc.xb_x,    io.idx_k,     gv::O_F16,  L.idx_k))) return e;
     if ((e = make_gv(T.t[T_IDX_WPROJ], BF16W, 1,  32, M, sc.xb_x,    io.idx_w,     gv::O_F16,  L.idx_w))) return e;
     if (to) {}
-    else if (omx) e = make_gv(T.t[T_O_PROJ_MX], MXFP8, 2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
-    else     e = make_gv(T.t[T_O_PROJ],    INT4,  2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
+    else if (op_i8 >= 0) e = make_gv(T.t[T_O_PROJ_I8], op_i8, 2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
+    else if (omx)        e = make_gv(T.t[T_O_PROJ_MX], MXFP8, 2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
+    else                 e = make_gv(T.t[T_O_PROJ],    INT4,  2, 8, M, sc.xf_attn, io.attn_part, gv::O_BF16, L.o_proj);
     if (e) return e;
     // GR8_ROUTER_TPC=1: the router's 16 output tiles one per CTA (16 CTAs of 512 threads, not 8 of 1024); same tiles,
     // k parts and reduction order, so the same bits
     const int rtpc = static_cast<int>(knob::router_tpc());
     if ((e = make_gv(T.t[T_ROUTER],    BF16W, rtpc, 16, M, sc.xb_x2,  io.logits,    gv::O_F32,  L.router))) return e;
     if (!L.q_a.on || !L.kv_a.on || !(L.q_b.on || tq) || !(L.o_proj.on || to))
-        return "layer without q_a.gptq (or q_a.mx.gv) / kv_a.mx.gv / q_b (trellis, q_b.gptq or q_b.mx.gv) / o_proj (trellis, o_proj.gptq or o_proj.mx.gv)";
+        return "layer without q_a / kv_a / q_b / o_proj records";
     if (L.moe != L.router.on) return "router.w.gv and tr3.table must come together";
 #if DEC_I4PAIR
-    if ((!qmx && L.q_a.ks != T.i4pair_ks[0]) || (!omx && !to && L.o_proj.ks != T.i4pair_ks[1]) || (qi4 && L.q_b.ks != T.i4pair_ks[2]))
+    if ((L.q_a.codec == INT4 && L.q_a.ks != T.i4pair_ks[0]) || (L.o_proj.on && L.o_proj.codec == INT4 && L.o_proj.ks != T.i4pair_ks[1]) ||
+        (L.q_b.on && L.q_b.codec == INT4 && L.q_b.ks != T.i4pair_ks[2]))
         return "DEC_I4PAIR: int4 q_a / o_proj / q_b not repacked (bind::i4pair) for the launch's k-part count";
 #endif
     const int qbK = tq ? D.q_b.K : L.q_b.K, qbO = tq ? D.q_b.N : L.q_b.O, opK = to ? D.o_proj.K : L.o_proj.K, opO = to ? D.o_proj.N : L.o_proj.O;
@@ -1502,15 +1573,19 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
 // ------------------------------------------------------------------------------------------ head + MTP projection
 struct HeadTensors
 {
-    Tensor lm_head;                   // G.lm_head.mx.gv   [vn/16][192][528]  this rank's vocab rows
+    Tensor lm_head;                   // G.lm_head.mx.gv or G.lm_head.i8.gv  this rank's vocab rows
+    Tensor lm_head_i8;                // G.lm_head.i8.gv   [vn/16][K/G][GR]  native exlr8 int8 gG lm_head
     Tensor lm_head_scale;             // G.lm_head.scale   [vn] fp32          (Flash FP8-row head)
-    Tensor eh;                        // L078.eh.mx.gv     [384][384][528]    MTP eh_proj, O = 6144, K = 12288 (p = nullptr: no MTP)
+    Tensor eh;                        // L078.eh.mx.gv or L078.eh.i8.gv      MTP eh_proj, O = 6144, K = 12288 (p = nullptr: no MTP)
+    Tensor eh_i8;                     // L078.eh.i8.gv     [384][2*HID/G][GR]
 };
 template <class F> inline HeadTensors head_tensors(F find)
 {
     HeadTensors T;
     T.lm_head = find("G.lm_head.mx.gv");
+    T.lm_head_i8 = find("G.lm_head.i8.gv");
     T.eh = find(G6_MTP_L ".eh.mx.gv");
+    T.eh_i8 = find(G6_MTP_L ".eh.i8.gv");
     return T;
 }
 
@@ -1548,12 +1623,17 @@ inline const char* make_head(const HeadTensors& T, int rank, int M, const Scratc
     if (!vocab_slice(rank, H.vlo, H.vn)) return "rank must be 0..NR-1";
     H.M = M;
     const char* e = nullptr;
+    const int lm_i8 = int8_codec_of(T.lm_head_i8), eh_i8 = int8_codec_of(T.eh_i8);
     // best split on the GB10 (engine/results/item2-gv.jsonl): lm_head_rank tpc 1 ks 32, mtp_eh tpc 2 ks 16
-    if ((e = make_gv(T.lm_head, MXFP8, 1, 32, M, sc.xf_head, io.logits, gv::O_F32, H.lm_head))) return e;
-    if ((e = make_gv(T.eh,      MXFP8, 2, 16, M, sc.xf_eh,   io.eh,     gv::O_F16, H.eh))) return e;
-    if (!H.lm_head.on) return "no G.lm_head.mx.gv";
-    if (H.lm_head.K != HID || H.lm_head.O != H.vn) return "G.lm_head.mx.gv is not this rank's [vn/16][192][528] vocab slice";
-    if (H.eh.on && (H.eh.K != 2 * HID || H.eh.O != HID)) return "L078.eh.mx.gv is not [384][384][528]";
+    if (lm_i8 >= 0) e = make_gv(T.lm_head_i8, lm_i8, 1, 32, M, sc.xf_head, io.logits, gv::O_F32, H.lm_head);
+    else            e = make_gv(T.lm_head,    MXFP8, 1, 32, M, sc.xf_head, io.logits, gv::O_F32, H.lm_head);
+    if (e) return e;
+    if (eh_i8 >= 0) e = make_gv(T.eh_i8, eh_i8, 2, 16, M, sc.xf_eh, io.eh, gv::O_F16, H.eh);
+    else            e = make_gv(T.eh,    MXFP8, 2, 16, M, sc.xf_eh, io.eh, gv::O_F16, H.eh);
+    if (e) return e;
+    if (!H.lm_head.on) return "no G.lm_head.mx.gv or G.lm_head.i8.gv";
+    if (H.lm_head.K != HID || H.lm_head.O != H.vn) return "G.lm_head is not this rank's vocab slice";
+    if (H.eh.on && (H.eh.K != 2 * HID || H.eh.O != HID)) return "L078.eh is not [6144][12288]";
     H.xf_h.on = 1;  H.xf_h.src = io.h;      H.xf_h.ld = HID;      H.xf_h.K = HID;      H.xf_h.f16 = sc.xf_head;  H.xf_h.M = M;
     H.xf_eh.on = H.eh.on;
     H.xf_eh.src = io.eh_in; H.xf_eh.ld = 2 * HID; H.xf_eh.K = 2 * HID; H.xf_eh.f16 = sc.xf_eh; H.xf_eh.M = M;
@@ -1576,6 +1656,8 @@ inline cudaError_t init()
         const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
         if (err == cudaSuccess) err = e;
     };
+    set(reinterpret_cast<const void*>(k1_dense_i8_fc1));
+    set(reinterpret_cast<const void*>(k1_dense_i8_fc2));
     k1_each([&](auto E4, auto K2, auto SH, auto CB) {
         set(k1_fn_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
         set(k1_fn_fused<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());

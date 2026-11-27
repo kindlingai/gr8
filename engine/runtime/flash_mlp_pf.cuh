@@ -278,6 +278,12 @@ inline void bind_layer_tensors(Model& m, int i, const Find* find, cudaStream_t s
             }
         }
     }
+    else if (w.experts.t[bind::T_D_GATE_I8].p)
+    {
+        if (!bt.i8[bindp::T_D_GATE].p) bt.i8[bindp::T_D_GATE] = w.experts.t[bind::T_D_GATE_I8];
+        if (!bt.i8[bindp::T_D_UP].p)   bt.i8[bindp::T_D_UP]   = w.experts.t[bind::T_D_UP_I8];
+        if (!bt.i8[bindp::T_D_DOWN].p) bt.i8[bindp::T_D_DOWN] = w.experts.t[bind::T_D_DOWN_I8];
+    }
 }
 
 template <class Prefill>

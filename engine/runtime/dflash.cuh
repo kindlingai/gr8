@@ -944,7 +944,8 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
     io.h = D.x; io.logits = D.hlog;
 #if G6_MODEL_FLASH
     {   // Flash's lm_head is FP8R (row scales) or BF16: the codec rule of head_for, on fp16 fragments (BF16: bf16 ones)
-        const int codec = ht.lm_head_scale.p ? bind::FP8R : ht.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W;
+        const int i8g = bind::int8_grp_of_bytes(ht.lm_head.shape[2]);
+        const int codec = ht.lm_head_scale.p ? bind::FP8R : i8g > 0 ? bind::int8_codec_of(i8g) : ht.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W;
         D.head = bind::Head();
         D.head.M = B; D.head.vlo = main.vlo; D.head.vn = main.vn;
         if (const char* e = bind::make_gv(ht.lm_head, codec, 1, 32, B, D.xf_head, D.hlog, gv::O_F32, D.head.lm_head,

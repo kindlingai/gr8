@@ -18,7 +18,7 @@
 use crate::codebook::{self, Codebook};
 use crate::json::{self, Json};
 use crate::xxh64::Xxh64;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
@@ -34,6 +34,10 @@ pub const BF16: i64 = 6;
 pub const FP32: i64 = 7;
 /// FP8 E4M3 with one E8M0 scale per 32 x 32 block (DeepSeek-V4.1's dense matrices, stored as the source has them)
 pub const FP8_B32: i64 = 8;
+/// Row-trellis lookup table (exlr8 v4, FORMAT.md "Row trellis")
+pub const ROWS: i64 = 9;
+/// Signed 8-bit group-quantized dense matrix (`int8 gG`, G in {16, 32, 64, 128}); has no legacy code and requires `matrices` metadata.
+pub const INT8: i64 = 10;
 /// record field 4: the sharded side
 pub const SIDE_REPLICATED: i64 = 0;
 pub const SIDE_OUT: i64 = 1;
@@ -44,10 +48,12 @@ pub fn data_tensors(fmt: i64) -> &'static [&'static str] {
     match fmt {
         TRELLIS => &["trellis", "suh", "svh"],
         INT4 => &["q4", "s4"],
+        INT8 => &["q8", "s8"],
         MXFP8 | FP8_B32 => &["fp8", "e8m0"],
         FP8_BLOCK | FP8_ROW => &["fp8", "scale"],
         BF16 => &["bf16"],
         FP32 => &["fp32"],
+        ROWS => &["rows", "svh", "suh"],
         _ => &[],
     }
 }
@@ -851,18 +857,210 @@ fn had_right(x: &mut [f32], rows: usize, cols: usize, svh: &[f32]) {
 
 // ------------------------------------------------------------------------------------------------ matrices
 
-/// The 8 fields of `M.record`.
+/// The 8 fields of `M.record` (resolved through `matrices` metadata when present).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Record {
     pub fmt: i64,
     pub out: usize,
     pub inp: usize,
+    /// Trellis width K (integer) or `int8 gG` group size G (16, 32, 64, 128); 0 for other formats.
     pub k: usize,
     pub side: i64,
     /// channels per shard on the sharded side
     pub unit: usize,
     pub rotation: i64,
     pub solve: i64,
+}
+
+/// One entry of a v4 dense/vocab/extra/split file's `matrices` metadata (FORMAT.md "Matrix descriptions").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatrixDesc {
+    pub format: String,
+    pub kind: i64,
+    /// Encoded K for trellis/row-trellis (negative `-2K` for half widths), G for `int8 gG`, else 0.
+    pub field3: i64,
+    pub side: i64,
+    pub unit: usize,
+    pub rotation: Option<String>,
+    pub solve: i64,
+}
+
+/// Default legacy rotation names for record field 6 = 1, 2, 3 when metadata `rotations` is absent.
+const DEFAULT_ROTATIONS: [&str; 3] = ["attn_in", "q_resid", "mlp_in"];
+
+/// Parses a dense format string (FORMAT.md "Format strings") into `(kind, field3)`:
+/// K (or `-2K` for half-integer `p5`) for `trellis`/`row-trellis`, G in `{16, 32, 64, 128}` for `int8 gG`, else 0.
+pub fn parse_format(text: &str) -> Result<(i64, i64), String> {
+    if let Some(rest) = text.strip_prefix("trellis k").or_else(|| text.strip_prefix("row-trellis k")) {
+        let kind = if text.starts_with("trellis ") { TRELLIS } else { ROWS };
+        let (digits, half) = match rest.strip_suffix("p5") {
+            Some(d) => (d, true),
+            None => (rest, false),
+        };
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            let k: i64 = digits.parse().map_err(|_| format!("dense format string {text:?} has invalid width"))?;
+            let field3 = if half { -(2 * k + 1) } else { k };
+            return Ok((kind, field3));
+        }
+        return Err(format!("dense format string {text:?} is not one this loader implements"));
+    }
+    match text {
+        "int8 g16" => Ok((INT8, 16)),
+        "int8 g32" => Ok((INT8, 32)),
+        "int8 g64" => Ok((INT8, 64)),
+        "int8 g128" => Ok((INT8, 128)),
+        "int4 g32" => Ok((INT4, 0)),
+        "mxfp8" => Ok((MXFP8, 0)),
+        "fp8 b128" => Ok((FP8_BLOCK, 0)),
+        "fp8 b32" => Ok((FP8_B32, 0)),
+        "fp8 row" => Ok((FP8_ROW, 0)),
+        "bf16" => Ok((BF16, 0)),
+        "fp32" => Ok((FP32, 0)),
+        _ => Err(format!("dense format string {text:?} is not one this loader implements")),
+    }
+}
+
+/// Validates and parses a file's `matrices` metadata (FORMAT.md "Matrix descriptions"), or returns `Ok(None)` if absent.
+/// Refuses `matrices` in an `exlr8-v2` file, unknown keys/values, invalid `unit`/`rotation`, and missing/extra matrices.
+pub fn file_matrices(f: &StFile) -> Result<Option<BTreeMap<String, MatrixDesc>>, String> {
+    let Some(meta_val) = f.meta.get("matrices") else {
+        return Ok(None);
+    };
+    if f.meta.get("format").and_then(Json::str) == Some("exlr8-v2") {
+        return Err(format!("{}: matrices metadata (a v4 feature) in an exlr8-v2 file", f.path));
+    }
+    let text = meta_val.str().ok_or_else(|| format!("{}: matrices metadata is not a JSON string", f.path))?;
+    let parsed = json::parse(text).map_err(|e| format!("{}: matrices metadata: {e}", f.path))?;
+    let obj = parsed.obj().ok_or_else(|| format!("{}: matrices is not a JSON object", f.path))?;
+    let mut out = BTreeMap::new();
+    for (base, val) in obj {
+        let d = val.obj().ok_or_else(|| format!("{}: matrices[{base:?}] is not a JSON object", f.path))?;
+        for k in d.keys() {
+            if !matches!(k.as_str(), "format" | "side" | "unit" | "rotation" | "solve") {
+                return Err(format!("{}: matrices[{base:?}]: unknown key {k:?}", f.path));
+            }
+        }
+        let fmt_str = d.get("format").and_then(Json::str)
+            .ok_or_else(|| format!("{}: matrices[{base:?}]: missing or non-string format", f.path))?;
+        let (kind, field3) = parse_format(fmt_str)
+            .map_err(|e| format!("{}: matrices[{base:?}]: {e}", f.path))?;
+        let side_str = d.get("side").and_then(Json::str)
+            .ok_or_else(|| format!("{}: matrices[{base:?}]: missing or non-string side", f.path))?;
+        let side = match side_str {
+            "replicated" => SIDE_REPLICATED,
+            "out" => SIDE_OUT,
+            "in" => SIDE_IN,
+            _ => return Err(format!("{}: matrices[{base:?}]: unknown side {side_str:?}", f.path)),
+        };
+        let solve_str = d.get("solve").and_then(Json::str)
+            .ok_or_else(|| format!("{}: matrices[{base:?}]: missing or non-string solve", f.path))?;
+        let solve = match solve_str {
+            "copy" | "rtn" => 0,
+            "hessian" => 1,
+            _ => return Err(format!("{}: matrices[{base:?}]: unknown solve {solve_str:?}", f.path)),
+        };
+        let unit = if side == SIDE_REPLICATED {
+            if d.contains_key("unit") {
+                return Err(format!("{}: matrices[{base:?}]: unit must be absent when side is replicated", f.path));
+            }
+            0usize
+        } else {
+            match d.get("unit") {
+                Some(Json::Int(u)) if *u >= 1 => *u as usize,
+                _ => return Err(format!("{}: matrices[{base:?}]: unit must be a positive integer", f.path)),
+            }
+        };
+        let rotation = match d.get("rotation") {
+            None => None,
+            Some(Json::Str(rot)) => {
+                if kind != TRELLIS && kind != ROWS {
+                    return Err(format!("{}: matrices[{base:?}]: rotation is allowed for trellis and row-trellis only", f.path));
+                }
+                Some(rot.clone())
+            }
+            Some(_) => return Err(format!("{}: matrices[{base:?}]: rotation must be a string", f.path)),
+        };
+        out.insert(base.clone(), MatrixDesc { format: fmt_str.to_string(), kind, field3, side, unit, rotation, solve });
+    }
+    let stored: BTreeSet<&str> = f.names().iter().filter_map(|n| n.strip_suffix(".record")).collect();
+    let extra: Vec<&str> = out.keys().map(String::as_str).filter(|k| !stored.contains(k)).collect();
+    if !extra.is_empty() {
+        return Err(format!("{}: matrices describes {extra:?}, which it does not hold", f.path));
+    }
+    let missing: Vec<&str> = stored.iter().copied().filter(|k| !out.contains_key(*k)).collect();
+    if !missing.is_empty() {
+        return Err(format!("{}: matrices does not describe {missing:?}", f.path));
+    }
+    Ok(Some(out))
+}
+
+/// Reads and resolves `name.record` against `f`'s `matrices` metadata (when present), enforcing every legacy-field
+/// agreement rule of FORMAT.md "Records" and "Matrix descriptions".
+pub fn matrix_record(f: &StFile, name: &str) -> Result<Record, String> {
+    let info = f.info(&format!("{name}.record"))?;
+    if info.dtype != "I64" || info.shape != [8] {
+        return Err(format!("{}: {name}.record is not int64 [8]", f.path));
+    }
+    let r = f.read_all(&format!("{name}.record"))?;
+    if r.len() != 64 {
+        return Err(format!("{}: {name}.record is not int64 [8]", f.path));
+    }
+    let v: Vec<i64> = r.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c)).collect();
+    if v[1] < 0 || v[2] < 0 {
+        return Err(format!("{}: {name}.record has negative shape [{}, {}]", f.path, v[1], v[2]));
+    }
+    let matrices = file_matrices(f)?;
+    let Some(mats) = matrices else {
+        if !(TRELLIS..=ROWS).contains(&v[0]) {
+            return Err(format!("{}: {name} has legacy format {} and the file has no matrices", f.path, v[0]));
+        }
+        return Ok(Record {
+            fmt: v[0],
+            out: v[1] as usize,
+            inp: v[2] as usize,
+            k: if v[3] >= 0 { v[3] as usize } else { 0 },
+            side: v[4],
+            unit: v[5].max(0) as usize,
+            rotation: v[6],
+            solve: v[7],
+        });
+    };
+    let d = mats.get(name).ok_or_else(|| format!("{}: matrices does not describe {name}", f.path))?;
+    let rot_names: Vec<String> = match f.meta.get("rotations").and_then(Json::str) {
+        Some(s) => s.split(',').map(|x| x.trim().to_string()).collect(),
+        None => DEFAULT_ROTATIONS.iter().map(|s| s.to_string()).collect(),
+    };
+    let rot_str = d.rotation.as_deref().unwrap_or("own");
+    let want_rot: Option<i64> = if rot_str == "own" {
+        Some(0)
+    } else {
+        rot_names.iter().position(|x| x == rot_str).map(|idx| idx as i64 + 1)
+    };
+    let want_fmt = if d.kind == INT8 { 0 } else { d.kind };
+    let want_f3 = if d.kind == TRELLIS || d.kind == ROWS { d.field3 } else { 0 };
+    let checks: [(usize, Option<i64>); 6] = [
+        (0, Some(want_fmt)),
+        (3, Some(want_f3)),
+        (4, Some(d.side)),
+        (5, Some(d.unit as i64)),
+        (6, want_rot),
+        (7, Some(d.solve)),
+    ];
+    for (field, want) in checks {
+        if v[field] != 0 && Some(v[field]) != want {
+            return Err(format!("{}: {name} record field {field} is {}, disagrees with matrices description {:?}", f.path, v[field], d));
+        }
+    }
+    Ok(Record {
+        fmt: d.kind,
+        out: v[1] as usize,
+        inp: v[2] as usize,
+        k: if d.field3 >= 0 { d.field3 as usize } else { 0 },
+        side: d.side,
+        unit: d.unit,
+        rotation: want_rot.unwrap_or(0),
+        solve: d.solve,
+    })
 }
 
 /// One dense matrix of a dense or vocabulary file.
@@ -874,18 +1072,19 @@ pub struct Matrix<'a> {
 
 impl<'a> Matrix<'a> {
     pub fn open(f: &'a StFile, name: &str) -> Result<Matrix<'a>, String> {
-        let r = f.read_all(&format!("{name}.record"))?;
-        if r.len() != 64 {
-            return Err(format!("{}: {name}.record is not int64 [8]", f.path));
-        }
-        let v: Vec<i64> = r.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c)).collect();
-        let rec = Record { fmt: v[0], out: v[1] as usize, inp: v[2] as usize, k: v[3] as usize, side: v[4],
-                           unit: v[5] as usize, rotation: v[6], solve: v[7] };
-        if !(TRELLIS..=FP32).contains(&rec.fmt) {
+        let rec = matrix_record(f, name)?;
+        if !(TRELLIS..=INT8).contains(&rec.fmt) {
             return Err(format!("{}: {name}: unknown format {}", f.path, rec.fmt));
         }
         if rec.fmt == TRELLIS {
             codebook::check_dense_mcg(f)?;
+        }
+        if rec.fmt == INT8 {
+            let g = rec.k;
+            let align = if rec.side == SIDE_IN { 128 } else { g };
+            if !matches!(g, 16 | 32 | 64 | 128) || !rec.inp.is_multiple_of(align) {
+                return Err(format!("{}: {name}: int8 group size {g} with {} inputs (side {})", f.path, rec.inp, rec.side));
+            }
         }
         Ok(Matrix { f, name: name.to_string(), rec })
     }
@@ -1050,6 +1249,92 @@ impl<'a> Matrix<'a> {
                     }
                 }
             }
+            INT8 if r.side == SIDE_IN => {
+                let g = r.k;
+                if !matches!(g, 16 | 32 | 64 | 128) || !r.inp.is_multiple_of(128) {
+                    return Err(format!(
+                        "{}: {} side=IN int8 g{g} inp {} must have g in {{16,32,64,128}} and inp divisible by 128",
+                        self.f.path, self.name, r.inp
+                    ));
+                }
+                let ng = 128 / g;
+                self.check_tensor("q8", &["I8"], &[r.inp / 128, r.out, 128])?;
+                self.check_tensor("s8", &["F16"], &[r.inp / 128, r.out, ng])?;
+                for (b, &w) in want.iter().enumerate() {
+                    let qb = self.f.read(&self.t("q8"), (b * r.out * 128) as u64, (r.out * 128) as u64)?;
+                    let sb = self.f.read(&self.t("s8"), (b * r.out * ng * 2) as u64, (r.out * ng * 2) as u64)?;
+                    let mut h = Xxh64::new(0);
+                    h.update(&qb);
+                    h.update(&sb);
+                    let got = h.digest();
+                    if got != w {
+                        return Err(format!("{}: {} block {b}: checksum {got:#x}, expected {w:#x}", self.f.path, self.name));
+                    }
+                }
+            }
+            INT8 => {
+                let g = r.k;
+                if !matches!(g, 16 | 32 | 64 | 128) || !r.inp.is_multiple_of(g) {
+                    return Err(format!(
+                        "{}: {} int8 g{g} inp {} must have g in {{16,32,64,128}} and inp divisible by {g}",
+                        self.f.path, self.name, r.inp
+                    ));
+                }
+                self.check_tensor("q8", &["I8"], &[r.out, r.inp])?;
+                self.check_tensor("s8", &["F16"], &[r.out, r.inp / g])?;
+                for (b, &w) in want.iter().enumerate() {
+                    let rows = b * 128..((b + 1) * 128).min(r.out);
+                    let mut h = Xxh64::new(0);
+                    h.update(&self.rows_of("q8", &rows, r.inp, 1)?);
+                    h.update(&self.rows_of("s8", &rows, r.inp / g, 2)?);
+                    let got = h.digest();
+                    if got != w {
+                        return Err(format!("{}: {} block {b}: checksum {got:#x}, expected {w:#x}", self.f.path, self.name));
+                    }
+                }
+            }
+            FP8_B32 if r.side == SIDE_IN => {
+                if !r.inp.is_multiple_of(128) || !r.out.is_multiple_of(32) {
+                    return Err(format!(
+                        "{}: {} side=IN fp8_b32 shape ({}, {}) invalid",
+                        self.f.path, self.name, r.out, r.inp
+                    ));
+                }
+                self.check_tensor("fp8", &["U8", "F8_E4M3"], &[r.inp / 128, r.out, 128])?;
+                self.check_tensor("e8m0", &["U8", "F8_E8M0"], &[r.inp / 128, r.out / 32, 4])?;
+                for (b, &w) in want.iter().enumerate() {
+                    let fb = self.f.read(&self.t("fp8"), (b * r.out * 128) as u64, (r.out * 128) as u64)?;
+                    let eb = self.f.read(&self.t("e8m0"), (b * (r.out / 32) * 4) as u64, ((r.out / 32) * 4) as u64)?;
+                    let mut h = Xxh64::new(0);
+                    h.update(&fb);
+                    h.update(&eb);
+                    let got = h.digest();
+                    if got != w {
+                        return Err(format!("{}: {} block {b}: checksum {got:#x}, expected {w:#x}", self.f.path, self.name));
+                    }
+                }
+            }
+            FP8_B32 => {
+                if !r.inp.is_multiple_of(32) || !r.out.is_multiple_of(32) {
+                    return Err(format!(
+                        "{}: {} fp8_b32 shape ({}, {}) must be divisible by 32",
+                        self.f.path, self.name, r.out, r.inp
+                    ));
+                }
+                self.check_tensor("fp8", &["U8", "F8_E4M3"], &[r.out, r.inp])?;
+                self.check_tensor("e8m0", &["U8", "F8_E8M0"], &[r.out / 32, r.inp / 32])?;
+                for (b, &w) in want.iter().enumerate() {
+                    let rows = b * 128..((b + 1) * 128).min(r.out);
+                    let srows = (4 * b)..(4 * b + 4).min(r.out / 32);
+                    let mut h = Xxh64::new(0);
+                    h.update(&self.rows_of("fp8", &rows, r.inp, 1)?);
+                    h.update(&self.rows_of("e8m0", &srows, r.inp / 32, 1)?);
+                    let got = h.digest();
+                    if got != w {
+                        return Err(format!("{}: {} block {b}: checksum {got:#x}, expected {w:#x}", self.f.path, self.name));
+                    }
+                }
+            }
             MXFP8 => {
                 if !r.inp.is_multiple_of(32) {
                     return Err(format!(
@@ -1160,6 +1445,27 @@ impl<'a> Matrix<'a> {
                 }
                 Ok(o)
             }
+            INT8 => {
+                let g = r.k;
+                let (c_aligned, c_off) = if r.side == SIDE_IN {
+                    (cols.clone(), 0)
+                } else {
+                    let cs = cols.start / g * g;
+                    let ce = cols.end.div_ceil(g) * g;
+                    (cs..ce, cols.start - cs)
+                };
+                let (q8, s8) = self.int8(&rows, &c_aligned)?;
+                let ac = c_aligned.len();
+                let gw = ac / g;
+                let mut o = vec![0f32; nr * nc];
+                for i in 0..nr {
+                    for j in 0..nc {
+                        let aj = c_off + j;
+                        o[i * nc + j] = q8[i * ac + aj] as f32 * f16_to_f32(s8[i * gw + aj / g]);
+                    }
+                }
+                Ok(o)
+            }
             MXFP8 => {
                 self.check_shape("fp8", &[r.out, r.inp])?;
                 self.check_shape("e8m0", &[r.out, r.inp / 32])?;
@@ -1175,6 +1481,34 @@ impl<'a> Matrix<'a> {
                 let s = f32s(&self.f.read_all(&self.t("scale"))?);
                 Ok(pick(&|i, j| e4m3_to_f32(w[i * r.inp + j]) * s[(rows.start + i) / 128 * bi + j / 128]))
             }
+            FP8_B32 => {
+                let (so, si) = (r.out.div_ceil(32), r.inp.div_ceil(32));
+                if r.side == SIDE_IN {
+                    if !cols.start.is_multiple_of(128) || !nc.is_multiple_of(128) {
+                        return Err(format!("{}: {} side-2 fp8 b32 columns {cols:?} are not on 128-input blocks", self.f.path, self.name));
+                    }
+                    self.check_shape("fp8", &[r.inp / 128, r.out, 128])?;
+                    self.check_shape("e8m0", &[r.inp / 128, so, 4])?;
+                    let mut o = vec![0f32; nr * nc];
+                    for (bi, b) in (cols.start / 128..cols.end / 128).enumerate() {
+                        let qb = self.f.read(&self.t("fp8"), (b * r.out * 128) as u64, (r.out * 128) as u64)?;
+                        let sb = self.f.read(&self.t("e8m0"), (b * so * 4) as u64, (so * 4) as u64)?;
+                        for i in 0..nr {
+                            let row = rows.start + i;
+                            for c in 0..128 {
+                                o[i * nc + bi * 128 + c] = e4m3_to_f32(qb[row * 128 + c]) * e8m0_to_f32(sb[(row / 32) * 4 + c / 32]);
+                            }
+                        }
+                    }
+                    Ok(o)
+                } else {
+                    self.check_shape("fp8", &[r.out, r.inp])?;
+                    self.check_shape("e8m0", &[so, si])?;
+                    let w = self.rows_of("fp8", &rows, r.inp, 1)?;
+                    let e = self.f.read_all(&self.t("e8m0"))?;
+                    Ok(pick(&|i, j| e4m3_to_f32(w[i * r.inp + j]) * e8m0_to_f32(e[(rows.start + i) / 32 * si + j / 32])))
+                }
+            }
             FP8_ROW => {
                 self.check_shape("fp8", &[r.out, r.inp])?;
                 self.check_shape("scale", &[r.out])?;
@@ -1187,13 +1521,89 @@ impl<'a> Matrix<'a> {
                 let w = u16s(&self.rows_of("bf16", &rows, r.inp, 2)?);
                 Ok(pick(&|i, j| bf16_to_f32(w[i * r.inp + j])))
             }
-            _ => {
+            FP32 => {
                 self.check_shape("fp32", &[r.out, r.inp])?;
                 let w = f32s(&self.rows_of("fp32", &rows, r.inp, 4)?);
                 Ok(pick(&|i, j| w[i * r.inp + j]))
             }
+            other => Err(format!("{}: {}: decode not implemented for format {other}", self.f.path, self.name)),
         }
     }
+
+    /// int8 gG signed codes ([rows][cols], i8 in [-127, 127]) and fp16 scale bits ([rows][cols / G]) of the block in
+    /// the HF orientation. Side-2 storage (`[in/128, out, 128]` and `[in/128, out, 128/G]`) comes back transposed to
+    /// this layout. Columns must fall on G-input groups (or 128-input blocks on side 2).
+    /// Refuses any code == -128 and any scale that is non-finite or negative (FORMAT.md "int8 groups").
+    pub fn int8(&self, rows: &Range<usize>, cols: &Range<usize>) -> Result<(Vec<i8>, Vec<u16>), String> {
+        let r = self.rec;
+        if r.fmt != INT8 {
+            return Err(format!("{}: {} is not int8 gG", self.f.path, self.name));
+        }
+        let g = r.k;
+        if !matches!(g, 16 | 32 | 64 | 128) || !r.inp.is_multiple_of(if r.side == SIDE_IN { 128 } else { g }) {
+            return Err(format!("{}: {} int8 group size {g} with {} inputs (side {})", self.f.path, self.name, r.inp, r.side));
+        }
+        if rows.end > r.out || cols.end > r.inp || rows.is_empty() || cols.is_empty() {
+            return Err(format!("{}: {} block {rows:?} x {cols:?} is outside ({}, {})", self.f.path, self.name, r.out, r.inp));
+        }
+        let (nr, nc) = (rows.len(), cols.len());
+        if !cols.start.is_multiple_of(g) || !nc.is_multiple_of(g) {
+            return Err(format!("{}: {} int8 g{g} columns {cols:?} are not on {g}-input groups", self.f.path, self.name));
+        }
+        let qi = self.f.info(&self.t("q8"))?;
+        if qi.dtype != "I8" {
+            return Err(format!("{}: {}.q8 has dtype {}, expected I8", self.f.path, self.name, qi.dtype));
+        }
+        let si = self.f.info(&self.t("s8"))?;
+        if si.dtype != "F16" {
+            return Err(format!("{}: {}.s8 has dtype {}, expected F16", self.f.path, self.name, si.dtype));
+        }
+        let mut q = vec![0i8; nr * nc];
+        let mut s = vec![0u16; nr * (nc / g)];
+        if r.side == SIDE_IN {
+            if !cols.start.is_multiple_of(128) || !nc.is_multiple_of(128) {
+                return Err(format!("{}: {} side-2 int8 columns {cols:?} are not on 128-input blocks", self.f.path, self.name));
+            }
+            let spg = 128 / g;
+            self.check_shape("q8", &[r.inp / 128, r.out, 128])?;
+            self.check_shape("s8", &[r.inp / 128, r.out, spg])?;
+            for (bi, b) in (cols.start / 128..cols.end / 128).enumerate() {
+                let qb = self.f.read(&self.t("q8"), (b * r.out * 128) as u64, (r.out * 128) as u64)?;
+                let sb = u16s(&self.f.read(&self.t("s8"), (b * r.out * spg * 2) as u64, (r.out * spg * 2) as u64)?);
+                for i in 0..nr {
+                    let o = rows.start + i;
+                    let dst_q = &mut q[i * nc + bi * 128..][..128];
+                    for (d, &src_b) in dst_q.iter_mut().zip(&qb[o * 128..o * 128 + 128]) {
+                        *d = src_b as i8;
+                    }
+                    s[i * (nc / g) + bi * spg..][..spg].copy_from_slice(&sb[o * spg..o * spg + spg]);
+                }
+            }
+        } else {
+            self.check_shape("q8", &[r.out, r.inp])?;
+            self.check_shape("s8", &[r.out, r.inp / g])?;
+            let qa = self.rows_of("q8", rows, r.inp, 1)?;
+            let sa = u16s(&self.rows_of("s8", rows, r.inp / g, 2)?);
+            for i in 0..nr {
+                let dst_q = &mut q[i * nc..][..nc];
+                for (d, &src_b) in dst_q.iter_mut().zip(&qa[i * r.inp + cols.start..][..nc]) {
+                    *d = src_b as i8;
+                }
+                s[i * (nc / g)..][..nc / g].copy_from_slice(&sa[i * (r.inp / g) + cols.start / g..][..nc / g]);
+            }
+        }
+        if q.contains(&-128) {
+            return Err(format!("{}: {} int8 code -128 is not a code", self.f.path, self.name));
+        }
+        for &h in &s {
+            let sf = f16_to_f32(h);
+            if !sf.is_finite() || sf < 0.0 {
+                return Err(format!("{}: {} int8 scales must be finite and >= 0", self.f.path, self.name));
+            }
+        }
+        Ok((q, s))
+    }
+
 
     /// int4 codes and fp16 scale bits of the block, as [rows][cols / 2] and [rows][cols / 32] in the HF orientation.
     /// Input 2j sits in the low nibble of byte j. Side-2 storage comes back transposed to this layout. The columns
@@ -1412,7 +1822,7 @@ impl<'a> Matrix<'a> {
 pub fn decode_par(m: &Matrix, rows: Range<usize>, cols: Range<usize>, threads: usize) -> Result<Vec<f32>, String> {
     let along_cols = m.rec.side == SIDE_IN;
     let span = if along_cols { cols.clone() } else { rows.clone() };
-    let step = if m.rec.fmt == TRELLIS || (m.rec.fmt == INT4 && along_cols) { 128 } else { 1 };
+    let step = if m.rec.fmt == TRELLIS || (matches!(m.rec.fmt, INT4 | INT8 | FP8_B32) && along_cols) { 128 } else { 1 };
     let units = span.len() / step;
     let threads = threads.max(1).min(units.max(1));
     if threads == 1 || !span.len().is_multiple_of(step) {

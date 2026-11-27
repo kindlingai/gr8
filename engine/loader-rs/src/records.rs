@@ -84,6 +84,65 @@ pub fn int4_quantize(w: &[f32], k: usize) -> (Vec<u8>, Vec<u16>) {
     (q, sc)
 }
 
+/// int8 gG codes ([n][k], signed i8 in [-127, 127]) and fp16 scale bits ([n][k / G]) of a row-major [n][k] fp32
+/// matrix, round to nearest (FORMAT.md "int8 groups"): s8 = fp16(max |w| / 127), q8 = clamp(rint(w / s8), -127, 127).
+pub fn int8_quantize(w: &[f32], k: usize, g: usize) -> (Vec<i8>, Vec<u16>) {
+    assert!(matches!(g, 16 | 32 | 64 | 128) && k.is_multiple_of(g) && w.len().is_multiple_of(k));
+    let mut q = vec![0i8; w.len()];
+    let mut sc = vec![0u16; w.len() / g];
+    for (gi, (x, dst)) in w.chunks_exact(g).zip(q.chunks_exact_mut(g)).enumerate() {
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let s = f16_bits(amax / 127.0);
+        sc[gi] = s;
+        let sf = crate::exlr8::f16_to_f32(s);
+        if sf == 0.0 {
+            continue;
+        }
+        for (o, &v) in dst.iter_mut().zip(x) {
+            *o = (v / sf).round_ties_even().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    (q, sc)
+}
+
+/// Bytes per 16-row x G-input group record for `int8 gG` (G in {16, 32, 64, 128}): (G/16) * 256 + 32.
+pub fn int8_record_bytes(g: usize) -> usize {
+    assert!(matches!(g, 16 | 32 | 64 | 128));
+    (g / 16) * 256 + 32
+}
+
+/// Native `int8 gG` shared decode/prefill record: codes [16T][K] (i8 in [-127, 127]), fp16 scale bits [16T][K/G] ->
+/// [T][K/G][GR] where GR = (G/16) * 256 + 32 (G/16 tiles of 16x16 i8 codes in GV_ORDER lane layout, followed by 8 pairs
+/// {s[i], s[i+8]} of little-endian fp16 scales = 32 B). Exact q8 * s8 representation (~1.031 B/weight at g64).
+pub fn int8_record(q: &[i8], s: &[u16], k: usize, g: usize) -> Vec<u8> {
+    assert!(matches!(g, 16 | 32 | 64 | 128));
+    let n = q.len() / k;
+    assert!(n.is_multiple_of(16) && k > 0 && k.is_multiple_of(g));
+    assert_eq!(q.len(), n * k);
+    assert_eq!(s.len(), n * (k / g));
+    let ord = gv_order();
+    let ng = k / g;
+    let nt = g / 16;
+    let gr = nt * 256 + 32;
+    let mut out = vec![0u8; (n / 16) * ng * gr];
+    for t in 0..n / 16 {
+        for grp in 0..ng {
+            let rec = &mut out[(t * ng + grp) * gr..][..gr];
+            for h in 0..nt {
+                for (i, &(r, c)) in ord.iter().enumerate() {
+                    rec[h * 256 + i] = q[(16 * t + r) * k + g * grp + 16 * h + c] as u8;
+                }
+            }
+            let sb = nt * 256;
+            for i in 0..8 {
+                rec[sb + 4 * i..sb + 4 * i + 2].copy_from_slice(&s[(16 * t + i) * ng + grp].to_le_bytes());
+                rec[sb + 4 * i + 2..sb + 4 * i + 4].copy_from_slice(&s[(16 * t + i + 8) * ng + grp].to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
 /// The 32 lanes' (row, k) pairs of a 16x16 tile in the GEMV record order: lane l = (r, c), r = l / 4, c = l % 4,
 /// eight elements (r, 2c), (r, 2c+1), (r+8, 2c), (r+8, 2c+1), (r, 2c+8), (r, 2c+9), (r+8, 2c+8), (r+8, 2c+9).
 const GV_ORDER: [(usize, usize); 256] = {
@@ -300,6 +359,50 @@ mod tests {
         for j in 0..32usize {
             let n = if j.is_multiple_of(2) { q[j / 2] & 15 } else { q[j / 2] >> 4 } as f32 - 8.0;
             assert_eq!(n * s, w[j]);
+        }
+    }
+
+    #[test]
+    fn int8_quantize_and_record_round_trip() {
+        for g in [16usize, 32, 64, 128] {
+            let k = 128usize;
+            let n = 32usize;
+            let s = f16_to_f32(f16_bits(1.27 / 127.0));
+            let mut w = vec![0f32; n * k];
+            for r in 0..n {
+                for c in 0..k {
+                    let qv = (((r * 13 + c * 7) % 255) as i32 - 127) as f32;
+                    w[r * k + c] = if r == 0 && c < g { 0.0 } else { qv * s };
+                }
+            }
+            let (q, sc) = int8_quantize(&w, k, g);
+            assert!(q.iter().all(|&v| v != -128));
+            assert_eq!(sc[0], 0);
+            let rec = int8_record(&q, &sc, k, g);
+            let gr = int8_record_bytes(g);
+            let ng = k / g;
+            let nt = g / 16;
+            assert_eq!(rec.len(), (n / 16) * ng * gr);
+            // Invert record back to [n][k] and verify exact q8 and s8 match
+            for t in 0..n / 16 {
+                for grp in 0..ng {
+                    let slice = &rec[(t * ng + grp) * gr..][..gr];
+                    for h in 0..nt {
+                        for (i, &(rr, cc)) in GV_ORDER.iter().enumerate() {
+                            let got_q = slice[h * 256 + i] as i8;
+                            let want_q = q[(16 * t + rr) * k + g * grp + 16 * h + cc];
+                            assert_eq!(got_q, want_q, "g={g} t={t} grp={grp} h={h} ({rr},{cc})");
+                        }
+                    }
+                    let sb = nt * 256;
+                    for i in 0..8 {
+                        let s0 = u16::from_le_bytes([slice[sb + 4 * i], slice[sb + 4 * i + 1]]);
+                        let s8 = u16::from_le_bytes([slice[sb + 4 * i + 2], slice[sb + 4 * i + 3]]);
+                        assert_eq!(s0, sc[(16 * t + i) * ng + grp]);
+                        assert_eq!(s8, sc[(16 * t + i + 8) * ng + grp]);
+                    }
+                }
+            }
         }
     }
 }
