@@ -447,6 +447,7 @@ pub enum Model {
     Glm5v,
     Ink2,
     Qw38,
+    Qwen3Vl,
 }
 
 impl Model {
@@ -457,6 +458,7 @@ impl Model {
             Model::Glm5v => glm5v::IMAGE_TOKEN_ID,
             Model::Ink2 => ink2::IMAGE_TOKEN_ID,
             Model::Qw38 => qw38::IMAGE_TOKEN_ID,
+            Model::Qwen3Vl => qwen3vl::IMAGE_TOKEN_ID,
         }
     }
     pub fn prepare_rgb(self, im: &Rgb) -> Result<Prepared, VisionError> {
@@ -465,6 +467,7 @@ impl Model {
             Model::Glm5v => glm5v::prepare_rgb(im),
             Model::Ink2 => ink2::prepare_rgb(im),
             Model::Qw38 => qw38::prepare_rgb(im),
+            Model::Qwen3Vl => qwen3vl::prepare_rgb(im),
         }
     }
     /// Image bytes -> RGB as the model's processor reads them: Inkling-2-Small composites transparency on its
@@ -472,7 +475,7 @@ impl Model {
     pub fn decode(self, bytes: &[u8]) -> Result<Rgb, VisionError> {
         match self {
             Model::Ink2 => ink2::decode_ink2_rgb(bytes),
-            Model::Ds41 | Model::Glm5v | Model::Qw38 => decode_rgb(bytes),
+            Model::Ds41 | Model::Glm5v | Model::Qw38 | Model::Qwen3Vl => decode_rgb(bytes),
         }
     }
     /// Base64 image data -> what the engine gets.
@@ -487,6 +490,7 @@ impl Model {
             Model::Glm5v => glm5v::plan(w, h).tokens(),
             Model::Ink2 => ink2::plan(w, h)?.tokens,
             Model::Qw38 => qw38::plan(w, h)?.tokens(),
+            Model::Qwen3Vl => qwen3vl::plan(w, h)?.tokens(),
         })
     }
 }
@@ -651,6 +655,85 @@ pub mod qw38 {
     }
 
     /// `transformers.models.qwen2_vl.image_processing_qwen2_vl.smart_resize(height, width, factor=32, min_pixels=65536, max_pixels=16777216)`.
+    pub fn smart_resize(height: usize, width: usize) -> Result<(usize, usize), VisionError> {
+        if height == 0 || width == 0 {
+            return verr("empty image");
+        }
+        let hi = height.max(width) as f64;
+        let lo = height.min(width) as f64;
+        if hi / lo > 200.0 {
+            return verr(format!("image aspect ratio {:.1} exceeds 200", hi / lo));
+        }
+        let f = FACTOR as f64;
+        let mut h_bar = py_round(height as f64 / f).max(1) * FACTOR;
+        let mut w_bar = py_round(width as f64 / f).max(1) * FACTOR;
+        if h_bar * w_bar > MAX_PIXELS {
+            let beta = ((height * width) as f64 / MAX_PIXELS as f64).sqrt();
+            h_bar = ((height as f64 / beta / f).floor() as usize).max(1) * FACTOR;
+            w_bar = ((width as f64 / beta / f).floor() as usize).max(1) * FACTOR;
+        } else if h_bar * w_bar < MIN_PIXELS {
+            let beta = (MIN_PIXELS as f64 / (height * width) as f64).sqrt();
+            h_bar = ((height as f64 * beta / f).ceil() as usize).max(1) * FACTOR;
+            w_bar = ((width as f64 * beta / f).ceil() as usize).max(1) * FACTOR;
+        }
+        Ok((h_bar, w_bar))
+    }
+
+    pub fn plan(width: usize, height: usize) -> Result<Plan, VisionError> {
+        let (target_h, target_w) = smart_resize(height, width)?;
+        Ok(Plan { target_h, target_w })
+    }
+
+    pub fn prepare_rgb(im: &Rgb) -> Result<Prepared, VisionError> {
+        let p = plan(im.w, im.h)?;
+        let rgb = if im.w == p.target_w && im.h == p.target_h {
+            im.px.clone()
+        } else {
+            resize_bicubic(&im.px, im.w, im.h, p.target_w, p.target_h)
+        };
+        let key = content_key(p.vit_h(), p.vit_w(), &rgb);
+        Ok(Prepared { vit_h: p.vit_h(), vit_w: p.vit_w(), n_span: p.tokens(), key, rgb })
+    }
+}
+
+/// Qwen3-VL-Embedding (2B / 8B): transformers' `Qwen2VLImageProcessor` (`patch=16`, `merge=2`, `factor=32`,
+/// `min_pixels=4096` [4 tokens], `max_pixels=1310720` [1280 tokens], bicubic resize, no padding, `<|image_pad|>` = 151655).
+pub mod qwen3vl {
+    use super::{content_key, resize_bicubic, verr, Prepared, Rgb, VisionError};
+
+    /// `image_token_id`: `<|image_pad|>` (151655) in Qwen3-VL-Embedding vocabularies.
+    pub const IMAGE_TOKEN_ID: u32 = 151_655;
+    pub const PATCH: usize = 16;
+    pub const MERGE: usize = 2;
+    pub const FACTOR: usize = PATCH * MERGE; // 32
+    pub const MIN_PIXELS: usize = 4_096;     // 4 tokens
+    pub const MAX_PIXELS: usize = 1_310_720; // 1280 tokens
+    pub const MIN_TOKENS: usize = MIN_PIXELS / (FACTOR * FACTOR); // 4
+    pub const MAX_TOKENS: usize = MAX_PIXELS / (FACTOR * FACTOR); // 1280
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Plan {
+        pub target_h: usize,
+        pub target_w: usize,
+    }
+
+    impl Plan {
+        pub fn vit_h(&self) -> usize {
+            self.target_h / PATCH
+        }
+        pub fn vit_w(&self) -> usize {
+            self.target_w / PATCH
+        }
+        pub fn tokens(&self) -> usize {
+            (self.vit_h() / MERGE) * (self.vit_w() / MERGE)
+        }
+    }
+
+    fn py_round(x: f64) -> usize {
+        x.round_ties_even().max(0.0) as usize
+    }
+
+    /// `smart_resize(height, width, factor=32, min_pixels=4096, max_pixels=1310720)`.
     pub fn smart_resize(height: usize, width: usize) -> Result<(usize, usize), VisionError> {
         if height == 0 || width == 0 {
             return verr("empty image");
@@ -1409,5 +1492,32 @@ mod tests {
         ] {
             assert!(block_b64(&b).is_err(), "{b}");
         }
+    }
+
+    #[test]
+    fn qwen3vl_plan_and_prepare() {
+        assert_eq!(Model::Qwen3Vl.token(), 151_655);
+        // 512x512 -> 512x512 (32x32 patches = 256 tokens)
+        let p = qwen3vl::plan(512, 512).unwrap();
+        assert_eq!((p.target_h, p.target_w, p.vit_h(), p.vit_w(), p.tokens()), (512, 512, 32, 32, 256));
+        // Tiny 16x16 upscales to at least MIN_PIXELS (4096 = 64x64 = 4 tokens)
+        let small = qwen3vl::plan(16, 16).unwrap();
+        assert!(small.target_h * small.target_w >= qwen3vl::MIN_PIXELS);
+        assert_eq!((small.target_h, small.target_w, small.tokens()), (64, 64, qwen3vl::MIN_TOKENS));
+        // Large 4000x3000 downscales within MAX_PIXELS (1_310_720 = 1280 tokens)
+        let big = qwen3vl::plan(4000, 3000).unwrap();
+        assert!(big.target_h * big.target_w <= qwen3vl::MAX_PIXELS);
+        assert!(big.tokens() <= qwen3vl::MAX_TOKENS);
+        assert_eq!(big.target_h % qwen3vl::FACTOR, 0);
+        assert_eq!(big.target_w % qwen3vl::FACTOR, 0);
+        // Reject empty and extreme aspect ratio
+        assert!(qwen3vl::plan(0, 64).is_err());
+        assert!(qwen3vl::plan(10000, 10).is_err());
+        // Prepare RGB on a 64x64 PNG round-trip
+        let rgb = vec![128u8; 64 * 64 * 3];
+        let png_bytes = png(64, 64, image::ExtendedColorType::Rgb8, &rgb);
+        let prep = Model::Qwen3Vl.prepare_b64(&b64_encode(&png_bytes)).unwrap();
+        assert_eq!((prep.vit_h, prep.vit_w, prep.n_span), (4, 4, 4));
+        assert_eq!(prep.rgb, rgb);
     }
 }

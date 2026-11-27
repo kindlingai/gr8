@@ -642,6 +642,19 @@ struct GemmWorkspace {
         EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<16>::SMEM));
     }
 
+    void ensure_rot(int M, int K) {
+        const size_t rb = (size_t(M) + 15) / 16;
+        const size_t k16 = (size_t(K) + 15) / 16;
+        const size_t need = std::max<size_t>(4096, rb * k16 * 512);
+        if (need > x_rot_bytes) {
+            if (x_rot) cudaFree(x_rot);
+            x_rot = nullptr;
+            x_rot_bytes = 0;
+            EMB_CK(cudaMalloc(&x_rot, need));
+            x_rot_bytes = need;
+        }
+    }
+
     void release() {
         if (blas) { cublasDestroy(blas); blas = nullptr; }
         if (x_rot) { cudaFree(x_rot); x_rot = nullptr; x_rot_bytes = 0; }

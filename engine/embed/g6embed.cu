@@ -10,6 +10,7 @@
 #include "embed_config.h"
 #include "embed_proto.h"
 #include "embed_text.cuh"
+#include "embed_vision.cuh"
 #include "embed_weights.h"
 
 namespace {
@@ -123,6 +124,8 @@ int main(int argc, char** argv) {
         }
         g6emb::TextRunner text_runner;
         text_runner.init(weights, opts.max_batched_tokens);
+        g6emb::VisionRunner vision_runner;
+        vision_runner.init(weights);
 
         cudaStream_t stream = nullptr;
         EMB_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -134,7 +137,8 @@ int main(int argc, char** argv) {
 
         g6emb::EmbedMetrics metrics;
         auto runner = [&](const std::vector<g6emb::EmbedRequest>& batch) -> std::vector<g6emb::EmbedOutput> {
-            return text_runner.forward_batch(batch, nullptr, stream);
+            g6emb::PackedVisionFeatures vis = vision_runner.encode_batch(batch, text_runner.ws, &text_runner.prof, stream);
+            return text_runner.forward_batch(batch, vis.n_img_tokens > 0 ? &vis : nullptr, stream);
         };
 
         while (!g_stop) {
