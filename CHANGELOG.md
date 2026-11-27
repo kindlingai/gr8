@@ -6,6 +6,13 @@ for versioning, release gates, and optional machine-readable specs in [`releases
 
 ---
 
+## [1.5.0](https://github.com/kindlingai/gr8/compare/v1.4.0...v1.5.0) (2026-11-27)
+
+
+### Features
+
+* **docker,launch:** ship g6embed in gr8 image and add embed launcher profile ([#637](https://github.com/kindlingai/gr8/issues/637)) ([6c9f1ab](https://github.com/kindlingai/gr8/commit/6c9f1abab41e3dd816e8d88e82b8712610f48992))
+
 ## [1.4.0](https://github.com/kindlingai/gr8/compare/v1.3.1...v1.4.0) (2026-11-27)
 
 
