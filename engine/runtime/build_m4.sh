@@ -121,7 +121,20 @@ wflags() {
 for n in $WIDTHS; do
   case $n in 1|2|3|4|5|6|8) ;; *) echo "WIDTHS: $n is not a TP width (1, 2, 3, 4, 5, 6 or 8)"; exit 2 ;; esac
 done
-J=${JOBS:-$(nproc)}
+if [ -n "${JOBS:-}" ]; then
+  J=$JOBS
+else
+  J=$(nproc)
+  # g6m4.cu / m4sim.cu ptxas peaks near 4 GB per TU on Flash; cap default parallelism to fit host RAM (e.g. 16 GB CI runners)
+  if [ -r /proc/meminfo ]; then
+    MEM_GIB=$(awk '/^MemTotal:/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
+    PER_JOB=5
+    case " ${EXTRA:-} " in *" -DG6_MODEL_FLASH=1 "*) PER_JOB=6 ;; esac
+    MEM_J=$(( MEM_GIB / PER_JOB ))
+    [ "$MEM_J" -lt 1 ] && MEM_J=1
+    [ "$J" -gt "$MEM_J" ] && J=$MEM_J
+  fi
+fi
 rm -f $O/*.log $O/*.failed
 job() {   # job <log> <command..>: in the background, at most J at once; a failure leaves <log>.failed
   while [ "$(jobs -rp | wc -l)" -ge "$J" ]; do wait -n || true; done

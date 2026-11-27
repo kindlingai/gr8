@@ -13,11 +13,7 @@ __device__ __forceinline__ void k1_shared_fc1(const K1Args& A, int cta, float* s
     __half* act = A.act + static_cast<size_t>(A.smax) * 8 * ACTW;
     g6mx::nt_dispatch_dev(g6mx::tiles(A.M), [&](auto N) {
         constexpr int NTv = decltype(N)::value;
-        if (A.s_i8_fc1 == 1) rt_fc1_cta<Int8v<1>, GvGroup<Int8v<1>>, NTv>(A.s_fc1, A.s_up, Int8v<1>::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
-        else if (A.s_i8_fc1 == 2) rt_fc1_cta<Int8v<2>, GvGroup<Int8v<2>>, NTv>(A.s_fc1, A.s_up, Int8v<2>::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
-        else if (A.s_i8_fc1 == 4) rt_fc1_cta<Int8v<4>, GvGroup<Int8v<4>>, NTv>(A.s_fc1, A.s_up, Int8v<4>::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
-        else if (A.s_i8_fc1 == 8) rt_fc1_cta<Int8v<8>, GvGroup<Int8v<8>>, NTv>(A.s_fc1, A.s_up, Int8v<8>::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
-        else if (A.s_mx) rt_fc1_cta<Mxfp8, GvGroup<Mxfp8>, NTv>(A.s_fc1, A.s_up, Mxfp8::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
+        if (A.s_mx) rt_fc1_cta<Mxfp8, GvGroup<Mxfp8>, NTv>(A.s_fc1, A.s_up, Mxfp8::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
         else rt_fc1_cta<Int4, RtGroup<Int4>, NTv>(A.s_fc1, A.s_fc1 + Int4::GR, 2 * Int4::GR, A.xfrag, cta * A.s_cw, A.s_cw, A.s_nch, A.s_ks, 1.f, 1.f, act, SACTW, smem);
     });
 }
@@ -40,14 +36,138 @@ __device__ __forceinline__ void k1_shared_fc2(const K1Args& A, int os, u32* smem
         __syncthreads();
         g6mx::nt_dispatch_dev(n, [&](auto N) {
             constexpr int NTv = decltype(N)::value;
-            if (A.s_i8_fc2 == 1) rt_gemv_body<Int8v<1>, GvGroup<Int8v<1>>, NTv>(A.s_fc2, smem, A.s_nch, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
-            else if (A.s_i8_fc2 == 2) rt_gemv_body<Int8v<2>, GvGroup<Int8v<2>>, NTv>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
-            else if (A.s_i8_fc2 == 4) rt_gemv_body<Int8v<4>, GvGroup<Int8v<4>>, NTv>(A.s_fc2, smem, A.s_nch / 4, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
-            else if (A.s_i8_fc2 == 8) rt_gemv_body<Int8v<8>, GvGroup<Int8v<8>>, NTv>(A.s_fc2, smem, A.s_nch / 8, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
-            else if (A.s_mx) rt_gemv_body<Mxfp8, GvGroup<Mxfp8>, NTv>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
+            if (A.s_mx) rt_gemv_body<Mxfp8, GvGroup<Mxfp8>, NTv>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
             else rt_gemv_body<Int4, RtGroup<Int4>, NTv>(A.s_fc2, smem, A.s_nch / 2, os * OTU, (os + 1) * OTU, nullptr, 1.f, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
         });
     }
+}
+
+// Dedicated dense int8 gG MLP kernels (decoupled from k1_tr3_* so MoE kernels pay zero PTX/register cost).
+template <int NT>
+__device__ __forceinline__ void rt_fc1_cta_i8(const uint8_t* gate, const uint8_t* up, int grp, const u32* xfrag, int chunk0, int cw, int nch,
+                                              int ks, __half* act, int aw, float* smem)
+{
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int cl = warp / ks, part = warp % ks, chunk = chunk0 + cl;
+    const bool on = cl < cw && chunk < nch;
+    const int NG = KSH / grp, NGP = NG / ks, g0 = part * NGP;
+    const int GR = grp * 256 + 32;
+    float ag[NT][4], au[NT][4];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) ag[t][0] = ag[t][1] = ag[t][2] = ag[t][3] = au[t][0] = au[t][1] = au[t][2] = au[t][3] = 0.f;
+    if (on)
+    {
+        const size_t t_off = static_cast<size_t>(chunk) * NG * GR;
+        gv_tile_part_i8<NT>(gate + t_off, xfrag + lane * 2, KSH * 64, g0, g0 + NGP, grp, ag);
+        gv_tile_part_i8<NT>(up + t_off, xfrag + lane * 2, KSH * 64, g0, g0 + NGP, grp, au);
+    }
+    if (ks > 1)
+    {
+        float4* ps = reinterpret_cast<float4*>(smem) + (warp * 32 + lane) * 2 * NT;
+        if (on)
+        {
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+            {
+                ps[2 * t] = make_float4(ag[t][0], ag[t][1], ag[t][2], ag[t][3]);
+                ps[2 * t + 1] = make_float4(au[t][0], au[t][1], au[t][2], au[t][3]);
+            }
+        }
+        __syncthreads();
+        if (on && part == 0)
+            for (int q = 1; q < ks; ++q)
+            {
+                #pragma unroll
+                for (int t = 0; t < NT; ++t)
+                {
+                    const float4 g = ps[q * 64 * NT + 2 * t], u = ps[q * 64 * NT + 2 * t + 1];
+                    ag[t][0] += g.x; ag[t][1] += g.y; ag[t][2] += g.z; ag[t][3] += g.w;
+                    au[t][0] += u.x; au[t][1] += u.y; au[t][2] += u.z; au[t][3] += u.w;
+                }
+            }
+    }
+    if (!on || part) return;
+    const int r = lane >> 2, c = lane & 3;
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        __half* a0 = act + (8 * t + 2 * c) * aw + chunk * 16 + r;
+        a0[0] = __float2half_rn(swiglu_f(ag[t][0], au[t][0]));
+        a0[aw] = __float2half_rn(swiglu_f(ag[t][1], au[t][1]));
+        a0[8] = __float2half_rn(swiglu_f(ag[t][2], au[t][2]));
+        a0[aw + 8] = __float2half_rn(swiglu_f(ag[t][3], au[t][3]));
+    }
+}
+
+template <int NT>
+__device__ __forceinline__ void rt_gemv_body_i8(const uint8_t* stream, const u32* bfrag, int NG2, int grp, int ot0, int ot_end,
+                                                u32 mask, __half* y, int ystride, int bf16)
+{
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int GR = grp * 256 + 32;
+    const size_t tile_bytes = static_cast<size_t>(NG2) * GR;
+    const u32* bf = bfrag + lane * 2;
+    const int ts = NG2 * grp * 64;
+    const int r = lane >> 2, c = lane & 3;
+    for (int ot = ot0 + warp; ot < ot_end; ot += nwarps)
+    {
+        float acc[NT][4];
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+        gv_tile_part_i8<NT>(stream + static_cast<size_t>(ot) * tile_bytes, bf, ts, 0, NG2, grp, acc);
+        const int o = ot * 16 + r;
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            const int m0 = 8 * t + 2 * c;
+            if ((mask >> m0) & 1)
+            {
+                if (bf16) { reinterpret_cast<uint16_t*>(y)[m0 * ystride + o] = f2bf(acc[t][0]); reinterpret_cast<uint16_t*>(y)[m0 * ystride + o + 8] = f2bf(acc[t][2]); }
+                else { y[m0 * ystride + o] = __float2half_rn(acc[t][0]); y[m0 * ystride + o + 8] = __float2half_rn(acc[t][2]); }
+            }
+            if ((mask >> (m0 + 1)) & 1)
+            {
+                if (bf16) { reinterpret_cast<uint16_t*>(y)[(m0 + 1) * ystride + o] = f2bf(acc[t][1]); reinterpret_cast<uint16_t*>(y)[(m0 + 1) * ystride + o + 8] = f2bf(acc[t][3]); }
+                else { y[(m0 + 1) * ystride + o] = __float2half_rn(acc[t][1]); y[(m0 + 1) * ystride + o + 8] = __float2half_rn(acc[t][3]); }
+            }
+        }
+    }
+}
+
+__global__ __launch_bounds__(1024) void k1_dense_i8_fc1(K1Args A)
+{
+    extern __shared__ __align__(16) u32 smem[];
+    __half* act = A.act + static_cast<size_t>(A.smax) * 8 * ACTW;
+    g6mx::nt_dispatch_dev(g6mx::tiles(A.M), [&](auto N) {
+        constexpr int NTv = decltype(N)::value;
+        rt_fc1_cta_i8<NTv>(A.s_fc1, A.s_up, A.s_i8_fc1, A.xfrag, static_cast<int>(blockIdx.x) * A.s_cw, A.s_cw, A.s_nch, A.s_ks, act, SACTW, reinterpret_cast<float*>(smem));
+    });
+}
+
+__global__ __launch_bounds__(512, 2) void k1_dense_i8_fc2(K1Args A)
+{
+    extern __shared__ __align__(16) u32 smem[];
+    const int os = static_cast<int>(blockIdx.x);
+    const int OTU = KSH / A.s_ns2;
+    __half* y = A.s_direct ? K1_OUT(A) : A.ypart + static_cast<size_t>(A.ysh) * HID;
+    const int bf = A.s_direct && A.out_bf16;
+    const u32 mask = A.M >= 32 ? 0xffffffffu : (1u << A.M) - 1u;
+    const int ntot = g6mx::tiles(A.M);
+    for (int t0 = 0; t0 < ntot; t0 += A.s_ntp)
+    {
+        const int n = ntot - t0 < A.s_ntp ? ntot - t0 : A.s_ntp;
+        if (t0) __syncthreads();
+        rt_build_bfrag(smem, A.act + static_cast<size_t>(A.smax) * 8 * ACTW + static_cast<size_t>(8 * t0) * SACTW, SACTW, A.s_nch, n);
+        __syncthreads();
+        g6mx::nt_dispatch_dev(n, [&](auto N) {
+            constexpr int NTv = decltype(N)::value;
+            rt_gemv_body_i8<NTv>(A.s_fc2, smem, A.s_nch / A.s_i8_fc2, A.s_i8_fc2, os * OTU, (os + 1) * OTU, mask >> (8 * t0), y + static_cast<size_t>(8 * t0) * HID, HID, bf);
+        });
+    }
+#if DEC_SLOT >= 2
+    if (A.slot.send && A.s_direct) dslot::publish(A.slot, true);
+#endif
 }
 
 // ------------------------------------------------------------------ TR3 build

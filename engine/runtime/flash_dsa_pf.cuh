@@ -74,6 +74,20 @@ __global__ void __launch_bounds__(THREADS) k_gv_full(const uint8_t* w, const u32
     else gv_gemv_body<C, GV_NT>(w, xf, K, ot, tpc, ks, r, out, ld, odt, red, blockIdx.x, rscale);
 }
 
+template <int THREADS>
+__global__ void __launch_bounds__(THREADS) k_gv_full_i8(const uint8_t* w, const u32* xfrag, int K, int ot,
+                                                        int tpc, int ks, int M, void* y, int ld, int odt, int grp)
+{
+    const int r = flash_dsa_full_schedule::active_rows(M, blockIdx.y);
+    const u32* xf = xfrag + flash_dsa_full_schedule::fragment_words(blockIdx.y, K);
+    __half* out = static_cast<__half*>(y) + flash_dsa_full_schedule::output_elements(blockIdx.y, ld);
+    __shared__ float4 red[32][32];
+    if (r <= 8) gv_gemv_body_i8<1>(w, xf, K, ot, tpc, ks, r, out, ld, odt, grp, red, blockIdx.x);
+    else if (r <= 16) gv_gemv_body_i8<2>(w, xf, K, ot, tpc, ks, r, out, ld, odt, grp, red, blockIdx.x);
+    else if (r <= 24) gv_gemv_body_i8<3>(w, xf, K, ot, tpc, ks, r, out, ld, odt, grp, red, blockIdx.x);
+    else gv_gemv_body_i8<GV_NT>(w, xf, K, ot, tpc, ks, r, out, ld, odt, grp, red, blockIdx.x);
+}
+
 inline void launch_gv_full(const bind::Gv& g, const u32* xfrag, int M, void* y, cudaStream_t st)
 {
     if (!g.on || M <= 0) return;
@@ -85,20 +99,20 @@ inline void launch_gv_full(const bind::Gv& g, const u32* xfrag, int M, void* y, 
         const dim3 grid((ot + tpc - 1) / tpc, flash_dsa_full_schedule::grid_rows(M));
         kern<<<grid, tpc * g.ks * 32, 0, st>>>(g.w, xfrag, g.K, ot, tpc, g.ks, M, y, g.ld, g.odt, g.rscale);
     };
-    if (g.codec == bind::INT4) {
+    if (bind::is_int8_codec(g.codec)) {
+        const int grp = 1 << (g.codec - bind::INT8_G16);
+        auto go_i8 = [&](auto* kern) {
+            const int tpc = bind::gv_fit_tpc(kern, g.tpc, g.ks);
+            const dim3 grid((ot + tpc - 1) / tpc, flash_dsa_full_schedule::grid_rows(M));
+            kern<<<grid, tpc * g.ks * 32, 0, st>>>(g.w, xfrag, g.K, ot, tpc, g.ks, M, y, g.ld, g.odt, grp);
+        };
+        if (b512) go_i8(k_gv_full_i8<512>); else go_i8(k_gv_full_i8<1024>);
+    } else if (g.codec == bind::INT4) {
         if (b512) go(k_gv_full<Int4v, 512>); else go(k_gv_full<Int4v, 1024>);
     } else if (g.codec == bind::MXFP8) {
         if (b512) go(k_gv_full<Mxfp8, 512>); else go(k_gv_full<Mxfp8, 1024>);
     } else if (g.codec == bind::FP8R) {
         if (b512) go(k_gv_full<Fp8r, 512>); else go(k_gv_full<Fp8r, 1024>);
-    } else if (g.codec == bind::INT8_G16) {
-        if (b512) go(k_gv_full<Int8v<1>, 512>); else go(k_gv_full<Int8v<1>, 1024>);
-    } else if (g.codec == bind::INT8_G32) {
-        if (b512) go(k_gv_full<Int8v<2>, 512>); else go(k_gv_full<Int8v<2>, 1024>);
-    } else if (g.codec == bind::INT8_G64) {
-        if (b512) go(k_gv_full<Int8v<4>, 512>); else go(k_gv_full<Int8v<4>, 1024>);
-    } else if (g.codec == bind::INT8_G128) {
-        if (b512) go(k_gv_full<Int8v<8>, 512>); else go(k_gv_full<Int8v<8>, 1024>);
     } else {
         if (b512) go(k_gv_full<Bf16w, 512>); else go(k_gv_full<Bf16w, 1024>);
     }
@@ -132,13 +146,17 @@ inline void launch_gv_rows(const bind::Gv& g, const u32* xfrag, int M, void* y, 
             const int tpc = NTv == 1 ? g.tpc : bind::gv_fit_tpc(kern, g.tpc, g.ks);
             kern<<<(ot + tpc - 1) / tpc, tpc * g.ks * 32, 0, st>>>(g.w, xfrag, g.K, ot, tpc, g.ks, M, y, g.ld, g.odt, g.rscale);
         };
-        if (g.codec == bind::INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>); else if (b512) go(gv_gemv_lb512<Int4v, NTv>); else go(gv_gemv_lb<Int4v, NTv>); }
+        if (bind::is_int8_codec(g.codec)) {
+            const int grp = 1 << (g.codec - bind::INT8_G16);
+            auto go_i8 = [&](auto* kern) {
+                const int tpc = NTv == 1 ? g.tpc : bind::gv_fit_tpc(kern, g.tpc, g.ks);
+                kern<<<(ot + tpc - 1) / tpc, tpc * g.ks * 32, 0, st>>>(g.w, xfrag, g.K, ot, tpc, g.ks, M, y, g.ld, g.odt, grp);
+            };
+            if constexpr (NTv == 1) go_i8(gv_gemv_i8<1>); else if (b512) go_i8(gv_gemv_i8_lb512<NTv>); else go_i8(gv_gemv_i8_lb<NTv>);
+        }
+        else if (g.codec == bind::INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>); else if (b512) go(gv_gemv_lb512<Int4v, NTv>); else go(gv_gemv_lb<Int4v, NTv>); }
         else if (g.codec == bind::MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>); else if (b512) go(gv_gemv_lb512<Mxfp8, NTv>); else go(gv_gemv_lb<Mxfp8, NTv>); }
         else if (g.codec == bind::FP8R) { if constexpr (NTv == 1) go(gv_gemv<Fp8r, 1>); else if (b512) go(gv_gemv_lb512<Fp8r, NTv>); else go(gv_gemv_lb<Fp8r, NTv>); }
-        else if (g.codec == bind::INT8_G16) { if constexpr (NTv == 1) go(gv_gemv<Int8v<1>, 1>); else if (b512) go(gv_gemv_lb512<Int8v<1>, NTv>); else go(gv_gemv_lb<Int8v<1>, NTv>); }
-        else if (g.codec == bind::INT8_G32) { if constexpr (NTv == 1) go(gv_gemv<Int8v<2>, 1>); else if (b512) go(gv_gemv_lb512<Int8v<2>, NTv>); else go(gv_gemv_lb<Int8v<2>, NTv>); }
-        else if (g.codec == bind::INT8_G64) { if constexpr (NTv == 1) go(gv_gemv<Int8v<4>, 1>); else if (b512) go(gv_gemv_lb512<Int8v<4>, NTv>); else go(gv_gemv_lb<Int8v<4>, NTv>); }
-        else if (g.codec == bind::INT8_G128) { if constexpr (NTv == 1) go(gv_gemv<Int8v<8>, 1>); else if (b512) go(gv_gemv_lb512<Int8v<8>, NTv>); else go(gv_gemv_lb<Int8v<8>, NTv>); }
         else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>); else if (b512) go(gv_gemv_lb512<Bf16w, NTv>); else go(gv_gemv_lb<Bf16w, NTv>); }
     };
     const int nt = (M + 7) / 8;

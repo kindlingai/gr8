@@ -622,10 +622,7 @@ inline void launch(const Gv& g, cudaStream_t st)
         {
             if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv_slot<Int4v, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Int4v, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int4v, NTv>, g.ld, g.slot); }
             else if (g.codec == BF16W) { if constexpr (NTv == 1) go(gv_gemv_slot<Bf16w, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Bf16w, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Bf16w, NTv>, g.ld, g.slot); }
-            else if (g.codec == INT8_G16) { if constexpr (NTv == 1) go(gv_gemv_slot<Int8v<1>, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Int8v<1>, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int8v<1>, NTv>, g.ld, g.slot); }
-            else if (g.codec == INT8_G32) { if constexpr (NTv == 1) go(gv_gemv_slot<Int8v<2>, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Int8v<2>, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int8v<2>, NTv>, g.ld, g.slot); }
-            else if (g.codec == INT8_G64) { if constexpr (NTv == 1) go(gv_gemv_slot<Int8v<4>, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Int8v<4>, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int8v<4>, NTv>, g.ld, g.slot); }
-            else if (g.codec == INT8_G128) { if constexpr (NTv == 1) go(gv_gemv_slot<Int8v<8>, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Int8v<8>, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int8v<8>, NTv>, g.ld, g.slot); }
+            else if (is_int8_codec(g.codec)) { const int grp = 1 << (g.codec - INT8_G16); if constexpr (NTv == 1) go(gv_gemv_slot_i8<1>, g.ld, g.slot, grp); else if (b512) go(gv_gemv_slot_i8_lb512<NTv>, g.ld, g.slot, grp); else go(gv_gemv_slot_i8_lb<NTv>, g.ld, g.slot, grp); }
             else { if constexpr (NTv == 1) go(gv_gemv_slot<Mxfp8, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Mxfp8, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Mxfp8, NTv>, g.ld, g.slot); }
             return;
         }
@@ -633,10 +630,7 @@ inline void launch(const Gv& g, cudaStream_t st)
         if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); }
         else if (g.codec == MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); }
         else if (g.codec == FP8R) { if constexpr (NTv == 1) go(gv_gemv<Fp8r, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); }
-        else if (g.codec == INT8_G16) { if constexpr (NTv == 1) go(gv_gemv<Int8v<1>, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Int8v<1>, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Int8v<1>, NTv>, g.y, g.ld, g.odt, g.rscale); }
-        else if (g.codec == INT8_G32) { if constexpr (NTv == 1) go(gv_gemv<Int8v<2>, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Int8v<2>, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Int8v<2>, NTv>, g.y, g.ld, g.odt, g.rscale); }
-        else if (g.codec == INT8_G64) { if constexpr (NTv == 1) go(gv_gemv<Int8v<4>, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Int8v<4>, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Int8v<4>, NTv>, g.y, g.ld, g.odt, g.rscale); }
-        else if (g.codec == INT8_G128) { if constexpr (NTv == 1) go(gv_gemv<Int8v<8>, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Int8v<8>, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Int8v<8>, NTv>, g.y, g.ld, g.odt, g.rscale); }
+        else if (is_int8_codec(g.codec)) { const int grp = 1 << (g.codec - INT8_G16); if constexpr (NTv == 1) go(gv_gemv_i8<1>, g.y, g.ld, g.odt, grp); else if (b512) go(gv_gemv_i8_lb512<NTv>, g.y, g.ld, g.odt, grp); else go(gv_gemv_i8_lb<NTv>, g.y, g.ld, g.odt, grp); }
         else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); }
     });
 }
@@ -755,6 +749,7 @@ template <bool E4, bool K2, bool SH, int CB> inline const void* k1_fn_fused()
 inline void launch_k1_fc1(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
+    if (k.a.s_i8_fc1) { k1_dense_i8_fc1<<<k.g1, k.b1, k.sm1, st>>>(k.a); return; }
     k1_pick(k, [&](auto E4, auto K2, auto SH, auto CB) {
         if constexpr (g6mx::NT > 1)
         {
@@ -766,6 +761,7 @@ inline void launch_k1_fc1(const K1& k, cudaStream_t st)
 inline void launch_k1_fc2(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
+    if (k.a.s_i8_fc2) { k1_dense_i8_fc2<<<k.g2, k.b2, k.sm2, st>>>(k.a); return; }
     k1_pick(k, [&](auto E4, auto K2, auto SH, auto CB) {
         if constexpr (g6mx::NT > 1)
         {
@@ -777,6 +773,12 @@ inline void launch_k1_fc2(const K1& k, cudaStream_t st)
 inline void launch_k1_fused(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
+    if (k.a.s_i8_fc1)
+    {
+        k1_dense_i8_fc1<<<k.g1, k.b1, k.sm1, st>>>(k.a);
+        k1_dense_i8_fc2<<<k.g2, k.b2, k.sm2, st>>>(k.a);
+        return;
+    }
     if (k.fuse_w4)
     {
         tr3_cb_dispatch(k.cb, [&](auto CB) {
@@ -1201,6 +1203,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         {
             if (const char* e = k1_bind_split(M, split_m, T.k2, sh, fuse, s, v)) return e;
         }
+        else if (di8) fuse = 0;
         else if (fuse)                                         // dense layers: the fused remap of K1_DENSE_SPLIT (4 x 2)
             if (const char* e = k1_fuse_split(s)) return e;
     }
@@ -1653,6 +1656,8 @@ inline cudaError_t init()
         const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
         if (err == cudaSuccess) err = e;
     };
+    set(reinterpret_cast<const void*>(k1_dense_i8_fc1));
+    set(reinterpret_cast<const void*>(k1_dense_i8_fc2));
     k1_each([&](auto E4, auto K2, auto SH, auto CB) {
         set(k1_fn_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
         set(k1_fn_fused<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());

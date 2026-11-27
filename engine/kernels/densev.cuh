@@ -447,6 +447,105 @@ __global__ void __launch_bounds__(512) gv_gemv_lb512(const uint8_t* stream, cons
     gv_gemv_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, blockIdx.x, rscale);
 }
 
+// Runtime-grp native exlr8 int8 gG warp part (grp = G / 16 in {1, 2, 4, 8}; 0-ULP identical to Int8v<GRP>).
+// Kept non-templated on grp with unroll-1 inner tile loop so nvcc/ptxas emits one compact kernel instead of 4x per-GRP copies.
+template <int NT = 1>
+__device__ __forceinline__ void gv_tile_part_i8(const uint8_t* tile, const u32* bf, int ts, int g0, int g1, int grp, float (&acc)[NT][4])
+{
+    const int lane = threadIdx.x & 31;
+    const int GR = grp * 256 + 32;
+    const int Q = g1 - g0;
+    for (int q = 0; q < Q; ++q)
+    {
+        const uint8_t* gp = tile + static_cast<size_t>(g0 + q) * GR;
+        const int ks = (g0 + q) * grp;
+        u32 nw[2];
+        Int8v<1>::ld_tile(gp, lane, nw);
+        const u32 s = ld_nc(gp + grp * 256 + (lane >> 2) * 4);
+        float g[NT][4];
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) g[t][0] = g[t][1] = g[t][2] = g[t][3] = 0.f;
+        #pragma unroll 1
+        for (int i = 0; i < grp; ++i)
+        {
+            const u32 cw[2] = {nw[0], nw[1]};
+            if (i + 1 < grp) Int8v<1>::ld_tile(gp + (i + 1) * 256, lane, nw);
+            u32 a[4];
+            Int8v<1>::dec(cw, a);
+            #pragma unroll
+            for (int t = 0; t < NT; ++t)
+                Int8v<1>::mma_a(g[t], a, bf[t * ts + (ks + i) * 64], bf[t * ts + (ks + i) * 64 + 1]);
+        }
+        const float2 sc = Int8v<1>::scale(s);
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            acc[t][0] = fmaf(sc.x, g[t][0], acc[t][0]); acc[t][1] = fmaf(sc.x, g[t][1], acc[t][1]);
+            acc[t][2] = fmaf(sc.y, g[t][2], acc[t][2]); acc[t][3] = fmaf(sc.y, g[t][3], acc[t][3]);
+        }
+    }
+}
+
+template <int NT>
+__device__ __forceinline__ void gv_gemv_body_i8(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
+                                                int M, void* y, int ystride, int odt, int grp, float4 (&red)[32][32], int cta = blockIdx.x)
+{
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tl = warp / ks, part = warp % ks;
+    const int ot = cta * tiles_per_cta + tl;
+    const int GR = grp * 256 + 32;
+    const int NG2 = K / (16 * grp), NGP = NG2 / ks;
+    const bool on = tl < tiles_per_cta && ot < out_tiles;
+    float acc[NT][4];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+    if (on) gv_tile_part_i8<NT>(stream + static_cast<size_t>(ot) * NG2 * GR, xfrag + lane * 2, K * 4, part * NGP, (part + 1) * NGP, grp, acc);
+    if (ks > 1) gv_reduce<NT>(red, acc, on, part, warp, lane, ks);
+    if (!on || part) return;
+    const int r = lane >> 2, c = lane & 3;
+    const size_t o = static_cast<size_t>(ot) * 16 + r;
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        const int m0 = 8 * t + 2 * c;
+        if (m0 < M)
+        {
+            gv::put(y, static_cast<size_t>(m0) * ystride + o, acc[t][0], odt);
+            gv::put(y, static_cast<size_t>(m0) * ystride + o + 8, acc[t][2], odt);
+        }
+        if (m0 + 1 < M)
+        {
+            gv::put(y, static_cast<size_t>(m0 + 1) * ystride + o, acc[t][1], odt);
+            gv::put(y, static_cast<size_t>(m0 + 1) * ystride + o + 8, acc[t][3], odt);
+        }
+    }
+}
+template <int NT>
+__device__ __forceinline__ void gv_gemv_body_i8(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
+                                                int M, void* y, int ystride, int odt, int grp, int cta = blockIdx.x)
+{
+    __shared__ float4 red[32][32];
+    gv_gemv_body_i8<NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, grp, red, cta);
+}
+template <int NT = 1>
+__global__ void gv_gemv_i8(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
+                           int M, void* y, int ystride, int odt, int grp)
+{
+    gv_gemv_body_i8<NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, grp, blockIdx.x);
+}
+template <int NT>
+__global__ void __launch_bounds__(1024) gv_gemv_i8_lb(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta,
+                                                      int ks, int M, void* y, int ystride, int odt, int grp)
+{
+    gv_gemv_body_i8<NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, grp, blockIdx.x);
+}
+template <int NT>
+__global__ void __launch_bounds__(512) gv_gemv_i8_lb512(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta,
+                                                        int ks, int M, void* y, int ystride, int odt, int grp)
+{
+    gv_gemv_body_i8<NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, y, ystride, odt, grp, blockIdx.x);
+}
+
 // Several GEMVs of up to 8 rows (NT = 1) in one launch of 1024-thread CTAs: CTAs cta0[i] .. cta0[i + 1] - 1 run part i,
 // each as its own gv_gemv would (same tiles, k parts and reduction order, so the same bits). Every part needs
 // tpc x ks <= 32 warps. Used for the GEMVs that read the layer input (q_a, kv_a, idx_k, idx_w), which alone fill
@@ -473,10 +572,7 @@ __global__ void __launch_bounds__(1024) gv_multi(GvMulti a)
     const int cta = blockIdx.x - p.cta0;
     if (p.codec == 0) gv_gemv_body<Int4v, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, red, cta);
     else if (p.codec == 1) gv_gemv_body<Mxfp8, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, red, cta);
-    else if (p.codec == 4) gv_gemv_body<Int8v<1>, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, red, cta);
-    else if (p.codec == 5) gv_gemv_body<Int8v<2>, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, red, cta);
-    else if (p.codec == 6) gv_gemv_body<Int8v<4>, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, red, cta);
-    else if (p.codec == 7) gv_gemv_body<Int8v<8>, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, red, cta);
+    else if (p.codec >= 4 && p.codec <= 7) gv_gemv_body_i8<1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, 1 << (p.codec - 4), red, cta);
     else gv_gemv_body<Bf16w, 1>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, p.ld, p.odt, red, cta);
 }
 
@@ -541,6 +637,66 @@ __global__ void __launch_bounds__(512) gv_gemv_slot_lb512(const uint8_t* stream,
                                                          int tiles_per_cta, int ks, int M, int ystride, dslot::Slot s)
 {
     gv_gemv_slot_body<C, NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, ystride, s);
+}
+template <int NT>
+__device__ __forceinline__ void gv_gemv_slot_body_i8(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta,
+                                                     int ks, int M, int ystride, dslot::Slot s, int grp)
+{
+    __shared__ float4 red[32][32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int tl = warp / ks, part = warp % ks;
+    const int ot = blockIdx.x * tiles_per_cta + tl;
+    const int GR = grp * 256 + 32;
+    const int NG2 = K / (16 * grp), NGP = NG2 / ks;
+    const bool on = tl < tiles_per_cta && ot < out_tiles;
+    float acc[NT][4];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+    if (on) gv_tile_part_i8<NT>(stream + static_cast<size_t>(ot) * NG2 * GR, xfrag + lane * 2, K * 4, part * NGP, (part + 1) * NGP, grp, acc);
+    if (ks > 1) gv_reduce<NT>(red, acc, on, part, warp, lane, ks);
+    const bool st = on && !part;
+    if (st)
+    {
+        void* y = dslot::ptr(s);
+        const int r = lane >> 2, c = lane & 3;
+        const size_t o = static_cast<size_t>(ot) * 16 + r;
+        #pragma unroll
+        for (int t = 0; t < NT; ++t)
+        {
+            const int m0 = 8 * t + 2 * c;
+            if (m0 < M)
+            {
+                gv::put(y, static_cast<size_t>(m0) * ystride + o, acc[t][0], gv::O_BF16);
+                gv::put(y, static_cast<size_t>(m0) * ystride + o + 8, acc[t][2], gv::O_BF16);
+            }
+            if (m0 + 1 < M)
+            {
+                gv::put(y, static_cast<size_t>(m0 + 1) * ystride + o, acc[t][1], gv::O_BF16);
+                gv::put(y, static_cast<size_t>(m0 + 1) * ystride + o + 8, acc[t][3], gv::O_BF16);
+            }
+        }
+    }
+#if DEC_SLOT >= 2
+    dslot::publish(s, st);
+#endif
+}
+template <int NT = 1>
+__global__ void gv_gemv_slot_i8(const uint8_t* stream, const u32* xfrag, int K, int out_tiles, int tiles_per_cta, int ks,
+                                int M, int ystride, dslot::Slot s, int grp)
+{
+    gv_gemv_slot_body_i8<NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, ystride, s, grp);
+}
+template <int NT>
+__global__ void __launch_bounds__(1024) gv_gemv_slot_i8_lb(const uint8_t* stream, const u32* xfrag, int K, int out_tiles,
+                                                            int tiles_per_cta, int ks, int M, int ystride, dslot::Slot s, int grp)
+{
+    gv_gemv_slot_body_i8<NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, ystride, s, grp);
+}
+template <int NT>
+__global__ void __launch_bounds__(512) gv_gemv_slot_i8_lb512(const uint8_t* stream, const u32* xfrag, int K, int out_tiles,
+                                                              int tiles_per_cta, int ks, int M, int ystride, dslot::Slot s, int grp)
+{
+    gv_gemv_slot_body_i8<NT>(stream, xfrag, K, out_tiles, tiles_per_cta, ks, M, ystride, s, grp);
 }
 #endif
 

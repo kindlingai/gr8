@@ -63,27 +63,28 @@ __device__ __forceinline__ u32 hmul2_u32(u32 a, u32 b)
     return r;
 }
 
-template <int GRP>
-__device__ __forceinline__ const uint8_t* tile_addr(const uint8_t* wtile, int ks)
+__device__ __forceinline__ const uint8_t* tile_addr(const uint8_t* wtile, int ks, int grp_shift, int grp_mask, int GR)
 {
-    constexpr int GR = Int8v<GRP>::GR;
-    return wtile + static_cast<size_t>(ks / GRP) * GR + (ks & (GRP - 1)) * 256;
+    return wtile + static_cast<size_t>(ks >> grp_shift) * GR + (ks & grp_mask) * 256;
 }
 
-template <int GRP>
-__device__ __forceinline__ const uint8_t* grp_addr(const uint8_t* wtile, int ks)
+__device__ __forceinline__ const uint8_t* grp_addr(const uint8_t* wtile, int ks, int grp_shift, int GR)
 {
-    constexpr int GR = Int8v<GRP>::GR;
-    return wtile + static_cast<size_t>(ks / GRP) * GR;
+    return wtile + static_cast<size_t>(ks >> grp_shift) * GR;
+}
+
+__device__ __forceinline__ u32 ld_scale_i8(const uint8_t* gp, int lane, int grp)
+{
+    return ld_nc(gp + grp * 256 + (lane >> 2) * 4);
 }
 
 // CTA = 8 warps (256 threads): BN = 128 output cols (1 warp = 16 output cols = 1 output tile ot),
 // BM_ROWS = MT * 8 prompt rows (MT = 4 -> 32 rows, MT = 8 -> 64 rows), BK = 32 (2 K16 slabs per stage).
 // Static smem: 3 stages x 2 slabs x BM_ROWS x 48 B (9 KB for MT=4, 18 KB for MT=8).
-template <int GRP, int MT, bool RS = false, bool F32 = false>
+template <int MT, bool RS = false, bool F32 = false>
 __global__ void __launch_bounds__(256) k_gemm_i8g(Args a0, Rs rs = Rs())
 {
-    using C = Int8v<GRP>;
+    using C = Int8v<1>;
     constexpr int STAGES = 3;
     constexpr int BM_ROWS = MT * 8;
     constexpr int X_LD_U32 = 12;      // 48 B/row (24 halfs): 16B aligned for cp.async, 0 bank conflicts for 32-lane B loads
@@ -91,6 +92,10 @@ __global__ void __launch_bounds__(256) k_gemm_i8g(Args a0, Rs rs = Rs())
     __shared__ __align__(16) u32 sm[STAGES][2][BM_ROWS * X_LD_U32];
 
     Args a = a0;
+    const int grp = a.grp;
+    const int grp_mask = grp - 1;
+    const int grp_shift = __ffs(grp) - 1;
+    const int GR = grp * 256 + 32;
     const int nb1 = (a0.N + 127) / 128;
     const int nb_tot = nb1 + (a0.w2 ? (a0.N2 + 127) / 128 : 0);
     const int mb_tot = (a0.M + BM_ROWS - 1) / BM_ROWS;
@@ -123,9 +128,9 @@ __global__ void __launch_bounds__(256) k_gemm_i8g(Args a0, Rs rs = Rs())
     const int m0 = by * BM_ROWS;
     const int K16 = a.K >> 4;
     const int K32 = (K16 + 1) >> 1;
-    const int NG = a.K / (16 * GRP);
+    const int NG = K16 >> grp_shift;
     const bool on = ot < (a.N >> 4);
-    const uint8_t* wtile = on ? (a.w + static_cast<size_t>(ot) * NG * C::GR) : nullptr;
+    const uint8_t* wtile = on ? (a.w + static_cast<size_t>(ot) * NG * GR) : nullptr;
 
     auto loadX32 = [&](int slot, int k32) {
         // Total uint4 transfers = BM_ROWS * 4 (256 for MT=8, 128 for MT=4): 1 load per thread, 0 idle at MT=8.
@@ -157,11 +162,11 @@ __global__ void __launch_bounds__(256) k_gemm_i8g(Args a0, Rs rs = Rs())
     if (on && K16 > 0)
     {
         C::ld_tile(wtile, lane, nw0);
-        nsc0 = C::ld_scale(wtile, lane);
+        nsc0 = ld_scale_i8(wtile, lane, grp);
         if (K16 > 1)
         {
-            C::ld_tile(tile_addr<GRP>(wtile, 1), lane, nw1);
-            if constexpr (GRP == 1) nsc1 = C::ld_scale(grp_addr<GRP>(wtile, 1), lane);
+            C::ld_tile(tile_addr(wtile, 1, grp_shift, grp_mask, GR), lane, nw1);
+            if (grp == 1) nsc1 = ld_scale_i8(grp_addr(wtile, 1, grp_shift, GR), lane, grp);
         }
     }
 
@@ -194,22 +199,20 @@ __global__ void __launch_bounds__(256) k_gemm_i8g(Args a0, Rs rs = Rs())
             const u32 cw0[2] = {nw0[0], nw0[1]};
             const u32 cw1[2] = {nw1[0], nw1[1]};
             const u32 csc0 = nsc0;
-            const u32 csc1 = (GRP == 1) ? nsc1 : csc0;
+            const u32 csc1 = (grp == 1) ? nsc1 : csc0;
 
             // Prefetch next BK=32 pair of W tiles and group scale(s)
             if (ks0 + 2 < K16)
             {
-                C::ld_tile(tile_addr<GRP>(wtile, ks0 + 2), lane, nw0);
-                if constexpr (GRP == 1)
-                    nsc0 = C::ld_scale(grp_addr<GRP>(wtile, ks0 + 2), lane);
-                else if (((ks0 + 2) & (GRP - 1)) == 0)
-                    nsc0 = C::ld_scale(grp_addr<GRP>(wtile, ks0 + 2), lane);
+                C::ld_tile(tile_addr(wtile, ks0 + 2, grp_shift, grp_mask, GR), lane, nw0);
+                if (grp == 1 || ((ks0 + 2) & grp_mask) == 0)
+                    nsc0 = ld_scale_i8(grp_addr(wtile, ks0 + 2, grp_shift, GR), lane, grp);
             }
             if (ks1 + 2 < K16)
             {
-                C::ld_tile(tile_addr<GRP>(wtile, ks1 + 2), lane, nw1);
-                if constexpr (GRP == 1)
-                    nsc1 = C::ld_scale(grp_addr<GRP>(wtile, ks1 + 2), lane);
+                C::ld_tile(tile_addr(wtile, ks1 + 2, grp_shift, grp_mask, GR), lane, nw1);
+                if (grp == 1)
+                    nsc1 = ld_scale_i8(grp_addr(wtile, ks1 + 2, grp_shift, GR), lane, grp);
             }
 
             // Slab 0: ks0 (k0..15)
@@ -294,9 +297,10 @@ __global__ void __launch_bounds__(256) k_gemm_i8g(Args a0, Rs rs = Rs())
     }
 }
 
-template <int GRP>
-inline void launch_grp(Args a, const Rs& rs, cudaStream_t st)
+inline void launch(Args a, cudaStream_t st, const Rs& rs = Rs())
 {
+    if (!a.w || a.M <= 0 || a.N <= 0 || a.K <= 0) return;
+    if (a.grp != 1 && a.grp != 2 && a.grp != 4 && a.grp != 8) return;
     const bool big = a.M >= 64;
     const int bm = big ? 64 : 32;
     const int nb = (a.N + 127) / 128 + (a.w2 ? (a.N2 + 127) / 128 : 0);
@@ -305,28 +309,19 @@ inline void launch_grp(Args a, const Rs& rs, cudaStream_t st)
     const dim3 grid(static_cast<unsigned>(nb), static_cast<unsigned>(mb));
     if (rs.base)
     {
-        if (big) k_gemm_i8g<GRP, 8, true, false><<<grid, 256, 0, st>>>(a, rs);
-        else     k_gemm_i8g<GRP, 4, true, false><<<grid, 256, 0, st>>>(a, rs);
+        if (big) k_gemm_i8g<8, true, false><<<grid, 256, 0, st>>>(a, rs);
+        else     k_gemm_i8g<4, true, false><<<grid, 256, 0, st>>>(a, rs);
     }
     else if (a.bf16 == 2)
     {
-        if (big) k_gemm_i8g<GRP, 8, false, true><<<grid, 256, 0, st>>>(a);
-        else     k_gemm_i8g<GRP, 4, false, true><<<grid, 256, 0, st>>>(a);
+        if (big) k_gemm_i8g<8, false, true><<<grid, 256, 0, st>>>(a);
+        else     k_gemm_i8g<4, false, true><<<grid, 256, 0, st>>>(a);
     }
     else
     {
-        if (big) k_gemm_i8g<GRP, 8, false, false><<<grid, 256, 0, st>>>(a);
-        else     k_gemm_i8g<GRP, 4, false, false><<<grid, 256, 0, st>>>(a);
+        if (big) k_gemm_i8g<8, false, false><<<grid, 256, 0, st>>>(a);
+        else     k_gemm_i8g<4, false, false><<<grid, 256, 0, st>>>(a);
     }
-}
-
-inline void launch(const Args& a, cudaStream_t st, const Rs& rs = Rs())
-{
-    if (!a.w || a.M <= 0 || a.N <= 0 || a.K <= 0) return;
-    if (a.grp == 1) launch_grp<1>(a, rs, st);
-    else if (a.grp == 2) launch_grp<2>(a, rs, st);
-    else if (a.grp == 4) launch_grp<4>(a, rs, st);
-    else if (a.grp == 8) launch_grp<8>(a, rs, st);
 }
 
 }   // namespace i8gemm

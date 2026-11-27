@@ -264,10 +264,7 @@ __global__ void __launch_bounds__(1024) k_kda_proj(ProjArgs a)
     while (i + 1 < a.n && static_cast<int>(blockIdx.x) >= a.p[i + 1].cta0) ++i;
     const ProjPart& p = a.p[i];
     if (p.codec == 1) gv_gemv_body<Mxfp8, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
-    else if (p.codec == 4) gv_gemv_body<Int8v<1>, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
-    else if (p.codec == 5) gv_gemv_body<Int8v<2>, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
-    else if (p.codec == 6) gv_gemv_body<Int8v<4>, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
-    else if (p.codec == 7) gv_gemv_body<Int8v<8>, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
+    else if (p.codec >= 4 && p.codec <= 7) gv_gemv_body_i8<NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, 1 << (p.codec - 4), blockIdx.x - p.cta0);
     else gv_gemv_body<Bf16w, NT>(p.w, p.xfrag, p.K, p.ot, p.tpc, p.ks, a.M, p.y, a.ld, a.odt, blockIdx.x - p.cta0);
 }
 __global__ void __launch_bounds__(256) k_kda_oh_f16frag(const uint16_t* oh, u32* xf, int K, int M)
@@ -582,6 +579,53 @@ __device__ __forceinline__ void gv_gemv_256_ks32(const uint8_t* stream, const u3
     }
 }
 
+template <int NT>
+__device__ __forceinline__ void gv_gemv_256_ks32_i8(const uint8_t* stream, const u32* xfrag, int K, int out_tiles,
+                                                    int M, void* y, int ystride, int grp, int cta, float4 (&red)[32][32])
+{
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int ot = cta;
+    if (ot >= out_tiles) return;
+    const int GR = grp * 256 + 32;
+    const int NG2 = K / (16 * grp), NGP = NG2 / 32;
+    const uint8_t* tile = stream + static_cast<size_t>(ot) * NG2 * GR;
+    float acc[4][NT][4];
+    #pragma unroll
+    for (int sub = 0; sub < 4; ++sub)
+    {
+        #pragma unroll
+        for (int t = 0; t < NT; ++t) acc[sub][t][0] = acc[sub][t][1] = acc[sub][t][2] = acc[sub][t][3] = 0.f;
+        const int part = sub * 8 + warp;
+        gv_tile_part_i8<NT>(tile, xfrag + lane * 2, K * 4, part * NGP, (part + 1) * NGP, grp, acc[sub]);
+    }
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        #pragma unroll
+        for (int sub = 0; sub < 4; ++sub)
+            red[sub * 8 + warp][lane] = make_float4(acc[sub][t][0], acc[sub][t][1], acc[sub][t][2], acc[sub][t][3]);
+        __syncthreads();
+        if (warp == 0)
+            for (int q = 1; q < 32; ++q)
+            {
+                const float4 v = red[q][lane];
+                acc[0][t][0] += v.x; acc[0][t][1] += v.y; acc[0][t][2] += v.z; acc[0][t][3] += v.w;
+            }
+        if (t + 1 < NT) __syncthreads();
+    }
+    if (warp != 0) return;
+    const int r = lane >> 2, c = lane & 3;
+    const size_t o = static_cast<size_t>(ot) * 16 + r;
+    float* yf = static_cast<float*>(y);
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        const int m0 = t * 8 + 2 * c;
+        if (m0 < M)     { yf[static_cast<size_t>(m0) * ystride + o] = acc[0][t][0]; yf[static_cast<size_t>(m0) * ystride + o + 8] = acc[0][t][2]; }
+        if (m0 + 1 < M) { yf[static_cast<size_t>(m0 + 1) * ystride + o] = acc[0][t][1]; yf[static_cast<size_t>(m0 + 1) * ystride + o + 8] = acc[0][t][3]; }
+    }
+}
+
 // Pre-rotate x * suh[0..2] (12 CTAs of 8 warps = 96 warps for 3 * 32 blocks of 128 channels) concurrently with
 // the 20 f_a / g_a / b_proj CTAs in a single 32-CTA wave (< 48 SMs).
 template <int NT>
@@ -612,10 +656,7 @@ __global__ void __launch_bounds__(256) k_kda_rot_pa(ProjTrellisArgs a)
     while (i + 1 < a.pa.n && gcta >= a.pa.p[i + 1].cta0) ++i;
     const ProjPart& p = a.pa.p[i];
     if (p.codec == 1) gv_gemv_256_ks32<Mxfp8, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-    else if (p.codec == 4) gv_gemv_256_ks32<Int8v<1>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-    else if (p.codec == 5) gv_gemv_256_ks32<Int8v<2>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-    else if (p.codec == 6) gv_gemv_256_ks32<Int8v<4>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-    else if (p.codec == 7) gv_gemv_256_ks32<Int8v<8>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+    else if (p.codec >= 4 && p.codec <= 7) gv_gemv_256_ks32_i8<NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, 1 << (p.codec - 4), gcta - p.cta0, red);
     else              gv_gemv_256_ks32<Bf16w, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
 }
 
@@ -633,10 +674,7 @@ __global__ void __launch_bounds__(256, NT <= 2 ? 4 : 2) k_kda_proj_trellis_norot
         const ProjPart& p = a.pa.p[i];
         auto& red = *reinterpret_cast<float4 (*)[32][32]>(sm);
         if (p.codec == 1) gv_gemv_256_ks32<Mxfp8, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-        else if (p.codec == 4) gv_gemv_256_ks32<Int8v<1>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-        else if (p.codec == 5) gv_gemv_256_ks32<Int8v<2>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-        else if (p.codec == 6) gv_gemv_256_ks32<Int8v<4>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-        else if (p.codec == 7) gv_gemv_256_ks32<Int8v<8>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+        else if (p.codec >= 4 && p.codec <= 7) gv_gemv_256_ks32_i8<NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, 1 << (p.codec - 4), gcta - p.cta0, red);
         else              gv_gemv_256_ks32<Bf16w, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
         return;
     }
@@ -755,10 +793,7 @@ __global__ void __launch_bounds__(256) k_kda_proj_trellis(ProjTrellisArgs a)
         const ProjPart& p = a.pa.p[i];
         auto& red = *reinterpret_cast<float4 (*)[32][32]>(sm);
         if (p.codec == 1) gv_gemv_256_ks32<Mxfp8, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-        else if (p.codec == 4) gv_gemv_256_ks32<Int8v<1>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-        else if (p.codec == 5) gv_gemv_256_ks32<Int8v<2>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-        else if (p.codec == 6) gv_gemv_256_ks32<Int8v<4>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
-        else if (p.codec == 7) gv_gemv_256_ks32<Int8v<8>, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
+        else if (p.codec >= 4 && p.codec <= 7) gv_gemv_256_ks32_i8<NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, 1 << (p.codec - 4), gcta - p.cta0, red);
         else              gv_gemv_256_ks32<Bf16w, NT>(p.w, p.xfrag, p.K, p.ot, a.pa.M, p.y, a.pa.ld, gcta - p.cta0, red);
         return;
     }
