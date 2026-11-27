@@ -201,21 +201,35 @@ struct TowerRunner {
     __half* d_ffn_1 = nullptr;      // [max_chunk, 6144]
     __half* d_ffn_3 = nullptr;      // [max_chunk, 6144]
     float* d_head_logits = nullptr; // [max_chunk, 4096] (or [max_chunk, 1024] slice)
-    int32_t* d_codes = nullptr;     // [max_chunk]
+    int32_t* d_codes = nullptr;     // [tower_res, max_chunk]
     uint8_t* d_sem = nullptr;       // [max_chunk]
     int32_t* d_frames = nullptr;    // [max_chunk, 11]
     int32_t* d_slots = nullptr;     // [max_chunk]
     int32_t* d_pos = nullptr;       // [max_chunk]
 
+    // Persistent pinned host staging for async prefill uploads & optional head logit readback
+    int32_t* h_slots = nullptr;     // [max_chunk]
+    int32_t* h_pos = nullptr;       // [max_chunk]
+    uint8_t* h_sem = nullptr;       // [max_chunk]
+    int32_t* h_codes = nullptr;     // [tower_res, max_chunk]
+    int32_t* h_frames = nullptr;    // [max_chunk, 11]
+    float* h_head_tmp = nullptr;    // [max_chunk, RES_CB_SIZE]
+
     size_t state_bytes = 0;
     size_t scratch_bytes = 0;
     TowerProfile prof;
-    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+    cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev_upload = nullptr;
+    bool upload_pending = false;
 
     ~TowerRunner() { release(); }
 
     void release() {
+        if (upload_pending && ev_upload) {
+            cudaEventSynchronize(ev_upload);
+            upload_pending = false;
+        }
         auto freep = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
+        auto freeh = [](auto*& p) { if (p) { cudaFreeHost(p); p = nullptr; } };
         for (auto*& p : k_caches) freep(p);
         for (auto*& p : v_caches) freep(p);
         k_caches.clear(); v_caches.clear();
@@ -223,8 +237,10 @@ struct TowerRunner {
         freep(d_res_f32); freep(d_norm); freep(d_wqkv); freep(d_q_ready);
         freep(d_attn_out); freep(d_ffn_1); freep(d_ffn_3); freep(d_head_logits);
         freep(d_codes); freep(d_sem); freep(d_frames); freep(d_slots); freep(d_pos);
+        freeh(h_slots); freeh(h_pos); freeh(h_sem); freeh(h_codes); freeh(h_frames); freeh(h_head_tmp);
         if (ev0) { cudaEventDestroy(ev0); ev0 = nullptr; }
         if (ev1) { cudaEventDestroy(ev1); ev1 = nullptr; }
+        if (ev_upload) { cudaEventDestroy(ev_upload); ev_upload = nullptr; }
         if (blas) { cublasDestroy(blas); blas = nullptr; }
     }
 
@@ -238,6 +254,8 @@ struct TowerRunner {
         TTS_BLAS_CK(cublasCreate(&blas));
         TTS_CK(cudaEventCreate(&ev0));
         TTS_CK(cudaEventCreate(&ev1));
+        TTS_CK(cudaEventCreate(&ev_upload));
+        upload_pending = false;
 
         const auto& c = W->cfg;
         const int n_tot = c.tower_shared + c.tower_res;
@@ -273,11 +291,18 @@ struct TowerRunner {
         alloc_d(d_ffn_1, size_t(max_chunk) * c.tower_intermediate);
         alloc_d(d_ffn_3, size_t(max_chunk) * c.tower_intermediate);
         alloc_d(d_head_logits, size_t(max_chunk) * c.tower_vocab);
-        alloc_d(d_codes, size_t(max_chunk));
+        alloc_d(d_codes, size_t(c.tower_res) * max_chunk);
         alloc_d(d_sem, size_t(max_chunk));
         alloc_d(d_frames, size_t(max_chunk) * c.row_width());
         alloc_d(d_slots, size_t(max_chunk));
         alloc_d(d_pos, size_t(max_chunk));
+
+        TTS_CK(cudaHostAlloc(&h_slots, size_t(max_chunk) * sizeof(int32_t), cudaHostAllocDefault));
+        TTS_CK(cudaHostAlloc(&h_pos, size_t(max_chunk) * sizeof(int32_t), cudaHostAllocDefault));
+        TTS_CK(cudaHostAlloc(&h_sem, size_t(max_chunk) * sizeof(uint8_t), cudaHostAllocDefault));
+        TTS_CK(cudaHostAlloc(&h_codes, size_t(c.tower_res) * max_chunk * sizeof(int32_t), cudaHostAllocDefault));
+        TTS_CK(cudaHostAlloc(&h_frames, size_t(max_chunk) * c.row_width() * sizeof(int32_t), cudaHostAllocDefault));
+        TTS_CK(cudaHostAlloc(&h_head_tmp, size_t(max_chunk) * geom::RES_CB_SIZE * sizeof(float), cudaHostAllocDefault));
     }
 
     // Runs one TowerLayer (shared or residual) on `M` rows.
@@ -378,47 +403,55 @@ struct TowerRunner {
     // Teacher-forced prefill over `M` paired rows: `frames[0..M-1]` paired with `next_frames[0..M-1]`.
     // If `out_head_logits_host != nullptr`, writes `[M, 9, 1024]` FP32 head logits (for Gate E1 parity!).
     void prefill_chunk(const __half* bb_hidden,
-                       const int32_t* h_frames, const int32_t* h_next_frames,
+                       const int32_t* h_frames_in, const int32_t* h_next_frames,
                        int slot, int pos0, int M,
                        float* out_head_logits_host, cudaStream_t stream) {
         if (M <= 0) return;
+        if (M > max_chunk) {
+            throw std::runtime_error("TowerRunner::prefill_chunk: M exceeds max_chunk");
+        }
+        // Ensure previous async H2D copies from our persistent pinned staging buffers have completed.
+        if (upload_pending) {
+            TTS_CK(cudaEventSynchronize(ev_upload));
+            upload_pending = false;
+        }
         const auto& c = W->cfg;
         const int rw = c.row_width();
-        std::vector<int32_t> slots(static_cast<size_t>(M), slot);
-        std::vector<int32_t> pos(static_cast<size_t>(M));
-        std::vector<uint8_t> sem(static_cast<size_t>(M));
-        std::vector<int32_t> code_buf(static_cast<size_t>(M));
+        std::memcpy(h_frames, h_frames_in, size_t(M) * rw * sizeof(int32_t));
         for (int m = 0; m < M; ++m) {
-            pos[size_t(m)] = pos0 + m;
+            h_slots[m] = slot;
+            h_pos[m] = pos0 + m;
             const int main_nxt = h_next_frames[size_t(m) * rw + 0];
-            sem[size_t(m)] = c.is_semantic(main_nxt) ? 1 : 0;
-            code_buf[size_t(m)] = h_next_frames[size_t(m) * rw + 1]; // c0
+            h_sem[m] = c.is_semantic(main_nxt) ? 1 : 0;
         }
-        TTS_CK(cudaMemcpyAsync(d_slots, slots.data(), size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_pos, pos.data(), size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_sem, sem.data(), size_t(M), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_codes, code_buf.data(), size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        // Pack all `c.tower_res` code rows [i, m] contiguously so a single H2D upload feeds shared (c0 = i=0) + all 9 residual layers.
+        for (int i = 0; i < c.tower_res; ++i) {
+            int32_t* dst = h_codes + size_t(i) * M;
+            for (int m = 0; m < M; ++m) {
+                dst[m] = h_next_frames[size_t(m) * rw + 1 + i]; // c_i
+            }
+        }
+        TTS_CK(cudaMemcpyAsync(d_slots, h_slots, size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        TTS_CK(cudaMemcpyAsync(d_pos, h_pos, size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        TTS_CK(cudaMemcpyAsync(d_sem, h_sem, size_t(M), cudaMemcpyHostToDevice, stream));
+        TTS_CK(cudaMemcpyAsync(d_codes, h_codes, size_t(c.tower_res) * M * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         TTS_CK(cudaMemcpyAsync(d_frames, h_frames, size_t(M) * rw * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        TTS_CK(cudaEventRecord(ev_upload, stream));
+        upload_pending = true;
 
         __half* hid = run_shared(bb_hidden, d_codes, d_sem, d_frames, d_slots, d_pos, M, stream);
 
-        std::vector<float> tmp_head;
-        if (out_head_logits_host) tmp_head.resize(size_t(M) * geom::RES_CB_SIZE);
-
         for (int i = 0; i < c.tower_res; ++i) {
-            for (int m = 0; m < M; ++m) {
-                code_buf[size_t(m)] = h_next_frames[size_t(m) * rw + 1 + i]; // c_i
-            }
-            TTS_CK(cudaMemcpyAsync(d_codes, code_buf.data(), size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-            hid = run_residual_step(i, hid, d_codes, d_sem, d_slots, d_pos,
+            hid = run_residual_step(i, hid, d_codes + size_t(i) * M, d_sem, d_slots, d_pos,
                                     M, geom::RES_CB_SIZE, out_head_logits_host != nullptr, stream);
             if (out_head_logits_host) {
-                TTS_CK(cudaMemcpyAsync(tmp_head.data(), d_head_logits,
+                TTS_CK(cudaMemcpyAsync(h_head_tmp, d_head_logits,
                                        size_t(M) * geom::RES_CB_SIZE * sizeof(float), cudaMemcpyDeviceToHost, stream));
                 TTS_CK(cudaStreamSynchronize(stream));
+                upload_pending = false;
                 for (int m = 0; m < M; ++m) {
                     std::memcpy(out_head_logits_host + (size_t(m) * c.tower_res + i) * geom::RES_CB_SIZE,
-                                tmp_head.data() + size_t(m) * geom::RES_CB_SIZE,
+                                h_head_tmp + size_t(m) * geom::RES_CB_SIZE,
                                 geom::RES_CB_SIZE * sizeof(float));
                 }
             }

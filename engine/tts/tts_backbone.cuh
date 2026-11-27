@@ -442,18 +442,21 @@ __global__ void k_gdn_rec_norm_seg(const __half* __restrict__ qkv_conv,
         }
         __syncthreads();
 
+        float qv = 0.0f, kv = 0.0f;
         if (kh == 0) {
-            const float qv = sq[v];
+            qv = sq[v];
             const float q2 = tts_warp_sum(qv * qv);
             if ((v & 31) == 0) qwarp[v >> 5] = q2;
-            __syncthreads();
+        } else {
+            kv = sk[v];
+            const float k2 = tts_warp_sum(kv * kv);
+            if ((v & 31) == 0) kwarp[v >> 5] = k2;
+        }
+        __syncthreads();
+        if (kh == 0) {
             const float qsum = qwarp[0] + qwarp[1] + qwarp[2] + qwarp[3];
             sq[v] = qv * rsqrtf(qsum + 1e-6f) * inv_sqrt_dk;
         } else {
-            const float kv = sk[v];
-            const float k2 = tts_warp_sum(kv * kv);
-            if ((v & 31) == 0) kwarp[v >> 5] = k2;
-            __syncthreads();
             const float ksum = kwarp[0] + kwarp[1] + kwarp[2] + kwarp[3];
             sk[v] = kv * rsqrtf(ksum + 1e-6f);
         }
@@ -488,18 +491,19 @@ __global__ void k_gdn_rec_norm_seg(const __half* __restrict__ qkv_conv,
         __syncthreads();
 
         // GatedRMSNorm: plain norm_w * rmsnorm(o) * silu(z)
+        float ov = 0.0f;
         if (kh == 0) {
-            const float ov = out_part + sp[v];
+            ov = out_part + sp[v];
             const float ss = tts_warp_sum(ov * ov);
             if ((v & 31) == 0) qwarp[v >> 5] = ss;
-            __syncthreads();
+        }
+        __syncthreads();
+        if (kh == 0) {
             const float inv = rsqrtf((qwarp[0] + qwarp[1] + qwarp[2] + qwarp[3]) / 128.0f + eps);
             const float normed = ov * inv * norm_w[v];
             const size_t zoff = (size_t(r) * nh_v + hv) * 128 + v;
             const float gate = tts_silu(__half2float(z_in[zoff]));
             core_out[zoff] = __float2half_rn(normed * gate);
-        } else {
-            __syncthreads();
         }
         __syncthreads();
     }
@@ -553,17 +557,20 @@ __global__ void k_gdn_rec_norm_dec(const __half* __restrict__ qkv_conv,
     __syncthreads();
 
     constexpr float inv_sqrt_dk = 0.08838834764831845f;
+    float qv = 0.0f, kv = 0.0f;
     if (kh == 0) {
-        const float qv = sq[v];
+        qv = sq[v];
         const float q2 = tts_warp_sum(qv * qv);
         if ((v & 31) == 0) qwarp[v >> 5] = q2;
-        __syncthreads();
-        sq[v] = qv * rsqrtf((qwarp[0] + qwarp[1] + qwarp[2] + qwarp[3]) + 1e-6f) * inv_sqrt_dk;
     } else {
-        const float kv = sk[v];
+        kv = sk[v];
         const float k2 = tts_warp_sum(kv * kv);
         if ((v & 31) == 0) kwarp[v >> 5] = k2;
-        __syncthreads();
+    }
+    __syncthreads();
+    if (kh == 0) {
+        sq[v] = qv * rsqrtf((qwarp[0] + qwarp[1] + qwarp[2] + qwarp[3]) + 1e-6f) * inv_sqrt_dk;
+    } else {
         sk[v] = kv * rsqrtf((kwarp[0] + kwarp[1] + kwarp[2] + kwarp[3]) + 1e-6f);
     }
     __syncthreads();
@@ -602,11 +609,14 @@ __global__ void k_gdn_rec_norm_dec(const __half* __restrict__ qkv_conv,
     if (kh == 1) sp[v] = out_part;
     __syncthreads();
 
+    float ov = 0.0f;
     if (kh == 0) {
-        const float ov = out_part + sp[v];
+        ov = out_part + sp[v];
         const float ss = tts_warp_sum(ov * ov);
         if ((v & 31) == 0) qwarp[v >> 5] = ss;
-        __syncthreads();
+    }
+    __syncthreads();
+    if (kh == 0) {
         const float inv = rsqrtf((qwarp[0] + qwarp[1] + qwarp[2] + qwarp[3]) / 128.0f + eps);
         const size_t zoff = size_t(idx) * 128 + v;
         core_out[zoff] = __float2half_rn(ov * inv * norm_w[v] * tts_silu(__half2float(z_in[zoff])));
@@ -759,8 +769,8 @@ struct BackboneRunner {
     __half* d_exp_g = nullptr;          // [max_chunk, 512]
     __half* d_exp_u = nullptr;          // [max_chunk, 512]
     float* d_exp_out = nullptr;         // [max_chunk, H]
-    int32_t* d_exp_rows = nullptr;      // [max_chunk]
-    float* d_exp_w = nullptr;           // [max_chunk]
+    int32_t* d_exp_rows = nullptr;      // [max_chunk * top_k]
+    float* d_exp_w = nullptr;           // [max_chunk * top_k]
     __half* d_deq_g = nullptr;          // [512, 2048] scratch for on-the-fly FP8 expert dequant
     __half* d_deq_u = nullptr;          // [512, 2048]
     __half* d_deq_d = nullptr;          // [2048, 512]
@@ -768,11 +778,12 @@ struct BackboneRunner {
     float* d_final_f32 = nullptr;       // [max_chunk, H]
     float* d_main_logits = nullptr;     // [max_chunk, 4097]
 
-    // Pinned host scratch for tiny MoE routing table & slot/pos staging
+    // Pinned host scratch for tiny MoE routing table & row/slot/pos staging
     int32_t* h_topk_ids = nullptr;
     float* h_topk_w = nullptr;
-    int32_t* h_exp_rows = nullptr;
-    float* h_exp_w = nullptr;
+    int32_t* h_exp_rows = nullptr;      // [max_chunk * top_k]
+    float* h_exp_w = nullptr;           // [max_chunk * top_k]
+    int32_t* h_rows_stage = nullptr;    // [max_chunk, row_width]
     int32_t* h_slots = nullptr;
     int32_t* h_pos = nullptr;
 
@@ -800,7 +811,7 @@ struct BackboneRunner {
         freep(d_deq_g); freep(d_deq_u); freep(d_deq_d);
         freep(d_final_f16); freep(d_final_f32); freep(d_main_logits);
         freeh(h_topk_ids); freeh(h_topk_w); freeh(h_exp_rows); freeh(h_exp_w);
-        freeh(h_slots); freeh(h_pos);
+        freeh(h_rows_stage); freeh(h_slots); freeh(h_pos);
         if (ev0) { cudaEventDestroy(ev0); ev0 = nullptr; }
         if (ev1) { cudaEventDestroy(ev1); ev1 = nullptr; }
         if (blas) { cublasDestroy(blas); blas = nullptr; }
@@ -879,8 +890,8 @@ struct BackboneRunner {
         alloc_d(d_exp_g, size_t(max_chunk) * I);
         alloc_d(d_exp_u, size_t(max_chunk) * I);
         alloc_d(d_exp_out, size_t(max_chunk) * H);
-        alloc_d(d_exp_rows, size_t(max_chunk));
-        alloc_d(d_exp_w, size_t(max_chunk));
+        alloc_d(d_exp_rows, size_t(max_chunk) * c.top_k);
+        alloc_d(d_exp_w, size_t(max_chunk) * c.top_k);
         alloc_d(d_deq_g, size_t(I) * H);
         alloc_d(d_deq_u, size_t(I) * H);
         alloc_d(d_deq_d, size_t(H) * I);
@@ -890,8 +901,9 @@ struct BackboneRunner {
 
         TTS_CK(cudaHostAlloc(&h_topk_ids, size_t(max_chunk) * c.top_k * sizeof(int32_t), cudaHostAllocDefault));
         TTS_CK(cudaHostAlloc(&h_topk_w, size_t(max_chunk) * c.top_k * sizeof(float), cudaHostAllocDefault));
-        TTS_CK(cudaHostAlloc(&h_exp_rows, size_t(max_chunk) * sizeof(int32_t), cudaHostAllocDefault));
-        TTS_CK(cudaHostAlloc(&h_exp_w, size_t(max_chunk) * sizeof(float), cudaHostAllocDefault));
+        TTS_CK(cudaHostAlloc(&h_exp_rows, size_t(max_chunk) * c.top_k * sizeof(int32_t), cudaHostAllocDefault));
+        TTS_CK(cudaHostAlloc(&h_exp_w, size_t(max_chunk) * c.top_k * sizeof(float), cudaHostAllocDefault));
+        TTS_CK(cudaHostAlloc(&h_rows_stage, size_t(max_chunk) * c.row_width() * sizeof(int32_t), cudaHostAllocDefault));
         TTS_CK(cudaHostAlloc(&h_slots, size_t(max_chunk) * sizeof(int32_t), cudaHostAllocDefault));
         TTS_CK(cudaHostAlloc(&h_pos, size_t(max_chunk) * sizeof(int32_t), cudaHostAllocDefault));
     }
@@ -917,11 +929,12 @@ struct BackboneRunner {
         const int val_dim = c.gdn_vh * c.gdn_vd;
         const int kv_dim = c.num_kv_heads * c.head_dim;
 
+        std::memcpy(h_rows_stage, h_rows, size_t(M) * c.row_width() * sizeof(int32_t));
         for (int m = 0; m < M; ++m) {
             h_slots[m] = is_single_slot_seg ? seg_slot : slots_host[m];
             h_pos[m] = is_single_slot_seg ? (seg_pos0 + m) : pos_host[m];
         }
-        TTS_CK(cudaMemcpyAsync(d_rows, h_rows, size_t(M) * c.row_width() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        TTS_CK(cudaMemcpyAsync(d_rows, h_rows_stage, size_t(M) * c.row_width() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         TTS_CK(cudaMemcpyAsync(d_slots, h_slots, size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         TTS_CK(cudaMemcpyAsync(d_pos, h_pos, size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
@@ -1039,17 +1052,32 @@ struct BackboneRunner {
             const size_t gu_sc_elems = size_t(bo_gu) * bi_gu;
             const size_t dn_sc_elems = size_t(bo_dn) * bi_dn;
 
+            // Pack all active (row, weight) pairs contiguously and upload once so async DMA cannot be overwritten.
+            struct ExpertSlice { int e; int off; int cnt; };
+            std::vector<ExpertSlice> active_slices;
+            active_slices.reserve(static_cast<size_t>(std::min(M * c.top_k, c.num_experts)));
+            int total_pairs = 0;
             for (int e = 0; e < c.num_experts; ++e) {
                 const auto& bucket = exp_buckets[size_t(e)];
                 if (bucket.empty()) continue;
                 const int cnt = static_cast<int>(bucket.size());
+                active_slices.push_back({e, total_pairs, cnt});
                 for (int i = 0; i < cnt; ++i) {
-                    h_exp_rows[i] = bucket[size_t(i)].first;
-                    h_exp_w[i] = bucket[size_t(i)].second;
+                    h_exp_rows[total_pairs + i] = bucket[size_t(i)].first;
+                    h_exp_w[total_pairs + i] = bucket[size_t(i)].second;
                 }
-                TTS_CK(cudaMemcpyAsync(d_exp_rows, h_exp_rows, size_t(cnt) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                TTS_CK(cudaMemcpyAsync(d_exp_w, h_exp_w, size_t(cnt) * sizeof(float), cudaMemcpyHostToDevice, stream));
-                k_gather_rows_f16<<<cnt, 256, 0, stream>>>(d_norm, d_exp_rows, d_exp_x, cnt, H);
+                total_pairs += cnt;
+            }
+            if (total_pairs > 0) {
+                TTS_CK(cudaMemcpyAsync(d_exp_rows, h_exp_rows, size_t(total_pairs) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                TTS_CK(cudaMemcpyAsync(d_exp_w, h_exp_w, size_t(total_pairs) * sizeof(float), cudaMemcpyHostToDevice, stream));
+            }
+
+            for (const auto& sl : active_slices) {
+                const int e = sl.e;
+                const int off = sl.off;
+                const int cnt = sl.cnt;
+                k_gather_rows_f16<<<cnt, 256, 0, stream>>>(d_norm, d_exp_rows + off, d_exp_x, cnt, H);
 
                 const __half* wg = nullptr;
                 const __half* wu = nullptr;
@@ -1077,7 +1105,7 @@ struct BackboneRunner {
                 const size_t act_n = size_t(cnt) * I;
                 k_silu_mul_f16<<<int((act_n + 255) / 256), 256, 0, stream>>>(d_exp_g, d_exp_u, d_exp_g, act_n);
                 gemm_f16(blas, d_exp_g, wd, d_exp_out, cnt, H, I, true, 0.0f);
-                k_scatter_add_f32<<<cnt, 256, 0, stream>>>(d_exp_out, d_exp_rows, d_exp_w, d_residual, cnt, H);
+                k_scatter_add_f32<<<cnt, 256, 0, stream>>>(d_exp_out, d_exp_rows + off, d_exp_w + off, d_residual, cnt, H);
             }
             toc(prof.moe_ms);
         }

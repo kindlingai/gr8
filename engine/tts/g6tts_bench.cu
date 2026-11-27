@@ -423,9 +423,10 @@ int main(int argc, char** argv) {
                 else if (sc == "m8") M = 8;
                 else continue;
 
+                const int cap_eff = std::max(opts.cap, opts.prompt_len + opts.gen_frames + 16);
                 g6tts::BackboneRunner bb; g6tts::TowerRunner tw;
-                bb.init(W, M, opts.cap, 128);
-                tw.init(W, M, opts.cap, 128);
+                bb.init(W, M, cap_eff, std::max(128, opts.prompt_len));
+                tw.init(W, M, cap_eff, std::max(128, opts.prompt_len));
                 bb.prof.enabled = opts.profile;
 
                 const int H = W.cfg.hidden_size;
@@ -444,36 +445,49 @@ int main(int argc, char** argv) {
                 TTS_CK(cudaMemset(d_cd, 0, size_t(M) * sizeof(int32_t)));
                 TTS_CK(cudaMemset(d_sem, 1, size_t(M)));
 
-                std::vector<int32_t> h_slots(static_cast<size_t>(M)), h_pos(static_cast<size_t>(M)), h_rows(static_cast<size_t>(M) * rw, 0);
+                std::vector<int32_t> h_slots(static_cast<size_t>(M)), h_rows(static_cast<size_t>(M) * rw, 0);
+                // Keep per-slot prompt buffers alive until stream sync completes.
+                std::vector<std::vector<int32_t>> prompts(static_cast<size_t>(M));
                 for (int m = 0; m < M; ++m) {
-                    auto pr = make_synthetic_rows(opts.prompt_len, uint32_t(100 + m));
+                    prompts[size_t(m)] = make_synthetic_rows(opts.prompt_len, uint32_t(100 + m));
+                    const auto& pr = prompts[size_t(m)];
                     bb.forward(pr.data(), opts.prompt_len, true, m, 0, nullptr, nullptr, false, false, stream);
                     tw.prefill_chunk(bb.d_final_f16, pr.data(), pr.data() + rw, m, 0, opts.prompt_len - 1, nullptr, stream);
                     TTS_CK(cudaMemcpyAsync(d_hid + size_t(m) * H, bb.d_final_f16 + size_t(opts.prompt_len - 1) * H,
                                            size_t(H) * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
                     h_slots[size_t(m)] = m;
-                    h_pos[size_t(m)] = opts.prompt_len - 1;
                     std::memcpy(h_rows.data() + size_t(m) * rw, pr.data() + size_t(opts.prompt_len - 1) * rw,
                                 size_t(rw) * sizeof(int32_t));
                 }
                 TTS_CK(cudaStreamSynchronize(stream));
+                prompts.clear();
                 bb.prof.reset();
+
+                // Pre-fill immutable per-step position table (no host buffer mutated while async H2D DMAs are in flight).
+                std::vector<int32_t> h_pos_steps(size_t(opts.gen_frames + 1) * M);
+                for (int step = 0; step <= opts.gen_frames; ++step) {
+                    for (int m = 0; m < M; ++m) {
+                        h_pos_steps[size_t(step) * M + m] = (opts.prompt_len - 1) + step;
+                    }
+                }
+                TTS_CK(cudaMemcpyAsync(d_sl, h_slots.data(), size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                TTS_CK(cudaMemcpyAsync(d_fr, h_rows.data(), size_t(M) * rw * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                TTS_CK(cudaStreamSynchronize(stream));
 
                 cudaEvent_t ev0 = nullptr, ev1 = nullptr;
                 TTS_CK(cudaEventCreate(&ev0));
                 TTS_CK(cudaEventCreate(&ev1));
                 TTS_CK(cudaEventRecord(ev0, stream));
                 for (int step = 0; step < opts.gen_frames; ++step) {
-                    TTS_CK(cudaMemcpyAsync(d_sl, h_slots.data(), size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                    TTS_CK(cudaMemcpyAsync(d_ps, h_pos.data(), size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                    TTS_CK(cudaMemcpyAsync(d_fr, h_rows.data(), size_t(M) * rw * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                    const int32_t* pos_tw = h_pos_steps.data() + size_t(step) * M;
+                    const int32_t* pos_bb = h_pos_steps.data() + size_t(step + 1) * M;
+                    TTS_CK(cudaMemcpyAsync(d_ps, pos_tw, size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
                     g6tts::gemm_f16(bb.blas, d_hid, W.lm_head_cand, bb.d_main_logits, M, W.cfg.main_candidates(), H, true, 0.0f);
                     __half* ch = tw.run_shared(d_hid, d_c0, d_sem, d_fr, d_sl, d_ps, M, stream);
                     for (int i = 0; i < W.cfg.tower_res; ++i) {
                         ch = tw.run_residual_step(i, ch, d_cd, d_sem, d_sl, d_ps, M, g6tts::geom::RES_CB_SIZE, true, stream);
                     }
-                    for (int m = 0; m < M; ++m) ++h_pos[size_t(m)];
-                    bb.forward(h_rows.data(), M, false, 0, 0, h_slots.data(), h_pos.data(), false, false, stream);
+                    bb.forward(h_rows.data(), M, false, 0, 0, h_slots.data(), pos_bb, false, false, stream);
                     TTS_CK(cudaMemcpyAsync(d_hid, bb.d_final_f16, size_t(M) * H * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
                 }
                 TTS_CK(cudaEventRecord(ev1, stream));

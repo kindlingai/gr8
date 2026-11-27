@@ -16,7 +16,10 @@ Binary formats:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import math
+import os
 import struct
 import subprocess
 import sys
@@ -137,6 +140,90 @@ def evaluate_gate_e1(
     return passed, summary
 
 
+def _import_exlr8(exlr8_repo: Path | None) -> Any:
+    """Import the standalone `exlr8` loader module from `<exlr8_repo>/loader/exlr8.py` (or `EXLR8_LOADER_DIR`)."""
+    candidates: list[Path] = []
+    if exlr8_repo is not None:
+        candidates.append(exlr8_repo / "loader")
+        candidates.append(exlr8_repo)
+    env_dir = os.environ.get("EXLR8_LOADER_DIR", "").strip()
+    if env_dir:
+        p = Path(env_dir)
+        candidates.append(p / "loader" if (p / "loader" / "exlr8.py").is_file() else p)
+    for c in candidates:
+        if (c / "exlr8.py").is_file():
+            cs = str(c.resolve())
+            if cs not in sys.path:
+                sys.path.insert(0, cs)
+            break
+    import exlr8  # type: ignore[import-not-found]
+
+    return exlr8
+
+
+def _safe_to_device(t: Any, device: Any, dtype: Any | None = None) -> Any:
+    """Clone CPU tensors before transferring to CUDA (64K-page kernel mmap safety)."""
+    if t.device.type == "cpu":
+        t = t.clone()
+    return t.to(device=device, dtype=dtype) if dtype is not None else t.to(device=device)
+
+
+def _load_release_vocab_and_tower(
+    exlr8: Any, model_dir: Path, dtype: Any, verify: bool = False
+) -> dict[str, Any]:
+    """Load only vocab + global + mtp_shared + mtp dense files (~2.5 GB total)."""
+    state: dict[str, Any] = {}
+    for path in exlr8._discover_dense_files(str(model_dir)):
+        f = exlr8.SafeFile(path)
+        exlr8.check_format(f)
+        contents = f.meta.get("contents")
+        if contents == "vocab" or (contents is None and os.path.basename(path) == "exlr8-vocab.safetensors"):
+            names = exlr8._vocab_names(f)
+            state.update(exlr8.load_matrices(f, lambda n: names.get(n, n), dtype, "cpu", verify))
+        elif f.meta.get("group") in ("global", "mtp_shared", "mtp"):
+            pre = exlr8._dense_prefix(f)
+            state.update(exlr8.load_matrices(f, lambda n: pre + n, dtype, "cpu", verify))
+    return state
+
+
+def _load_release_backbone_layer(
+    exlr8: Any,
+    model_dir: Path,
+    manifest: dict[str, Any] | None,
+    layer_idx: int,
+    layer_type: str,
+    dtype: Any,
+    verify: bool = False,
+) -> dict[str, Any]:
+    """Decode only backbone layer L (dense + experts) to bound peak RAM/VRAM to < 8 GB."""
+    grp = "attn" if layer_type == "full_attention" else "gdn"
+    dense_path = model_dir / "dense" / f"exlr8-dense-{grp}-{layer_idx:03d}.safetensors"
+    if not dense_path.is_file():
+        dense_path = model_dir / f"exlr8-dense-{grp}-{layer_idx:03d}.safetensors"
+    f_dense = exlr8.SafeFile(str(dense_path))
+    exlr8.check_format(f_dense)
+    pre = exlr8._dense_prefix(f_dense)
+    state = exlr8.load_matrices(f_dense, lambda n: pre + n, dtype, "cpu", verify)
+
+    idx_file = model_dir / "experts" / f"exlr8-layer-{layer_idx:03d}.index.safetensors"
+    if idx_file.is_file():
+        if manifest is None:
+            raise ValueError(f"{model_dir}: trellis experts present for layer {layer_idx} but --manifest is empty")
+        exp_state = exlr8._load_drama3_trellis_experts(str(model_dir), manifest, layer_idx, dtype, "cpu", verify)
+    else:
+        exp_path = model_dir / "dense" / f"exlr8-dense-experts-{layer_idx:03d}.safetensors"
+        if not exp_path.is_file():
+            exp_path = model_dir / f"exlr8-dense-experts-{layer_idx:03d}.safetensors"
+        f_exp = exlr8.SafeFile(str(exp_path))
+        exlr8.check_format(f_exp)
+        epre = exlr8._dense_prefix(f_exp)
+        raw_exp = exlr8.load_matrices(f_exp, lambda n: epre + n, dtype, "cpu", verify)
+        exp_state = exlr8._stack_drama3_experts(raw_exp, epre, dtype)
+
+    state.update(exp_state)
+    return state
+
+
 def run_torch_reference(
     model_dir: Path,
     manifest: str | None,
@@ -145,18 +232,20 @@ def run_torch_reference(
     seqs: list[np.ndarray],
     device: str,
 ) -> list[dict[str, np.ndarray]]:
+    """Layer-streamed teacher-forced PyTorch Drama 3 reference (< 8 GB peak RAM/VRAM)."""
     import torch
 
-    sys.path.insert(0, str(fish_speech_dir))
-    if exlr8_repo is not None:
-        sys.path.insert(0, str(exlr8_repo))
+    fs_str = str(fish_speech_dir.resolve())
+    if fs_str not in sys.path:
+        sys.path.insert(0, fs_str)
+    exlr8 = _import_exlr8(exlr8_repo)
 
-    from exlr8.loader.exlr8 import load_drama3
-    from fish_speech.models.text2semantic.fish_omni.backbone import (
-        FishOmniBackbone,
-        load_backbone_weights,
-    )
+    from fish_speech.models.text2semantic.fish_omni.backbone import DecoderLayer
     from fish_speech.models.text2semantic.fish_omni.config import FishOmniConfig
+    from fish_speech.models.text2semantic.fish_omni.layers import (
+        LayerContext,
+        ZeroCenteredRMSNorm,
+    )
     from fish_speech.models.text2semantic.fish_omni.tower import (
         FishOmniAudioDecoder,
         load_audio_decoder_weights,
@@ -164,63 +253,144 @@ def run_torch_reference(
 
     cfg_dict = json.loads((model_dir / "config.json").read_text())
     cfg = FishOmniConfig.from_dict(cfg_dict)
+    dtype = torch.bfloat16
+    dev = torch.device(device)
 
-    # Load weights from the exact same release (keeps memory bounded via CPU state dict -> device).
-    sd = load_drama3(str(model_dir), manifest_name=manifest, dtype=torch.bfloat16, device="cpu", verify=False)
-    bb_items = []
-    tw_items = []
-    for k, v in sd.items():
-        t = v.clone()
-        if k.startswith(("audio_decoder.", "audio_decoder_mtp_shared.", "audio_decoder_mtp.")):
-            tw_items.append((k, t))
-        else:
-            bb_items.append((k, t))
+    manifest_obj = exlr8.load_manifest(str(model_dir), manifest) if manifest else None
+    vt_state = _load_release_vocab_and_tower(exlr8, model_dir, dtype=dtype, verify=False)
 
-    backbone = FishOmniBackbone(cfg.text, fp8_experts=False, dtype=torch.bfloat16, device=device)
-    load_backbone_weights(backbone, bb_items)
-    backbone.eval()
+    # 1. Input embeddings (embed_tokens + semantic codebook c1 mix / sqrt(1 + vq_backbone_codebooks))
+    embed_w = _safe_to_device(vt_state["model.language_model.embed_tokens.weight"], dev, dtype)
+    cb_w = _safe_to_device(vt_state["audio_decoder.codebook_embeddings.weight"], dev, dtype)
+    frame_tensors = [torch.from_numpy(arr.copy()).to(dtype=torch.long) for arr in seqs]
 
-    tower = FishOmniAudioDecoder(cfg, dtype=torch.bfloat16, device=device)
-    load_audio_decoder_weights(tower, tw_items)
-    tower.eval()
+    hidden_seqs: list[torch.Tensor] = []
+    with torch.inference_mode():
+        vq_count = cfg.audio_decoder.vq_backbone_codebooks
+        cb_vocab = cfg.audio_decoder.vocab_size
+        offsets = torch.arange(1, 1 + vq_count, device=dev) * cb_vocab
+        inv_sqrt = 1.0 / math.sqrt(1 + vq_count)
+        for ft in frame_tensors:
+            f_dev = ft.to(dev)
+            text_emb = torch.nn.functional.embedding(f_dev[:, 0], embed_w)
+            rows = f_dev[:, 2 : 2 + vq_count] + offsets
+            extra = torch.nn.functional.embedding_bag(rows, cb_w, mode="sum")
+            mixed = (text_emb + extra) * inv_sqrt
+            sem = (f_dev[:, 0] >= cfg.semantic_start_token_id) & (f_dev[:, 0] <= cfg.semantic_end_token_id)
+            emb = torch.where(sem[:, None], mixed, text_emb).to(dtype)
+            hidden_seqs.append(emb.cpu())
+    del embed_w, cb_w
 
+    # Precompute NeoX RoPE table matching `FishOmniBackbone.run_layers`
+    max_len = max(int(arr.shape[0]) for arr in seqs)
+    rotary_dim = cfg.text.rotary_dim
+    exponents = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=dev)
+    frequencies = 1.0 / (cfg.text.rope_theta ** (exponents / rotary_dim))
+    all_positions = torch.arange(max_len, dtype=torch.float32, device=dev)
+    angles = all_positions[:, None] * frequencies[None, :]
+    angles = torch.cat((angles, angles), dim=-1)
+    cos_all, sin_all = angles.cos(), angles.sin()
+
+    # 2. Layer-streamed backbone forward (only 1 layer resident at a time)
+    for layer_idx in range(cfg.text.num_hidden_layers):
+        layer_type = cfg.text.layer_types[layer_idx]
+        lstate = _load_release_backbone_layer(
+            exlr8, model_dir, manifest_obj, layer_idx, layer_type, dtype=dtype, verify=False
+        )
+        layer = DecoderLayer(cfg.text, layer_idx, fp8=False, dtype=dtype, device=dev).eval()
+        prefix = f"model.language_model.layers.{layer_idx}."
+        targets = dict(layer.named_parameters())
+        targets.update(dict(layer.named_buffers()))
+        for rel_name, tgt in targets.items():
+            full_k = prefix + rel_name
+            if full_k not in lstate:
+                raise KeyError(f"Layer {layer_idx}: missing tensor {full_k}")
+            tgt.data.copy_(_safe_to_device(lstate[full_k], dev, tgt.dtype))
+        del lstate
+
+        with torch.inference_mode():
+            for si, h_cpu in enumerate(hidden_seqs):
+                t_len = int(h_cpu.shape[0])
+                pos = torch.arange(t_len, dtype=torch.long, device=dev)
+                ctx = LayerContext(
+                    input_pos=pos,
+                    cos=cos_all[:t_len],
+                    sin=sin_all[:t_len],
+                    kv_len=t_len,
+                    continue_state=False,
+                    use_cache=False,
+                )
+                out = layer(h_cpu.to(dev).unsqueeze(0), ctx)[0]
+                hidden_seqs[si] = out.cpu()
+
+        del layer
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+
+    del cos_all, sin_all, exponents, frequencies, all_positions, angles
+
+    # 3. Final norm + sliced lm_head over the 4097 legal main candidates
+    norm = ZeroCenteredRMSNorm(cfg.text.hidden_size, cfg.text.rms_norm_eps, dtype=dtype, device=dev).eval()
+    norm.weight.data.copy_(_safe_to_device(vt_state["model.language_model.norm.weight"], dev, dtype))
     cand_ids = torch.cat(
         (
-            torch.tensor([cfg.eos_token_id], device=device),
-            torch.arange(cfg.semantic_start_token_id, cfg.semantic_end_token_id + 1, device=device),
+            torch.tensor([cfg.eos_token_id], dtype=torch.long, device="cpu"),
+            torch.arange(cfg.semantic_start_token_id, cfg.semantic_end_token_id + 1, dtype=torch.long, device="cpu"),
         )
     ).sort().values
+    lm_head_sliced = _safe_to_device(vt_state["lm_head.weight"][cand_ids], dev, dtype)
+
+    normed_seqs: list[torch.Tensor] = []
+    hid_np_list: list[np.ndarray] = []
+    main_np_list: list[np.ndarray] = []
+    with torch.inference_mode():
+        for h_cpu in hidden_seqs:
+            h_norm = norm(h_cpu.to(dev)).to(dtype)
+            normed_seqs.append(h_norm.cpu())
+            hid_np_list.append(h_norm.float().cpu().numpy().astype(np.float32))
+            mlogits = torch.nn.functional.linear(h_norm, lm_head_sliced)
+            main_np_list.append(mlogits.float().cpu().numpy().astype(np.float32))
+    del norm, lm_head_sliced, hidden_seqs
+
+    # 4. Teacher-forced codebook tower (4 shared + 9 residual + 9 heads)
+    tower = FishOmniAudioDecoder(cfg, dtype=dtype, device=dev).eval()
+    tw_items = [
+        (k, v.clone() if v.device.type == "cpu" else v)
+        for k, v in vt_state.items()
+        if k.startswith(("audio_decoder.", "audio_decoder_mtp_shared.", "audio_decoder_mtp."))
+    ]
+    load_audio_decoder_weights(tower, tw_items)
+    del vt_state, tw_items
 
     outs: list[dict[str, np.ndarray]] = []
     with torch.inference_mode():
-        for arr in seqs:
-            t_len = arr.shape[0]
-            frames = torch.from_numpy(arr.copy()).to(device=device, dtype=torch.long)
-            pos = torch.arange(t_len, device=device, dtype=torch.long)
-            emb = tower.embed_backbone(frames, backbone.embed(frames[:, 0]))
-            hidden = backbone(inputs_embeds=emb[None], input_pos=pos)[0]  # [T, H]
-            main_logits = backbone.compute_logits(hidden)[:, cand_ids]   # [T, 4097]
-
-            # Teacher-forced tower over rows 0..T-2 labelled with frames[1..T-1]
+        for h_norm_cpu, ft, hid_np, main_np in zip(normed_seqs, frame_tensors, hid_np_list, main_np_list):
+            t_len = int(ft.shape[0])
+            frames = ft.to(dev)
+            h_in = h_norm_cpu[:-1].to(dev)
             cur_f = frames[:-1]
             nxt_f = frames[1:]
-            p_pos = pos[:-1]
+            p_pos = torch.arange(t_len - 1, device=dev, dtype=torch.long)
             sem = tower.is_semantic(nxt_f[:, 0])
-            th = tower.run_shared(hidden[:-1], nxt_f[:, 1], sem, p_pos, cur_f)
+            th = tower.run_shared(h_in, nxt_f[:, 1], sem, p_pos, cur_f)
             head_list = []
-            for idx, (layer, head) in enumerate(zip(tower.residual_layers, tower.codebook_heads)):
-                th = layer(th, nxt_f[:, idx + 1], sem, p_pos)
+            for idx, (rlayer, head) in enumerate(zip(tower.residual_layers, tower.codebook_heads)):
+                th = rlayer(th, nxt_f[:, idx + 1], sem, p_pos)
                 hl = head(th)[:, :1024].float().cpu().numpy()
                 head_list.append(hl)
             head_arr = np.stack(head_list, axis=1).astype(np.float32)  # [T-1, 9, 1024]
-
             outs.append(
                 {
-                    "hidden": hidden.float().cpu().numpy().astype(np.float32),
-                    "main_logits": main_logits.float().cpu().numpy().astype(np.float32),
+                    "hidden": hid_np,
+                    "main_logits": main_np,
                     "head_logits": head_arr,
                 }
             )
+
+    del tower, normed_seqs, frame_tensors
+    gc.collect()
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
     return outs
 
 
