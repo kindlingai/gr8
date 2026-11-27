@@ -255,6 +255,193 @@ __global__ void __launch_bounds__(128) k_q3v_attn(
     }
 }
 
+// Tensor-Core BF16 bidirectional FlashAttention-2 for packed ViT images (HD=64 for 2B, HD=72 for 8B).
+// BQ = 64 (4 warps x 16 patches), BK = 64 KV patches, Q held in registers, online softmax via 4-lane quad shuffles.
+// Grid: (num_q_tiles, heads), Block: 128.
+constexpr int VIT_TC_BQ = 64;
+constexpr int VIT_TC_BK = 64;
+
+template <int HD, int HD_PAD>
+__global__ void __launch_bounds__(128, 3) k_q3v_flash_attn_tc(
+    const bf16* __restrict__ qkv,
+    bf16* __restrict__ out,
+    const int* __restrict__ cu_patches,
+    const int2* __restrict__ q_tiles,
+    int num_q_tiles,
+    int heads) {
+    static_assert(HD % 8 == 0 && HD_PAD % 16 == 0 && HD_PAD >= HD, "invalid ViT head_dim");
+    constexpr int KS_Q = HD_PAD / 16;
+    constexpr int DT_O = HD / 8;
+    constexpr int STRIDE = HD_PAD + 8; // 16-byte aligned (72*2=144 B for 2B, 88*2=176 B for 8B)
+    __shared__ __align__(16) bf16 sK[VIT_TC_BK][STRIDE];
+    __shared__ __align__(16) bf16 sV[VIT_TC_BK][STRIDE];
+
+    const int tile_idx = blockIdx.x;
+    if (tile_idx >= num_q_tiles) return;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int r = lane >> 2;
+    const int c = (lane & 3) * 2;
+
+    const int2 qt = q_tiles[tile_idx];
+    const int img = qt.x;
+    const int q_local_base = qt.y;
+    const int p_start = cu_patches[img];
+    const int img_len = cu_patches[img + 1] - p_start;
+    const int h = blockIdx.y;
+    const int H_v = heads * HD;
+    const float scale = rsqrtf(static_cast<float>(HD));
+
+    const int q_row0 = q_local_base + warp * 16 + r;
+    const int q_row1 = q_row0 + 8;
+
+    u32 q_frag[KS_Q][4];
+    const bf16* qp0 = (q_row0 < img_len) ? (qkv + size_t(p_start + q_row0) * (3 * H_v) + h * HD) : nullptr;
+    const bf16* qp1 = (q_row1 < img_len) ? (qkv + size_t(p_start + q_row1) * (3 * H_v) + h * HD) : nullptr;
+    #pragma unroll
+    for (int ks = 0; ks < KS_Q; ++ks) {
+        const int col = ks * 16 + c;
+        q_frag[ks][0] = (qp0 && col < HD) ? *reinterpret_cast<const u32*>(qp0 + col) : 0u;
+        q_frag[ks][1] = (qp1 && col < HD) ? *reinterpret_cast<const u32*>(qp1 + col) : 0u;
+        q_frag[ks][2] = (qp0 && col + 8 < HD) ? *reinterpret_cast<const u32*>(qp0 + col + 8) : 0u;
+        q_frag[ks][3] = (qp1 && col + 8 < HD) ? *reinterpret_cast<const u32*>(qp1 + col + 8) : 0u;
+    }
+
+    float O_acc[DT_O][4];
+    #pragma unroll
+    for (int dt = 0; dt < DT_O; ++dt) {
+        O_acc[dt][0] = O_acc[dt][1] = O_acc[dt][2] = O_acc[dt][3] = 0.f;
+    }
+    float m_max0 = -1e30f, m_max1 = -1e30f;
+    float l_sum0 = 0.f, l_sum1 = 0.f;
+
+    constexpr int VEC_PER_ROW = HD_PAD / 8;
+    for (int k0 = 0; k0 < img_len; k0 += VIT_TC_BK) {
+        const int kt = min(VIT_TC_BK, img_len - k0);
+        for (int idx = tid; idx < VIT_TC_BK * VEC_PER_ROW; idx += 128) {
+            const int kr = idx / VEC_PER_ROW;
+            const int kc = (idx % VEC_PER_ROW) * 8;
+            if (kr < kt && kc < HD) {
+                const bf16* kv_row = qkv + size_t(p_start + k0 + kr) * (3 * H_v);
+                *reinterpret_cast<uint4*>(&sK[kr][kc]) = *reinterpret_cast<const uint4*>(kv_row + H_v + h * HD + kc);
+                *reinterpret_cast<uint4*>(&sV[kr][kc]) = *reinterpret_cast<const uint4*>(kv_row + 2 * H_v + h * HD + kc);
+            } else {
+                *reinterpret_cast<uint4*>(&sK[kr][kc]) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(&sV[kr][kc]) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+
+        float S[8][4];
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) S[nt][0] = S[nt][1] = S[nt][2] = S[nt][3] = 0.f;
+
+        #pragma unroll
+        for (int ks = 0; ks < KS_Q; ++ks) {
+            const int kcol = ks * 16 + c;
+            #pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                const int kr = nt * 8 + r;
+                const u32 b0 = *reinterpret_cast<const u32*>(&sK[kr][kcol]);
+                const u32 b1 = *reinterpret_cast<const u32*>(&sK[kr][kcol + 8]);
+                emb_mma16816_bf16(S[nt], q_frag[ks][0], q_frag[ks][1], q_frag[ks][2], q_frag[ks][3], b0, b1);
+            }
+        }
+
+        const bool need_mask = (k0 + VIT_TC_BK > img_len);
+        float rmax0 = -1e30f, rmax1 = -1e30f;
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int kp0 = k0 + nt * 8 + c;
+            const int kp1 = kp0 + 1;
+            float s0 = S[nt][0] * scale, s1 = S[nt][1] * scale;
+            float s2 = S[nt][2] * scale, s3 = S[nt][3] * scale;
+            if (need_mask) {
+                if (kp0 >= img_len) { s0 = -1e30f; s2 = -1e30f; }
+                if (kp1 >= img_len) { s1 = -1e30f; s3 = -1e30f; }
+            }
+            S[nt][0] = s0; S[nt][1] = s1; S[nt][2] = s2; S[nt][3] = s3;
+            rmax0 = fmaxf(rmax0, fmaxf(s0, s1));
+            rmax1 = fmaxf(rmax1, fmaxf(s2, s3));
+        }
+        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffffu, rmax0, 1));
+        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffffu, rmax0, 2));
+        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffffu, rmax1, 1));
+        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffffu, rmax1, 2));
+
+        const float m_new0 = fmaxf(m_max0, rmax0);
+        const float m_new1 = fmaxf(m_max1, rmax1);
+        const float alpha0 = (m_max0 > -1e20f) ? __expf(m_max0 - m_new0) : 0.f;
+        const float alpha1 = (m_max1 > -1e20f) ? __expf(m_max1 - m_new1) : 0.f;
+
+        #pragma unroll
+        for (int dt = 0; dt < DT_O; ++dt) {
+            O_acc[dt][0] *= alpha0; O_acc[dt][1] *= alpha0;
+            O_acc[dt][2] *= alpha1; O_acc[dt][3] *= alpha1;
+        }
+        l_sum0 *= alpha0;
+        l_sum1 *= alpha1;
+
+        float rsum0 = 0.f, rsum1 = 0.f;
+        u32 pf[4][4];
+        #pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            const int n0 = ks * 2, n1 = ks * 2 + 1;
+            const float p00 = (S[n0][0] > -1e20f) ? __expf(S[n0][0] - m_new0) : 0.f;
+            const float p01 = (S[n0][1] > -1e20f) ? __expf(S[n0][1] - m_new0) : 0.f;
+            const float p02 = (S[n0][2] > -1e20f) ? __expf(S[n0][2] - m_new1) : 0.f;
+            const float p03 = (S[n0][3] > -1e20f) ? __expf(S[n0][3] - m_new1) : 0.f;
+            const float p10 = (S[n1][0] > -1e20f) ? __expf(S[n1][0] - m_new0) : 0.f;
+            const float p11 = (S[n1][1] > -1e20f) ? __expf(S[n1][1] - m_new0) : 0.f;
+            const float p12 = (S[n1][2] > -1e20f) ? __expf(S[n1][2] - m_new1) : 0.f;
+            const float p13 = (S[n1][3] > -1e20f) ? __expf(S[n1][3] - m_new1) : 0.f;
+            rsum0 += (p00 + p01) + (p10 + p11);
+            rsum1 += (p02 + p03) + (p12 + p13);
+            pf[ks][0] = emb_pack_bf2(p00, p01);
+            pf[ks][1] = emb_pack_bf2(p02, p03);
+            pf[ks][2] = emb_pack_bf2(p10, p11);
+            pf[ks][3] = emb_pack_bf2(p12, p13);
+        }
+        rsum0 += __shfl_xor_sync(0xffffffffu, rsum0, 1);
+        rsum0 += __shfl_xor_sync(0xffffffffu, rsum0, 2);
+        rsum1 += __shfl_xor_sync(0xffffffffu, rsum1, 1);
+        rsum1 += __shfl_xor_sync(0xffffffffu, rsum1, 2);
+        l_sum0 += rsum0;
+        l_sum1 += rsum1;
+        m_max0 = m_new0;
+        m_max1 = m_new1;
+
+        #pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            const int krow = ks * 16 + c;
+            #pragma unroll
+            for (int dt = 0; dt < DT_O; ++dt) {
+                const int dc = dt * 8 + r;
+                const uint16_t v0 = *reinterpret_cast<const uint16_t*>(&sV[krow][dc]);
+                const uint16_t v1 = *reinterpret_cast<const uint16_t*>(&sV[krow + 1][dc]);
+                const uint16_t v2 = *reinterpret_cast<const uint16_t*>(&sV[krow + 8][dc]);
+                const uint16_t v3 = *reinterpret_cast<const uint16_t*>(&sV[krow + 9][dc]);
+                const u32 b0 = static_cast<u32>(v0) | (static_cast<u32>(v1) << 16);
+                const u32 b1 = static_cast<u32>(v2) | (static_cast<u32>(v3) << 16);
+                emb_mma16816_bf16(O_acc[dt], pf[ks][0], pf[ks][1], pf[ks][2], pf[ks][3], b0, b1);
+            }
+        }
+        __syncthreads();
+    }
+
+    const float inv0 = (l_sum0 > 0.f) ? (1.0f / l_sum0) : 0.f;
+    const float inv1 = (l_sum1 > 0.f) ? (1.0f / l_sum1) : 0.f;
+    bf16* op0 = (q_row0 < img_len) ? (out + size_t(p_start + q_row0) * H_v + h * HD) : nullptr;
+    bf16* op1 = (q_row1 < img_len) ? (out + size_t(p_start + q_row1) * H_v + h * HD) : nullptr;
+    #pragma unroll
+    for (int dt = 0; dt < DT_O; ++dt) {
+        const int col = dt * 8 + c;
+        if (op0) *reinterpret_cast<u32*>(op0 + col) = emb_pack_bf2(O_acc[dt][0] * inv0, O_acc[dt][1] * inv0);
+        if (op1) *reinterpret_cast<u32*>(op1 + col) = emb_pack_bf2(O_acc[dt][2] * inv1, O_acc[dt][3] * inv1);
+    }
+}
+
 // gelu_pytorch_tanh in-place for Qwen3VLVisionMLP.
 __global__ void __launch_bounds__(256) k_q3v_gelu_tanh(bf16* __restrict__ x, size_t n) {
     const size_t i = size_t(blockIdx.x) * 256 + threadIdx.x;
@@ -282,7 +469,9 @@ struct VisionRunner {
     uint8_t* d_rgb = nullptr;
     int* d_cu_patches = nullptr;
     int* d_img_of_patch = nullptr;
+    int2* d_img_qtiles = nullptr;
     int cap_imgs = 0;
+    int cap_qtiles = 0;
 
     bf16* d_patches = nullptr; // [cap_patches, 1536]
     bf16* d_x = nullptr;       // [cap_patches, H_v]
@@ -305,6 +494,7 @@ struct VisionRunner {
         fre(d_rgb);
         fre(d_cu_patches);
         fre(d_img_of_patch);
+        fre(d_img_qtiles);
         fre(d_patches);
         fre(d_x);
         fre(d_ln);
@@ -318,6 +508,7 @@ struct VisionRunner {
         cap_patches = 0;
         cap_rgb_bytes = 0;
         cap_imgs = 0;
+        cap_qtiles = 0;
     }
     ~VisionRunner() { release(); }
 
@@ -356,6 +547,12 @@ struct VisionRunner {
             if (d_cu_patches) cudaFree(d_cu_patches);
             cap_imgs = std::max(need_imgs + 1, 16);
             EMB_CK(cudaMalloc(&d_cu_patches, size_t(cap_imgs) * sizeof(int)));
+        }
+        const int need_qt = need_patches / VIT_TC_BQ + need_imgs + 8;
+        if (need_qt > cap_qtiles) {
+            if (d_img_qtiles) cudaFree(d_img_qtiles);
+            cap_qtiles = std::max(need_qt, 64);
+            EMB_CK(cudaMalloc(&d_img_qtiles, size_t(cap_qtiles) * sizeof(int2)));
         }
     }
 
@@ -427,18 +624,23 @@ struct VisionRunner {
         std::vector<uint8_t> h_rgb(total_rgb);
         std::vector<int> h_cu(imgs.size() + 1, 0);
         std::vector<int> h_iof(size_t(total_patches), 0);
+        std::vector<int2> h_qtiles;
+        h_qtiles.reserve(size_t(total_patches / VIT_TC_BQ + imgs.size() + 4));
         for (size_t i = 0; i < imgs.size(); ++i) {
             const EmbedImage& im = *imgs[i].span;
             std::memcpy(h_rgb.data() + imgs[i].rgb_off, im.rgb.data(), im.rgb.size());
             h_cu[i] = imgs[i].patch_off;
             const int n_p = im.vit_h * im.vit_w;
             for (int p = 0; p < n_p; ++p) h_iof[size_t(imgs[i].patch_off + p)] = static_cast<int>(i);
+            for (int ql = 0; ql < n_p; ql += VIT_TC_BQ) h_qtiles.push_back(make_int2(static_cast<int>(i), ql));
         }
         h_cu[imgs.size()] = total_patches;
+        const int num_qtiles = static_cast<int>(h_qtiles.size());
 
         EMB_CK(cudaMemcpyAsync(d_rgb, h_rgb.data(), total_rgb, cudaMemcpyHostToDevice, st));
         EMB_CK(cudaMemcpyAsync(d_cu_patches, h_cu.data(), h_cu.size() * sizeof(int), cudaMemcpyHostToDevice, st));
         EMB_CK(cudaMemcpyAsync(d_img_of_patch, h_iof.data(), h_iof.size() * sizeof(int), cudaMemcpyHostToDevice, st));
+        EMB_CK(cudaMemcpyAsync(d_img_qtiles, h_qtiles.data(), h_qtiles.size() * sizeof(int2), cudaMemcpyHostToDevice, st));
 
         auto run_body = [&] {
             // 1. Patchify each image
@@ -467,9 +669,19 @@ struct VisionRunner {
                         d_qkv + size_t(ir.patch_off) * (3 * H_v), ir.span->vit_h, ir.span->vit_w,
                         c.vit_heads, c.vit_head_dim);
                 }
-                const dim3 ag((total_patches + VIT_FA_QW - 1) / VIT_FA_QW, c.vit_heads);
-                k_q3v_attn<<<ag, 128, 0, st>>>(
-                    d_qkv, d_attn, d_cu_patches, d_img_of_patch, total_patches, c.vit_heads, c.vit_head_dim);
+                if (c.vit_head_dim == 64) {
+                    const dim3 ag(num_qtiles, c.vit_heads);
+                    k_q3v_flash_attn_tc<64, 64><<<ag, 128, 0, st>>>(
+                        d_qkv, d_attn, d_cu_patches, d_img_qtiles, num_qtiles, c.vit_heads);
+                } else if (c.vit_head_dim == 72) {
+                    const dim3 ag(num_qtiles, c.vit_heads);
+                    k_q3v_flash_attn_tc<72, 80><<<ag, 128, 0, st>>>(
+                        d_qkv, d_attn, d_cu_patches, d_img_qtiles, num_qtiles, c.vit_heads);
+                } else {
+                    const dim3 ag((total_patches + VIT_FA_QW - 1) / VIT_FA_QW, c.vit_heads);
+                    k_q3v_attn<<<ag, 128, 0, st>>>(
+                        d_qkv, d_attn, d_cu_patches, d_img_of_patch, total_patches, c.vit_heads, c.vit_head_dim);
+                }
                 linear_forward(d_attn, B.proj_w, B.proj_b, d_x, total_patches, true, ws, st);
 
                 k_q3v_layernorm<<<total_patches, 256, 0, st>>>(d_x, B.norm2_w, B.norm2_b, d_ln, total_patches, H_v, 1e-6f);
