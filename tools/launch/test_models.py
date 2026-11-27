@@ -135,12 +135,10 @@ class Kv4OptionsTests(unittest.TestCase):
         self.assert_words_once(env, Kv4ExactOptionsTests.WORDS +
                                ('GR8_KV4_TC=0', 'GR8_KV4_FOLD=0', 'GR8_CP_ONECHAIN=0'))
 
-    def test_fp8_weights_keep_exact_path(self):
+    def test_fp8_weights_enable_fold_and_tc(self):
         for args in (('--kvb', 'fp8'), ('--extra-env', 'GR8_KVB=fp8')):
             env = self.plan('--kv-format', 'int4', '--v2-dense', '/release', *args)['env']
-            self.assertNotIn('GR8_KV4_FOLD=1', env)
-            self.assertNotIn('GR8_KV4_TC=1', env)
-            self.assert_words_once(env, Kv4ExactOptionsTests.WORDS)
+            self.assert_words_once(env, self.WORDS)
 
     def test_fold_override_disables_implicit_tc(self):
         env = self.plan('--kv-format', 'int4', '--extra-env', 'GR8_KV4_FOLD=0')['env']
@@ -158,8 +156,7 @@ class Kv4OptionsTests(unittest.TestCase):
             self.assertFalse([w for w in env if w.startswith(('GR8_KV4_', 'GR8_CP_ONECHAIN='))])
 
     def test_refusals(self):
-        for args in (('--kv4-fold', '2'), ('--kv4-tc', 'x'), ('--kv-format', 'fp8', '--kv4-fold', '1'),
-                     ('--kv-format', 'int4', '--kv4-fold', '1', '--kvb', 'fp8', '--v2-dense', '/release')):
+        for args in (('--kv4-fold', '2'), ('--kv4-tc', 'x'), ('--kv-format', 'fp8', '--kv4-fold', '1')):
             with self.assertRaises(opt.OptionError):
                 self.plan(*args)
         with self.assertRaises(opt.OptionError):

@@ -856,7 +856,8 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--spec-adaptive', plan['args'])
         self.assertIn('--reuse-prefix', plan['args'])
         for v in ('GR8_PF_OWN=1', 'GR8_PF_STREAMS=1', 'GR8_PF_DENSE=1024', 'GR8_PF_ATTN_ROWS=256',
-                  'GR8_PF_BLAS_ROWS=512', 'GR8_S2_DECODE_PF=1024', 'GR8_CP_R=4096',
+                  'GR8_PF_BLAS_ROWS=512', 'GR8_S2_DECODE_PF=1024', 'GR8_CP_R=4096', 'GR8_DEC_BK=4096', 'GR8_DEC_BK_MAX=4096',
+                  'GR8_KV4_FOLD=1', 'GR8_KV4_TC=1',
                   'GR8_MEM_MIN=2', 'GR8_V2_SHARED=trellis', 'GR8_KV_SHARE_PAGES=1', 'GR8_DFL_DEDUP=1',
                   'GR8_SPEC_K0=1', 'GR8_DFL_VERIFY_CAP=0.35', 'GR8_MOE_UNION_CAP=48', 'GR8_REUSE_GRID=64'):
             self.assertIn(v, plan['env'])
