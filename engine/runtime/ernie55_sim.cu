@@ -253,8 +253,85 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    auto run_prompt = [&](const std::vector<int>& prompt, bool print_sessions, bool allow_dump) {
+        const int P = static_cast<int>(prompt.size());
+        if (P + gen + 2 > cap) die("prompt + --gen exceeds --cap");
+
+        std::vector<ernie55rt::RowOut> out;
+        std::vector<float> full_logits;
+        std::vector<int> next(size_t(sessions), 0);
+        std::vector<std::vector<int>> said(static_cast<size_t>(sessions));
+        const float inv_temp = temp > 0.f ? 1.f / temp : 0.f;
+
+        const auto t_pf0 = std::chrono::steady_clock::now();
+        for (int s = 0; s < sessions; ++s) {
+            e.reset_slot(s);
+            for (int p = 0; p < P; p += chunk) {
+                const int n = std::min(chunk, P - p);
+                const bool last = (p + n == P);
+                std::vector<ernie55::StepSeg> segs = {{s, 0, p, n}};
+                std::vector<ernie55rt::RowSample> sm(static_cast<size_t>(n));
+                for (int i = 0; i < n; ++i) sm[size_t(i)] = ernie55rt::RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};
+                e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last, (last && allow_dump && dump_logits) ? &full_logits : nullptr);
+                if (last) next[size_t(s)] = out[size_t(n - 1)].tok;
+            }
+        }
+        ERNIE55_CK(cudaStreamSynchronize(e.stream));
+        const auto t_pf1 = std::chrono::steady_clock::now();
+
+        const auto t_dec0 = std::chrono::steady_clock::now();
+        if (gen > 0) {
+            for (int s = 0; s < sessions; ++s) said[size_t(s)].push_back(next[size_t(s)]);
+            for (int g = 1; g < gen; ++g) {
+                std::vector<ernie55::StepSeg> segs;
+                std::vector<int> tk;
+                std::vector<ernie55rt::RowSample> sm;
+                for (int s = 0; s < sessions; ++s) {
+                    segs.push_back({s, s, P + g - 1, 1});
+                    tk.push_back(next[size_t(s)]);
+                    sm.push_back(ernie55rt::RowSample{inv_temp, top_p, seed, uint32_t(P + g)});
+                }
+                e.forward(segs, tk.data(), sm.data(), out, false);
+                for (int s = 0; s < sessions; ++s) {
+                    next[size_t(s)] = out[size_t(s)].tok;
+                    said[size_t(s)].push_back(next[size_t(s)]);
+                }
+            }
+        }
+        ERNIE55_CK(cudaStreamSynchronize(e.stream));
+        const auto t_dec1 = std::chrono::steady_clock::now();
+
+        const double pf_ms  = std::chrono::duration<double, std::milli>(t_pf1 - t_pf0).count();
+        const double dec_ms = std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count();
+        const double tps = gen > 1 ? ((gen - 1) / (dec_ms / 1e3 + 1e-9)) : 0.0;
+        std::fprintf(stderr, "# m4sim_ernie55 TP=%d kv=%s mx8=%d hybrid=%d P=%d gen=%d sess=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s/sess, %.2f agg tok/s)\n",
+                     G6_NR, ernie55rt::kv_fmt_name(e.o.kv_fmt), e.o.mx8_dense ? 1 : 0, e.o.use_hybrid ? 1 : 0,
+                     P, gen, sessions, pf_ms, (double(P) * sessions) / (pf_ms / 1e3 + 1e-9), dec_ms, tps, tps * sessions);
+        if (e.o.profile) e.prof.print(0);
+        if (print_sessions) {
+            for (int s = 0; s < sessions; ++s) {
+                std::printf("session %d:", s);
+                for (int t : said[size_t(s)]) std::printf(" %d", t);
+                std::printf("\n");
+            }
+        }
+    };
+
+    if (!tok_str.empty()) {
+        std::vector<int> prompt;
+        std::string raw_toks = tok_str;
+        for (char& ch : raw_toks) if (ch == ',') ch = ' ';
+        std::stringstream ss(raw_toks);
+        int tid = 0;
+        while (ss >> tid) prompt.push_back(tid);
+        if (prompt.empty()) prompt.push_back(geom::TOK_BOS);
+        run_prompt(prompt, true, true);
+        if (e.o.profile && (bench_kv_pos > 0 || bench_ctx > 0)) e.prof.reset();
+    }
+
     if (bench_kv_pos > 0) {
         if (bench_kv_pos + gen + 2 > cap) die("--bench-kv-pos + --gen exceeds --cap");
+        for (int s = 0; s < sessions; ++s) e.reset_slot(s);
         e.seed_bench_kv(bench_kv_pos, sessions);
         std::vector<ernie55rt::RowOut> out;
         std::vector<int> cur(size_t(sessions), geom::TOK_BOS);
@@ -291,82 +368,16 @@ int main(int argc, char** argv) {
                      G6_NR, ernie55rt::kv_fmt_name(e.o.kv_fmt), e.o.mx8_dense ? 1 : 0, e.o.use_hybrid ? 1 : 0,
                      bench_kv_pos, gen, sessions, dec_ms, tps, tps * sessions);
         if (e.o.profile) e.prof.print(0);
-        if (bench_ctx <= 0 && tok_str.empty()) return 0;
-        if (e.o.profile) e.prof.reset();
+        if (e.o.profile && bench_ctx > 0) e.prof.reset();
     }
 
-    std::vector<int> prompt;
     if (bench_ctx > 0) {
-        prompt.resize(size_t(bench_ctx));
+        std::vector<int> prompt(static_cast<size_t>(bench_ctx));
         prompt[0] = geom::TOK_BOS;
         for (int i = 1; i < bench_ctx; ++i) prompt[size_t(i)] = 100 + ((i * 131 + 17) % 30000);
-    } else if (!tok_str.empty()) {
-        std::string raw_toks = tok_str;
-        for (char& ch : raw_toks) if (ch == ',') ch = ' ';
-        std::stringstream ss(raw_toks);
-        int tid = 0;
-        while (ss >> tid) prompt.push_back(tid);
-    } else {
-        prompt.push_back(geom::TOK_BOS);
-    }
-    const int P = static_cast<int>(prompt.size());
-    if (P + gen + 2 > cap) die("prompt + --gen exceeds --cap");
-
-    std::vector<ernie55rt::RowOut> out;
-    std::vector<float> full_logits;
-    std::vector<int> next(size_t(sessions), 0);
-    std::vector<std::vector<int>> said(static_cast<size_t>(sessions));
-    const float inv_temp = temp > 0.f ? 1.f / temp : 0.f;
-
-    const auto t_pf0 = std::chrono::steady_clock::now();
-    for (int s = 0; s < sessions; ++s) {
-        e.reset_slot(s);
-        for (int p = 0; p < P; p += chunk) {
-            const int n = std::min(chunk, P - p);
-            const bool last = (p + n == P);
-            std::vector<ernie55::StepSeg> segs = {{s, 0, p, n}};
-            std::vector<ernie55rt::RowSample> sm(static_cast<size_t>(n));
-            for (int i = 0; i < n; ++i) sm[size_t(i)] = ernie55rt::RowSample{inv_temp, top_p, seed, uint32_t(p + i + 1)};
-            e.forward(segs, &prompt[size_t(p)], sm.data(), out, !last, (last && dump_logits) ? &full_logits : nullptr);
-            if (last) next[size_t(s)] = out[size_t(n - 1)].tok;
-        }
-    }
-    ERNIE55_CK(cudaStreamSynchronize(e.stream));
-    const auto t_pf1 = std::chrono::steady_clock::now();
-
-    const auto t_dec0 = std::chrono::steady_clock::now();
-    if (gen > 0) {
-        for (int s = 0; s < sessions; ++s) said[size_t(s)].push_back(next[size_t(s)]);
-        for (int g = 1; g < gen; ++g) {
-            std::vector<ernie55::StepSeg> segs;
-            std::vector<int> tk;
-            std::vector<ernie55rt::RowSample> sm;
-            for (int s = 0; s < sessions; ++s) {
-                segs.push_back({s, s, P + g - 1, 1});
-                tk.push_back(next[size_t(s)]);
-                sm.push_back(ernie55rt::RowSample{inv_temp, top_p, seed, uint32_t(P + g)});
-            }
-            e.forward(segs, tk.data(), sm.data(), out, false);
-            for (int s = 0; s < sessions; ++s) {
-                next[size_t(s)] = out[size_t(s)].tok;
-                said[size_t(s)].push_back(next[size_t(s)]);
-            }
-        }
-    }
-    ERNIE55_CK(cudaStreamSynchronize(e.stream));
-    const auto t_dec1 = std::chrono::steady_clock::now();
-
-    const double pf_ms  = std::chrono::duration<double, std::milli>(t_pf1 - t_pf0).count();
-    const double dec_ms = std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count();
-    const double tps = gen > 1 ? ((gen - 1) / (dec_ms / 1e3 + 1e-9)) : 0.0;
-    std::fprintf(stderr, "# m4sim_ernie55 TP=%d kv=%s mx8=%d hybrid=%d P=%d gen=%d sess=%d: prefill=%.1f ms (%.1f tok/s), decode=%.1f ms (%.2f tok/s/sess, %.2f agg tok/s)\n",
-                 G6_NR, ernie55rt::kv_fmt_name(e.o.kv_fmt), e.o.mx8_dense ? 1 : 0, e.o.use_hybrid ? 1 : 0,
-                 P, gen, sessions, pf_ms, (double(P) * sessions) / (pf_ms / 1e3 + 1e-9), dec_ms, tps, tps * sessions);
-    if (e.o.profile) e.prof.print(0);
-    for (int s = 0; s < sessions; ++s) {
-        std::printf("session %d:", s);
-        for (int t : said[size_t(s)]) std::printf(" %d", t);
-        std::printf("\n");
+        run_prompt(prompt, tok_str.empty(), tok_str.empty());
+    } else if (tok_str.empty() && bench_kv_pos <= 0) {
+        run_prompt({geom::TOK_BOS}, true, true);
     }
     return 0;
 }
