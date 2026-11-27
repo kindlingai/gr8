@@ -262,15 +262,15 @@ __global__ void __launch_bounds__(128) k_ernie55_mx8_gemv(
     for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
 
     int i = hlane;
-    uint4 wv = (i < K16) ? __ldcs(qrow + i) : make_uint4(0, 0, 0, 0);
-    uint8_t sv = (i < K16) ? __ldcs(srow + (i >> 1)) : 127u;
+    uint4 wv = (i < K16) ? __ldg(qrow + i) : make_uint4(0, 0, 0, 0);
+    uint8_t sv = (i < K16) ? __ldg(srow + (i >> 1)) : 127u;
     for (; i < K16; i += 16) {
         const int ni = i + 16;
         uint4 wv_next;
         uint8_t sv_next = 127u;
         if (ni < K16) {
-            wv_next = __ldcs(qrow + ni);
-            sv_next = __ldcs(srow + (ni >> 1));
+            wv_next = __ldg(qrow + ni);
+            sv_next = __ldg(srow + (ni >> 1));
         }
         const float sc = __uint_as_float(static_cast<uint32_t>(sv) << 23);
         float2 wf[8];

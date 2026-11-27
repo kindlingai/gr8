@@ -267,7 +267,7 @@ int main(int argc, char** argv) {
             for (int s = 0; s < sessions; ++s) cur[size_t(s)] = out[size_t(s)].tok;
         }
         ERNIE55_CK(cudaStreamSynchronize(e.stream));
-        if (e.o.profile) e.prof = ernie55rt::ProfileAccum{};
+        if (e.o.profile) e.prof.reset();
         const auto td0 = std::chrono::steady_clock::now();
         for (int g = 0; g < gen; ++g) {
             std::vector<ernie55::StepSeg> segs;

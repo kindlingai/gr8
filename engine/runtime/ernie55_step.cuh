@@ -303,16 +303,41 @@ struct Options {
 
 struct ProfileAccum {
     double mhc_ms = 0, hca_ms = 0, dsa_ms = 0, moe_ms = 0, ar_ms = 0, head_ms = 0;
+    double head_gemv_ms = 0, head_pack_ms = 0;
+    ernie55::HcaProfDetail hca_d{};
+    ernie55::MoeProfDetail moe_d{};
     int steps = 0, tokens = 0;
+    void reset() {
+        mhc_ms = hca_ms = dsa_ms = moe_ms = ar_ms = head_ms = 0;
+        head_gemv_ms = head_pack_ms = 0;
+        hca_d.qkv_comp_ms = hca_d.prep_ms = hca_d.qup_gate_ms = hca_d.q_norm_rope_ms = 0;
+        hca_d.attn_tc_ms = hca_d.vha_invrope_ms = hca_d.woa_gate_ms = hca_d.o_proj_ms = 0;
+        moe_d.router_ms = moe_d.fc1_lat_ms = moe_d.prerot_r_ms = moe_d.routed_fc1_ms = 0;
+        moe_d.routed_fc2_ms = moe_d.shared_ms = moe_d.finish_ms = 0;
+        steps = tokens = 0;
+    }
     void print(int rank) const {
         if (!steps) return;
         const double tot = mhc_ms + hca_ms + dsa_ms + moe_ms + ar_ms + head_ms;
         std::fprintf(stderr,
                      "# ernie55 profile r%d (%d steps, %d tok, %.2f ms total, %.2f ms/step): "
-                     "mhc=%.2f hca=%.2f dsa=%.2f moe=%.2f ar=%.2f head=%.2f\n",
+                     "mhc=%.2f hca=%.2f dsa=%.2f moe=%.2f ar=%.2f head=%.2f (gemv=%.2f pack=%.2f)\n",
                      rank, steps, tokens, tot, tot / steps,
                      mhc_ms / steps, hca_ms / steps, dsa_ms / steps,
-                     moe_ms / steps, ar_ms / steps, head_ms / steps);
+                     moe_ms / steps, ar_ms / steps, head_ms / steps,
+                     head_gemv_ms / steps, head_pack_ms / steps);
+        std::fprintf(stderr,
+                     "# ernie55 hca_detail (ms/step, 37L): qkv_comp=%.2f prep=%.2f qup_gate=%.2f q_rope=%.2f "
+                     "attn_tc=%.2f vha=%.2f woa_gate=%.2f o_proj=%.2f\n",
+                     hca_d.qkv_comp_ms / steps, hca_d.prep_ms / steps, hca_d.qup_gate_ms / steps,
+                     hca_d.q_norm_rope_ms / steps, hca_d.attn_tc_ms / steps, hca_d.vha_invrope_ms / steps,
+                     hca_d.woa_gate_ms / steps, hca_d.o_proj_ms / steps);
+        std::fprintf(stderr,
+                     "# ernie55 moe_detail (ms/step, 42L): router=%.2f fc1_lat=%.2f prerot=%.2f r_fc1=%.2f "
+                     "r_fc2=%.2f shared=%.2f finish=%.2f\n",
+                     moe_d.router_ms / steps, moe_d.fc1_lat_ms / steps, moe_d.prerot_r_ms / steps,
+                     moe_d.routed_fc1_ms / steps, moe_d.routed_fc2_ms / steps, moe_d.shared_ms / steps,
+                     moe_d.finish_ms / steps);
     }
 };
 
@@ -322,6 +347,8 @@ struct Engine {
     cublasHandle_t blas = nullptr;
     void* cublas_ws = nullptr;
     cudaStream_t stream = 0;
+    cudaStream_t stream_sh = 0;
+    cudaEvent_t  ev_moe_fork = nullptr, ev_moe_join = nullptr;
     std::vector<std::unique_ptr<Image>> img;
     std::vector<std::unique_ptr<Image>> dense_bf16_keep; // kept only if !mx8_dense && hybrid
     std::vector<ernie55::mx8::Mx8Arena> mx8_arena;
@@ -382,6 +409,8 @@ struct Engine {
     ernie55::MoeScratch      moe_sc{};
 
     float*   head_logits = nullptr;
+    float*   head_argmax_val = nullptr;
+    int*     head_argmax_id = nullptr;
     uint8_t* head_dev_pkt = nullptr;
     uint8_t* head_host_parts = nullptr;
     int*     d_tok = nullptr;
@@ -397,8 +426,10 @@ struct Engine {
         bool big_kv = false;
         bool sparse = false;
         int  idx_bucket = 0;
+        bool greedy_fast = false;
         bool operator<(const GraphKey& r) const {
-            return std::tie(M, big_kv, sparse, idx_bucket) < std::tie(r.M, r.big_kv, r.sparse, r.idx_bucket);
+            return std::tie(M, big_kv, sparse, idx_bucket, greedy_fast) <
+                   std::tie(r.M, r.big_kv, r.sparse, r.idx_bucket, r.greedy_fast);
         }
     };
     std::map<GraphKey, cudaGraphExec_t> graphs;
@@ -416,13 +447,22 @@ struct Engine {
         clear_graphs();
         if (head_host_parts) cudaFreeHost(head_host_parts);
         if (h_meta_pinned) cudaFreeHost(h_meta_pinned);
+        if (head_argmax_val) cudaFree(head_argmax_val);
+        if (head_argmax_id) cudaFree(head_argmax_id);
         if (d_yarn_inv_freq) cudaFree(d_yarn_inv_freq);
         if (d_vha_mix_pool) cudaFree(d_vha_mix_pool);
         if (d_dsa_sinks_f32) cudaFree(d_dsa_sinks_f32);
         if (ev_a) cudaEventDestroy(ev_a);
         if (ev_b) cudaEventDestroy(ev_b);
+        if (ev_moe_fork) cudaEventDestroy(ev_moe_fork);
+        if (ev_moe_join) cudaEventDestroy(ev_moe_join);
+        if (prof.hca_d.ev_a) cudaEventDestroy(prof.hca_d.ev_a);
+        if (prof.hca_d.ev_b) cudaEventDestroy(prof.hca_d.ev_b);
+        if (prof.moe_d.ev_a) cudaEventDestroy(prof.moe_d.ev_a);
+        if (prof.moe_d.ev_b) cudaEventDestroy(prof.moe_d.ev_b);
         if (blas) cublasDestroy(blas);
         if (cublas_ws) cudaFree(cublas_ws);
+        if (stream_sh) cudaStreamDestroy(stream_sh);
         if (stream) cudaStreamDestroy(stream);
     }
 
@@ -532,12 +572,19 @@ struct Engine {
         }
 
         ERNIE55_CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        ERNIE55_CK(cudaStreamCreateWithFlags(&stream_sh, cudaStreamNonBlocking));
         if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) die("cublasCreate failed");
         cublasSetStream(blas, stream);
         ERNIE55_CK(cudaMalloc(&cublas_ws, 32ull << 20));
         cublasSetWorkspace(blas, cublas_ws, 32ull << 20);
         ERNIE55_CK(cudaEventCreate(&ev_a));
         ERNIE55_CK(cudaEventCreate(&ev_b));
+        ERNIE55_CK(cudaEventCreateWithFlags(&ev_moe_fork, cudaEventDisableTiming));
+        ERNIE55_CK(cudaEventCreateWithFlags(&ev_moe_join, cudaEventDisableTiming));
+        ERNIE55_CK(cudaEventCreate(&prof.hca_d.ev_a));
+        ERNIE55_CK(cudaEventCreate(&prof.hca_d.ev_b));
+        ERNIE55_CK(cudaEventCreate(&prof.moe_d.ev_a));
+        ERNIE55_CK(cudaEventCreate(&prof.moe_d.ev_b));
 
         // Pre-configure dynamic shared memory attributes BEFORE any graph capture
         ernie55::ensure_hca_tc_smem();
@@ -933,8 +980,10 @@ struct Engine {
         moe_sc.fc1_act_s     = dalloc<__half>(size_t(Mmax) * eb_loc * 128);
         moe_sc.fc2_part_r    = dalloc<float>(size_t(Mmax) * geom::TOPK * geom::EH);
 
-        head_logits  = dalloc<float>(size_t(Mmax) * max_vr);
-        head_dev_pkt = dalloc<uint8_t>(size_t(Mmax) * head_row_bytes(o.nc));
+        head_logits     = dalloc<float>(size_t(Mmax) * max_vr);
+        head_argmax_val = dalloc<float>(size_t(Mmax) * ink2::HEAD_ARGMAX_NG);
+        head_argmax_id  = dalloc<int>(size_t(Mmax) * ink2::HEAD_ARGMAX_NG);
+        head_dev_pkt    = dalloc<uint8_t>(size_t(Mmax) * head_row_bytes(o.nc));
         ERNIE55_CK(cudaHostAlloc(&head_host_parts, size_t(o.nr) * Mmax * head_row_bytes(o.nc), cudaHostAllocDefault));
         ERNIE55_CK(cudaHostAlloc(&h_meta_pinned, size_t(3) * Mmax * sizeof(int), cudaHostAllocDefault));
         d_tok  = dalloc<int>(size_t(Mmax));
@@ -1003,7 +1052,8 @@ struct Engine {
             } else {
                 ernie55::hca_forward(blas, rl.hca_w, hca_sc, rl.hca_kv, mixed_ln, p_dst,
                                      segs, nsegs, d_slot, d_pos, d_yarn_inv_freq,
-                                     M, max_pos, mx8_x8, stream, g_ns);
+                                     M, max_pos, mx8_x8, stream, g_ns,
+                                     (!capture_mode && o.profile) ? &prof.hca_d : nullptr);
             }
         }
         if (!capture_mode) prof_mark(y.is_dsa ? prof.dsa_ms : prof.hca_ms);
@@ -1043,7 +1093,12 @@ struct Engine {
                 ernie55::moe_shared(rl.moe_w, moe_sc, mixed_ln, M, stream);
                 ernie55::moe_routed_finish(blas, rl.moe_w, moe_sc, p_dst, M, mx8_x8, stream, fuse_tp1_moe);
             } else {
-                ernie55::moe_forward_resident(blas, rl.moe_w, moe_sc, mixed_ln, p_dst, M, mx8_x8, stream, fuse_tp1_moe);
+                const bool use_par_sh = (capture_mode || !o.profile);
+                ernie55::moe_forward_resident(blas, rl.moe_w, moe_sc, mixed_ln, p_dst, M, mx8_x8, stream, fuse_tp1_moe,
+                                              (!capture_mode && o.profile) ? &prof.moe_d : nullptr,
+                                              use_par_sh ? stream_sh : nullptr,
+                                              use_par_sh ? ev_moe_fork : nullptr,
+                                              use_par_sh ? ev_moe_join : nullptr);
             }
         }
         if (!capture_mode) prof_mark(prof.moe_ms);
@@ -1070,7 +1125,7 @@ struct Engine {
     // Forward pass across all 43 layers + optional mhc_contract + final norm + lm_head + multimax + sampling.
     void forward(const std::vector<ernie55::StepSeg>& segs, const int* toks, const RowSample* sm,
                  std::vector<RowOut>& out, bool skip_head = false,
-                 std::vector<float>* out_full_logits = nullptr) {
+                 std::vector<float>* out_full_logits = nullptr, bool need_logprobs = false) {
         int M = 0, max_pos = 0;
         for (const auto& sg : segs) {
             M = std::max(M, sg.row0 + sg.len);
@@ -1097,6 +1152,14 @@ struct Engine {
 
         if (on_step_begin) on_step_begin(M, skip_head);
 
+        bool all_greedy = true;
+        if (sm != nullptr) {
+            for (int m = 0; m < M; ++m) {
+                if (sm[m].inv_temp > 0.f) { all_greedy = false; break; }
+            }
+        }
+        const bool greedy_fast = (o.nr == 1 && o.nloc == 1 && all_greedy && !need_logprobs && !out_full_logits);
+
         const size_t rb = head_row_bytes(o.nc);
         const bool use_graph_now = o.use_graphs && !o.use_hybrid && o.nr == 1 && o.nloc == 1 &&
                                    !o.profile && o.dump_dir.empty() && !skip_head && !out_full_logits && M <= 12;
@@ -1105,7 +1168,7 @@ struct Engine {
             const bool is_big_kv = (max_pos + 1 >= 256);
             const bool is_sparse = (max_pos + 1 - geom::SLIDING_WIN > geom::IDX_TOPK);
             const int  ib        = idx_cap_bucket(max_pos, o.cap);
-            const GraphKey gk{M, is_big_kv, is_sparse, ib};
+            const GraphKey gk{M, is_big_kv, is_sparse, ib, greedy_fast};
             auto it = graphs.find(gk);
             if (it == graphs.end()) {
                 cudaGraph_t gr = nullptr;
@@ -1118,9 +1181,14 @@ struct Engine {
                 }
                 ernie55::k_ernie55_hc_head_and_norm<<<M, 256, 0, stream>>>(
                     hyper, hc_head.fn, hc_head.base, hc_head.scale, final_norm, mixed_ln, M);
-                ernie55::linear_bf16_f32(blas, mixed_ln, lm_head[0], head_logits, M, v_rows[0], geom::HID, stream);
-                ernie55::apply_multimax(head_logits, multimax_ranges, multimax_ts, M, v_rows[0], stream);
-                ink2::k_ink2_head_pack<<<M, 256, 0, stream>>>(head_logits, v_rows[0], v_lo[0], o.nc, head_dev_pkt, rb);
+                ernie55::linear_bf16_f32_multimax(blas, mixed_ln, lm_head[0], multimax_ranges, multimax_ts,
+                                                  head_logits, M, v_rows[0], geom::HID, stream);
+                if (greedy_fast) {
+                    ink2::head_argmax_dev(head_logits, M, v_rows[0], v_lo[0],
+                                          head_argmax_val, head_argmax_id, head_dev_pkt, rb, stream);
+                } else {
+                    ink2::k_ink2_head_pack<<<M, 256, 0, stream>>>(head_logits, v_rows[0], v_lo[0], o.nc, head_dev_pkt, rb);
+                }
                 ERNIE55_CK(cudaStreamEndCapture(stream, &gr));
                 cudaGraphExec_t ex = nullptr;
                 ERNIE55_CK(cudaGraphInstantiate(&ex, gr, nullptr, nullptr, 0));
@@ -1181,8 +1249,13 @@ struct Engine {
             const int r = o.rank0 + i;
             const int vr = v_rows[size_t(i)];
             const int v0 = v_lo[size_t(i)];
-            ernie55::linear_bf16_f32(blas, mixed_ln, lm_head[size_t(i)], head_logits, M, vr, geom::HID, stream);
-            ernie55::apply_multimax(head_logits, multimax_ranges, multimax_ts, M, vr, stream);
+            ernie55::linear_bf16_f32_multimax(blas, mixed_ln, lm_head[size_t(i)], multimax_ranges, multimax_ts,
+                                              head_logits, M, vr, geom::HID, stream);
+            if (o.profile) {
+                const double before = prof.head_gemv_ms;
+                prof_mark(prof.head_gemv_ms);
+                prof.head_ms += (prof.head_gemv_ms - before);
+            }
             if (out_full_logits) {
                 ERNIE55_CK(cudaStreamSynchronize(stream));
                 std::vector<float> tmp(size_t(M) * vr);
@@ -1192,7 +1265,11 @@ struct Engine {
                                 tmp.data() + size_t(m) * vr, size_t(vr) * sizeof(float));
                 }
             }
-            ink2::k_ink2_head_pack<<<M, 256, 0, stream>>>(head_logits, vr, v0, o.nc, head_dev_pkt, rb);
+            if (greedy_fast) {
+                ink2::head_argmax_dev(head_logits, M, vr, v0, head_argmax_val, head_argmax_id, head_dev_pkt, rb, stream);
+            } else {
+                ink2::k_ink2_head_pack<<<M, 256, 0, stream>>>(head_logits, vr, v0, o.nc, head_dev_pkt, rb);
+            }
             ERNIE55_CK(cudaMemcpyAsync(head_host_parts + static_cast<size_t>(r) * M * rb,
                                        head_dev_pkt, size_t(M) * rb, cudaMemcpyDeviceToHost, stream));
         }
@@ -1200,7 +1277,11 @@ struct Engine {
         if (on_head_gather) on_head_gather(coll++, M, head_host_parts, rb);
         if (on_step_end) on_step_end();
         if (o.use_hybrid) hybrid_cache.maintain_after_step(stream);
-        prof_mark(prof.head_ms);
+        if (o.profile) {
+            const double before = prof.head_pack_ms;
+            prof_mark(prof.head_pack_ms);
+            prof.head_ms += (prof.head_pack_ms - before);
+        }
 
         if (!o.dump_dir.empty() && out_full_logits) {
             std::ofstream f(o.dump_dir + "/logits.f32", std::ios::binary);

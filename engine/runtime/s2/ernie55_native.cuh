@@ -74,7 +74,7 @@ inline void serve_ernie55(Ernie55Context c, const BootstrapConfig& bc, int chunk
                 sm[size_t(r)] = ernie55rt::RowSample{s.inv_temp, s.top_p, s.seed, uint32_t(x.spos)};
             }
         }
-        c.engine.forward(segs, toks.data(), sm.data(), out, false);
+        c.engine.forward(segs, toks.data(), sm.data(), out, false, nullptr, true);
         lp_rows = M;
         std::vector<int> ids(static_cast<size_t>(M));
         for (int r = 0; r < M; ++r) ids[size_t(r)] = out[size_t(r)].tok;

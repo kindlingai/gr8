@@ -37,7 +37,7 @@ static constexpr float ERNIE55_SQ128 = 0.08838834764831844f; // 1 / sqrt(128)
 
 __device__ __forceinline__ __half2 as_h2(u32 v) { return *reinterpret_cast<__half2*>(&v); }
 __device__ __forceinline__ u32 as_u32(__half2 h) { return *reinterpret_cast<u32*>(&h); }
-__device__ __forceinline__ u64 rd64_u8(const uint8_t* p) { return *reinterpret_cast<const u64*>(p); }
+__device__ __forceinline__ u64 rd64_u8(const uint8_t* p) { return __ldg(reinterpret_cast<const u64*>(p)); }
 
 __device__ __forceinline__ void mma16816_f16(float (&c)[4], u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -263,8 +263,8 @@ __device__ __forceinline__ void ernie55_mul1_fc1_hb_wide(
     const uint8_t* grp = mw + static_cast<size_t>(hb) * (2048 * BITS);
 
     if constexpr (BITS == 4) {
-        const uint4 w0 = *reinterpret_cast<const uint4*>(grp + warp * 1024 + lane * 16);
-        const uint4 w1 = *reinterpret_cast<const uint4*>(grp + warp * 1024 + 512 + lane * 16);
+        const uint4 w0 = __ldg(reinterpret_cast<const uint4*>(grp + warp * 1024 + lane * 16));
+        const uint4 w1 = __ldg(reinterpret_cast<const uint4*>(grp + warp * 1024 + 512 + lane * 16));
         const u32 chs[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
         #pragma unroll
         for (int p = 0; p < 8; ++p) {
@@ -303,8 +303,8 @@ __device__ __forceinline__ void ernie55_mul1_fc2_ntile_wide(
     const uint8_t* nt = mw + static_cast<size_t>(n_tile) * (256 * BITS);
 
     if constexpr (BITS == 4) {
-        const uint4 w0 = *reinterpret_cast<const uint4*>(nt + lane * 16);
-        const uint4 w1 = *reinterpret_cast<const uint4*>(nt + 512 + lane * 16);
+        const uint4 w0 = __ldg(reinterpret_cast<const uint4*>(nt + lane * 16));
+        const uint4 w1 = __ldg(reinterpret_cast<const uint4*>(nt + 512 + lane * 16));
         const u32 chs[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
         #pragma unroll
         for (int p = 0; p < 8; ++p) {
@@ -344,8 +344,8 @@ __device__ __forceinline__ void ernie55_mul1_fc1_hb_wide16(
     const uint8_t* grp = mw + static_cast<size_t>(hb) * (2048 * BITS);
 
     if constexpr (BITS == 4) {
-        const uint4 w0 = *reinterpret_cast<const uint4*>(grp + warp * 1024 + lane * 16);
-        const uint4 w1 = *reinterpret_cast<const uint4*>(grp + warp * 1024 + 512 + lane * 16);
+        const uint4 w0 = __ldg(reinterpret_cast<const uint4*>(grp + warp * 1024 + lane * 16));
+        const uint4 w1 = __ldg(reinterpret_cast<const uint4*>(grp + warp * 1024 + 512 + lane * 16));
         const u32 chs[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
         #pragma unroll
         for (int p = 0; p < 8; ++p) {
@@ -395,8 +395,8 @@ __device__ __forceinline__ void ernie55_mul1_fc2_ntile_wide16(
     const uint8_t* nt = mw + static_cast<size_t>(n_tile) * (256 * BITS);
 
     if constexpr (BITS == 4) {
-        const uint4 w0 = *reinterpret_cast<const uint4*>(nt + lane * 16);
-        const uint4 w1 = *reinterpret_cast<const uint4*>(nt + 512 + lane * 16);
+        const uint4 w0 = __ldg(reinterpret_cast<const uint4*>(nt + lane * 16));
+        const uint4 w1 = __ldg(reinterpret_cast<const uint4*>(nt + 512 + lane * 16));
         const u32 chs[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
         #pragma unroll
         for (int p = 0; p < 8; ++p) {
@@ -569,20 +569,29 @@ __global__ void __launch_bounds__(128) k_ernie55_router_f32_gemv(
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) { a0[m] = 0.0f; a1[m] = 0.0f; }
 
-    // HID / 4 = 1024 = 32 * 32 exact!
-    for (int i = lane; i < (geom::HID >> 2); i += 32) {
-        const float4 f0 = __ldg(w0r + i);
-        const float4 f1 = __ldg(w1r + i);
+    // HID / 4 = 1024 = 32 * 32 exact! 2x software-pipelined __ldg loads.
+    int i = lane;
+    float4 f0 = __ldg(w0r + i);
+    float4 f1 = __ldg(w1r + i);
+    for (; i < (geom::HID >> 2); i += 32) {
+        const int ni = i + 32;
+        float4 nf0, nf1;
+        if (ni < (geom::HID >> 2)) {
+            nf0 = __ldg(w0r + ni);
+            nf1 = __ldg(w1r + ni);
+        }
         #pragma unroll
         for (int m = 0; m < MAX_M; ++m) {
             if (m < M) {
-                const uint2 raw = reinterpret_cast<const uint2*>(X + static_cast<size_t>(m) * geom::HID)[i];
+                const uint2 raw = __ldg(reinterpret_cast<const uint2*>(X + static_cast<size_t>(m) * geom::HID) + i);
                 const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
                 const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
                 a0[m] = fmaf(x01.x, f0.x, fmaf(x01.y, f0.y, fmaf(x23.x, f0.z, fmaf(x23.y, f0.w, a0[m]))));
                 a1[m] = fmaf(x01.x, f1.x, fmaf(x01.y, f1.y, fmaf(x23.x, f1.z, fmaf(x23.y, f1.w, a1[m]))));
             }
         }
+        f0 = nf0;
+        f1 = nf1;
     }
     #pragma unroll
     for (int m = 0; m < MAX_M; ++m) {
@@ -786,40 +795,32 @@ __global__ void __launch_bounds__(256) k_ernie55_routed_fc1_grp(
     const int kg = ernie55_fc1_unit<geom::EHB>(fc1, ptab, kmix, e, tr, 2 * b + 0, eb, mw_g);
     const int ku = ernie55_fc1_unit<geom::EHB>(fc1, ptab, kmix, e, tr, 2 * b + 1, eb, mw_u);
 
-    __shared__ __half x_rot[8][136];
+    __shared__ __half x_rot_g[8][136];
+    __shared__ __half x_rot_u[8][136];
     float cg[4] = {0, 0, 0, 0};
     float cu[4] = {0, 0, 0, 0};
 
     for (int hb = 0; hb < geom::EHB; ++hb) {
         if (warp < cnt) {
-            const __half2 bsh = __half2half2(v1b[(brow * 2 + 0) * geom::EHB + hb]);
-            const uint2 xv = *reinterpret_cast<const uint2*>(
-                x_had + (static_cast<size_t>(s_tok[warp]) * geom::EHB + hb) * 128 + lane * 4);
-            uint2 ov;
-            *reinterpret_cast<__half2*>(&ov.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsh);
-            *reinterpret_cast<__half2*>(&ov.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsh);
-            *reinterpret_cast<uint2*>(x_rot[warp] + lane * 4) = ov;
+            const uint2 xv = __ldg(reinterpret_cast<const uint2*>(
+                x_had + (static_cast<size_t>(s_tok[warp]) * geom::EHB + hb) * 128 + lane * 4));
+            const __half2 bsg = __half2half2(__ldg(v1b + (brow * 2 + 0) * geom::EHB + hb));
+            const __half2 bsu = __half2half2(__ldg(v1b + (brow * 2 + 1) * geom::EHB + hb));
+            uint2 ovg, ovu;
+            *reinterpret_cast<__half2*>(&ovg.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsg);
+            *reinterpret_cast<__half2*>(&ovg.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsg);
+            *reinterpret_cast<__half2*>(&ovu.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsu);
+            *reinterpret_cast<__half2*>(&ovu.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsu);
+            *reinterpret_cast<uint2*>(x_rot_g[warp] + lane * 4) = ovg;
+            *reinterpret_cast<uint2*>(x_rot_u[warp] + lane * 4) = ovu;
         }
         __syncthreads();
-        if (kg == 3)      ernie55_mul1_fc1_hb_wide<3>(mw_g, hb, warp, lane, x_rot, cnt, cg);
-        else if (kg == 4) ernie55_mul1_fc1_hb_wide<4>(mw_g, hb, warp, lane, x_rot, cnt, cg);
-        else              ernie55_mul1_fc1_hb_wide<2>(mw_g, hb, warp, lane, x_rot, cnt, cg);
-        __syncthreads();
-    }
-    for (int hb = 0; hb < geom::EHB; ++hb) {
-        if (warp < cnt) {
-            const __half2 bsh = __half2half2(v1b[(brow * 2 + 1) * geom::EHB + hb]);
-            const uint2 xv = *reinterpret_cast<const uint2*>(
-                x_had + (static_cast<size_t>(s_tok[warp]) * geom::EHB + hb) * 128 + lane * 4);
-            uint2 ov;
-            *reinterpret_cast<__half2*>(&ov.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsh);
-            *reinterpret_cast<__half2*>(&ov.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsh);
-            *reinterpret_cast<uint2*>(x_rot[warp] + lane * 4) = ov;
-        }
-        __syncthreads();
-        if (ku == 3)      ernie55_mul1_fc1_hb_wide<3>(mw_u, hb, warp, lane, x_rot, cnt, cu);
-        else if (ku == 4) ernie55_mul1_fc1_hb_wide<4>(mw_u, hb, warp, lane, x_rot, cnt, cu);
-        else              ernie55_mul1_fc1_hb_wide<2>(mw_u, hb, warp, lane, x_rot, cnt, cu);
+        if (kg == 3)      ernie55_mul1_fc1_hb_wide<3>(mw_g, hb, warp, lane, x_rot_g, cnt, cg);
+        else if (kg == 4) ernie55_mul1_fc1_hb_wide<4>(mw_g, hb, warp, lane, x_rot_g, cnt, cg);
+        else              ernie55_mul1_fc1_hb_wide<2>(mw_g, hb, warp, lane, x_rot_g, cnt, cg);
+        if (ku == 3)      ernie55_mul1_fc1_hb_wide<3>(mw_u, hb, warp, lane, x_rot_u, cnt, cu);
+        else if (ku == 4) ernie55_mul1_fc1_hb_wide<4>(mw_u, hb, warp, lane, x_rot_u, cnt, cu);
+        else              ernie55_mul1_fc1_hb_wide<2>(mw_u, hb, warp, lane, x_rot_u, cnt, cu);
         __syncthreads();
     }
 
@@ -1202,40 +1203,32 @@ __global__ void __launch_bounds__(256) k_ernie55_shared_fc1(
     const int kg = ernie55_fc1_unit<geom::HB>(fc1, nullptr, kmix, 0, tr, 2 * b + 0, eb, mw_g);
     const int ku = ernie55_fc1_unit<geom::HB>(fc1, nullptr, kmix, 0, tr, 2 * b + 1, eb, mw_u);
 
-    __shared__ __half x_rot[8][136];
+    __shared__ __half x_rot_g[8][136];
+    __shared__ __half x_rot_u[8][136];
     float cg[4] = {0, 0, 0, 0};
     float cu[4] = {0, 0, 0, 0};
 
     for (int hb = 0; hb < geom::HB; ++hb) {
         if (warp < cnt) {
-            const __half2 bsh = __half2half2(v1b[(brow * 2 + 0) * geom::HB + hb]);
-            const uint2 xv = *reinterpret_cast<const uint2*>(
-                x_had_s + (static_cast<size_t>(m0 + warp) * geom::HB + hb) * 128 + lane * 4);
-            uint2 ov;
-            *reinterpret_cast<__half2*>(&ov.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsh);
-            *reinterpret_cast<__half2*>(&ov.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsh);
-            *reinterpret_cast<uint2*>(x_rot[warp] + lane * 4) = ov;
+            const uint2 xv = __ldg(reinterpret_cast<const uint2*>(
+                x_had_s + (static_cast<size_t>(m0 + warp) * geom::HB + hb) * 128 + lane * 4));
+            const __half2 bsg = __half2half2(__ldg(v1b + (brow * 2 + 0) * geom::HB + hb));
+            const __half2 bsu = __half2half2(__ldg(v1b + (brow * 2 + 1) * geom::HB + hb));
+            uint2 ovg, ovu;
+            *reinterpret_cast<__half2*>(&ovg.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsg);
+            *reinterpret_cast<__half2*>(&ovg.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsg);
+            *reinterpret_cast<__half2*>(&ovu.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsu);
+            *reinterpret_cast<__half2*>(&ovu.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsu);
+            *reinterpret_cast<uint2*>(x_rot_g[warp] + lane * 4) = ovg;
+            *reinterpret_cast<uint2*>(x_rot_u[warp] + lane * 4) = ovu;
         }
         __syncthreads();
-        if (kg == 4)      ernie55_mul1_fc1_hb_wide<4>(mw_g, hb, warp, lane, x_rot, cnt, cg);
-        else if (kg == 3) ernie55_mul1_fc1_hb_wide<3>(mw_g, hb, warp, lane, x_rot, cnt, cg);
-        else              ernie55_mul1_fc1_hb_wide<2>(mw_g, hb, warp, lane, x_rot, cnt, cg);
-        __syncthreads();
-    }
-    for (int hb = 0; hb < geom::HB; ++hb) {
-        if (warp < cnt) {
-            const __half2 bsh = __half2half2(v1b[(brow * 2 + 1) * geom::HB + hb]);
-            const uint2 xv = *reinterpret_cast<const uint2*>(
-                x_had_s + (static_cast<size_t>(m0 + warp) * geom::HB + hb) * 128 + lane * 4);
-            uint2 ov;
-            *reinterpret_cast<__half2*>(&ov.x) = __hmul2(*reinterpret_cast<const __half2*>(&xv.x), bsh);
-            *reinterpret_cast<__half2*>(&ov.y) = __hmul2(*reinterpret_cast<const __half2*>(&xv.y), bsh);
-            *reinterpret_cast<uint2*>(x_rot[warp] + lane * 4) = ov;
-        }
-        __syncthreads();
-        if (ku == 4)      ernie55_mul1_fc1_hb_wide<4>(mw_u, hb, warp, lane, x_rot, cnt, cu);
-        else if (ku == 3) ernie55_mul1_fc1_hb_wide<3>(mw_u, hb, warp, lane, x_rot, cnt, cu);
-        else              ernie55_mul1_fc1_hb_wide<2>(mw_u, hb, warp, lane, x_rot, cnt, cu);
+        if (kg == 4)      ernie55_mul1_fc1_hb_wide<4>(mw_g, hb, warp, lane, x_rot_g, cnt, cg);
+        else if (kg == 3) ernie55_mul1_fc1_hb_wide<3>(mw_g, hb, warp, lane, x_rot_g, cnt, cg);
+        else              ernie55_mul1_fc1_hb_wide<2>(mw_g, hb, warp, lane, x_rot_g, cnt, cg);
+        if (ku == 4)      ernie55_mul1_fc1_hb_wide<4>(mw_u, hb, warp, lane, x_rot_u, cnt, cu);
+        else if (ku == 3) ernie55_mul1_fc1_hb_wide<3>(mw_u, hb, warp, lane, x_rot_u, cnt, cu);
+        else              ernie55_mul1_fc1_hb_wide<2>(mw_u, hb, warp, lane, x_rot_u, cnt, cu);
         __syncthreads();
     }
 
@@ -1567,15 +1560,46 @@ inline void moe_routed_finish(cublasHandle_t blas, const MoeWeights& w, MoeScrat
     }
 }
 
+struct MoeProfDetail {
+    double router_ms = 0, fc1_lat_ms = 0, prerot_r_ms = 0, routed_fc1_ms = 0;
+    double routed_fc2_ms = 0, shared_ms = 0, finish_ms = 0;
+    cudaEvent_t ev_a = nullptr, ev_b = nullptr;
+    void mark(double& acc, cudaStream_t st) {
+        cudaEventRecord(ev_b, st);
+        cudaEventSynchronize(ev_b);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, ev_a, ev_b);
+        acc += ms;
+        cudaEventRecord(ev_a, st);
+    }
+};
+
 // Resident MoE forward (Spark TP=1 or TP=2/4). Hybrid offload calls moe_route + fc1_lat + prerot +
 // hybrid.run_routed_layer(...) + moe_shared + moe_routed_finish!
+// When stream_sh/ev_fork/ev_join are provided (and !pd), runs shared expert in parallel with routed path
+// (including native fork/join inside CUDA Graph capture) to fill small-grid SM wave tails!
 inline void moe_forward_resident(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc,
                                  const __nv_bfloat16* x_norm, __nv_bfloat16* out_part,
-                                 int M, uint8_t* x8_scratch, cudaStream_t st, bool skip_add = false) {
+                                 int M, uint8_t* x8_scratch, cudaStream_t st, bool skip_add = false,
+                                 MoeProfDetail* pd = nullptr,
+                                 cudaStream_t stream_sh = nullptr,
+                                 cudaEvent_t ev_fork = nullptr,
+                                 cudaEvent_t ev_join = nullptr) {
+    const bool parallel_sh = (!pd && stream_sh != nullptr && ev_fork != nullptr && ev_join != nullptr);
+    if (parallel_sh) {
+        cudaEventRecord(ev_fork, st);
+        cudaStreamWaitEvent(stream_sh, ev_fork, 0);
+        moe_shared(w, sc, x_norm, M, stream_sh);
+        cudaEventRecord(ev_join, stream_sh);
+    }
+    if (pd) cudaEventRecord(pd->ev_a, st);
     moe_route(blas, w, sc, x_norm, M, nullptr, st);
+    if (pd) pd->mark(pd->router_ms, st);
     mx8::linear_w(blas, x_norm, w.fc1_lat, sc.routed_in, M, geom::EH, geom::HID, x8_scratch, nullptr, st);
+    if (pd) pd->mark(pd->fc1_lat_ms, st);
     const int n_routes = M * geom::TOPK;
     k_ernie55_prerot_x<geom::EHB><<<M * geom::EHB, 32, 0, st>>>(sc.routed_in, w.routed.sg, sc.x_had_r, M);
+    if (pd) pd->mark(pd->prerot_r_ms, st);
 
     if (M == 1) {
         k_ernie55_moe_groups_m1<<<1, 32, 0, st>>>(sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes);
@@ -1583,9 +1607,11 @@ inline void moe_forward_resident(cublasHandle_t blas, const MoeWeights& w, MoeSc
         k_ernie55_routed_fc1_grp<<<grid_G * w.routed.eb, 256, 0, st>>>(
             sc.x_had_r, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
             w.routed.tab, w.routed.kmix, w.routed.fc1, w.routed.ptab, w.routed.v1b, w.routed.v2, sc.fc1_act_r, w.routed.eb);
+        if (pd) pd->mark(pd->routed_fc1_ms, st);
         k_ernie55_routed_fc2_grp<<<grid_G * geom::EHB, 256, 0, st>>>(
             sc.fc1_act_r, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
             sc.topk_w, w.routed.tab, w.routed.fc2, w.routed.ptab, w.routed.sg, w.routed.v3b, sc.fc2_part_r, w.routed.eb);
+        if (pd) pd->mark(pd->routed_fc2_ms, st);
     } else if (M < 16) {
         k_ernie55_moe_build_groups<8><<<1, geom::NEXP, 0, st>>>(
             sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes, n_routes);
@@ -1593,9 +1619,11 @@ inline void moe_forward_resident(cublasHandle_t blas, const MoeWeights& w, MoeSc
         k_ernie55_routed_fc1_grp<<<grid_G * w.routed.eb, 256, 0, st>>>(
             sc.x_had_r, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
             w.routed.tab, w.routed.kmix, w.routed.fc1, w.routed.ptab, w.routed.v1b, w.routed.v2, sc.fc1_act_r, w.routed.eb);
+        if (pd) pd->mark(pd->routed_fc1_ms, st);
         k_ernie55_routed_fc2_grp<<<grid_G * geom::EHB, 256, 0, st>>>(
             sc.fc1_act_r, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
             sc.topk_w, w.routed.tab, w.routed.fc2, w.routed.ptab, w.routed.sg, w.routed.v3b, sc.fc2_part_r, w.routed.eb);
+        if (pd) pd->mark(pd->routed_fc2_ms, st);
     } else {
         k_ernie55_moe_build_groups<16><<<1, geom::NEXP, 0, st>>>(
             sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes, n_routes);
@@ -1603,12 +1631,25 @@ inline void moe_forward_resident(cublasHandle_t blas, const MoeWeights& w, MoeSc
         k_ernie55_routed_fc1_grp16<<<grid_G * w.routed.eb, 256, 0, st>>>(
             sc.x_had_r, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
             w.routed.tab, w.routed.kmix, w.routed.fc1, w.routed.ptab, w.routed.v1b, w.routed.v2, sc.fc1_act_r, w.routed.eb);
+        if (pd) pd->mark(pd->routed_fc1_ms, st);
         k_ernie55_routed_fc2_grp16<<<grid_G * geom::EHB, 256, 0, st>>>(
             sc.fc1_act_r, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
             sc.topk_w, w.routed.tab, w.routed.fc2, w.routed.ptab, w.routed.sg, w.routed.v3b, sc.fc2_part_r, w.routed.eb);
+        if (pd) pd->mark(pd->routed_fc2_ms, st);
     }
-    moe_shared(w, sc, x_norm, M, st);
-    moe_routed_finish(blas, w, sc, out_part, M, x8_scratch, st, skip_add);
+    if (!parallel_sh) {
+        moe_shared(w, sc, x_norm, M, st);
+        if (pd) pd->mark(pd->shared_ms, st);
+    }
+    k_ernie55_routed_reduce_and_norm<<<M, 256, 0, st>>>(sc.fc2_part_r, w.lat_norm, sc.routed_normed, M);
+    mx8::linear_w(blas, sc.routed_normed, w.fc2_lat, sc.routed_up_out, M, geom::HID, geom::EH, x8_scratch, nullptr, st);
+    if (parallel_sh) cudaStreamWaitEvent(st, ev_join, 0);
+    if (!skip_add && out_part != nullptr) {
+        const size_t n = static_cast<size_t>(M) * geom::HID;
+        k_ernie55_add_bf16<<<static_cast<unsigned>((n + 255) / 256), 256, 0, st>>>(
+            sc.routed_up_out, sc.shared_out, out_part, n);
+    }
+    if (pd) pd->mark(pd->finish_ms, st);
 }
 
 } // namespace ernie55

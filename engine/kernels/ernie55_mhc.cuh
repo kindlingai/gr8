@@ -699,4 +699,93 @@ inline void apply_multimax(float* logits, const __nv_bfloat16* ranges, const __n
     k_ernie55_multimax<<<static_cast<unsigned>((total + 255) / 256), 256, 0, st>>>(logits, ranges, ts, total);
 }
 
+// Fused BF16 LM-head GEMV + multimax transform for small-M decode (M <= 12).
+// Saves a full [M, 201216] F32 read/write pass and keeps multimax scalars in registers.
+template <int MAX_M>
+__global__ void __launch_bounds__(128) k_ernie55_lm_head_bf16_multimax(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    const __nv_bfloat16* __restrict__ ranges,
+    const __nv_bfloat16* __restrict__ ts,
+    float* __restrict__ C,
+    int M, int N, int K) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * 4 + warp;
+    if (n >= N) return;
+    const int K8 = K >> 3;
+    const uint4* brow = reinterpret_cast<const uint4*>(B + static_cast<size_t>(n) * K);
+    float acc[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+
+    int i = lane;
+    for (; i + 96 < K8; i += 128) {
+        const uint4 b0 = __ldg(brow + i);
+        const uint4 b1 = __ldg(brow + i + 32);
+        const uint4 b2 = __ldg(brow + i + 64);
+        const uint4 b3 = __ldg(brow + i + 96);
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+                const uint4* am = reinterpret_cast<const uint4*>(A + static_cast<size_t>(m) * K);
+                acc[m] += dot_bf16x8(__ldg(am + i), b0) + dot_bf16x8(__ldg(am + i + 32), b1)
+                        + dot_bf16x8(__ldg(am + i + 64), b2) + dot_bf16x8(__ldg(am + i + 96), b3);
+            }
+        }
+    }
+    for (; i < K8; i += 32) {
+        const uint4 bv = __ldg(brow + i);
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+                const uint4 av = __ldg(reinterpret_cast<const uint4*>(A + static_cast<size_t>(m) * K) + i);
+                acc[m] += dot_bf16x8(av, bv);
+            }
+        }
+    }
+    const bool has_mm = (ranges != nullptr && ts != nullptr);
+    const float r0 = has_mm ? __bfloat162float(__ldg(ranges + 0)) : 0.0f;
+    const float r1 = has_mm ? __bfloat162float(__ldg(ranges + 1)) : 0.0f;
+    const float r2 = has_mm ? __bfloat162float(__ldg(ranges + 2)) : 0.0f;
+    const float r3 = has_mm ? __bfloat162float(__ldg(ranges + 3)) : 0.0f;
+    const float t0 = has_mm ? __bfloat162float(__ldg(ts + 0)) : 0.0f;
+    const float t1 = has_mm ? __bfloat162float(__ldg(ts + 1)) : 0.0f;
+    const float t2 = has_mm ? __bfloat162float(__ldg(ts + 2)) : 0.0f;
+    const float t3 = has_mm ? __bfloat162float(__ldg(ts + 3)) : 0.0f;
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            float x = warp_sum(acc[m]);
+            if (lane == 0) {
+                if (has_mm) {
+                    const float a = fmaxf(0.0f, r0 - x);
+                    const float b = fmaxf(0.0f, x - r1);
+                    const float c = fmaxf(0.0f, r2 - x);
+                    const float d = fmaxf(0.0f, x - r3);
+                    x = x + t0 * a + t1 * b + t2 * (c * c) + t3 * (d * d);
+                }
+                C[static_cast<size_t>(m) * N + n] = x;
+            }
+        }
+    }
+}
+
+inline void linear_bf16_f32_multimax(cublasHandle_t blas, const __nv_bfloat16* A, const __nv_bfloat16* B,
+                                     const __nv_bfloat16* ranges, const __nv_bfloat16* ts,
+                                     float* C, int M, int N, int K, cudaStream_t st) {
+    if (M <= 12 && (K & 7) == 0) {
+        const unsigned grid = static_cast<unsigned>((N + 3) / 4);
+        if (M <= 1)      k_ernie55_lm_head_bf16_multimax<1> <<<grid, 128, 0, st>>>(A, B, ranges, ts, C, M, N, K);
+        else if (M <= 2) k_ernie55_lm_head_bf16_multimax<2> <<<grid, 128, 0, st>>>(A, B, ranges, ts, C, M, N, K);
+        else if (M <= 4) k_ernie55_lm_head_bf16_multimax<4> <<<grid, 128, 0, st>>>(A, B, ranges, ts, C, M, N, K);
+        else if (M <= 8) k_ernie55_lm_head_bf16_multimax<8> <<<grid, 128, 0, st>>>(A, B, ranges, ts, C, M, N, K);
+        else             k_ernie55_lm_head_bf16_multimax<12><<<grid, 128, 0, st>>>(A, B, ranges, ts, C, M, N, K);
+    } else {
+        cublasSetStream(blas, st);
+        gemm_bf16_nt_f32(blas, M, N, K, A, B, C);
+        apply_multimax(C, ranges, ts, M, N, st);
+    }
+}
+
 } // namespace ernie55
