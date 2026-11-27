@@ -220,17 +220,17 @@ __global__ void __launch_bounds__(128) k_ernie55_dsa_q_absorb_rope_bf16(
         }
     }
     if (blockIdx.y == 0 && warp == 0) {
-        #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (m < M) {
-                const __nv_bfloat16* src = q_raw + (static_cast<size_t>(m) * nh + h) * geom::QK_HEAD + geom::QK_NOPE;
-                float x0 = __bfloat162float(src[2 * lane]);
-                float x1 = __bfloat162float(src[2 * lane + 1]);
-                dsa_rope_pair(x0, x1, d_pos[m], lane);
-                __nv_bfloat16* dst = q_full + (static_cast<size_t>(m) * nh + h) * geom::KVA + geom::KV_LORA;
-                dst[2 * lane]     = __float2bfloat16(x0);
-                dst[2 * lane + 1] = __float2bfloat16(x1);
-            }
+        const float inv_freq = powf(geom::DSA_ROPE_THETA, -static_cast<float>(lane * 2) * (1.0f / 64.0f));
+        #pragma unroll 1
+        for (int m = 0; m < M; ++m) {
+            const size_t q_off = (static_cast<size_t>(m) * nh + h) * geom::QK_HEAD + geom::QK_NOPE;
+            const size_t d_off = (static_cast<size_t>(m) * nh + h) * geom::KVA + geom::KV_LORA;
+            const float x0 = __bfloat162float(q_raw[q_off + 2 * lane]);
+            const float x1 = __bfloat162float(q_raw[q_off + 2 * lane + 1]);
+            float s, cv;
+            sincosf(static_cast<float>(d_pos[m]) * inv_freq, &s, &cv);
+            q_full[d_off + 2 * lane]     = __float2bfloat16(x0 * cv - x1 * s);
+            q_full[d_off + 2 * lane + 1] = __float2bfloat16(x1 * cv + x0 * s);
         }
     }
 }
@@ -280,17 +280,17 @@ __global__ void __launch_bounds__(128) k_ernie55_dsa_q_absorb_rope_mx8(
     }
     if (blockIdx.y == 0 && threadIdx.x < 32) {
         const int p = threadIdx.x;
-        #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (m < M) {
-                const __nv_bfloat16* src = q_raw + (static_cast<size_t>(m) * nh + h) * geom::QK_HEAD + geom::QK_NOPE;
-                float x0 = __bfloat162float(src[2 * p]);
-                float x1 = __bfloat162float(src[2 * p + 1]);
-                dsa_rope_pair(x0, x1, d_pos[m], p);
-                __nv_bfloat16* dst = q_full + (static_cast<size_t>(m) * nh + h) * geom::KVA + geom::KV_LORA;
-                dst[2 * p]     = __float2bfloat16(x0);
-                dst[2 * p + 1] = __float2bfloat16(x1);
-            }
+        const float inv_freq = powf(geom::DSA_ROPE_THETA, -static_cast<float>(p * 2) * (1.0f / 64.0f));
+        #pragma unroll 1
+        for (int m = 0; m < M; ++m) {
+            const size_t q_off = (static_cast<size_t>(m) * nh + h) * geom::QK_HEAD + geom::QK_NOPE;
+            const size_t d_off = (static_cast<size_t>(m) * nh + h) * geom::KVA + geom::KV_LORA;
+            const float x0 = __bfloat162float(q_raw[q_off + 2 * p]);
+            const float x1 = __bfloat162float(q_raw[q_off + 2 * p + 1]);
+            float s, cv;
+            sincosf(static_cast<float>(d_pos[m]) * inv_freq, &s, &cv);
+            q_full[d_off + 2 * p]     = __float2bfloat16(x0 * cv - x1 * s);
+            q_full[d_off + 2 * p + 1] = __float2bfloat16(x1 * cv + x0 * s);
         }
     }
 }
