@@ -330,6 +330,7 @@ __global__ void __launch_bounds__(256, 1) k_emb_rmsnorm_rot_h16_multi(
         }
         __syncthreads();
         const float rs = rsqrtf(red[0] / float(H) + eps);
+        __syncthreads();
         #pragma unroll
         for (int pass = 0; pass < 2; ++pass) {
             if (pass < nvec) {

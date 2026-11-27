@@ -40,7 +40,9 @@ __device__ __forceinline__ float emb_block_sum256(float v, float* red) {
         if (threadIdx.x == 0) red[0] = tot;
     }
     __syncthreads();
-    return red[0];
+    const float out = red[0];
+    __syncthreads();
+    return out;
 }
 
 // Qwen3VLTextRMSNorm: y = w * bf16(x_f32 * rsqrt(mean(x_f32^2) + eps)). Grid: (M), Block: 256.
