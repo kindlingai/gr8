@@ -432,7 +432,7 @@ __global__ void __launch_bounds__(32) k_qp_wait(g6::BulkDev bd, int f, int peer,
     const long long t0 = clock64();
     unsigned it = 0;
     while (glue::ld_acquire_sys(fl) < want)
-        if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(bd.error) != 0 || clock64() - t0 > G6_SPIN_TIMEOUT_CYC))
+        if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(bd.error) != 0 || clock64() - t0 > bd.spin_cyc))
         {
             atomicCAS(bd.error, 0u, code);
             return;

@@ -529,6 +529,11 @@ void Fabric::init(const FabricConfig& cfg) {
   }
   }
   I.xenv = xtrace_env();
+  // GR8_SPIN_TIMEOUT_S (knobs/runtime.yaml) -> SM cycles (g6::spin_timeout_cyc, fabric.h): one set here covers the
+  // fabric's own waits (dev_.spin_cyc) and the bulk flag waits (bd.spin_cyc) for both mesh and ring; unset keeps the
+  // compile default.
+  dev_.spin_cyc = spin_timeout_cyc(knob::spin_timeout_s().value_or(0), G6_SPIN_TIMEOUT_CYC);
+  if (I.bulk) I.bd.spin_cyc = dev_.spin_cyc;
   // One rank (TP=1): a kernel reads only the slots of other ranks, of which there are none, so nothing needs sending.
   // The region stays, for the kernels' own slots and doorbells; steps and barriers do nothing.
   if (nr == 1) {
@@ -755,7 +760,9 @@ const VLayout& Fabric::vlayout() const { FCHECK(impl_ && impl_->var); return imp
 VSlotDev Fabric::vslot(int c) const {
   const VLayout& L = vlayout();
   FCHECK(c >= 0 && c < L.ncoll);
-  return L.vslot(c, cfg_.rank, dev_.send, dev_.recv, dev_.doorbell, dev_.error);
+  VSlotDev v = L.vslot(c, cfg_.rank, dev_.send, dev_.recv, dev_.doorbell, dev_.error);
+  v.spin_cyc = dev_.spin_cyc;          // the boot's GR8_SPIN_TIMEOUT_S rides with every CP wait
+  return v;
 }
 
 void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& sizes, const Rs& rs) {

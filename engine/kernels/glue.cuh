@@ -19,10 +19,6 @@
 #include "../comms/fabric.h"
 #include "../comms/xtrace.h"
 
-#ifndef G6_SPIN_TIMEOUT_CYC
-#define G6_SPIN_TIMEOUT_CYC 20000000000LL   // ~10 s at GB10 clocks; tests override
-#endif
-
 namespace glue {
 
 namespace cg = cooperative_groups;
@@ -147,7 +143,7 @@ __device__ __forceinline__ void wait_peers(const g6::FabricDev& f, u64 step, int
         while (ld_acquire_sys(tail) != seq)
         {
             if ((++it & 1023u) == 0 &&
-                (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > G6_SPIN_TIMEOUT_CYC))
+                (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > f.spin_cyc))
             {
                 atomicCAS(f.error, 0u, code | ((unsigned)c << 8) | (unsigned)p);
                 break;
