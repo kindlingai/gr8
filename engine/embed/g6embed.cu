@@ -102,8 +102,12 @@ int main(int argc, char** argv) {
         usage();
         return 2;
     }
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
+    struct sigaction sa{};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // no SA_RESTART so accept() unblocks cleanly on SIGINT/SIGTERM
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
     std::signal(SIGPIPE, SIG_IGN);
 
     try {

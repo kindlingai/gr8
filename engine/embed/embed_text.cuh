@@ -342,6 +342,7 @@ struct EmbedProfiler {
     template <class Fn>
     void record(double& bucket, cudaStream_t st, Fn&& fn) {
         if (!enabled) { fn(); return; }
+        if (!ev0) init(true);
         EMB_CK(cudaEventRecord(ev0, st));
         fn();
         EMB_CK(cudaEventRecord(ev1, st));
