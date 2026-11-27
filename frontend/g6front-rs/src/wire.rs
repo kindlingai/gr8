@@ -133,6 +133,22 @@ pub struct EmbeddingFrame {
 }
 
 #[derive(Deserialize)]
+pub struct AudioFrame {
+    pub frames: usize,
+    #[serde(default)]
+    pub pcm: Option<String>,
+    #[serde(default)]
+    pub codes: Option<Vec<i32>>,
+}
+
+#[derive(Deserialize)]
+pub struct CodesFrame {
+    #[serde(default)]
+    pub frames: Option<usize>,
+    pub codes: Vec<i32>,
+}
+
+#[derive(Deserialize)]
 pub struct Finish {
     pub reason: String,
     #[serde(default)]
@@ -483,6 +499,74 @@ pub fn embed(id: &str, prompt: &[u32], p: &EmbedParams) -> Bytes {
     w.finish()
 }
 
+/// Output mode for a `speech` request (PROTOCOL.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeechEmit {
+    Pcm,
+    Codes,
+    Both,
+}
+
+impl SpeechEmit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpeechEmit::Pcm => "pcm",
+            SpeechEmit::Codes => "codes",
+            SpeechEmit::Both => "both",
+        }
+    }
+}
+
+/// `speech` parameters (PROTOCOL.md).
+#[derive(Clone, Debug)]
+pub struct SpeechParams {
+    pub max_frames: u64,
+    pub temperature: f64,
+    pub top_p: f64,
+    pub top_k: i64,
+    pub seed: Option<i64>,
+    pub emit: SpeechEmit,
+}
+
+pub fn speech(id: &str, rows: &[i32], p: &SpeechParams) -> Bytes {
+    let mut w = FrameWriter::with_capacity(192 + rows.len() * 7);
+    let b = &mut w.b;
+    b.extend_from_slice(b"{\"id\":");
+    pyjson::string(b, id);
+    b.extend_from_slice(b",\"rows\":[");
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            b.push(b',');
+        }
+        pyjson::int(b, *r);
+    }
+    b.extend_from_slice(b"],\"max_frames\":");
+    pyjson::int(b, p.max_frames);
+    b.extend_from_slice(b",\"temperature\":");
+    pyjson::float(b, p.temperature);
+    b.extend_from_slice(b",\"top_p\":");
+    pyjson::float(b, p.top_p);
+    b.extend_from_slice(b",\"top_k\":");
+    pyjson::int(b, p.top_k);
+    b.extend_from_slice(b",\"seed\":");
+    opt_int(b, p.seed);
+    b.extend_from_slice(b",\"emit\":");
+    pyjson::string(b, p.emit.as_str());
+    b.extend_from_slice(b",\"type\":\"speech\"}");
+    w.finish()
+}
+
+pub fn encode_audio(id: &str, pcm_b64: &str) -> Bytes {
+    let mut w = FrameWriter::with_capacity(64 + pcm_b64.len());
+    let b = &mut w.b;
+    b.extend_from_slice(b"{\"id\":");
+    pyjson::string(b, id);
+    b.extend_from_slice(b",\"pcm\":\"");
+    b.extend_from_slice(pcm_b64.as_bytes()); // base64 alphabet needs no JSON escape
+    b.extend_from_slice(b"\",\"type\":\"encode_audio\"}");
+    w.finish()
+}
+
 pub fn cancel(id: &str) -> Bytes {
     let mut w = FrameWriter::with_capacity(64);
     w.b.extend_from_slice(b"{\"type\":\"cancel\",\"id\":");
@@ -647,5 +731,41 @@ mod tests {
         let v2: serde_json::Value = serde_json::from_slice(&embed("emb-2", &[5], &p2)[4..]).unwrap();
         assert!(!v2.as_object().unwrap().contains_key("dimensions"));
         assert_eq!(v2["normalize"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn speech_and_encode_audio_frames_roundtrip() {
+        let p = SpeechParams {
+            max_frames: 600,
+            temperature: 0.7,
+            top_p: 0.7,
+            top_k: 30,
+            seed: Some(42),
+            emit: SpeechEmit::Both,
+        };
+        let rows = [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&speech("tts-1", &rows, &p));
+        buf.extend_from_slice(&encode_audio("enc-1", "AAAA"));
+        let mut r = FrameReader::new(&buf[..]);
+
+        let body1 = r.next().await.unwrap().unwrap();
+        let h1 = head(&body1).unwrap();
+        assert_eq!((h1.kind.as_ref(), h1.id.as_deref()), ("speech", Some("tts-1")));
+        let v1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+        assert_eq!(v1["rows"], serde_json::json!(rows));
+        assert_eq!(v1["max_frames"], serde_json::json!(600));
+        assert_eq!(v1["temperature"], serde_json::json!(0.7));
+        assert_eq!(v1["top_p"], serde_json::json!(0.7));
+        assert_eq!(v1["top_k"], serde_json::json!(30));
+        assert_eq!(v1["seed"], serde_json::json!(42));
+        assert_eq!(v1["emit"], serde_json::json!("both"));
+
+        let body2 = r.next().await.unwrap().unwrap();
+        let h2 = head(&body2).unwrap();
+        assert_eq!((h2.kind.as_ref(), h2.id.as_deref()), ("encode_audio", Some("enc-1")));
+        let v2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(v2["pcm"], serde_json::json!("AAAA"));
+        assert!(r.next().await.unwrap().is_none());
     }
 }

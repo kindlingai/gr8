@@ -446,6 +446,13 @@ pub async fn route(
         }
         ("/v1/completions", &Method::POST) => completions(st, req).await,
         ("/v1/embeddings", &Method::POST) => embeddings(st, req).await,
+        ("/v1/audio/speech", &Method::POST) => audio_speech(st, req).await,
+        ("/v1/audio/voices", &Method::POST) => audio_voices_create(st, req).await,
+        ("/v1/audio/voices", &Method::GET | &Method::HEAD) => audio_voices_list(st).await,
+        (p, &Method::DELETE) if p.starts_with("/v1/audio/voices/") => {
+            let name = &p["/v1/audio/voices/".len()..];
+            audio_voices_delete(st, name).await
+        }
         ("/tokenize", &Method::POST) => tokenize(st, req).await,
         ("/detokenize", &Method::POST) => detokenize(st, req).await,
         ("/v1/models", &Method::GET | &Method::HEAD) => models(st),
@@ -453,9 +460,18 @@ pub async fn route(
         ("/health", &Method::GET | &Method::HEAD) => health(st),
         ("/internal/hold", &Method::GET | &Method::POST) => hold(st, &req, peer),
         ("/metrics", &Method::GET | &Method::HEAD) => metrics_route(st).await,
-        ("/v1/chat/completions" | "/v1/completions" | "/v1/embeddings" | "/tokenize" | "/detokenize", _) => {
+        (
+            "/v1/chat/completions" | "/v1/completions" | "/v1/embeddings" | "/v1/audio/speech" | "/tokenize"
+            | "/detokenize",
+            _,
+        ) => {
             let mut r = response(405, "text/plain; charset=utf-8", b"405: Method Not Allowed".to_vec());
             r.headers_mut().insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+            r
+        }
+        ("/v1/audio/voices", _) => {
+            let mut r = response(405, "text/plain; charset=utf-8", b"405: Method Not Allowed".to_vec());
+            r.headers_mut().insert(header::ALLOW, header::HeaderValue::from_static("GET,HEAD,POST"));
             r
         }
         ("/v1/models" | "/health" | "/metrics", _) => {
@@ -2081,6 +2097,757 @@ async fn embeddings(st: &'static State, req: Request<Incoming>) -> Response<Http
     json_response(200, o)
 }
 
+// ---- /v1/audio/speech and /v1/audio/voices -----------------------------------------------------------------------
+
+fn parse_codes_array(v: &Value, num_codebooks: usize, param: &str) -> Result<Vec<i32>, ApiError> {
+    let arr = v.as_array().ok_or_else(|| ApiError::bad(format!("`{param}` must be an array of code ints"), Some(param)))?;
+    if arr.is_empty() {
+        return Err(ApiError::bad(format!("`{param}` must not be empty"), Some(param)));
+    }
+    let codes = if arr[0].is_array() {
+        // Codebook-major 2D array `[num_codebooks][frames]` -> frame-major `[frames * num_codebooks]`.
+        if arr.len() != num_codebooks {
+            return Err(ApiError::bad(
+                format!("`{param}` 2D codes must have {num_codebooks} codebook rows, got {}", arr.len()),
+                Some(param),
+            ));
+        }
+        let mut rows_2d: Vec<Vec<i32>> = Vec::with_capacity(num_codebooks);
+        let mut n_frames: Option<usize> = None;
+        for row in arr {
+            let r = row
+                .as_array()
+                .ok_or_else(|| ApiError::bad(format!("`{param}` rows must be arrays of ints"), Some(param)))?;
+            if r.is_empty() {
+                return Err(ApiError::bad(format!("`{param}` must contain at least 1 frame"), Some(param)));
+            }
+            if let Some(prev) = n_frames {
+                if r.len() != prev {
+                    return Err(ApiError::bad(
+                        format!("`{param}` codebook rows have mismatched frame counts ({prev} vs {})", r.len()),
+                        Some(param),
+                    ));
+                }
+            } else {
+                n_frames = Some(r.len());
+            }
+            let mut vals = Vec::with_capacity(r.len());
+            for x in r {
+                let i = x
+                    .as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(|| ApiError::bad(format!("`{param}` must contain integers"), Some(param)))?;
+                vals.push(i);
+            }
+            rows_2d.push(vals);
+        }
+        let frames = n_frames.unwrap_or(0);
+        let mut flat = Vec::with_capacity(frames * num_codebooks);
+        for f in 0..frames {
+            for c in 0..num_codebooks {
+                flat.push(rows_2d[c][f]);
+            }
+        }
+        flat
+    } else {
+        // Flat frame-major array `[frames * num_codebooks]`.
+        let mut flat = Vec::with_capacity(arr.len());
+        for x in arr {
+            let i = x
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| ApiError::bad(format!("`{param}` must contain integers"), Some(param)))?;
+            flat.push(i);
+        }
+        flat
+    };
+    crate::tts::check_codes(&codes, num_codebooks, param).map_err(|e| ApiError::bad(e, Some(param)))?;
+    Ok(codes)
+}
+
+async fn decode_and_encode_wav_b64(
+    st: &'static State,
+    audio_b64: &str,
+    param: &'static str,
+) -> Result<Vec<i32>, ApiError> {
+    let trimmed = audio_b64.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::bad(format!("`{param}` must not be empty"), Some(param)));
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") || trimmed.starts_with("file://") {
+        return Err(ApiError::bad(
+            "URL references are not supported; pass base64-encoded WAV bytes in `audio`",
+            Some(param),
+        ));
+    }
+    let wav_bytes = crate::vision::b64_decode(trimmed)
+        .map_err(|e| ApiError::bad(format!("invalid base64 in `{param}`: {}", e.0), Some(param)))?;
+    let f32_pcm = tokio::task::spawn_blocking(move || crate::tts::decode_wav_to_f32_44100(&wav_bytes))
+        .await
+        .map_err(|e| ApiError::new(500, &format!("audio decode task failed: {e}"), None))?
+        .map_err(|e| ApiError::bad(e, Some(param)))?;
+    let pcm_b64 = crate::tts::f32_to_le_b64(&f32_pcm);
+    encode_audio_via_engine(st, &pcm_b64).await
+}
+
+async fn encode_audio_via_engine(st: &'static State, pcm_b64: &str) -> Result<Vec<i32>, ApiError> {
+    let num_codebooks = st.engine.codebooks();
+    let mut stream = st
+        .engine
+        .encode_audio(new_id("enc"), pcm_b64)
+        .map_err(|e| ApiError::new(503, &e.0, None))?;
+    let mut got: Option<crate::wire::CodesFrame> = None;
+    loop {
+        match stream.next().await {
+            Some(crate::engine::Msg::Frame(crate::engine::Kind::Codes, bytes)) => {
+                let cf: crate::wire::CodesFrame = serde_json::from_slice(&bytes)
+                    .map_err(|e| ApiError::new(500, &format!("bad codes frame: {e}"), None))?;
+                got = Some(cf);
+            }
+            Some(crate::engine::Msg::Frame(crate::engine::Kind::Finish, bytes)) => {
+                let fin: crate::wire::Finish = serde_json::from_slice(&bytes)
+                    .map_err(|e| ApiError::new(500, &format!("bad finish frame: {e}"), None))?;
+                if fin.reason == "error" {
+                    let msg = fin.message.unwrap_or_else(|| "engine error".into());
+                    return Err(ApiError {
+                        status: fin.status.unwrap_or(500),
+                        message: msg,
+                        param: None,
+                        retry_after: fin.retry_after,
+                    });
+                }
+                if fin.reason != "stop" {
+                    return Err(ApiError::new(
+                        500,
+                        &format!("encode_audio finished with reason {}", fin.reason),
+                        None,
+                    ));
+                }
+                break;
+            }
+            Some(crate::engine::Msg::Frame(_, _)) => {}
+            Some(crate::engine::Msg::Lost(msg)) => return Err(ApiError::new(500, msg, None)),
+            None => return Err(ApiError::new(500, "engine stream closed before finish", None)),
+        }
+    }
+    let cf = got.ok_or_else(|| ApiError::new(500, "engine finished without a codes frame", None))?;
+    let n_frames = crate::tts::check_codes(&cf.codes, num_codebooks, "codes")
+        .map_err(|e| ApiError::new(500, &format!("engine returned invalid codes: {e}"), None))?;
+    if let Some(declared) = cf.frames {
+        if declared != n_frames {
+            return Err(ApiError::new(
+                500,
+                &format!("engine codes frame count mismatch: declared {declared}, got {n_frames}"),
+                None,
+            ));
+        }
+    }
+    Ok(cf.codes)
+}
+
+fn build_chunk_rows_fitting_history(
+    st: &'static State,
+    chunk_text: &str,
+    refs: &[crate::tts::ReferenceItem],
+    history: &crate::tts::Drama3History,
+    max_new_tokens: u64,
+) -> Result<Vec<i32>, ApiError> {
+    let num_codebooks = st.engine.codebooks();
+    let cap = st.max_model_len() as usize;
+    let max_prompt_rows = if cap > 0 {
+        let budget = cap.saturating_sub(max_new_tokens as usize);
+        budget.min(crate::tts::DRAMA3_MAX_PROMPT_ROWS)
+    } else {
+        crate::tts::DRAMA3_MAX_PROMPT_ROWS
+    };
+    if max_prompt_rows == 0 {
+        return Err(ApiError::bad(
+            format!("`max_new_tokens` ({max_new_tokens}) leaves no room in max_model_len ({cap})"),
+            Some("max_new_tokens"),
+        ));
+    }
+    let mut last_err = String::new();
+    for cand in history.candidates() {
+        match crate::tts::build_drama3_prompt_rows(
+            chunk_text,
+            st.tok.tk,
+            refs,
+            &cand,
+            num_codebooks,
+            max_prompt_rows,
+        ) {
+            Ok((rows, _)) => return Ok(rows),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(ApiError::bad(last_err, Some("input")))
+}
+
+async fn audio_speech(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {
+    let prepared = async {
+        let body = read_json(req).await?;
+        st.check_model(&body)?;
+        let admit = st.require_engine().await?;
+        if !st.engine.speech() {
+            return Err(ApiError::bad("this engine does not support /v1/audio/speech", None));
+        }
+
+        // `input`
+        let input = match body.get("input") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(ApiError::bad("`input` must be a non-empty string", Some("input"))),
+        };
+        crate::tts::validate_drama3_text(&input, "input").map_err(|e| ApiError::bad(e, Some("input")))?;
+
+        // `speed` (only 1.0 supported)
+        if let Some(v) = body.get("speed") {
+            if !v.is_null() {
+                let spd = v
+                    .as_f64()
+                    .filter(|x| x.is_finite())
+                    .ok_or_else(|| ApiError::bad("`speed` must be a number", Some("speed")))?;
+                if (spd - 1.0).abs() > 1e-6 {
+                    return Err(ApiError::bad("`speed` other than 1 is not supported", Some("speed")));
+                }
+            }
+        }
+
+        // `response_format`: "pcm" (default, streamed) or "wav" (buffered RIFF/WAVE)
+        let as_wav = match body.get("response_format") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(s)) if s == "pcm" => false,
+            Some(Value::String(s)) if s == "wav" => true,
+            _ => {
+                return Err(ApiError::bad(
+                    "`response_format` must be \"pcm\" or \"wav\"",
+                    Some("response_format"),
+                ));
+            }
+        };
+
+        // Sampling parameters (fish-speech defaults: 0.7 / 0.7 / 30, 600 frames/chunk)
+        let temperature = match body.get("temperature") {
+            None | Some(Value::Null) => 0.7,
+            Some(v) => v
+                .as_f64()
+                .filter(|x| x.is_finite() && *x >= 0.0)
+                .ok_or_else(|| ApiError::bad("`temperature` must be a finite number >= 0", Some("temperature")))?,
+        };
+        let top_p = match body.get("top_p") {
+            None | Some(Value::Null) => 0.7,
+            Some(v) => v
+                .as_f64()
+                .filter(|x| x.is_finite() && *x > 0.0 && *x <= 1.0)
+                .ok_or_else(|| ApiError::bad("`top_p` must be a finite number in (0, 1]", Some("top_p")))?,
+        };
+        let top_k = match body.get("top_k") {
+            None | Some(Value::Null) => 30i64,
+            Some(v) => v
+                .as_i64()
+                .filter(|&k| k >= 0)
+                .ok_or_else(|| ApiError::bad("`top_k` must be an integer >= 0", Some("top_k")))?,
+        };
+        let max_new_tokens = match body.get("max_new_tokens") {
+            None | Some(Value::Null) => crate::tts::DRAMA3_CHUNK_MAX_NEW_TOKENS,
+            Some(v) => v
+                .as_u64()
+                .filter(|&n| n >= 1)
+                .ok_or_else(|| ApiError::bad("`max_new_tokens` must be an integer >= 1", Some("max_new_tokens")))?,
+        };
+        let seed = match body.get("seed") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_i64().ok_or_else(|| ApiError::bad("`seed` must be an integer", Some("seed")))?,
+            ),
+        };
+
+        let num_codebooks = st.engine.codebooks();
+        let mut refs: Vec<crate::tts::ReferenceItem> = Vec::new();
+
+        // `voice`: "default" (no stored reference) or an uploaded voice name; anything else -> 400
+        let voice = match body.get("voice") {
+            None | Some(Value::Null) => "default",
+            Some(Value::String(s)) => s.as_str(),
+            _ => return Err(ApiError::bad("`voice` must be a string", Some("voice"))),
+        };
+        if voice != "default" {
+            crate::tts::validate_voice_name(voice).map_err(|e| ApiError::bad(e, Some("voice")))?;
+            let rec = crate::tts::load_voice(&st.voices_dir, voice)
+                .map_err(|e| ApiError::new(500, &e, None))?
+                .ok_or_else(|| {
+                    ApiError::bad(
+                        format!(
+                            "unknown voice {voice:?}; use \"default\" or upload a voice via POST /v1/audio/voices"
+                        ),
+                        Some("voice"),
+                    )
+                })?;
+            refs.push(crate::tts::ReferenceItem { text: rec.text, codes: rec.codes });
+        }
+
+        // `references`: [{"audio": "<base64 WAV>", "text": "..."}] (no URL / path fetching)
+        if let Some(v) = body.get("references") {
+            if !v.is_null() {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| ApiError::bad("`references` must be a list of objects", Some("references")))?;
+                for item in arr {
+                    let obj = item
+                        .as_object()
+                        .ok_or_else(|| ApiError::bad("each reference must be an object", Some("references")))?;
+                    if obj.contains_key("audio_path") || obj.contains_key("url") {
+                        return Err(ApiError::bad(
+                            "URL and path references are not supported; provide base64 WAV in `audio`",
+                            Some("references"),
+                        ));
+                    }
+                    let text = obj
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ApiError::bad("reference missing `text` string", Some("references")))?;
+                    crate::tts::validate_drama3_text(text, "reference")
+                        .map_err(|e| ApiError::bad(e, Some("references")))?;
+                    let audio_b64 = obj
+                        .get("audio")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ApiError::bad("reference missing base64 WAV `audio`", Some("references")))?;
+                    let codes = decode_and_encode_wav_b64(st, audio_b64, "references").await?;
+                    refs.push(crate::tts::ReferenceItem { text: text.to_string(), codes });
+                }
+            }
+        }
+
+        // `vq_codes`: pre-encoded reference codes (either [{"text", "codes"}] or raw [10, F] with reference_text)
+        if let Some(v) = body.get("vq_codes") {
+            if !v.is_null() {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| ApiError::bad("`vq_codes` must be an array", Some("vq_codes")))?;
+                if !arr.is_empty() && arr[0].is_object() {
+                    for item in arr {
+                        let obj = item
+                            .as_object()
+                            .ok_or_else(|| ApiError::bad("each `vq_codes` item must be an object", Some("vq_codes")))?;
+                        let text = obj
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| ApiError::bad("`vq_codes` item missing `text`", Some("vq_codes")))?;
+                        crate::tts::validate_drama3_text(text, "vq_codes")
+                            .map_err(|e| ApiError::bad(e, Some("vq_codes")))?;
+                        let cval = obj
+                            .get("codes")
+                            .ok_or_else(|| ApiError::bad("`vq_codes` item missing `codes`", Some("vq_codes")))?;
+                        let codes = parse_codes_array(cval, num_codebooks, "vq_codes")?;
+                        refs.push(crate::tts::ReferenceItem { text: text.to_string(), codes });
+                    }
+                } else {
+                    let text = body
+                        .get("reference_text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ApiError::bad(
+                                "raw `vq_codes` requires `reference_text` (or pass [{\"text\", \"codes\"}])",
+                                Some("vq_codes"),
+                            )
+                        })?;
+                    crate::tts::validate_drama3_text(text, "reference_text")
+                        .map_err(|e| ApiError::bad(e, Some("reference_text")))?;
+                    let codes = parse_codes_array(v, num_codebooks, "vq_codes")?;
+                    refs.push(crate::tts::ReferenceItem { text: text.to_string(), codes });
+                }
+            }
+        }
+
+        // `previous_takes`: optional history turns [{"text", "codes" | "audio"}]
+        let mut history = crate::tts::Drama3History::new(crate::tts::DRAMA3_HISTORY_RECENT_TURNS);
+        if let Some(v) = body.get("previous_takes") {
+            if !v.is_null() {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| ApiError::bad("`previous_takes` must be a list", Some("previous_takes")))?;
+                for item in arr {
+                    let obj = item
+                        .as_object()
+                        .ok_or_else(|| ApiError::bad("each previous take must be an object", Some("previous_takes")))?;
+                    if obj.contains_key("audio_path") || obj.contains_key("url") {
+                        return Err(ApiError::bad(
+                            "URL and path audio are not supported in `previous_takes`",
+                            Some("previous_takes"),
+                        ));
+                    }
+                    let text = obj
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ApiError::bad("previous take missing `text`", Some("previous_takes")))?;
+                    crate::tts::validate_drama3_text(text, "previous_takes")
+                        .map_err(|e| ApiError::bad(e, Some("previous_takes")))?;
+                    let codes = if let Some(cval) = obj.get("codes") {
+                        parse_codes_array(cval, num_codebooks, "previous_takes")?
+                    } else if let Some(ab64) = obj.get("audio").and_then(Value::as_str) {
+                        decode_and_encode_wav_b64(st, ab64, "previous_takes").await?
+                    } else {
+                        return Err(ApiError::bad(
+                            "previous take needs `codes` or base64 WAV `audio`",
+                            Some("previous_takes"),
+                        ));
+                    };
+                    history.push(text.to_string(), codes);
+                }
+            }
+        }
+
+        let chunks = crate::tts::split_drama3_text(
+            &input,
+            crate::tts::DRAMA3_CHUNK_BYTES,
+            crate::tts::DRAMA3_CHUNK_MAX_SPEAKERS,
+        );
+        if chunks.is_empty() {
+            return Err(ApiError::bad("`input` must not be empty", Some("input")));
+        }
+
+        let need_codes = chunks.len() > 1;
+        let emit = if need_codes { crate::wire::SpeechEmit::Both } else { crate::wire::SpeechEmit::Pcm };
+        let params = crate::wire::SpeechParams { max_frames: max_new_tokens, temperature, top_p, top_k, seed, emit };
+
+        // Validate & build chunk 0 rows upfront before starting any streaming HTTP response.
+        let first_rows = build_chunk_rows_fitting_history(st, &chunks[0], &refs, &history, max_new_tokens)?;
+
+        Ok((admit, as_wav, chunks, refs, history, params, first_rows, need_codes))
+    };
+
+    let (admit, as_wav, chunks, refs, mut history, params, first_rows, need_codes) = match prepared.await {
+        Ok(x) => x,
+        Err(e) => return e.response(),
+    };
+
+    if as_wav {
+        let mut all_pcm: Vec<u8> = Vec::new();
+        let mut next_rows = Some(first_rows);
+        for (idx, chunk_text) in chunks.iter().enumerate() {
+            let rows = match next_rows.take() {
+                Some(r) => r,
+                None => match build_chunk_rows_fitting_history(st, chunk_text, &refs, &history, params.max_frames) {
+                    Ok(r) => r,
+                    Err(e) => return e.response(),
+                },
+            };
+            let mut stream = match st.engine.speech_stream(new_id("tts"), &rows, &params) {
+                Ok(s) => s,
+                Err(e) => return ApiError::new(503, &e.0, None).response(),
+            };
+            let mut chunk_codes: Vec<i32> = Vec::new();
+            loop {
+                match stream.next().await {
+                    Some(crate::engine::Msg::Frame(crate::engine::Kind::Audio, bytes)) => {
+                        let af: crate::wire::AudioFrame = match serde_json::from_slice(&bytes) {
+                            Ok(x) => x,
+                            Err(e) => return ApiError::new(500, &format!("bad audio frame: {e}"), None).response(),
+                        };
+                        if let Some(pcm_b64) = &af.pcm {
+                            match crate::vision::b64_decode(pcm_b64) {
+                                Ok(raw) => all_pcm.extend_from_slice(&raw),
+                                Err(e) => return ApiError::new(500, &format!("bad audio pcm b64: {}", e.0), None).response(),
+                            }
+                        }
+                        if need_codes {
+                            if let Some(c) = af.codes {
+                                if af.frames > 0 && c.len() != af.frames * st.engine.codebooks() {
+                                    return ApiError::new(500, "audio frame codes length mismatch", None).response();
+                                }
+                                chunk_codes.extend_from_slice(&c);
+                            }
+                        }
+                    }
+                    Some(crate::engine::Msg::Frame(crate::engine::Kind::Finish, bytes)) => {
+                        let fin: crate::wire::Finish = match serde_json::from_slice(&bytes) {
+                            Ok(x) => x,
+                            Err(e) => return ApiError::new(500, &format!("bad finish frame: {e}"), None).response(),
+                        };
+                        if fin.reason == "error" {
+                            let err = ApiError {
+                                status: fin.status.unwrap_or(500),
+                                message: fin.message.unwrap_or_else(|| "engine error".into()),
+                                param: None,
+                                retry_after: fin.retry_after,
+                            };
+                            return err.response();
+                        }
+                        break;
+                    }
+                    Some(crate::engine::Msg::Frame(_, _)) => {}
+                    Some(crate::engine::Msg::Lost(msg)) => return ApiError::new(500, msg, None).response(),
+                    None => return ApiError::new(500, "engine stream closed before finish", None).response(),
+                }
+            }
+            if need_codes && !chunk_codes.is_empty() && idx + 1 < chunks.len() {
+                history.push(chunk_text.clone(), chunk_codes);
+            }
+        }
+        drop(admit);
+        let sample_rate = st.engine.sample_rate();
+        return match crate::tts::encode_s16le_pcm_to_wav(&all_pcm, sample_rate) {
+            Ok(wav) => response(200, "audio/wav", wav),
+            Err(e) => ApiError::new(500, &e, None).response(),
+        };
+    }
+
+    // Streamed chunked `audio/pcm`: start chunk 0 and inspect its first frame before sending HTTP 200 headers
+    // so early engine errors (e.g. 400 over-capacity) return proper HTTP status codes with zero added TTFA.
+    let mut stream0 = match st.engine.speech_stream(new_id("tts"), &first_rows, &params) {
+        Ok(s) => s,
+        Err(e) => return ApiError::new(503, &e.0, None).response(),
+    };
+    let mut first_pcm: Option<Bytes> = None;
+    let mut chunk0_codes: Vec<i32> = Vec::new();
+    let mut chunk0_done = false;
+    loop {
+        match stream0.next().await {
+            Some(crate::engine::Msg::Frame(crate::engine::Kind::Audio, bytes)) => {
+                let af: crate::wire::AudioFrame = match serde_json::from_slice(&bytes) {
+                    Ok(x) => x,
+                    Err(e) => return ApiError::new(500, &format!("bad audio frame: {e}"), None).response(),
+                };
+                if need_codes {
+                    if let Some(c) = af.codes {
+                        chunk0_codes.extend_from_slice(&c);
+                    }
+                }
+                if let Some(pcm_b64) = &af.pcm {
+                    match crate::vision::b64_decode(pcm_b64) {
+                        Ok(raw) if !raw.is_empty() => {
+                            first_pcm = Some(Bytes::from(raw));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) => return ApiError::new(500, &format!("bad audio pcm b64: {}", e.0), None).response(),
+                    }
+                }
+            }
+            Some(crate::engine::Msg::Frame(crate::engine::Kind::Finish, bytes)) => {
+                let fin: crate::wire::Finish = match serde_json::from_slice(&bytes) {
+                    Ok(x) => x,
+                    Err(e) => return ApiError::new(500, &format!("bad finish frame: {e}"), None).response(),
+                };
+                if fin.reason == "error" {
+                    let err = ApiError {
+                        status: fin.status.unwrap_or(500),
+                        message: fin.message.unwrap_or_else(|| "engine error".into()),
+                        param: None,
+                        retry_after: fin.retry_after,
+                    };
+                    return err.response();
+                }
+                chunk0_done = true;
+                break;
+            }
+            Some(crate::engine::Msg::Frame(_, _)) => {}
+            Some(crate::engine::Msg::Lost(msg)) => return ApiError::new(500, msg, None).response(),
+            None => return ApiError::new(500, "engine stream closed before finish", None).response(),
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<Bytes>(32);
+    tokio::spawn(async move {
+        let _admit = admit;
+        if let Some(b) = first_pcm {
+            if tx.send(b).await.is_err() {
+                return;
+            }
+        }
+        // Drain remaining frames of chunk 0.
+        if !chunk0_done {
+            loop {
+                match stream0.next().await {
+                    Some(crate::engine::Msg::Frame(crate::engine::Kind::Audio, bytes)) => {
+                        let Ok(af) = serde_json::from_slice::<crate::wire::AudioFrame>(&bytes) else {
+                            return;
+                        };
+                        if need_codes {
+                            if let Some(c) = af.codes {
+                                chunk0_codes.extend_from_slice(&c);
+                            }
+                        }
+                        if let Some(pcm_b64) = &af.pcm {
+                            if let Ok(raw) = crate::vision::b64_decode(pcm_b64) {
+                                if !raw.is_empty() && tx.send(Bytes::from(raw)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Some(crate::engine::Msg::Frame(crate::engine::Kind::Finish, bytes)) => {
+                        if let Ok(fin) = serde_json::from_slice::<crate::wire::Finish>(&bytes) {
+                            if fin.reason == "error" {
+                                log::warn!("tts stream error: {:?}", fin.message);
+                                return;
+                            }
+                        }
+                        break;
+                    }
+                    Some(crate::engine::Msg::Frame(_, _)) => {}
+                    Some(crate::engine::Msg::Lost(_)) | None => return,
+                }
+            }
+        }
+        if need_codes && !chunk0_codes.is_empty() && chunks.len() > 1 {
+            history.push(chunks[0].clone(), chunk0_codes);
+        }
+
+        // Subsequent chunks (1..N)
+        for idx in 1..chunks.len() {
+            let Ok(rows) = build_chunk_rows_fitting_history(st, &chunks[idx], &refs, &history, params.max_frames) else {
+                return;
+            };
+            let Ok(mut stream) = st.engine.speech_stream(new_id("tts"), &rows, &params) else {
+                return;
+            };
+            let mut chunk_codes: Vec<i32> = Vec::new();
+            loop {
+                match stream.next().await {
+                    Some(crate::engine::Msg::Frame(crate::engine::Kind::Audio, bytes)) => {
+                        let Ok(af) = serde_json::from_slice::<crate::wire::AudioFrame>(&bytes) else {
+                            return;
+                        };
+                        if need_codes {
+                            if let Some(c) = af.codes {
+                                if af.frames > 0 && c.len() != af.frames * st.engine.codebooks() {
+                                    log::warn!("tts stream chunk {idx} codes length mismatch");
+                                    return;
+                                }
+                                chunk_codes.extend_from_slice(&c);
+                            }
+                        }
+                        if let Some(pcm_b64) = &af.pcm {
+                            if let Ok(raw) = crate::vision::b64_decode(pcm_b64) {
+                                if !raw.is_empty() && tx.send(Bytes::from(raw)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Some(crate::engine::Msg::Frame(crate::engine::Kind::Finish, bytes)) => {
+                        if let Ok(fin) = serde_json::from_slice::<crate::wire::Finish>(&bytes) {
+                            if fin.reason == "error" {
+                                log::warn!("tts stream chunk {idx} error: {:?}", fin.message);
+                                return;
+                            }
+                        }
+                        break;
+                    }
+                    Some(crate::engine::Msg::Frame(_, _)) => {}
+                    Some(crate::engine::Msg::Lost(_)) | None => return,
+                }
+            }
+            if need_codes && !chunk_codes.is_empty() && idx + 1 < chunks.len() {
+                history.push(chunks[idx].clone(), chunk_codes);
+            }
+        }
+    });
+
+    let mut r = Response::new(HttpBody::Chan(rx));
+    *r.status_mut() = StatusCode::OK;
+    r.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("audio/pcm"));
+    r
+}
+
+async fn audio_voices_create(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {
+    let r = async {
+        let body = read_json(req).await?;
+        let _admit = st.require_engine().await?;
+        if !st.engine.speech() {
+            return Err(ApiError::bad("this engine does not support /v1/audio/voices", None));
+        }
+        if body.contains_key("audio_path") || body.contains_key("url") {
+            return Err(ApiError::bad(
+                "URL and path audio are not supported; pass base64 WAV in `audio`",
+                Some("audio"),
+            ));
+        }
+        let name = body
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::bad("`name` must be a non-empty string", Some("name")))?;
+        crate::tts::validate_voice_name(name).map_err(|e| ApiError::bad(e, Some("name")))?;
+
+        let text = body
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::bad("`text` must be a non-empty string", Some("text")))?;
+        crate::tts::validate_drama3_text(text, "text").map_err(|e| ApiError::bad(e, Some("text")))?;
+
+        let audio_b64 = body
+            .get("audio")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::bad("`audio` must be base64-encoded WAV data", Some("audio")))?;
+        let codes = decode_and_encode_wav_b64(st, audio_b64, "audio").await?;
+        let frames = codes.len() / st.engine.codebooks().max(1);
+
+        let rec = crate::tts::VoiceRecord {
+            name: name.to_string(),
+            text: text.to_string(),
+            codes,
+            frames,
+            sample_rate: st.engine.sample_rate(),
+        };
+        crate::tts::save_voice(&st.voices_dir, &rec).map_err(|e| ApiError::new(500, &e, None))?;
+        Ok(serde_json::json!({
+            "name": rec.name,
+            "text": rec.text,
+            "frames": rec.frames,
+            "sample_rate": rec.sample_rate,
+        }))
+    };
+    match r.await {
+        Ok(v) => json_value(200, v),
+        Err(e) => e.response(),
+    }
+}
+
+async fn audio_voices_list(st: &'static State) -> Response<HttpBody> {
+    let r = async {
+        let _admit = st.require_engine().await?;
+        if !st.engine.speech() {
+            return Err(ApiError::bad("this engine does not support /v1/audio/voices", None));
+        }
+        let voices = crate::tts::list_voices(&st.voices_dir).map_err(|e| ApiError::new(500, &e, None))?;
+        let items: Vec<Value> = voices
+            .into_iter()
+            .map(|v| {
+                serde_json::json!({
+                    "name": v.name,
+                    "text": v.text,
+                    "frames": v.frames,
+                    "sample_rate": v.sample_rate,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({"object": "list", "voices": items}))
+    };
+    match r.await {
+        Ok(v) => json_value(200, v),
+        Err(e) => e.response(),
+    }
+}
+
+async fn audio_voices_delete(st: &'static State, name: &str) -> Response<HttpBody> {
+    let r = async {
+        let _admit = st.require_engine().await?;
+        if !st.engine.speech() {
+            return Err(ApiError::bad("this engine does not support /v1/audio/voices", None));
+        }
+        crate::tts::validate_voice_name(name).map_err(|e| ApiError::bad(e, Some("name")))?;
+        let existed = crate::tts::delete_voice(&st.voices_dir, name).map_err(|e| ApiError::new(500, &e, None))?;
+        if !existed {
+            return Err(ApiError::new(404, &format!("voice {name:?} not found"), Some("name")));
+        }
+        Ok(serde_json::json!({"name": name, "deleted": true}))
+    };
+    match r.await {
+        Ok(v) => json_value(200, v),
+        Err(e) => e.response(),
+    }
+}
+
 // ---- /tokenize, /detokenize, /v1/models, /health, /metrics -------------------------------------------------------
 
 async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {
@@ -2635,6 +3402,7 @@ mod http_tokenize_chat_tests {
             started: now_secs(),
             supervisor: None,
             sessions: None,
+            voices_dir: crate::tts::default_voices_dir(),
         }));
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2734,6 +3502,7 @@ mod http_tokenize_chat_tests {
             started: now_secs(),
             supervisor: None,
             sessions: Some(crate::sessions::Sessions::new(Duration::from_secs(60))),
+            voices_dir: crate::tts::default_voices_dir(),
         }));
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2835,6 +3604,7 @@ mod http_tokenize_chat_tests {
             started: now_secs(),
             supervisor: None,
             sessions: None,
+            voices_dir: crate::tts::default_voices_dir(),
         }));
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2949,6 +3719,7 @@ mod http_tokenize_chat_tests {
             started: now_secs(),
             supervisor: None,
             sessions: None,
+            voices_dir: crate::tts::default_voices_dir(),
         }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3092,6 +3863,7 @@ mod http_tokenize_chat_tests {
             started: now_secs(),
             supervisor: None,
             sessions: None,
+            voices_dir: crate::tts::default_voices_dir(),
         }));
         let l_off = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr_off = l_off.local_addr().unwrap();
@@ -3137,6 +3909,7 @@ mod http_tokenize_chat_tests {
             started: now_secs(),
             supervisor: None,
             sessions: None,
+            voices_dir: crate::tts::default_voices_dir(),
         }));
         let l = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -3316,6 +4089,7 @@ mod http_tokenize_chat_tests {
             started: now_secs(),
             supervisor: None,
             sessions: None,
+            voices_dir: crate::tts::default_voices_dir(),
         }));
         let l = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -3352,6 +4126,454 @@ mod http_tokenize_chat_tests {
         assert_eq!(v["usage"]["total_tokens"], 10);
 
         let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn fake_speech_engine(enabled: bool) -> (Arc<Engine>, Arc<Mutex<Vec<Value>>>) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::path::PathBuf::from(format!("/tmp/g6f-tts-{}-{n}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let reqs = Arc::new(Mutex::new(Vec::new()));
+        let r2 = reqs.clone();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            let mut hello = json!({"type": "hello", "version": 1, "max_model_len": 4096});
+            if enabled {
+                hello["speech"] = json!(true);
+                hello["sample_rate"] = json!(44100);
+                hello["codebooks"] = json!(10);
+                hello["frame_samples"] = json!(2048);
+                hello["eos_ids"] = json!([248046]);
+            }
+            wr.write_all(&frame(hello)).await.unwrap();
+            let mut r = FrameReader::new(rd);
+            let mut call_idx = 0i32;
+            while let Ok(Some(f)) = r.next().await {
+                let v: Value = serde_json::from_slice(&f).unwrap();
+                let ty = v["type"].as_str().unwrap_or("");
+                if ty != "speech" && ty != "encode_audio" {
+                    continue;
+                }
+                r2.lock().unwrap().push(v.clone());
+                let id = v["id"].clone();
+                if ty == "encode_audio" {
+                    let raw = crate::vision::b64_decode(v["pcm"].as_str().unwrap()).unwrap();
+                    let n_samples = raw.len() / 4;
+                    let n_frames = (n_samples + 2047) / 2048;
+                    let n_frames = n_frames.max(1);
+                    let mut codes = Vec::with_capacity(n_frames * 10);
+                    for fi in 0..n_frames {
+                        for c in 0..10 {
+                            codes.push(((fi * 10 + c + 7) % 1024) as i32);
+                        }
+                    }
+                    wr.write_all(&frame(json!({"type": "codes", "id": id, "frames": n_frames, "codes": codes})))
+                        .await
+                        .unwrap();
+                    wr.write_all(&frame(json!({
+                        "type": "finish", "id": id, "reason": "stop", "stop_id": null,
+                        "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": n_frames
+                    })))
+                    .await
+                    .unwrap();
+                    continue;
+                }
+
+                // `speech` request
+                call_idx += 1;
+                let max_frames = v["max_frames"].as_u64().unwrap();
+                if max_frames == 3333 {
+                    wr.write_all(&frame(json!({
+                        "type": "finish", "id": id, "reason": "error", "status": 400,
+                        "message": "request exceeds KV capacity"
+                    })))
+                    .await
+                    .unwrap();
+                    continue;
+                }
+                let emit = v["emit"].as_str().unwrap_or("pcm");
+                let prompt_rows = v["rows"].as_array().unwrap().len() / 11;
+                for chunk_i in 0..2i16 {
+                    let sample_val = (call_idx as i16) * 100 + chunk_i + 1;
+                    let pcm_bytes: Vec<u8> = (0..2048).flat_map(|_| sample_val.to_le_bytes()).collect();
+                    let mut af = json!({"type": "audio", "id": id, "frames": 1});
+                    if emit == "pcm" || emit == "both" {
+                        af["pcm"] = json!(crate::vision::b64_encode(&pcm_bytes));
+                    }
+                    if emit == "codes" || emit == "both" {
+                        let base = (call_idx * 20 + chunk_i as i32) % 900;
+                        let codes: Vec<i32> = (0..10).map(|c| base + c).collect();
+                        af["codes"] = json!(codes);
+                    }
+                    wr.write_all(&frame(af)).await.unwrap();
+                }
+                wr.write_all(&frame(json!({
+                    "type": "finish", "id": id, "reason": "stop", "stop_id": 248046,
+                    "prompt_tokens": prompt_rows, "cached_tokens": 0, "completion_tokens": 2
+                })))
+                .await
+                .unwrap();
+            }
+        });
+        let engine = Engine::new(path.to_string_lossy().into_owned());
+        engine.start();
+        for _ in 0..500 {
+            if engine.ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(engine.ready(), "fake speech engine did not connect");
+        (engine, reqs)
+    }
+
+    async fn http_raw(addr: std::net::SocketAddr, method: &str, path: &str, body: Option<&Value>) -> (u16, String, Vec<u8>) {
+        let b = body.map(|v| serde_json::to_vec(v).unwrap()).unwrap_or_default();
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let mut req = if body.is_some() {
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                b.len()
+            )
+            .into_bytes()
+        } else {
+            format!("{method} {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").into_bytes()
+        };
+        req.extend_from_slice(&b);
+        s.write_all(&req).await.unwrap();
+        let mut raw = Vec::new();
+        match s.read_to_end(&mut raw).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && !raw.is_empty() => {}
+            Err(e) => panic!("read_to_end failed: {e}"),
+        }
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+        let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let mut payload = raw[split + 4..].to_vec();
+        if head.contains("transfer-encoding: chunked") {
+            let (mut out, mut rest) = (Vec::new(), &payload[..]);
+            loop {
+                let eol = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+                let n = usize::from_str_radix(std::str::from_utf8(&rest[..eol]).unwrap().trim(), 16).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&rest[eol + 2..eol + 2 + n]);
+                rest = &rest[eol + 4 + n..];
+            }
+            payload = out;
+        }
+        (status, head, payload)
+    }
+
+    fn test_wav_b64(sample_rate: u32, channels: u16, duration_frames: usize) -> String {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut cur = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = hound::WavWriter::new(&mut cur, spec).unwrap();
+            for i in 0..duration_frames {
+                let s = ((2.0 * std::f64::consts::PI * 440.0 * i as f64 / sample_rate as f64).sin() * 12000.0) as i16;
+                for _ in 0..channels {
+                    w.write_sample(s).unwrap();
+                }
+            }
+            w.finalize().unwrap();
+        }
+        crate::vision::b64_encode(&cur.into_inner())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn speech_http_endpoint_end_to_end_and_capability_gate() {
+        let tok = crate::tok::prefix_tests::fixture(true);
+        let dir = std::env::temp_dir().join(format!("g6front-tts-model-{}", crate::util::new_id("m")));
+        let voices_dir = std::env::temp_dir().join(format!("g6front-tts-voices-{}", crate::util::new_id("v")));
+        std::fs::create_dir_all(&dir).unwrap();
+        tok.tk.save(dir.join("tokenizer.json"), false).unwrap();
+        let grammars = crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap();
+
+        // 1. Engine WITHOUT speech capability returns 400 on /v1/audio/speech and /v1/audio/voices
+        let (eng_off, _) = fake_speech_engine(false).await;
+        let st_off: &'static State = Box::leak(Box::new(State {
+            tok: crate::tok::prefix_tests::fixture(true),
+            template: None,
+            dialect: Dialect::Ds41,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine: eng_off,
+            served: vec!["drama-3".into()],
+            model_name: "drama-3".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: false,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars: crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap(),
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+            sessions: None,
+            voices_dir: voices_dir.clone(),
+        }));
+        let l_off = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr_off = l_off.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = l_off.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st_off, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+        assert_eq!(
+            post(addr_off, "/v1/audio/speech", &json!({"model": "drama-3", "input": "hello"})).await.0,
+            400
+        );
+        assert_eq!(http_raw(addr_off, "GET", "/v1/audio/voices", None).await.0, 400);
+        assert_eq!(http_raw(addr_off, "DELETE", "/v1/audio/voices/alice", None).await.0, 400);
+
+        // 2. Engine WITH speech capability
+        let (eng, reqs) = fake_speech_engine(true).await;
+        let st: &'static State = Box::leak(Box::new(State {
+            tok,
+            template: None,
+            dialect: Dialect::Ds41,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine: eng,
+            served: vec!["drama-3".into()],
+            model_name: "drama-3".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: false,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars,
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+            sessions: None,
+            voices_dir: voices_dir.clone(),
+        }));
+        let l = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = l.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+
+        // Default PCM streaming
+        let (code, head, pcm) =
+            http_raw(addr, "POST", "/v1/audio/speech", Some(&json!({"model": "drama-3", "input": "Hello world!"})))
+                .await;
+        assert_eq!(code, 200);
+        assert!(head.contains("content-type: audio/pcm"), "{head}");
+        assert!(head.contains("transfer-encoding: chunked"), "{head}");
+        assert_eq!(pcm.len(), 2 * 2048 * 2);
+        {
+            let r = reqs.lock().unwrap();
+            assert_eq!(r.len(), 1);
+            assert_eq!(r[0]["type"], "speech");
+            assert_eq!(r[0]["emit"], "pcm");
+            assert_eq!(r[0]["max_frames"], 600);
+            assert_eq!(r[0]["top_k"], 30);
+            assert_eq!(r[0]["rows"].as_array().unwrap().len() % 11, 0);
+        }
+
+        // Buffered WAV response
+        let (code, head, wav) = http_raw(
+            addr,
+            "POST",
+            "/v1/audio/speech",
+            Some(&json!({"model": "drama-3", "input": "Hello wav!", "response_format": "wav", "seed": 7})),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(head.contains("content-type: audio/wav"), "{head}");
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        let reader = hound::WavReader::new(std::io::Cursor::new(&wav)).unwrap();
+        assert_eq!(reader.spec().sample_rate, 44_100);
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        assert_eq!(reader.duration(), 4096);
+
+        // Multi-chunk long input: emits "both" and passes chunk 0 codes as history into chunk 1
+        let before = reqs.lock().unwrap().len();
+        let long_input = "This is a sentence meant to push the prompt beyond three hundred bytes. ".repeat(6);
+        let (code, _, multi_pcm) = http_raw(
+            addr,
+            "POST",
+            "/v1/audio/speech",
+            Some(&json!({"model": "drama-3", "input": long_input, "response_format": "pcm"})),
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(multi_pcm.len(), 2 * 2 * 2048 * 2);
+        {
+            let r = reqs.lock().unwrap();
+            assert_eq!(r.len(), before + 2);
+            assert_eq!(r[before]["emit"], "both");
+            assert_eq!(r[before + 1]["emit"], "both");
+            let rows1: Vec<i64> = r[before + 1]["rows"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
+            let audio_rows = rows1.chunks_exact(11).filter(|row| row[0] >= 248_099).count();
+            assert_eq!(audio_rows, 2, "expected 2 history audio rows from chunk 0");
+        }
+
+        // Voices CRUD: create (48 kHz stereo -> resampled mono 44.1 kHz -> encode_audio), list, synthesize, delete
+        let wav48_b64 = test_wav_b64(48_000, 2, 4800);
+        let (code, v) = post(
+            addr,
+            "/v1/audio/voices",
+            &json!({"name": "narrator", "audio": wav48_b64, "text": "Reference clip text."}),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["name"], "narrator");
+        assert!(voices_dir.join("narrator.json").exists());
+
+        let (code, _, body) = http_raw(addr, "GET", "/v1/audio/voices", None).await;
+        assert_eq!(code, 200);
+        let list_v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list_v["voices"].as_array().unwrap().len(), 1);
+        assert_eq!(list_v["voices"][0]["name"], "narrator");
+
+        // Synthesize with uploaded voice -> speech rows include reference audio rows
+        let before = reqs.lock().unwrap().len();
+        let (code, _, _) = http_raw(
+            addr,
+            "POST",
+            "/v1/audio/speech",
+            Some(&json!({"model": "drama-3", "input": "Using narrator voice.", "voice": "narrator"})),
+        )
+        .await;
+        assert_eq!(code, 200);
+        {
+            let r = reqs.lock().unwrap();
+            let rows: Vec<i64> = r[before]["rows"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect();
+            assert!(rows.chunks_exact(11).any(|row| row[0] >= 248_099), "voice reference audio rows missing");
+        }
+
+        // Inline reference + vq_codes + previous_takes
+        let wav44_b64 = test_wav_b64(44_100, 1, 2048);
+        let (code, _, _) = http_raw(
+            addr,
+            "POST",
+            "/v1/audio/speech",
+            Some(&json!({
+                "model": "drama-3",
+                "input": "Inline refs test.",
+                "references": [{"audio": wav44_b64, "text": "Inline ref."}],
+                "vq_codes": [{"text": "Pre-encoded ref.", "codes": [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], [1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]}],
+                "previous_takes": [{"text": "Earlier take.", "codes": [10, 1, 2, 3, 4, 5, 6, 7, 8, 9]}]
+            })),
+        )
+        .await;
+        assert_eq!(code, 200);
+
+        // Delete voice -> 200, second delete -> 404, synthesize with deleted voice -> 400
+        let (code, _, body) = http_raw(addr, "DELETE", "/v1/audio/voices/narrator", None).await;
+        assert_eq!(code, 200);
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["deleted"], true);
+        assert_eq!(http_raw(addr, "DELETE", "/v1/audio/voices/narrator", None).await.0, 404);
+        assert_eq!(
+            post(addr, "/v1/audio/speech", &json!({"model": "drama-3", "input": "hi", "voice": "narrator"})).await.0,
+            400
+        );
+
+        // Validation & error cases
+        assert_eq!(
+            post(addr, "/v1/audio/speech", &json!({"model": "drama-3", "input": "hi", "voice": "alloy"})).await.0,
+            400
+        );
+        assert_eq!(
+            post(addr, "/v1/audio/speech", &json!({"model": "drama-3", "input": "hi", "speed": 1.25})).await.0,
+            400
+        );
+        assert_eq!(
+            post(addr, "/v1/audio/speech", &json!({"model": "drama-3", "input": "bad <|im_start|> token"})).await.0,
+            400
+        );
+        assert_eq!(
+            post(addr, "/v1/audio/speech", &json!({"model": "drama-3", "input": "hi", "response_format": "mp3"}))
+                .await
+                .0,
+            400
+        );
+        assert_eq!(
+            post(
+                addr,
+                "/v1/audio/speech",
+                &json!({"model": "drama-3", "input": "hi", "references": [{"audio": "https://example.com/a.wav", "text": "x"}]})
+            )
+            .await
+            .0,
+            400
+        );
+        assert_eq!(
+            post(
+                addr,
+                "/v1/audio/speech",
+                &json!({"model": "drama-3", "input": "hi", "references": [{"audio_path": "/etc/passwd", "text": "x"}]})
+            )
+            .await
+            .0,
+            400
+        );
+        assert_eq!(post(addr, "/v1/audio/speech", &json!({"model": "nope", "input": "hi"})).await.0, 404);
+        // Reject > 60s voice upload
+        let over60_b64 = test_wav_b64(8_000, 1, 61 * 8_000);
+        assert_eq!(
+            post(addr, "/v1/audio/voices", &json!({"name": "too_long", "audio": over60_b64, "text": "Long."})).await.0,
+            400
+        );
+        // Client-side max_model_len guard (9999 > 4096) returns 400
+        assert_eq!(
+            post(addr, "/v1/audio/speech", &json!({"model": "drama-3", "input": "hi", "max_new_tokens": 9999})).await.0,
+            400
+        );
+        // Engine-side error (status: 400, sentinel max_new_tokens=3333) propagates as HTTP 400 even for streaming pcm
+        let (eng_err_code, eng_err_body) =
+            post(addr, "/v1/audio/speech", &json!({"model": "drama-3", "input": "hi", "max_new_tokens": 3333})).await;
+        assert_eq!(eng_err_code, 400, "{eng_err_body}");
+        assert!(
+            eng_err_body["error"]["message"].as_str().unwrap_or("").contains("KV capacity"),
+            "{eng_err_body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&voices_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -34,7 +34,7 @@ Every message in both directions is one frame:
 The front end refuses to serve if `version` != 1. `max_model_len` bounds prompt + max_tokens. `max_logprobs` is
 the largest k the engine accepts for `logprobs` and `prompt_logprobs`. `"insert": true` (absent = false) says the
 engine applies `generate`'s `insert` rule. `"grammar": true` (absent = false) says it masks a reply with `generate`'s
-`grammar`. `"vision": true` (absent = false) says it takes `generate`'s `images` (DeepSeek-V4.1 or GLM-5.3-Flash with its vision tower). `"penalties": true` (absent = false) says it applies `generate`'s `presence_penalty` and `frequency_penalty`, `"think_end_boost": true` its `think_end_boost`, `"sequence_penalty": true` its `sequence_penalty`. `"embeddings": true` (absent = false) says the engine accepts `embed` frames and replies with `embedding` frames (optionally advertising `"embedding_dim": D`, its native output dimension, and `"matryoshka": true` when `embed`'s `dimensions` truncation is supported).
+`grammar`. `"vision": true` (absent = false) says it takes `generate`'s `images` (DeepSeek-V4.1 or GLM-5.3-Flash with its vision tower). `"penalties": true` (absent = false) says it applies `generate`'s `presence_penalty` and `frequency_penalty`, `"think_end_boost": true` its `think_end_boost`, `"sequence_penalty": true` its `sequence_penalty`. `"embeddings": true` (absent = false) says the engine accepts `embed` frames and replies with `embedding` frames (optionally advertising `"embedding_dim": D`, its native output dimension, and `"matryoshka": true` when `embed`'s `dimensions` truncation is supported). `"speech": true` (absent = false) says the engine accepts `speech` and `encode_audio` frames and replies with `audio` and `codes` frames, advertising `"sample_rate": 44100`, `"codebooks": 10`, and `"frame_samples": 2048`.
 
 An optional `steering` object advertises a loaded profile: `profile` (name), `digest` (64 lowercase hex
 manifest SHA-256), `scope` (`shared` or `full`), `layers` (positive active-layer count), `forced` (boolean),
@@ -107,13 +107,51 @@ Only sent to an engine whose `hello` says `"embeddings": true`.
 
 An `embed` request may be cancelled with `cancel` and ends with either an `embedding` frame followed by `finish` (`reason: "stop"`, `completion_tokens: 0`), or directly with `finish` (`reason: "error"`, `message`, optional `status` / `retry_after`).
 
+### `speech`
+
+Only sent to an engine whose `hello` says `"speech": true`.
+
+```json
+{"type": "speech", "id": "tts-3f2a...",
+ "rows": [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+ "max_frames": 600, "temperature": 0.7, "top_p": 0.7, "top_k": 30,
+ "seed": null, "emit": "pcm"}
+```
+
+| field | meaning |
+|---|---|
+| `rows` | flattened frame-major `[T, 1 + codebooks]` (`11 * T` ints for Drama 3): row `t` is `[main, c0, ..., c9]`. Text rows carry `[token_id, 0, ..., 0]`; audio rows carry `[c0 + semantic_start, c0, ..., c9]` |
+| `max_frames` | hard cap on generated audio frames (>= 1). Requests where `T + max_frames` exceeds the engine's KV capacity receive `finish` with `reason: "error"`, `status: 400` |
+| `temperature` | sampling temperature (default 0.7; 0 = greedy) |
+| `top_p` | nucleus mass (default 0.7) |
+| `top_k` | top-k cap (default 30; residual heads cap at `min(top_k, 30)`) |
+| `seed` | integer or null |
+| `emit` | `"pcm"` (stream `pcm` bytes only), `"codes"` (stream `codes` only), or `"both"` (include both `pcm` and `codes` in each `audio` frame) |
+
+A `speech` request emits zero or more `audio` frames and ends with `finish` (`reason: stop|length|abort|error`, `completion_tokens` = emitted frames).
+
+### `encode_audio`
+
+Only sent to an engine whose `hello` says `"speech": true`.
+
+```json
+{"type": "encode_audio", "id": "enc-3f2a...",
+ "pcm": "<base64 f32le mono 44.1 kHz>"}
+```
+
+| field | meaning |
+|---|---|
+| `pcm` | base64-encoded little-endian float32 mono waveform at `hello.sample_rate` (44.1 kHz), normalized to `[-1, 1]` |
+
+An `encode_audio` request replies with one `codes` frame followed by `finish` (`reason: "stop"`, `completion_tokens: F`), or directly with `finish` (`reason: "error"`, `message`, optional `status`).
+
 ### `cancel`
 
 ```json
 {"type": "cancel", "id": "cmpl-3f2a..."}
 ```
 
-Stop the request as soon as possible and free its state. The engine answers with a `finish` frame
+Stop the request (`generate`, `embed`, `speech`, or `encode_audio`) as soon as possible and free its state. The engine answers with a `finish` frame
 (`"reason": "abort"`) unless the request already finished. Cancelling an unknown id is a no-op (no reply). The front
 end sends it when the HTTP client disconnects, when a text stop string matched, or when a `thinking_budget` closes the
 think block. In the last case it waits for the `finish`, then sends a new `generate` (a new id) whose prompt is the old
@@ -171,6 +209,32 @@ Sent once in response to an `embed` frame, before its `finish` frame (`reason: "
 
 - `embedding`: finite float32 values in order (length = `dimensions` if requested, else the model's native `embedding_dim`), pooled according to the loaded model's rule (e.g. last non-pad token for Qwen3-VL-Embedding, mean pooling for EmbeddingGemma 2) and L2-normalized when `normalize` is true.
 - `prompt_tokens`: `len(prompt)`.
+
+### `audio`
+
+```json
+{"type": "audio", "id": "tts-3f2a...", "frames": 4,
+ "pcm": "<base64 s16le mono 44.1 kHz>",
+ "codes": [12, 34, 56, 78, 90, 12, 34, 56, 78, 90]}
+```
+
+Sent one or more times in response to a `speech` frame, before its `finish` frame.
+
+- `frames`: number of audio frames (`n >= 1`) carried by this chunk.
+- `pcm`: present when `emit` is `"pcm"` or `"both"`; base64-encoded signed 16-bit little-endian mono PCM at `hello.sample_rate` (`n * frame_samples * 2` bytes).
+- `codes`: present when `emit` is `"codes"` or `"both"`; `n * codebooks` (`10 * n`) integers flattened frame-major `[n, codebooks]` (`f * codebooks + c`).
+
+### `codes`
+
+```json
+{"type": "codes", "id": "enc-3f2a...", "frames": 42,
+ "codes": [12, 34, 56, 78, 90, 12, 34, 56, 78, 90]}
+```
+
+Sent once in response to an `encode_audio` frame, before its `finish` frame (`reason: "stop"`, `completion_tokens: frames`).
+
+- `frames`: number of encoded codec frames `F` (optional for readers; equals `len(codes) / codebooks`).
+- `codes`: `F * codebooks` (`10 * F`) integers flattened frame-major `[F, codebooks]` (`f * codebooks + c`).
 
 ### `finish`
 
@@ -255,3 +319,6 @@ The front end maps these to vLLM's Prometheus names on `/metrics` (see frontend/
 - v1 (2026-11-26): `embed` request, `embedding` response, and hello `embeddings` (with optional `embedding_dim` and
   `matryoshka`). An engine without dense embedding support leaves `embeddings` out of `hello`, and the front end
   refuses `/v1/embeddings` requests (400), so the protocol version stays 1.
+- v1 (2026-11-27): `speech` and `encode_audio` requests, `audio` and `codes` responses, and hello `speech` (with
+  `sample_rate`, `codebooks`, and `frame_samples`). An engine without speech support leaves `speech` out of `hello`,
+  and the front end refuses `/v1/audio/speech` and `/v1/audio/voices` requests (400), so the protocol version stays 1.

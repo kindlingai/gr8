@@ -35,6 +35,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 base64 = "0.22"
 sha2 = "0.10"
 gif = { version = "0.14", default-features = false, features = ["std"] }
+hound = "3.5"
+rubato = "0.16"
 
 [profile.release]
 opt-level = 3

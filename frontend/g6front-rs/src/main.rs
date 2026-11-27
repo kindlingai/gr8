@@ -26,6 +26,7 @@ mod template;
 mod thinking;
 mod tok;
 mod tool_choice;
+mod tts;
 mod util;
 mod vision;
 mod wire;
@@ -88,6 +89,8 @@ pub struct State {
     /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
     pub supervisor: Option<String>,
     pub sessions: Option<sessions::Sessions>,
+    /// Directory where uploaded TTS voices (`<name>.json`) are persisted (`$GR8_WORK_DIR/voices`).
+    pub voices_dir: PathBuf,
 }
 
 struct Args {
@@ -529,6 +532,7 @@ async fn serve(args: Args) -> Result<(), String> {
         started: util::now_secs(),
         supervisor: args.supervisor,
         sessions: sessions_on.then(|| sessions::Sessions::new(std::time::Duration::from_secs(args.session_idle_seconds))),
+        voices_dir: tts::default_voices_dir(),
     }));
     engine.start();
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)

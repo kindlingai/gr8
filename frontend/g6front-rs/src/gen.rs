@@ -372,7 +372,7 @@ impl Generation {
                         ..Default::default()
                     }));
                 }
-                Kind::Embedding => {}
+                Kind::Embedding | Kind::Audio | Kind::Codes => {}
             }
         }
     }
