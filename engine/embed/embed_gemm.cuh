@@ -234,6 +234,69 @@ __global__ void __launch_bounds__(256) k_emb_rot_h16(
     out_blk[lane] = make_uint4(a0, a1, a2, a3);
 }
 
+// Multi-output H16 activation rotation: reads X[M, K] ONCE from DRAM and produces N_OUT rotated A-fragment buffers
+// (N_OUT = 2 for Gate+Up, N_OUT = 3 for Q+K+V) using distinct suh[i] vectors.
+template <int N_OUT>
+__global__ void __launch_bounds__(256) k_emb_rot_h16_multi(
+    const bf16* __restrict__ x,
+    const __half* suh0, const __half* suh1, const __half* suh2,
+    uint8_t* dst0, uint8_t* dst1, uint8_t* dst2,
+    int M, int K) {
+    __shared__ __half sh[16][128];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int mb = blockIdx.x, kb = blockIdx.y;
+    const int k0 = kb * 128 + lane * 4;
+    const int K16 = K >> 4;
+    const __half* suhs[3] = {suh0, suh1, suh2};
+    uint8_t* dsts[3] = {dst0, dst1, dst2};
+
+    // Load the 2 rows of X owned by this warp ONCE into registers.
+    float x01_r[2][2] = {{0.f, 0.f}, {0.f, 0.f}};
+    float x23_r[2][2] = {{0.f, 0.f}, {0.f, 0.f}};
+    bool valid[2] = {false, false};
+    #pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        const int row = mb * 16 + warp + pass * 8;
+        if (row < M) {
+            valid[pass] = true;
+            const uint2 xr = *reinterpret_cast<const uint2*>(x + size_t(row) * K + k0);
+            const float2 f01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xr.x));
+            const float2 f23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xr.y));
+            x01_r[pass][0] = f01.x; x01_r[pass][1] = f01.y;
+            x23_r[pass][0] = f23.x; x23_r[pass][1] = f23.y;
+        }
+    }
+
+    const int j = warp;
+    const int r = lane >> 2, c = (lane & 3) * 2;
+    const int c0 = j * 16 + c;
+
+    #pragma unroll
+    for (int m = 0; m < N_OUT; ++m) {
+        const uint2 sr = *reinterpret_cast<const uint2*>(suhs[m] + k0);
+        const float2 s01 = __half22float2(emb_as_h2(sr.x)), s23 = __half22float2(emb_as_h2(sr.y));
+        #pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            const int lr = warp + pass * 8;
+            float v[4] = {0.f, 0.f, 0.f, 0.f};
+            if (valid[pass]) {
+                v[0] = x01_r[pass][0] * s01.x; v[1] = x01_r[pass][1] * s01.y;
+                v[2] = x23_r[pass][0] * s23.x; v[3] = x23_r[pass][1] * s23.y;
+                emb_had128(v, lane);
+            }
+            *reinterpret_cast<uint2*>(&sh[lr][lane * 4]) = make_uint2(emb_pack_h2(v[0], v[1]), emb_pack_h2(v[2], v[3]));
+        }
+        __syncthreads();
+        const u32 a0 = *reinterpret_cast<const u32*>(&sh[r][c0]);
+        const u32 a1 = *reinterpret_cast<const u32*>(&sh[r + 8][c0]);
+        const u32 a2 = *reinterpret_cast<const u32*>(&sh[r][c0 + 8]);
+        const u32 a3 = *reinterpret_cast<const u32*>(&sh[r + 8][c0 + 8]);
+        uint4* out_blk = reinterpret_cast<uint4*>(dsts[m] + (size_t(mb) * K16 + kb * 8 + j) * 512);
+        out_blk[lane] = make_uint4(a0, a1, a2, a3);
+        if (m + 1 < N_OUT) __syncthreads();
+    }
+}
+
 // Stage 1b (Fused SwiGLU + H16 rotation): reads gate[M, K] and up[M, K] (BF16), computes bf16(silu(gate)) * up,
 // multiplies by suh[K] (FP16), applies H128, and packs directly into FP16 m16n8k16 A-fragments dst[ceil(M/16)][K/16][512B].
 // Eliminates the intermediate [M, K] d_act DRAM write+read before down_proj.
@@ -519,6 +582,232 @@ __global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA
     }
 }
 
+// Multi-matrix descriptor for fused Gate+Up (N_MAT=2) and Q+K+V (N_MAT=3) Trellis K4 GEMM launches.
+struct MultiTrDesc {
+    const uint8_t* x_h16[3] = {};
+    const uint8_t* tw[3] = {};
+    const __half* svh[3] = {};
+    bf16* y[3] = {};
+    int N[3] = {};
+    int nb_end[3] = {}; // cumulative 128-col block end: nb_end[0]=N0/128, nb_end[1]=nb0+N1/128, ...
+    int64_t sB[3] = {};
+    int64_t sG[3] = {};
+};
+
+template <int BM, int N_MAT>
+__global__ void __launch_bounds__(EmbTrH16Cfg<BM>::NTH, EmbTrH16Cfg<BM>::MIN_CTA) k_emb_tr_h16_multi(
+    MultiTrDesc d, int M, int K) {
+    using C = EmbTrH16Cfg<BM>;
+    constexpr int NT = C::NT, ST = C::ST;
+    extern __shared__ __align__(16) unsigned char sm[];
+
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int wm = warp / C::WN, wn = warp % C::WN;
+    const int K16 = K >> 4, NST = K >> 5, RB = (M + 15) >> 4;
+
+    int bx_glob = blockIdx.x, by = blockIdx.y;
+    const int lin = blockIdx.y * gridDim.x + blockIdx.x;
+    if (gridDim.y <= 8) {
+        by = lin % gridDim.y;
+        bx_glob = lin / gridDim.y;
+    } else {
+        constexpr int RGRP = 4;
+        const int per = RGRP * gridDim.x;
+        const int grp = lin / per;
+        const int gy0 = grp * RGRP;
+        const int gh = min(RGRP, gridDim.y - gy0);
+        const int r = lin - grp * per;
+        by = gy0 + r % gh;
+        bx_glob = r / gh;
+    }
+
+    int mi = 0, bx = bx_glob;
+    if (bx_glob >= d.nb_end[0]) {
+        if (N_MAT == 3 && bx_glob >= d.nb_end[1]) {
+            mi = 2;
+            bx = bx_glob - d.nb_end[1];
+        } else {
+            mi = 1;
+            bx = bx_glob - d.nb_end[0];
+        }
+    }
+    const uint8_t* x_h16 = d.x_h16[mi];
+    const uint8_t* tw_bx = d.tw[mi] + int64_t(bx) * d.sB[mi];
+    const __half* svh = d.svh[mi];
+    bf16* y = d.y[mi];
+    const int N = d.N[mi];
+    const int64_t sG = d.sG[mi];
+
+    const int c0 = bx * 128, rb0 = by * BM;
+    const int nb = min(BM, RB - rb0), colw = wn * C::WC;
+    const bool full = (nb == BM);
+    unsigned char* sdec = sm + ST * C::STG;
+
+    constexpr int NA_LOADS = (2 * BM * 32) / C::NTH;
+    int a_j[NA_LOADS], a_mb[NA_LOADS], a_ch[NA_LOADS];
+    #pragma unroll
+    for (int i = 0; i < NA_LOADS; ++i) {
+        const int c = t + i * C::NTH;
+        a_j[i] = c / (BM * 32);
+        const int rem = c - a_j[i] * (BM * 32);
+        a_mb[i] = rem >> 5;
+        a_ch[i] = (rem & 31) * 16;
+    }
+    const int r_ti = t >> 3, r_j = r_ti >> 3, r_c = r_ti & 7, r_ch = (t & 7) * 16;
+
+    auto loadAB = [&](int st) {
+        unsigned char* a = sm + (st % ST) * C::STG;
+        const int k16_0 = st * 2;
+        if (full) {
+            #pragma unroll
+            for (int i = 0; i < NA_LOADS; ++i) {
+                emb_cp16(a + (t + i * C::NTH) * 16,
+                         x_h16 + (size_t(rb0 + a_mb[i]) * K16 + k16_0 + a_j[i]) * 512 + a_ch[i]);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < NA_LOADS; ++i) {
+                if (a_mb[i] < nb) {
+                    emb_cp16(a + (t + i * C::NTH) * 16,
+                             x_h16 + (size_t(rb0 + a_mb[i]) * K16 + k16_0 + a_j[i]) * 512 + a_ch[i]);
+                }
+            }
+        }
+        if (t < 128) {
+            const int ks = k16_0 + r_j;
+            emb_cp16(a + C::A + t * 16, tw_bx + int64_t(ks >> 3) * sG + int64_t((ks & 7) * 8 + r_c) * 128 + r_ch);
+        }
+    };
+
+    const int r8 = lane >> 2, kc = 2 * (lane & 3);
+    EmbTr3Lane4<true> tl;
+    tl.init(lane);
+    auto at = [&](int n, int k) { return n * 64 + (((k >> 3) ^ ((n >> 1) & 3)) << 4) + ((k & 7) << 1); };
+
+    auto decode = [&](int st) {
+        const unsigned char* raw = sm + (st % ST) * C::STG + C::A;
+        unsigned char* dd = sdec + (st & 1) * C::B;
+        #pragma unroll
+        for (int u = 0; u < 16 / C::NW; ++u) {
+            const int ti = warp + u * C::NW;
+            const int j = ti >> 3, c = ti & 7;
+            const int nd = c * 16 + r8, kd = j * 16 + kc;
+            const u32* tile = reinterpret_cast<const u32*>(raw + ti * 128);
+            u32 f0[2], f1[2];
+            tl.decode(tile[tl.i0], tile[tl.i1], f0, f1);
+            *reinterpret_cast<u32*>(dd + at(nd, kd)) = f0[0];
+            *reinterpret_cast<u32*>(dd + at(nd, kd + 8)) = f0[1];
+            *reinterpret_cast<u32*>(dd + at(nd + 8, kd)) = f1[0];
+            *reinterpret_cast<u32*>(dd + at(nd + 8, kd + 8)) = f1[1];
+        }
+    };
+
+    if (NST > 0) { loadAB(0); emb_cp_commit(); }
+    if (NST > 1) { loadAB(1); emb_cp_commit(); }
+    emb_cp_wait<1>();
+    __syncthreads();
+    if (NST > 0) decode(0);
+
+    float acc[4][NT][4];
+    #pragma unroll
+    for (int mb = 0; mb < 4; ++mb)
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mb][nt][i] = 0.f;
+
+    const int mat = lane >> 3, lr = lane & 7;
+    const int wm4 = wm * 4;
+    const int mb_lim = min(4, max(0, nb - wm4));
+
+    for (int st = 0; st < NST; ++st) {
+        emb_cp_wait<0>();
+        __syncthreads();
+        if (st + 2 < NST) {
+            loadAB(st + 2);
+            emb_cp_commit();
+        }
+        if (st + 1 < NST) decode(st + 1);
+        const unsigned char* a = sm + (st % ST) * C::STG;
+        const unsigned char* b = sdec + (st & 1) * C::B;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            u32 bf[NT][2];
+            #pragma unroll
+            for (int pr = 0; pr < NT / 2; ++pr) {
+                const int n = colw + (pr * 2 + (mat >> 1)) * 8 + lr;
+                const int ch = j * 2 + (mat & 1);
+                emb_ldsm_x4(b + n * 64 + ((ch ^ ((n >> 1) & 3)) << 4),
+                            bf[2 * pr][0], bf[2 * pr][1], bf[2 * pr + 1][0], bf[2 * pr + 1][1]);
+            }
+            if (full) {
+                uint4 fa = *reinterpret_cast<const uint4*>(a + (j * BM + wm4) * 512 + lane * 16);
+                #pragma unroll
+                for (int mb = 0; mb < 4; ++mb) {
+                    uint4 fa_nx;
+                    if (mb + 1 < 4) {
+                        fa_nx = *reinterpret_cast<const uint4*>(a + (j * BM + wm4 + mb + 1) * 512 + lane * 16);
+                    }
+                    #pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        emb_mma16816(acc[mb][nt], fa.x, fa.y, fa.z, fa.w, bf[nt][0], bf[nt][1]);
+                    }
+                    if (mb + 1 < 4) fa = fa_nx;
+                }
+            } else {
+                #pragma unroll
+                for (int mb = 0; mb < 4; ++mb) {
+                    if (mb >= mb_lim) break;
+                    const uint4 fa = *reinterpret_cast<const uint4*>(a + (j * BM + wm4 + mb) * 512 + lane * 16);
+                    #pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        emb_mma16816(acc[mb][nt], fa.x, fa.y, fa.z, fa.w, bf[nt][0], bf[nt][1]);
+                    }
+                }
+            }
+        }
+    }
+    emb_cp_wait<0>();
+
+    constexpr int LD = 136;
+    float* tile = reinterpret_cast<float*>(sm);
+    const int c = lane & 3, r = lane >> 2;
+    const uint2 sr = *reinterpret_cast<const uint2*>(svh + c0 + lane * 4);
+    const float2 s01 = __half22float2(emb_as_h2(sr.x)), s23 = __half22float2(emb_as_h2(sr.y));
+    #pragma unroll
+    for (int p = 0; p < BM; p += 4) {
+        __syncthreads();
+        if (wm * 4 == p && p < nb) {
+            #pragma unroll
+            for (int mb = 0; mb < 4; ++mb) {
+                if (p + mb >= nb) continue;
+                #pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    const int rr = mb * 16 + r, col = colw + nt * 8 + 2 * c;
+                    *reinterpret_cast<float2*>(tile + rr * LD + col) = make_float2(acc[mb][nt][0], acc[mb][nt][1]);
+                    *reinterpret_cast<float2*>(tile + (rr + 8) * LD + col) = make_float2(acc[mb][nt][2], acc[mb][nt][3]);
+                }
+            }
+        }
+        __syncthreads();
+        const int nrows = min(64, max(0, (nb - p) * 16));
+        for (int rr = warp; rr < nrows; rr += C::NW) {
+            const int row = (rb0 + p) * 16 + rr;
+            if (row >= M) break;
+            const float2 a0 = *reinterpret_cast<const float2*>(tile + rr * LD + lane * 4);
+            const float2 a1 = *reinterpret_cast<const float2*>(tile + rr * LD + lane * 4 + 2);
+            float v[4] = {a0.x, a0.y, a1.x, a1.y};
+            emb_had128(v, lane);
+            v[0] = __fmul_rn(v[0], s01.x);
+            v[1] = __fmul_rn(v[1], s01.y);
+            v[2] = __fmul_rn(v[2], s23.x);
+            v[3] = __fmul_rn(v[3], s23.y);
+            *reinterpret_cast<uint2*>(y + size_t(row) * N + c0 + lane * 4) =
+                make_uint2(emb_pack_bf2(v[0], v[1]), emb_pack_bf2(v[2], v[3]));
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------------------ FP8_ROW & INT4 kernels
 
 // Fused FP8_ROW token embedding lookup: out[m, d] = bf16(e4m3(fp8[tok[m], d]) * scale[tok[m]]).
@@ -783,6 +1072,10 @@ struct GemmWorkspace {
         EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<4>::SMEM));
         EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<8>::SMEM));
         EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<16>::SMEM));
+        EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_multi<4, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<4>::SMEM));
+        EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_multi<8, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<8>::SMEM));
+        EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_multi<4, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<4>::SMEM));
+        EMB_CK(cudaFuncSetAttribute(k_emb_tr_h16_multi<8, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, EmbTrH16Cfg<8>::SMEM));
     }
 
     void ensure_rot(int M, int K) {
@@ -886,6 +1179,86 @@ inline void linear_forward(const bf16* X, const DevMatrix& W, const bf16* bias, 
         default:
             throw std::runtime_error("g6embed linear_forward: unsupported matrix format " + std::to_string(W.fmt));
     }
+}
+
+// Fused dual Trellis linear (e.g. Gate + Up) sharing the same BF16 input X[M, K]:
+// reads X ONCE in k_emb_rot_h16_multi<2> and computes both outputs in one k_emb_tr_h16_multi<BM, 2> launch.
+inline void linear_forward_dual(const bf16* X, const DevMatrix& W0, const DevMatrix& W1,
+                                bf16* Y0, bf16* Y1, int M, GemmWorkspace& ws, cudaStream_t st) {
+    if (M <= 0) return;
+    if (W0.fmt == FMT_TRELLIS && W1.fmt == FMT_TRELLIS && W0.inp == W1.inp) {
+        const size_t rb = (size_t(M) + 15) / 16;
+        const size_t k16 = (size_t(W0.inp) + 15) / 16;
+        const size_t one_bytes = rb * k16 * 512;
+        if (one_bytes * 2 <= ws.x_rot_bytes) {
+            uint8_t* x0 = ws.x_rot;
+            uint8_t* x1 = ws.x_rot + one_bytes;
+            const unsigned kb = static_cast<unsigned>(W0.inp / 128);
+            k_emb_rot_h16_multi<2><<<dim3(static_cast<unsigned>(rb), kb), 256, 0, st>>>(
+                X, W0.suh, W1.suh, nullptr, x0, x1, nullptr, M, W0.inp);
+            MultiTrDesc d;
+            d.x_h16[0] = x0; d.x_h16[1] = x1;
+            d.tw[0] = W0.data; d.tw[1] = W1.data;
+            d.svh[0] = W0.svh; d.svh[1] = W1.svh;
+            d.y[0] = Y0; d.y[1] = Y1;
+            d.N[0] = W0.out; d.N[1] = W1.out;
+            d.nb_end[0] = W0.out / 128;
+            d.nb_end[1] = d.nb_end[0] + W1.out / 128;
+            d.sB[0] = W0.sB; d.sB[1] = W1.sB;
+            d.sG[0] = W0.sG; d.sG[1] = W1.sG;
+            const int RB = static_cast<int>(rb);
+            if (M >= 128) {
+                k_emb_tr_h16_multi<8, 2><<<dim3(d.nb_end[1], (RB + 7) / 8), EmbTrH16Cfg<8>::NTH, EmbTrH16Cfg<8>::SMEM, st>>>(d, M, W0.inp);
+            } else {
+                k_emb_tr_h16_multi<4, 2><<<dim3(d.nb_end[1], (RB + 3) / 4), EmbTrH16Cfg<4>::NTH, EmbTrH16Cfg<4>::SMEM, st>>>(d, M, W0.inp);
+            }
+            return;
+        }
+    }
+    linear_forward(X, W0, nullptr, Y0, M, false, ws, st);
+    linear_forward(X, W1, nullptr, Y1, M, false, ws, st);
+}
+
+// Fused triple Trellis linear (Q + K + V) sharing the same BF16 input X[M, K]:
+// reads X ONCE in k_emb_rot_h16_multi<3> and computes Q, K, V in one k_emb_tr_h16_multi<BM, 3> launch.
+inline void linear_forward_triple(const bf16* X, const DevMatrix& W0, const DevMatrix& W1, const DevMatrix& W2,
+                                  bf16* Y0, bf16* Y1, bf16* Y2, int M, GemmWorkspace& ws, cudaStream_t st) {
+    if (M <= 0) return;
+    if (W0.fmt == FMT_TRELLIS && W1.fmt == FMT_TRELLIS && W2.fmt == FMT_TRELLIS &&
+        W0.inp == W1.inp && W0.inp == W2.inp) {
+        const size_t rb = (size_t(M) + 15) / 16;
+        const size_t k16 = (size_t(W0.inp) + 15) / 16;
+        const size_t one_bytes = rb * k16 * 512;
+        if (one_bytes * 3 <= ws.x_rot_bytes) {
+            uint8_t* x0 = ws.x_rot;
+            uint8_t* x1 = ws.x_rot + one_bytes;
+            uint8_t* x2 = ws.x_rot + one_bytes * 2;
+            const unsigned kb = static_cast<unsigned>(W0.inp / 128);
+            k_emb_rot_h16_multi<3><<<dim3(static_cast<unsigned>(rb), kb), 256, 0, st>>>(
+                X, W0.suh, W1.suh, W2.suh, x0, x1, x2, M, W0.inp);
+            MultiTrDesc d;
+            d.x_h16[0] = x0; d.x_h16[1] = x1; d.x_h16[2] = x2;
+            d.tw[0] = W0.data; d.tw[1] = W1.data; d.tw[2] = W2.data;
+            d.svh[0] = W0.svh; d.svh[1] = W1.svh; d.svh[2] = W2.svh;
+            d.y[0] = Y0; d.y[1] = Y1; d.y[2] = Y2;
+            d.N[0] = W0.out; d.N[1] = W1.out; d.N[2] = W2.out;
+            d.nb_end[0] = W0.out / 128;
+            d.nb_end[1] = d.nb_end[0] + W1.out / 128;
+            d.nb_end[2] = d.nb_end[1] + W2.out / 128;
+            d.sB[0] = W0.sB; d.sB[1] = W1.sB; d.sB[2] = W2.sB;
+            d.sG[0] = W0.sG; d.sG[1] = W1.sG; d.sG[2] = W2.sG;
+            const int RB = static_cast<int>(rb);
+            if (M >= 128) {
+                k_emb_tr_h16_multi<8, 3><<<dim3(d.nb_end[2], (RB + 7) / 8), EmbTrH16Cfg<8>::NTH, EmbTrH16Cfg<8>::SMEM, st>>>(d, M, W0.inp);
+            } else {
+                k_emb_tr_h16_multi<4, 3><<<dim3(d.nb_end[2], (RB + 3) / 4), EmbTrH16Cfg<4>::NTH, EmbTrH16Cfg<4>::SMEM, st>>>(d, M, W0.inp);
+            }
+            return;
+        }
+    }
+    linear_forward(X, W0, nullptr, Y0, M, false, ws, st);
+    linear_forward(X, W1, nullptr, Y1, M, false, ws, st);
+    linear_forward(X, W2, nullptr, Y2, M, false, ws, st);
 }
 
 // Raw BF16 weight matrix GEMM (e.g. 5D patch_embed.proj flattened to [out, inp]).

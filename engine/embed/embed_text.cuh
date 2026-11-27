@@ -749,9 +749,7 @@ public:
             });
 
             prof.record(prof.qkv_ms, st, [&] {
-                linear_forward(d_normed, L.q_proj, nullptr, d_q, total_M, false, ws, st);
-                linear_forward(d_normed, L.k_proj, nullptr, d_k, total_M, false, ws, st);
-                linear_forward(d_normed, L.v_proj, nullptr, d_v, total_M, false, ws, st);
+                linear_forward_triple(d_normed, L.q_proj, L.k_proj, L.v_proj, d_q, d_k, d_v, total_M, ws, st);
             });
 
             prof.record(prof.qknorm_mrope_ms, st, [&] {
@@ -786,8 +784,7 @@ public:
             });
 
             prof.record(prof.mlp_gate_up_ms, st, [&] {
-                linear_forward(d_normed, L.gate_proj, nullptr, d_gate, total_M, false, ws, st);
-                linear_forward(d_normed, L.up_proj, nullptr, d_up, total_M, false, ws, st);
+                linear_forward_dual(d_normed, L.gate_proj, L.up_proj, d_gate, d_up, total_M, ws, st);
             });
 
             if (L.down_proj.fmt == FMT_TRELLIS) {
