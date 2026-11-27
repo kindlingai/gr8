@@ -40,7 +40,7 @@ __device__ __forceinline__ void vwait(const g6::VSlotDev& v, u64 step, size_t pa
         while (glue::ld_acquire_sys(tail) != seq)
         {
             if ((++it & 1023u) == 0 &&
-                (*reinterpret_cast<volatile unsigned*>(v.error) != 0 || clock64() - t0 > G6_SPIN_TIMEOUT_CYC))
+                (*reinterpret_cast<volatile unsigned*>(v.error) != 0 || clock64() - t0 > v.spin_cyc))
             {
                 atomicCAS(v.error, 0u, code | ((unsigned)(v.c & 0xffff) << 8) | (unsigned)v.src[j]);
                 break;

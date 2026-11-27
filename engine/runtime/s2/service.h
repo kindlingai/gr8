@@ -88,7 +88,7 @@ struct NativeHooks {
     std::function<void()> before_work;
     // optional: did this rank run tier copies since the last call (the same answer on every rank: the copies are). Then
     // the ranks line up before the next round: one rank's copies can take seconds longer than another's, and a GPU wait
-    // for a peer's rows gives up after ~10 s (G6_SPIN_TIMEOUT_CYC)
+    // for a peer's rows gives up after ~10 s (GR8_SPIN_TIMEOUT_S, default the compile-time G6_SPIN_TIMEOUT_CYC)
     std::function<bool()> drained;
     // optional, a tier on a group lease of a KV node (s2/kv_share.h): share = the head's report to the node, on its
     // control thread every GR8_S2_SHARE_MS (default 1000) while no resize is in flight, told whether the engine is idle

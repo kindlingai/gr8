@@ -70,6 +70,7 @@ struct BulkDev {
   unsigned long long* aux_out;   // [bulk_flags] GPU -> proxy (read after the doorbell)
   unsigned int* error;
   int rank, nr, nflags;
+  long long spin_cyc = G6_SPIN_TIMEOUT_CYC;  // wait cap for the bulk flag waits, cp_pf / qo (GR8_SPIN_TIMEOUT_S)
 };
 
 // Plain-old-data view handed to kernels. All pointers are device-accessible pinned host memory.
@@ -92,7 +93,19 @@ struct FabricDev {
   // p == me and glue::peer_slot reads this rank's contribution from its send slot.
   int compact = 0;
   int pool = 0;                // FabricConfig::pool
+  long long spin_cyc = G6_SPIN_TIMEOUT_CYC;  // wait cap for glue::wait_peers / the RS and AG waits (GR8_SPIN_TIMEOUT_S)
 };
+
+// GR8_SPIN_TIMEOUT_S (seconds, knobs/runtime.yaml) -> SM cycles at the ~2 GHz GB10 estimate the compile-time
+// G6_SPIN_TIMEOUT_CYC documents; unset (or <= 0) keeps the compile value, so a -D override (tests) is untouched.
+// Clamped so 2 * spin_cyc (ds41_step.cuh relay wait) never overflows signed 64-bit cycles.
+inline long long spin_timeout_cyc(long long knob_s, long long compile_cyc)
+{
+  if (knob_s <= 0) return compile_cyc;
+  constexpr long long kMaxSpinTimeoutS = 1000000000LL;  // 2 * (1e9 * 2e9) = 4e18 < LLONG_MAX
+  const long long clamped = knob_s > kMaxSpinTimeoutS ? kMaxSpinTimeoutS : knob_s;
+  return clamped * 2000000000LL;
+}
 
 // A set of collectives (Fabric::Rs mask / skip / p2p / flat): bit c for c in [0, 256). It converts from a 32-bit
 // `unsigned`, so callers that pass 0x5 compile unchanged. 48-layer SP-HC prefill uses up to 192 collectives.
