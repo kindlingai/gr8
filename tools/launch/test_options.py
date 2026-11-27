@@ -97,6 +97,39 @@ class PrecedenceTests(unittest.TestCase):
                 opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--extra-env', f'{old}=1'], GLM))
             self.assertIn(f'{old}: {why}', str(e.exception))
 
+    def test_bare_gr8_engine_knobs_are_refused(self):
+        # Engine knobs (scope != 'outside') set directly in the environment or a config file are silently dropped by
+        # supervisor.py's clean engine environment; refuse them so operators pass them via EXTRA_ENV (--extra-env).
+        for var, val in (('GR8_MOE_TOPK', '6'), ('GR8_BUSY_GUARD', '1'), ('GR8_MTP_KSTOPB_TAU_S0', '0.5')):
+            with self.assertRaises(opt.OptionError) as e:
+                opt.validate(opt.parse(['--no-config', '--peers', PEERS], {**GLM, var: val}))
+            self.assertIn(var, str(e.exception))
+            self.assertIn('EXTRA_ENV', str(e.exception))
+        f = write(self.d, 'bare_gr8.env', f'PEERS={PEERS}\nGR8_BUSY_GUARD=1\nGR8_REUSE_ALIGN=0\n')
+        o = opt.parse(['@' + f], GLM)
+        self.assertEqual(o.gr8env, ['GR8_BUSY_GUARD', 'GR8_REUSE_ALIGN'])
+        self.assertFalse(any('unknown key GR8_' in w for w in o.warnings))
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(o)
+        self.assertIn('GR8_BUSY_GUARD, GR8_REUSE_ALIGN', str(e.exception))
+        self.assertIn('EXTRA_ENV', str(e.exception))
+        # Outside-scoped deploy/build vars, launcher KEYS (GR8_MODEL, GR8_WORK_DIR), and DISPRAM_* remain accepted.
+        outside = {
+            **GLM,
+            'GR8_IMAGE': 'ghcr.io/kindlingai/gr8:latest',
+            'GR8_CACHE': '/srv/gr8/cache',
+            'GR8_HOME': '/srv/gr8/home',
+            'GR8_STOP_GRACE': '150s',
+            'GR8_HF_ENDPOINT': 'https://huggingface.co',
+            'GR8_FETCH_WORKERS': '4',
+            'GR8_WORK_DIR': '/tmp/gr8',
+            'DISPRAM_SOCKET': '/run/spark-attic/attic.sock',
+            'DISPRAM_KEY_FILE': '/run/gr8-attic/key',
+        }
+        o_ok = opt.parse(['--no-config', '--peers', PEERS], outside)
+        self.assertEqual(o_ok.gr8env, [])
+        opt.validate(o_ok)
+
     def test_default_file_and_no_config(self):
         o = opt.parse([], {'GR8_CLUSTER': self.f})
         self.assertEqual((o.file, o.get('CAP')), (self.f, '1000'))
