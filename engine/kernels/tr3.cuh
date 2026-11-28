@@ -330,7 +330,9 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     const bool wide4 = BS && BITS == 4 && tr3_is_wide4(A.t_wide4, e);
     const bool wide = trw_ok<BITS>() && A.t_wide;                 // K3, and K2
     const uint8_t* g0 = base - static_cast<size_t>(j) * TB + j * 256 + lane * 8;
+    const uint8_t* g4 = mw + static_cast<size_t>((ks0 + ksq) >> 3) * TR4W_GROUP + (j * 2) * 512 + lane * 16;
     u64 nw[3] = {0, 0, 0};
+    uint4 w4_next{};
     Tr3Lane<BITS, E4, CB> ld;
     ld.init(lane);
     u32 na[TR3_UNR];
@@ -344,7 +346,14 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     }
     else if constexpr (!trw_ok<BITS>() && TR3_EARLY)
     {
-        if (!wide4)
+        if (wide4)
+        {
+            if constexpr (BS && BITS == 4)
+            {
+                if (steps > 0) w4_next = tr4w_ld128(g4);
+            }
+        }
+        else
         {
             #pragma unroll
             for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(base + static_cast<size_t>(p) * 8 * TB, lane);
@@ -442,16 +451,15 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     {
         if constexpr (BS && BITS == 4)
         {
-            const uint8_t* g4 = mw + static_cast<size_t>((ks0 + ksq) >> 3) * TR4W_GROUP + (j * 2) * 512 + lane * 16;
             const int prev_lane = (lane + 31) & 31;
+            if (!TR3_EARLY && steps > 0) w4_next = tr4w_ld128(g4);
             for (int s = 0; s < steps; s += 8)
             {
                 const uint8_t* gp = g4 + static_cast<size_t>(s >> 3) * TR4W_GROUP;
-                #pragma unroll
-                for (int h = 0; h < 2; ++h)
+                const uint4 wh0 = w4_next;
+                const uint4 wh1 = tr4w_ld128(gp + 512);
                 {
-                    const uint4 wh = tr4w_ld128(gp + h * 512);
-                    const u32 w[4] = {wh.x, wh.y, wh.z, wh.w};
+                    const u32 w[4] = {wh0.x, wh0.y, wh0.z, wh0.w};
                     #pragma unroll
                     for (int p = 0; p < 4; ++p)
                     {
@@ -459,7 +467,20 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
                         const u32 pc = __shfl_sync(0xffffffffu, c, prev_lane);
                         u32 f0[2], f1[2];
                         Tr3Lane<4, E4, CB>::decode_m((static_cast<u64>(pc) << 32) | c, 28, f0, f1);
-                        mma16816(acc, f0[0], f1[0], f0[1], f1[1], XA0(s + h * 4 + p), XA1(s + h * 4 + p));
+                        mma16816(acc, f0[0], f1[0], f0[1], f1[1], XA0(s + p), XA1(s + p));
+                    }
+                }
+                if (s + 8 < steps) w4_next = tr4w_ld128(gp + TR4W_GROUP);
+                {
+                    const u32 w[4] = {wh1.x, wh1.y, wh1.z, wh1.w};
+                    #pragma unroll
+                    for (int p = 0; p < 4; ++p)
+                    {
+                        const u32 c = w[p];
+                        const u32 pc = __shfl_sync(0xffffffffu, c, prev_lane);
+                        u32 f0[2], f1[2];
+                        Tr3Lane<4, E4, CB>::decode_m((static_cast<u64>(pc) << 32) | c, 28, f0, f1);
+                        mma16816(acc, f0[0], f1[0], f0[1], f1[1], XA0(s + 4 + p), XA1(s + 4 + p));
                     }
                 }
             }
@@ -573,7 +594,9 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     const bool wide4 = BS && BITS == 4 && tr3_is_wide4(A.t_wide42, e);
     const bool wide = trw_ok<BITS>() && A.t_wide2;                // K3, and K2
     const uint8_t* wg = base + static_cast<size_t>(nt0) * 8 * TB + lane * 8;
+    const uint8_t* wg4 = base + static_cast<size_t>(nt0) * TR4W_NT + lane * 16;
     u64 nw[3] = {0, 0, 0};
+    uint4 w4_next{};
     Tr3Lane<BITS, E4, CB> ld;
     ld.init(lane);
     auto tile_ptr = [&](int q) { return base + (static_cast<size_t>(nt0 + (q >> 3) * nwarps) * 8 + (q & 7)) * TB; };
@@ -589,7 +612,14 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     }
     else if constexpr (!trw_ok<BITS>() && TR3_EARLY)
     {
-        if (!wide4 && Q > 0)
+        if (wide4)
+        {
+            if constexpr (BS && BITS == 4)
+            {
+                if (ntiles > 0) w4_next = tr4w_ld128(wg4);
+            }
+        }
+        else if (Q > 0)
         {
             #pragma unroll
             for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(tile_ptr(p), lane);
@@ -670,16 +700,15 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     {
         if (wide4)
         {
-            const uint8_t* wg4 = base + static_cast<size_t>(nt0) * TR4W_NT + lane * 16;
             const int prev_lane = (lane + 31) & 31;
+            if (!TR3_EARLY && ntiles > 0) w4_next = tr4w_ld128(wg4);
             for (int i = 0; i < ntiles; ++i)
             {
                 const uint8_t* np = wg4 + static_cast<size_t>(i) * nwarps * TR4W_NT;
-                #pragma unroll
-                for (int h = 0; h < 2; ++h)
+                const uint4 wh0 = w4_next;
+                const uint4 wh1 = tr4w_ld128(np + 512);
                 {
-                    const uint4 wh = tr4w_ld128(np + h * 512);
-                    const u32 w[4] = {wh.x, wh.y, wh.z, wh.w};
+                    const u32 w[4] = {wh0.x, wh0.y, wh0.z, wh0.w};
                     #pragma unroll
                     for (int p = 0; p < 4; ++p)
                     {
@@ -687,7 +716,20 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
                         const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
                         u32 f0[2], f1[2];
                         Tr3Lane<4, E4, CB>::decode_m((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
-                        mma16816(acc, f0[0], f1[0], f0[1], f1[1], ha[(h * 4 + p) * 64], ha[(h * 4 + p) * 64 + 1]);
+                        mma16816(acc, f0[0], f1[0], f0[1], f1[1], ha[p * 64], ha[p * 64 + 1]);
+                    }
+                }
+                if (i + 1 < ntiles) w4_next = tr4w_ld128(wg4 + static_cast<size_t>(i + 1) * nwarps * TR4W_NT);
+                {
+                    const u32 w[4] = {wh1.x, wh1.y, wh1.z, wh1.w};
+                    #pragma unroll
+                    for (int p = 0; p < 4; ++p)
+                    {
+                        const u32 ch = w[p];
+                        const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+                        u32 f0[2], f1[2];
+                        Tr3Lane<4, E4, CB>::decode_m((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
+                        mma16816(acc, f0[0], f1[0], f0[1], f1[1], ha[(4 + p) * 64], ha[(4 + p) * 64 + 1]);
                     }
                 }
                 __half* zp = zb + (nt0 + i * nwarps) * 16;
