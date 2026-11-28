@@ -6,6 +6,9 @@
 #include "service.h"
 #include "../../knobs-rs/gr8_knobs.h"
 #include "../prefill.cuh"
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+#include "../glm53_vision_stage.cuh"
+#endif
 #include "../../comms/fabric.h"
 #include <chrono>
 #include <map>
@@ -148,6 +151,10 @@ struct NativeContext {
     // the pages before first and maps the quantum's)
     std::function<void(const g6rt::StepIn&, const g6rt::S2In&)> before_main;
     std::function<void(const Slot&, uint32_t first, uint32_t rows)> before_prefill;
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+    // optional (GR8_GLM53_VISION): the GLM-5.3 vision tower and its pool (prefill and prefill2 attached), null = text only
+    g6rt::Glm53Vision* vision = nullptr;
+#endif
 };
 class NativeDispatch {
     NativeContext c_;
@@ -328,6 +335,13 @@ class NativeDispatch {
         const float scale = payload.steering.enabled ? g6rt::steering::bits_float(payload.steering.scale_bits) : 0.f;
         p.steering_scale = p2.steering_scale = scale;
         p.steering_slot = p2.steering_slot = int(payload.steering.slot);
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+        if (c_.vision && !payload.images.empty()) {
+            int pool_row = 0;
+            c_.vision->stage(p, payload.images, a, ma, pool_row, c_.stream, c_.main.rank, slot.req.id);
+            if (mb) c_.vision->stage(p2, payload.images, a + ma, mb, pool_row, c_.stream, c_.main.rank, slot.req.id);
+        }
+#endif
         g6rt::pf_inputs(p,ma,payload.prompt.data()+a,pos.data());
         g6rt::pf_enqueue(c_.prefill_fabric,p,prefill_sequence_,c_.main.nl,ma);
         if (mb) {
@@ -341,6 +355,7 @@ class NativeDispatch {
             if (c_.pf_enter) c_.pf_enter();
             g6rt::pf_step(c_.main,p,ma,a+ma,prefill_sequence_,c_.stream);
         }
+        p.vis_n = p2.vis_n = 0;
         if (c_.pf_exit) c_.pf_exit();
         fence(); prefill_sequence_ += c_.main.nl;
         g6rt::pf_draft_inputs(dq,ma,payload.prompt.data()+a+1,pos.data());

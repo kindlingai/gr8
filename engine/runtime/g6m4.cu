@@ -941,6 +941,54 @@ int main(int argc, char** argv)
         }
     }
     if (s2mode && R == 0 && !vis_on) std::remove((s2dir + "/vision.s2").c_str());   // a stale one from an earlier boot
+#elif !G6_MODEL_DS41
+    // GLM-5.3 image input (GR8_GLM53_VISION=1 or GR8_GLM53_VISION_PATH, default off, opt-in): with --serve and
+    // --prefill, loads the 348-tensor BF16 Glm5Next vision tower + 6144-dim merger + row_break_embed (trained by
+    // exlr8-vproj) before the KV pool is sized. Every rank runs the tower on the same pixels (m.emb is whole on every
+    // rank). Rank 0 writes DIR/vision.s2 ("glm53v"), so the shim advertises `vision: true` and `vision_model: "glm53v"`.
+    g6rt::image_model() = g6rt::GLM53V_IMAGES;
+    Glm53Vision gvis;
+    bool vis_on = false;
+    std::string vis_id;   // the loaded tower file's id (vision_id.h: its size and header), in the S2 runtime signature
+    const auto& glm53_vpath_opt = knob::glm53_vision_path();
+    const bool glm53_vis_req = knob::glm53_vision() || (glm53_vpath_opt && !glm53_vpath_opt->empty());
+    if (s2mode && glm53_vis_req) {
+        std::string vpath;
+        if (glm53_vpath_opt && !glm53_vpath_opt->empty()) {
+            if (FILE* fv = fopen(glm53_vpath_opt->c_str(), "rb")) { fclose(fv); vpath = *glm53_vpath_opt; }
+            else die("GLM-5.3 vision: GR8_GLM53_VISION_PATH not readable: " + *glm53_vpath_opt);
+        } else if (release) {
+            for (const char* rel : {
+                     "/dense/vision-glm53-bf16.safetensors",
+                     "/dense/vision-glm53-part1-bf16.safetensors",
+                     "/dense/vision-bf16.safetensors",
+                     "/vision-glm53-bf16.safetensors",
+                     "/vision-glm53-part1-bf16.safetensors",
+                     "/vision-bf16.safetensors"}) {
+                const std::string c = v2src.dense + rel;
+                if (FILE* fv = fopen(c.c_str(), "rb")) { fclose(fv); vpath = c; break; }
+            }
+        }
+        if (vpath.empty())
+            fprintf(stderr, "# rank %d: glm53 vision off: no dense/vision-glm53-bf16.safetensors in --v2-dense (or set GR8_GLM53_VISION_PATH)\n", R);
+        else if (!MP)
+            fprintf(stderr, "# rank %d: glm53 vision off: image rows reach the model only through the prefill, and --prefill is 0\n", R);
+        else {
+            vis_id = g6vis::file_id(vpath);
+            if (vis_id.empty()) die("GLM-5.3 vision: cannot read the safetensors header of " + vpath);
+            const int pool_rows = MP * (two ? 2 : 1);
+            gvis.boot(vpath, pool_rows);
+            gvis.attach(P);
+            if (two) gvis.attach(P2);
+            vis_on = true;
+            g6rt::vision_flag() = true;
+            fprintf(stderr, "# rank %d: glm53 vision: tower %s, %.1f MiB on the device (weights, workspace, %d-row pool, staging)\n",
+                    R, vpath.c_str(), gvis.device_bytes() / (1024.0 * 1024.0), pool_rows);
+            if (R == 0)
+                if (FILE* fv = fopen((s2dir + "/vision.s2").c_str(), "w")) { fputs("glm53v\n", fv); fclose(fv); }
+        }
+    }
+    if (s2mode && R == 0 && !vis_on) std::remove((s2dir + "/vision.s2").c_str());   // a stale one from an earlier boot
 #endif
     u64 ls0b = 1;
     DraftPrefill DQ;
@@ -2905,6 +2953,7 @@ int main(int argc, char** argv)
                     rt_selstat(*rtt, {{P.idx_all, rt_ma}, {two ? P2.idx_all : nullptr, rt_mb}}, start / 64 * 64, s);
             };
         }
+        nx.vision = vis_on ? &gvis : nullptr;
         try
         {
             g6s2::NativeDispatch nd(nx, sc);
@@ -3535,6 +3584,7 @@ int main(int argc, char** argv)
             sig.dsel_model = dsel_model; sig.dsel_tab = dsel_tab.str(); sig.kstopb = s2::kstopb_sig(kstop.b);
             sig.cp_step = cp_step; sig.cp_seg = sc.cp_seg; sig.ctx_sp = g6_attn_ctx_sp(); sig.posidx = g6_attn_posidx();
             sig.steer_shared = steering_boot.loaded && steering_boot.scope == steering::Scope::Shared;
+            sig.vis_on = vis_on; sig.vis_id = vis_id;
             sig.knobs = knob::signature();
             bc.runtime_signature = g6s2::runtime_signature(sig);
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,

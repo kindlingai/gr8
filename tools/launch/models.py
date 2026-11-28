@@ -91,6 +91,7 @@ GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exl
               {2: ('bit225', 'bit200'), 3: ('bit260', 'bit225'), 4: ('bit325',), 5: ('bit325',), 6: ('bit325',)},
               'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, True,
               vocab=154880, eos_ids=(154820, 154827, 154829), shim_legacy=True, drafter_url='https://huggingface.co/incoai/GLM-5.3-DFlash2', grammar=True, kv4_fold=True, legacy_identity=True,
+              vision_knob='GR8_GLM53_VISION',
               tp_defaults={'2': {'KV_FORMAT': 'int4'}, '4': {'KV_FORMAT': 'int4'}}, scalable=True)
 # GLM-5.3-Flash: uniform-width releases, K4 by default. K2 is the width whose experts fit one box (TP=1).
 GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4',

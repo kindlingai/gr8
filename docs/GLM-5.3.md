@@ -58,6 +58,11 @@ The recipe [glm-5.3-exlr8-4x-spark](https://github.com/kindlingai/recipes/tree/m
 - Opt-in runtime steering: one of up to eight validated rank-one profiles can be selected per request across decode, prefill and target
   verification, with steering identity included in prefix reuse. The fused operator adds no CUDA launches to the
   production path. See [STEERING.md](STEERING.md).
+- Opt-in vision input (`GR8_GLM53_VISION=1` or `GR8_GLM53_VISION_PATH=/path/to/vision-glm53-bf16.safetensors`): loads
+  the 348-tensor BF16 Glm5Next vision tower + 6144-dim merger + learned `row_break_embed` (trained by `exlr8-vproj`) on
+  every TP rank before the KV pool is sized. Advertises `vision: true` and `vision_model: "glm53v"` over `PROTOCOL.md`,
+  splicing `(vit_h/2) * (vit_w/2 + 1)` `<|image|>` rows (with `row_break_embed` at column `W_p` of each merged row)
+  into the prefill residual stream. Default is `0` (zero memory or runtime impact for text-only serving).
 - Prefill attention split by query and head owner across ranks ([DESIGN-QO-PAIR.md](DESIGN-QO-PAIR.md)).
 - Context-parallel KV: the first `SHARE_LIMIT` tokens (32,768 at TP=4 and TP=3) are on every rank, later pages (their
   latent and their indexer keys) are spread across ranks, so the pools above fit. Requests up to that size share decode steps.

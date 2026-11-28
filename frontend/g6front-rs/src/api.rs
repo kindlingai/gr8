@@ -756,10 +756,19 @@ fn image_err(e: crate::vision::VisionError) -> ApiError {
     ApiError::bad(e.0, Some("messages"))
 }
 
-/// The image processor and image token of the served model: Qwen3-VL-Embedding (for embedding engines on HF/Qwen
-/// dialects), DeepSeek-V4.1, Inkling-2-Small, Qwen3.8, else GLM-5.3-Flash (an engine without a vision tower refuses
-/// images before any is used).
+/// The image processor and image token of the served model: uses the engine's advertised `hello.vision_model` when
+/// present (distinguishing `glm53v` from `glm5v` on the shared `glm` dialect), else falls back to the dialect.
 fn image_model(st: &State) -> crate::vision::Model {
+    if let Some(vm) = st.engine.vision_model() {
+        match vm.as_str() {
+            "glm53v" => return crate::vision::Model::Glm53v,
+            "glm5v" => return crate::vision::Model::Glm5v,
+            "ds41" => return crate::vision::Model::Ds41,
+            "ink2" => return crate::vision::Model::Ink2,
+            "qw38" => return crate::vision::Model::Qw38,
+            _ => {}
+        }
+    }
     if st.engine.embeddings() && matches!(st.dialect, Dialect::Hf | Dialect::Qwen) {
         return crate::vision::Model::Qwen3Vl;
     }

@@ -445,6 +445,7 @@ pub struct Prepared {
 pub enum Model {
     Ds41,
     Glm5v,
+    Glm53v,
     Ink2,
     Qw38,
     Qwen3Vl,
@@ -456,6 +457,7 @@ impl Model {
         match self {
             Model::Ds41 => IMAGE_TOKEN_ID,
             Model::Glm5v => glm5v::IMAGE_TOKEN_ID,
+            Model::Glm53v => glm53v::IMAGE_TOKEN_ID,
             Model::Ink2 => ink2::IMAGE_TOKEN_ID,
             Model::Qw38 => qw38::IMAGE_TOKEN_ID,
             Model::Qwen3Vl => qwen3vl::IMAGE_TOKEN_ID,
@@ -465,6 +467,7 @@ impl Model {
         match self {
             Model::Ds41 => prepare_rgb(im),
             Model::Glm5v => glm5v::prepare_rgb(im),
+            Model::Glm53v => glm53v::prepare_rgb(im),
             Model::Ink2 => ink2::prepare_rgb(im),
             Model::Qw38 => qw38::prepare_rgb(im),
             Model::Qwen3Vl => qwen3vl::prepare_rgb(im),
@@ -475,7 +478,7 @@ impl Model {
     pub fn decode(self, bytes: &[u8]) -> Result<Rgb, VisionError> {
         match self {
             Model::Ink2 => ink2::decode_ink2_rgb(bytes),
-            Model::Ds41 | Model::Glm5v | Model::Qw38 | Model::Qwen3Vl => decode_rgb(bytes),
+            Model::Ds41 | Model::Glm5v | Model::Glm53v | Model::Qw38 | Model::Qwen3Vl => decode_rgb(bytes),
         }
     }
     /// Base64 image data -> what the engine gets.
@@ -488,6 +491,7 @@ impl Model {
         Ok(match self {
             Model::Ds41 => plan_image_grid(w, h).n_span(),
             Model::Glm5v => glm5v::plan(w, h).tokens(),
+            Model::Glm53v => glm53v::span_for(w, h),
             Model::Ink2 => ink2::plan(w, h)?.tokens,
             Model::Qw38 => qw38::plan(w, h)?.tokens(),
             Model::Qwen3Vl => qwen3vl::plan(w, h)?.tokens(),
@@ -612,6 +616,30 @@ pub mod glm5v {
         }
         let key = content_key(p.vit_h(), p.vit_w(), &rgb);
         Ok(Prepared { vit_h: p.vit_h(), vit_w: p.vit_w(), n_span: p.tokens(), key, rgb })
+    }
+}
+
+/// GLM-5.3 vision projector (trained by exlr8-vproj): identical pixel preprocessing and patch grid to `glm5v`, with a
+/// learned `row_break_embed` appended at the end of every merged row (`n_span = (vit_h / 2) * (vit_w / 2 + 1)` copies
+/// of `<|image|>`). engine/runtime/glm53_vision_plan.h holds the same geometry.
+pub mod glm53v {
+    use super::{glm5v, Prepared, Rgb, VisionError};
+
+    pub const IMAGE_TOKEN_ID: u32 = glm5v::IMAGE_TOKEN_ID;
+
+    pub fn span_of(vit_h: usize, vit_w: usize) -> usize {
+        (vit_h / glm5v::MERGE) * (vit_w / glm5v::MERGE + 1)
+    }
+
+    pub fn span_for(width: usize, height: usize) -> usize {
+        let p = glm5v::plan(width, height);
+        span_of(p.vit_h(), p.vit_w())
+    }
+
+    pub fn prepare_rgb(im: &Rgb) -> Result<Prepared, VisionError> {
+        let mut p = glm5v::prepare_rgb(im)?;
+        p.n_span = span_of(p.vit_h, p.vit_w);
+        Ok(p)
     }
 }
 
@@ -1521,5 +1549,24 @@ mod tests {
         let prep = Model::Qwen3Vl.prepare_b64(&b64_encode(&png_bytes)).unwrap();
         assert_eq!((prep.vit_h, prep.vit_w, prep.n_span), (4, 4, 4));
         assert_eq!(prep.rgb, rgb);
+    }
+
+    #[test]
+    fn glm53v_plan_and_prepare() {
+        assert_eq!(Model::Glm53v.token(), 154_854);
+        assert_eq!(glm53v::span_of(8, 8), 20);
+        assert_eq!(glm53v::span_of(16, 16), 72);
+        assert_eq!(glm53v::span_of(178, 178), 8010);
+        // 112x112 -> 8x8 patches -> 4x4 merged -> 4 * (4 + 1) = 20 spliced tokens (vs 16 for glm5v), identical pixels.
+        let rgb = vec![99u8; 112 * 112 * 3];
+        let png_bytes = png(112, 112, image::ExtendedColorType::Rgb8, &rgb);
+        let b64 = b64_encode(&png_bytes);
+        assert_eq!(Model::Glm5v.n_span_b64(&b64).unwrap(), 16);
+        assert_eq!(Model::Glm53v.n_span_b64(&b64).unwrap(), 20);
+        let p5 = Model::Glm5v.prepare_b64(&b64).unwrap();
+        let p53 = Model::Glm53v.prepare_b64(&b64).unwrap();
+        assert_eq!((p53.vit_h, p53.vit_w, p53.n_span), (8, 8, 20));
+        assert_eq!(p53.rgb, p5.rgb);
+        assert_eq!(p53.key, p5.key);
     }
 }
