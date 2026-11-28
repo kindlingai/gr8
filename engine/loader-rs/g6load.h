@@ -68,6 +68,10 @@ void* g6l_ernie55_plan_part(const char* release_dir, const char* widths, uint32_
                             const char* out_manifest, char* err, size_t errlen);
 void* g6l_qw38_plan(const char* release_dir, const char* widths, uint32_t nr, uint32_t rank, int with_mtp,
                     const char* layout, const char* out_manifest, char* err, size_t errlen);
+// Plans the TP=1 trellis expert image of a Drama 3 (`fish_omni`) exlr8 release directory (src/dr3.rs).
+// Emits Lnnn.tr3.{fc1,fc2,sg,v1b,v2,v3b,table,kmix} for every layer in `manifest_name` (dense tensors come from g6l_tts_*).
+void* g6l_dr3_plan(const char* release_dir, const char* manifest_name, const char* layout, const char* out_manifest,
+                   char* err, size_t errlen);
 // Fills dst with image bytes off .. off + n of a planned image, without a sink (one tensor at a time, for m4sim).
 // Returns 0, or 1 with a message in err.
 int g6l_plan_read(void* plan, uint64_t off, uint64_t n, void* dst, char* err, size_t errlen);

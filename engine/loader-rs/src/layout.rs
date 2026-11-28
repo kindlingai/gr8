@@ -40,6 +40,7 @@ impl ModelGeom {
     pub const GLM: ModelGeom = ModelGeom { nh: NH, heads: HEADS, dense: DENSE, vtiles: VTILES };
     pub const QW38: ModelGeom = ModelGeom { nh: 5, heads: 24, dense: 0, vtiles: 1940 };
     pub const HY4: ModelGeom = ModelGeom { nh: 12, heads: 64, dense: 108, vtiles: 944 };
+    pub const DR3: ModelGeom = ModelGeom { nh: 4, heads: 16, dense: 0, vtiles: 1971 };
 }
 
 /// A set of interchangeable pieces.
@@ -153,19 +154,21 @@ impl Model {
             || man.get("model").and_then(Json::str) == Some("qw38")
             || man.get("nh").and_then(Json::int) == Some(5)
             || first_nh == Some(5);
+        let is_dr3 = man.get("model").and_then(Json::str) == Some("dr3")
+            || (explicit_hidden == Some(2048) && (man.get("nh").and_then(Json::int) == Some(4) || first_nh == Some(4)));
         let is_hy4 = man.get("model").and_then(Json::str) == Some("hy4") || (explicit_hidden == Some(1536) && first_nh == Some(12));
-        let hidden = explicit_hidden.unwrap_or(if is_hy4 { 1536 } else if is_qw38 { 2560 } else { 6144 });
-        let geom = if is_hy4 { ModelGeom::HY4 } else if is_qw38 { ModelGeom::QW38 } else { ModelGeom::GLM };
+        let hidden = explicit_hidden.unwrap_or(if is_hy4 { 1536 } else if is_dr3 { 2048 } else if is_qw38 { 2560 } else { 6144 });
+        let geom = if is_hy4 { ModelGeom::HY4 } else if is_dr3 { ModelGeom::DR3 } else if is_qw38 { ModelGeom::QW38 } else { ModelGeom::GLM };
         let mut groups = vec![(Group::Vocab, vec![0; geom.vtiles])];
         for l in 0..=last {
-            if !is_qw38 || l % 4 == 3 {
+            if (!is_qw38 && !is_dr3) || l % 4 == 3 {
                 groups.push((Group::Heads(l), vec![0; geom.heads]));
             }
             if is_hy4 && l < 1 {
                 groups.push((Group::Dense(l), vec![0; geom.dense]));
                 continue;
             }
-            if !is_qw38 && !is_hy4 && l < 3 {
+            if !is_qw38 && !is_dr3 && !is_hy4 && l < 3 {
                 groups.push((Group::Dense(l), vec![0; geom.dense]));
                 continue;
             }
