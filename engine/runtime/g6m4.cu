@@ -431,6 +431,11 @@ int main(int argc, char** argv)
     // draft's copy when there is one), with GR8_DRAFT_HEAD_KS / _TPC. In the S2 runtime signature.
     const bool dfl_i4 = knob::dfl_head_i4();
     if (dfl_i4 && !dfl) die("GR8_DFL_HEAD_I4=1 needs --dflash-manifest");
+    // GR8_DFL_HEAD2=1 (dflash.cuh dfl_head2; default 0): two-stage 2-bit screen + MXFP8 rescore for the DFlash2 head
+    // (shares read-only screen weights with GR8_DRAFT_HEAD2 when active). Drafts only. In the S2 runtime signature.
+    const bool dfl_head2_on = knob::dfl_head2();
+    if (dfl_head2_on && !dfl) die("GR8_DFL_HEAD2=1 needs --dflash-manifest");
+    if (dfl_head2_on && dfl_i4) die("GR8_DFL_HEAD2=1 cannot be combined with GR8_DFL_HEAD_I4=1");
     // GR8_DFL_BODY_I4=1 (dflash.cuh dfl_body_i4; default 0): the DFlash2 drafter's body GEMVs read INT4 g32 copies of their
     // MXFP8 records. Drafts only; +382 MB per rank. In the S2 runtime signature
     const bool dfl_body_i4_on = knob::dfl_body_i4();
@@ -1014,6 +1019,7 @@ int main(int argc, char** argv)
         if (dfl_i4)
             dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "GR8_DFL_HEAD_I4", st),
                         dhead.tpc, dhead.ks);
+        if (dfl_head2_on) dfl_head2(DF, m, D.d.dh2.codes ? &D.d.dh2 : nullptr, st);
         if (dfl_body_i4_on) dfl_body_i4(DF, st);
         if (dfl_alpha != 1.f && !DF.sel) die("GR8_DFL_SEL_ALPHA needs the selector walk");
         DF.sel_alpha = dfl_alpha;

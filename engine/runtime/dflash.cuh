@@ -150,6 +150,7 @@ struct Dfl
     u32 *xf_act = nullptr, *xb_act = nullptr;
     // head
     bind::Head head;
+    head2::Bufs dh2;                  // GR8_DFL_HEAD2: 2-bit screen + MXFP8 rescore (codes/scales/mx shared with MTP when active)
     u32* xf_head = nullptr;
     float* hlog = nullptr;            // [B][vn]
     float* hp = nullptr;              // [B][SELR]
@@ -495,6 +496,50 @@ __global__ void __launch_bounds__(1024) k_top_local(TopArgs a)
             dst[k] = Cand{bl, top_id(a.vlo, bi)};   // TOP_NONE: every untaken logit NaN (dfl_topk.h)
         }
         __syncthreads();
+    }
+    glue::publish(a.f, a.c, g6::coll_seq(*a.stepp, a.c, a.f.ncoll), a.ticket);
+}
+// GR8_DFL_HEAD2: this rank's top-16 from head2::SL rescored candidates of rows 1..7 -> send slot, then publish.
+// grid K, block head2::SL (64).
+struct TopSlArgs
+{
+    g6::FabricDev f;
+    const u64* stepp;
+    int c;
+    const int* cand;
+    const float* cl;
+    int vlo;
+    unsigned* ticket;
+};
+__global__ void __launch_bounds__(head2::SL) k_top_local_sl(TopSlArgs a)
+{
+    static_assert(head2::SL == 64, "k_top_local_sl expects head2::SL == 64");
+    __shared__ float s_l[head2::SL];
+    __shared__ int s_i[head2::SL];
+    const int row = blockIdx.x, t = threadIdx.x;
+    s_l[t] = a.cl[(size_t)row * head2::SL + t];
+    s_i[t] = a.cand[(size_t)row * head2::SL + t];
+    __syncthreads();
+    if (t == 0)
+    {
+        Cand* dst = reinterpret_cast<Cand*>(glue::send_slot(a.f, *a.stepp, a.c)) + (size_t)row * TOPK;
+        uint64_t taken = 0;
+        for (int k = 0; k < TOPK; ++k)
+        {
+            float bl = -INFINITY;
+            int bi = TOP_NONE, bj = -1;
+            for (int j = 0; j < head2::SL; ++j)
+            {
+                if (!(taken & (1ULL << j)) && cand_before(s_l[j], s_i[j], bl, bi))
+                {
+                    bl = s_l[j];
+                    bi = s_i[j];
+                    bj = j;
+                }
+            }
+            if (bj >= 0) taken |= 1ULL << bj;
+            dst[k] = Cand{bl, top_id(a.vlo, bi)};
+        }
     }
     glue::publish(a.f, a.c, g6::coll_seq(*a.stepp, a.c, a.f.ncoll), a.ticket);
 }
@@ -992,6 +1037,41 @@ inline void dfl_head_i4(Dfl& D, const uint8_t* rec, int tpc, int ks)
     if (D.head.lm_head.O != D.vn || D.head.lm_head.K != HID) die("GR8_DFL_HEAD_I4: INT4 head is not this rank's vocab slice");
 }
 
+// GR8_DFL_HEAD2=1 (g6m4; default 0, needs --dflash-manifest): the DFlash2 drafter's head runs in two stages (kernels/head2.cuh):
+// a 2-bit g32 screen over this rank's vocab slice followed by exact MXFP8 rescoring of the top head2::SL candidates.
+// When GR8_DRAFT_HEAD2 is also active, shares the read-only screen weights (codes/scales/mx) with the MTP drafter (0 extra weight RAM)
+// while keeping a private 4 KB cand/cl workspace for parallel-stream safety. Drafts only: target verification is unchanged.
+inline void dfl_head2(Dfl& D, const Model& main, const head2::Bufs* shared, cudaStream_t st)
+{
+    if constexpr (HID != 6144) die("GR8_DFL_HEAD2=1 requires HID == 6144");
+    const bind::Tensor& mx = main.head_t.lm_head;
+    if (!mx.p || mx.nd != 3 || mx.shape[0] * 16 != D.vn || mx.shape[1] != HID / 32 || mx.shape[2] != head_i4::MXGR)
+        die("GR8_DFL_HEAD2: G.lm_head.mx.gv is not this rank's [vn/16][192][528] MXFP8 slice");
+    if (const char* e = head2::init()) die(std::string("GR8_DFL_HEAD2: ") + e);
+    const bool reused = shared && shared->codes && shared->scales && shared->mx;
+    if (reused)
+    {
+        D.dh2.codes = shared->codes;
+        D.dh2.scales = shared->scales;
+        D.dh2.mx = shared->mx;
+    }
+    else
+    {
+        uint4* codes = dmalloc<uint4>(head2::code_bytes(D.vn) / 16);
+        __half2* scales = dmalloc<__half2>(head2::scale_bytes(D.vn) / 4);
+        head2::convert(static_cast<const uint8_t*>(mx.p), codes, scales, D.vn, st);
+        G6RT_CK(cudaGetLastError());
+        D.dh2.codes = codes;
+        D.dh2.scales = scales;
+        D.dh2.mx = static_cast<const uint8_t*>(mx.p);
+    }
+    D.dh2.cand = dmalloc<int>((size_t)head2::MXM * head2::SL);
+    D.dh2.cl = dmalloc<float>((size_t)head2::MXM * head2::SL);
+    G6RT_CK(cudaStreamSynchronize(st));
+    fprintf(stderr, "# rank %d: GR8_DFL_HEAD2=1: 2-bit g32 screen (%s, %.1f MB), %d candidates rescored on MXFP8\n",
+            D.rank, reused ? "shared with MTP" : "standalone", head2::bytes(D.vn) / 1e6, head2::SL);
+}
+
 // GR8_DFL_BODY_I4=1 (g6m4; default 0, needs --dflash-manifest): the drafter's body GEMVs (fc, and per layer kv (context and
 // block: one record), aconv, q, o, mconv, gu, down) read INT4 g32 records made at boot from their MXFP8 records
 // (rank.cuh gv_to_i4, the GR8_DRAFT_HEAD_I4 arithmetic), with the same splits: 382 MB instead of 701 MB per rank, which the
@@ -1223,15 +1303,34 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
     if (p == NC - 1)                  // MLP of the last layer in, final norm, head out
     {
         dfl_consume(D, p - 1, D.dlt_m, D.ly[L - 1].mbase, D.norm, st);
-        bind::launch(D.head.xf_h, st);
-        bind::launch(D.head.lm_head, st);
-        if (D.sel)
+        if (D.dh2.codes)
         {
-            dfl_xfrag(D.x, HID, D.xf_x, D.xb_x, st);
-            bind::launch(D.hproj, st);
-            dflk::k_top_local<<<K, 1024, 0, st>>>(dflk::TopArgs{D.f, D.stepp, NC - 1, D.hlog, D.vn, D.vlo, D.vn, D.tickets + NC - 1});
+            if (D.sel)
+            {
+                // Selector mode only uses block rows 1..K (skip row 0).
+                head2::launch_front(D.dh2, D.x + HID, HID, D.hlog + D.vn, D.vn, D.vn, K, st);
+                dfl_xfrag(D.x, HID, D.xf_x, D.xb_x, st);
+                bind::launch(D.hproj, st);
+                dflk::k_top_local_sl<<<K, head2::SL, 0, st>>>(dflk::TopSlArgs{D.f, D.stepp, NC - 1, D.dh2.cand, D.dh2.cl, D.vlo, D.tickets + NC - 1});
+            }
+            else
+            {
+                head2::launch_front(D.dh2, D.x, HID, D.hlog, D.vn, D.vn, B, st);
+                head2::k_head_local_sl<<<B, 1024, 0, st>>>(dfl_head_args(D), D.dh2.cand, D.dh2.cl);
+            }
         }
-        else glue::k_head_local<<<B, 1024, 0, st>>>(dfl_head_args(D));
+        else
+        {
+            bind::launch(D.head.xf_h, st);
+            bind::launch(D.head.lm_head, st);
+            if (D.sel)
+            {
+                dfl_xfrag(D.x, HID, D.xf_x, D.xb_x, st);
+                bind::launch(D.hproj, st);
+                dflk::k_top_local<<<K, 1024, 0, st>>>(dflk::TopArgs{D.f, D.stepp, NC - 1, D.hlog, D.vn, D.vlo, D.vn, D.tickets + NC - 1});
+            }
+            else glue::k_head_local<<<B, 1024, 0, st>>>(dfl_head_args(D));
+        }
         return;
     }
     // p == NC: the merge (gr8's head merge in argmax mode, the walk in selector mode), StepOut

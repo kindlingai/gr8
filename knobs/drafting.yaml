@@ -26,6 +26,16 @@ knobs:
     doc: >-
       With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for
       engine/ref/dflash2_replay.py.
+  GR8_DFL_HEAD2:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      The DFlash2 drafter's lm_head runs in two stages: a 2-bit screen over this rank's vocab slice followed by exact
+      MXFP8 rescoring of the top 64 candidates. Shares read-only screen weights with GR8_DRAFT_HEAD2 when both are
+      enabled (0 extra weight RAM). Drafts only. Needs --dflash-manifest.
   GR8_DFL_HEAD_I4:
     scope: agree
     kind: flag
