@@ -1552,7 +1552,7 @@ mod tests {
         let (rendered, blocks) = t.render_images(Some(&msgs), None, Map::new()).unwrap();
         assert_eq!(
             rendered,
-            "<|user|>\n<|begin_of_image|><|image|><|end_of_image|> and <|begin_of_image|><|image|><|end_of_image|>?<|assistant|>\n"
+            "<|user|><|begin_of_image|><|image|><|end_of_image|> and <|begin_of_image|><|image|><|end_of_image|>?<|assistant|>"
         );
         assert_eq!(blocks.len(), 2);
         assert_eq!(crate::vision::block_b64(&blocks[0]).unwrap(), "0");
