@@ -942,7 +942,7 @@ class DrafterTests(unittest.TestCase):
         self.assertEqual(o.get('DFLASH_DIR'), ms.drafter.out)
         plan = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', epoch=1)
         self.assertIn(os.path.join(ms.drafter.out, 'dflash.r1.pack'), plan['args'])
-        self.assertIn('GR8_DFL_VERIFY_CAP=0.35', plan['env'])
+        self.assertIn('GR8_DFL_VERIFY_CAP=0.18', plan['env'])
         self.assertIn('GR8_SPEC_K0=1', plan['env'])
         # --dflash 0 opts out cleanly
         o_off = opt.parse([*base, '--dflash', '0'], GLM)

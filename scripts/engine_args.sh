@@ -36,7 +36,7 @@ share_cap() {
 # the model's estimates.
 int4_pages() {
   case $TP:$1 in
-    2:768) echo 800 ;;     # 800 int4 pages/rank = 98,304 CAP (96K) at SHARE_LIMIT=4096 (~1.85 GiB KV/rank, ~1.1 GiB live headroom; --cap 131072 fits tightly)
+    2:768) echo 1056 ;;    # 1056 int4 pages/rank = 131,072 CAP (128K) at SHARE_LIMIT=4096 (~2.0 GiB live headroom after decode/prefill weight reclaim; --cap 172032 fits with GR8_MEM_MIN=1)
     4:2280) echo 2390 ;;   # measured against fp8 at 1,920 pages, and not re-measured since the drafter's prefill shares
                            # the target's scratch: int4 keeps the memory of 1,981 fp8 pages
     3:1941) echo 2480 ;;
@@ -454,6 +454,14 @@ engine_defaults() {
        [ "$MTP" = 0 ] || { tp4_default MTP_L2PF 3; tp4_default MTP_LASTROW 1; }
        tp4_default MOE_UNION_CAP 48
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then
+         if [ "$SESS" -ge 2 ]; then
+           tp4_default S2_SHARED_WATERFILL 1
+           local _wf_eff=${S2_SHARED_WATERFILL:-0}
+           case " ${EXTRA_ENV:-} " in *" GR8_S2_SHARED_WATERFILL=1 "*) _wf_eff=1 ;; *" GR8_S2_SHARED_WATERFILL=0 "*) _wf_eff=0 ;; esac
+           if [ "$_wf_eff" = 1 ]; then
+             tp4_default S2_SHARED_WF_MARGIN 0.02
+           fi
+         fi
          tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
          case " ${EXTRA_ENV:-} " in *" GR8_ATTN_FLIP=1 "*) ;; *) tp4_default CP_ONECHAIN 1 ;; esac
          tp4_default KV4_FOLD 1
@@ -611,11 +619,13 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   if [ "$TP" = 2 ]; then
     case " ${EXTRA_ENV:-} " in *" GR8_MEM_MIN="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_MEM_MIN=2" ;; esac
     case " ${EXTRA_ENV:-} " in *" GR8_V2_SHARED="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_V2_SHARED=trellis" ;; esac
+    case " ${EXTRA_ENV:-} " in *" GR8_CP_STRIPE="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_CP_STRIPE=1" ;; esac
+    case " ${EXTRA_ENV:-} " in *" GR8_PF_STRIPE="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_PF_STRIPE=1" ;; esac
     if [ "${REUSE:-0}" = 1 ]; then
       case " ${EXTRA_ENV:-} " in *" GR8_KV_SHARE_PAGES="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_KV_SHARE_PAGES=1" ;; esac
     fi
     if [ "${DFLASH:-0}" = 1 ] && [ "${SPEC_ADAPT:-0}" = 1 ]; then
-      case " ${EXTRA_ENV:-} " in *" GR8_DFL_VERIFY_CAP="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_DFL_VERIFY_CAP=0.35" ;; esac
+      case " ${EXTRA_ENV:-} " in *" GR8_DFL_VERIFY_CAP="*) ;; *) ENGINE_ENV="$ENGINE_ENV GR8_DFL_VERIFY_CAP=0.18" ;; esac
     fi
   fi
   if [ "$TP" = 4 ] && [ "$PF_OWN" = 4 ]; then
