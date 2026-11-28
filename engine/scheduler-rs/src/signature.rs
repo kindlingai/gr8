@@ -186,6 +186,9 @@ pub fn runtime_signature(i: &SigInputs) -> String {
     s += &when(i.ctx_sp != 0, || format!(" ctxsp {}", i.ctx_sp));
     s += &when(i.posidx != 0, || " posidx 1".into());
     s += &when(i.steer_shared, || " s2steer 1".into());
+    // with the GLM-5.3 vision tower, " vision <file id>" (header and size agreement); a rank without the file boots
+    // text-only and refuses beside ranks with it
+    s += &when(i.vis_on, || format!(" vision {}", text(i.vis_id)));
     s + &knobs
 }
 

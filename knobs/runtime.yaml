@@ -255,3 +255,21 @@ knobs:
     values: "0.."
     doc: >-
       With GR8_KV_CHUNKS=1, pages per resizable KV chunk below place (0 = default 256 pages, clamped to place).
+  GR8_GLM53_VISION:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      GLM-5.3: 1 = with --serve and --prefill, loads the 348-tensor BF16 vision tower + 6144-dim merger +
+      row_break_embed (dense/vision-glm53-bf16.safetensors, dense/vision-glm53-part1-bf16.safetensors, or
+      GR8_GLM53_VISION_PATH) at boot before the KV pool is sized, and serves image requests (hello `vision: true`,
+      `vision_model: "glm53v"`). 0 (default) never loads the tower and runs the text-only code.
+  GR8_GLM53_VISION_PATH:
+    scope: agree
+    kind: path
+    unset: "discover dense/vision-glm53-bf16.safetensors in --v2-dense"
+    doc: >-
+      GLM-5.3: explicit path to a trained 348-tensor BF16 vision safetensors file (vision-glm53-bf16.safetensors or
+      vision-glm53-part1-bf16.safetensors). When set under --serve with --prefill, enables GLM-5.3 vision loading from
+      that path on every rank.

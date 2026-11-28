@@ -10,6 +10,7 @@
 #pragma once
 #include "ds41_vision_plan.h"
 #include "flash_vision_plan.h"
+#include "glm53_vision_plan.h"
 #include "ink2_vision_plan.h"
 #include "qw38_vision_plan.h"
 #include "../engram/sha256.h"
@@ -40,10 +41,12 @@ struct ImageModel {
 };
 inline int ds41_span(int vit_h, int vit_w) { const ds41v::Grid g = ds41v::grid_of(vit_h, vit_w); return g.ok ? g.span() : 0; }
 inline int glm5v_span(int vit_h, int vit_w) { return glm5v::span_of(vit_h, vit_w); }
+inline int glm53v_span(int vit_h, int vit_w) { return glm53v::span_of(vit_h, vit_w); }
 inline int ink2_span(int vit_h, int vit_w) { return ink2v::span_of(vit_h, vit_w); }
 inline int qw38_span(int vit_h, int vit_w) { return qw38v::span_of(vit_h, vit_w); }
 constexpr ImageModel DS41_IMAGES{"ds41", TOK_IMAGE, IMAGE_PATCH, ds41_span};
 constexpr ImageModel GLM5V_IMAGES{"glm5v", TOK_IMAGE_GLM5V, IMAGE_PATCH, glm5v_span};
+constexpr ImageModel GLM53V_IMAGES{"glm53v", TOK_IMAGE_GLM5V, IMAGE_PATCH, glm53v_span};
 constexpr ImageModel INK2_IMAGES{"ink2", TOK_IMAGE_INK2, ink2v::PATCH, ink2_span};
 constexpr ImageModel QW38_IMAGES{"qw38", TOK_IMAGE_QW38, qw38v::PATCH, qw38_span};
 // the build's model (a host test that runs both models sets it)

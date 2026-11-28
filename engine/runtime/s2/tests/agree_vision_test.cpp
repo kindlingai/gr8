@@ -72,7 +72,8 @@ int main(int argc, char** argv) {
     // g6m4.cu: the effective vision state and the file id go into each model's signature (not the knob)
     const std::string src = slurp(argv[1]);
     for (const auto& sb : {std::pair<const char*, const char*>{"sig.model = g6s2::SigModel::Ds41;", "g6s2::serve_ds41(dc, bc"},
-                           std::pair<const char*, const char*>{"sig.model = g6s2::SigModel::Flash;", "g6s2::serve_flash(fc, bc"}}) {
+                           std::pair<const char*, const char*>{"sig.model = g6s2::SigModel::Flash;", "g6s2::serve_flash(fc, bc"},
+                           std::pair<const char*, const char*>{"sig.model = g6s2::SigModel::Glm;", "g6s2::bootstrap(bc)"}}) {
         const size_t a = src.find(sb.first);
         const size_t b = a == std::string::npos ? a : src.find(sb.second, a);
         CHECK(a != std::string::npos && b != std::string::npos);
@@ -81,7 +82,7 @@ int main(int argc, char** argv) {
     }
     size_t ids = 0;
     for (size_t at = src.find("vis_id = g6vis::file_id(vpath);"); at != std::string::npos; at = src.find("vis_id = g6vis::file_id(vpath);", at + 1)) ++ids;
-    CHECK(ids == 2);
+    CHECK(ids == 3);
 
     char tmpl[] = "/tmp/ds41agreevisXXXXXX"; const std::string dir = mkdtemp(tmpl);
     const std::string t1 = dir + "/t1.safetensors", t1b = dir + "/t1-copy.safetensors", t2 = dir + "/t2.safetensors";
@@ -94,8 +95,8 @@ int main(int argc, char** argv) {
     CHECK(g6vis::signature(false, "x").empty());
 
     uint16_t port = uint16_t(21000 + getpid() % 20000);
-    for (const SigModel model : {SigModel::Ds41, SigModel::Flash}) {
-        const char* name = model == SigModel::Ds41 ? "ds41" : "flash";
+    for (const SigModel model : {SigModel::Ds41, SigModel::Flash, SigModel::Glm}) {
+        const char* name = model == SigModel::Ds41 ? "ds41" : (model == SigModel::Flash ? "flash" : "glm53");
         const std::string d = dir + "/" + name;
         ::mkdir(d.c_str(), 0700);
         std::string why;

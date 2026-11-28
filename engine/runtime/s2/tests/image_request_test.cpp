@@ -104,6 +104,38 @@ int main() {
              })
             CHECK(refused(bad));
     }
+    // GLM-5.3: <|image|> rows, (vit_h/2) * (vit_w/2 + 1) spliced tokens (row_break_embed after each merged row)
+    g6rt::image_model() = g6rt::GLM53V_IMAGES;
+    {
+        constexpr int G = g6rt::TOK_IMAGE_GLM5V;
+        CHECK(g6rt::image_model().token == G && g6rt::image_model().patch == 14);
+        CHECK(g6rt::image_model().span(8, 8) == 20 && g6rt::image_model().span(16, 16) == 72 &&
+              g6rt::image_model().span(178, 178) == 8010 && g6rt::image_model().span(16000, 2) == 16000);
+        std::vector<int> ids{5, 154830};
+        ids.insert(ids.end(), 20, G);   // 8x8 patches -> 4x4 merged -> 4 * (4 + 1) = 20 spliced tokens
+        ids.insert(ids.end(), {154831, 6, 7});
+        std::string p;
+        for (int i : ids) p += (p.empty() ? "" : ",") + std::to_string(i);
+        auto f = parse_request(head + " " + field(2, 9, 8, 8) + "\n" + p + "\n");
+        CHECK(f.images.size() == 1 && f.images[0].span == 20 && f.images[0].rgb->size() == size_t(8 * 8 * 14 * 14 * 3));
+        CHECK(f.steering.images && !*g6rt::img::refusal(f.prompt, f.images, false));
+        CHECK(*g6rt::img::refusal(f.prompt, f.images, true));
+        // A Flash-sized 16-token span is refused under GLM-5.3 geometry (missing row breaks).
+        std::vector<int> p_flash{5, 154830};
+        p_flash.insert(p_flash.end(), 16, G);
+        p_flash.insert(p_flash.end(), {154831, 6, 7});
+        std::string pf;
+        for (int i : p_flash) pf += (pf.empty() ? "" : ",") + std::to_string(i);
+        for (const std::string& bad : {
+                 head + " " + field(2, 9, 8, 8) + "\n" + pf + "\n",           // 16 tokens instead of 20
+                 head + " " + field(1, 9, 8, 8) + "\n" + p + "\n",            // starts on <|begin_of_image|>
+                 head + " " + field(2, 9, 6, 6) + "\n" + p + "\n",            // 9 merged tokens: below floor of 16
+                 head + " " + field(2, 9, 7, 8) + "\n" + p + "\n",            // odd side
+                 head + " " + field(2, 9, 2, 16002) + "\n" + p + "\n",        // past 8000 merged tokens
+                 head + " " + field(1, 7) + "\n" + p6 + "\n",                 // DS41's token and grid
+             })
+            CHECK(refused(bad));
+    }
     // Inkling-2-Small: <|unused_200054|> rows, one per 2 x 2 patches of 20 pixels, 1 to 6400 tokens
     g6rt::image_model() = g6rt::INK2_IMAGES;
     {

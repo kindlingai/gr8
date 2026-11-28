@@ -159,6 +159,10 @@ impl Engine {
     pub fn vision(&self) -> bool {
         self.hello().is_some_and(|h| h.get("vision") == Some(&Value::Bool(true)))
     }
+    /// The engine's advertised image geometry (`hello.vision_model`, e.g. `"glm5v"`, `"glm53v"`, `"ds41"`, `"ink2"`, `"qw38"`).
+    pub fn vision_model(&self) -> Option<String> {
+        self.hello().and_then(|h| h.get("vision_model").and_then(Value::as_str).map(str::to_string))
+    }
     /// The engine applies `generate`'s insert rule (its hello says `"insert": true`).
     pub fn inserts(&self) -> bool {
         self.hello().is_some_and(|h| h.get("insert") == Some(&Value::Bool(true)))

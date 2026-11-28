@@ -261,6 +261,17 @@ def glm5v_span(vit_h: int, vit_w: int) -> int | None:
     return n if GLM5V_MIN_TOKENS <= n <= GLM5V_MAX_TOKENS else None
 
 
+def glm53v_span(vit_h: int, vit_w: int) -> int | None:
+    """The spliced span of a GLM-5.3 patch grid: (vit_h/2) * (vit_w/2 + 1) copies of <|image|> (row_break_embed after
+    each merged row), None when its processor cannot produce it (glm53v::span_of)."""
+    m = GLM5V_MERGE
+    if vit_h < m or vit_w < m or vit_h % m or vit_w % m:
+        return None
+    hp, wp = vit_h // m, vit_w // m
+    n = hp * wp
+    return hp * (wp + 1) if GLM5V_MIN_TOKENS <= n <= GLM5V_MAX_TOKENS else None
+
+
 def ink2_span(vit_h: int, vit_w: int) -> int | None:
     """The span of an Inkling-2-Small patch grid, None when its processor cannot produce it (ink2v::span_of)."""
     m = INK2_MERGE
@@ -281,9 +292,11 @@ def qw38_span(vit_h: int, vit_w: int) -> int | None:
 
 def image_span(vit_h: int, vit_w: int, model: str = 'ds41') -> int | None:
     """The span of a patch grid, None when the model's processor cannot produce it (ds41v::grid_of, glm5v::span_of,
-    ink2v::span_of, qw38v::span_of)."""
+    glm53v::span_of, ink2v::span_of, qw38v::span_of)."""
     if model == 'glm5v':
         return glm5v_span(vit_h, vit_w)
+    if model == 'glm53v':
+        return glm53v_span(vit_h, vit_w)
     if model == 'ink2':
         return ink2_span(vit_h, vit_w)
     if model == 'qw38':
@@ -297,11 +310,11 @@ def image_span(vit_h: int, vit_w: int, model: str = 'ds41') -> int | None:
 
 
 def vision_model(path: str) -> str:
-    """The image geometry vision.s2 names: glm5v, ink2, qw38, else ds41 (its file holds 1)."""
+    """The image geometry vision.s2 names: glm5v, glm53v, ink2, qw38, else ds41 (its file holds 1)."""
     try:
         with open(path) as fh:
             words = fh.read().split()
-        return words[0] if words in (['glm5v'], ['ink2'], ['qw38']) else 'ds41'
+        return words[0] if words in (['glm5v'], ['glm53v'], ['ink2'], ['qw38']) else 'ds41'
     except OSError:
         return 'ds41'
 
@@ -310,7 +323,12 @@ def images_field(images, prompt, model: str = 'ds41') -> tuple[str, str | None]:
     """The generate frame's `images` -> (the request line's img fields or '', error or None). Checks what
     g6s2::parse_request checks (a request it refuses ends the epoch): the grid, the span inside the prompt and made of the
     image token, ascending spans, the pixel bytes' size. model: the engine's image geometry (vision.s2)."""
-    token = {'glm5v': GLM5V_IMAGE_TOKEN, 'ink2': INK2_IMAGE_TOKEN, 'qw38': QW38_IMAGE_TOKEN}.get(model, IMAGE_TOKEN)
+    token = {
+        'glm5v': GLM5V_IMAGE_TOKEN,
+        'glm53v': GLM5V_IMAGE_TOKEN,
+        'ink2': INK2_IMAGE_TOKEN,
+        'qw38': QW38_IMAGE_TOKEN,
+    }.get(model, IMAGE_TOKEN)
     patch = {'ink2': INK2_PATCH, 'qw38': QW38_PATCH}.get(model, IMAGE_PATCH)
     if images is None or images == []:
         return '', None
@@ -638,6 +656,8 @@ class Shim:
             hello['grammar'] = True
         if self.cfg.get('vision'):
             hello['vision'] = True
+            if self.cfg.get('vision_model'):
+                hello['vision_model'] = self.cfg['vision_model']
         if self.cfg.get('penalty'):
             hello['penalties'] = True
         if self.cfg.get('boost'):

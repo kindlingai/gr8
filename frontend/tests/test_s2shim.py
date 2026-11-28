@@ -156,6 +156,16 @@ class UnitTests(unittest.TestCase):
         for b in ({**g, 'pos': 1}, {**g, 'vit_h': 6, 'vit_w': 6}, {**g, 'vit_h': 7}, {**g, 'vit_h': 2, 'vit_w': 16002}):
             self.assertIsNotNone(g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [b]}, 0, None, 'glm5v')[1], b)
         self.assertEqual(g6s2shim.image_span(178, 178, 'glm5v'), 7921)
+        # GLM-5.3 geometry (vision.s2 says glm53v): <|image|> rows, (vit_h/2) * (vit_w/2 + 1) with row breaks
+        gp53 = [5, 154830] + [G] * 20 + [154831, 6]
+        body, err = g6s2shim.build_request({'prompt': gp53, 'max_tokens': 4, 'images': [g]}, 0, None, 'glm53v')
+        self.assertIsNone(err)
+        self.assertTrue(body.split(b'\n')[0].endswith(b' img 2:8:8:0123456789abcdef:' + g['rgb'].encode()))
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [g]}, 0, None, 'glm53v')[1])
+        self.assertEqual(g6s2shim.image_span(8, 8, 'glm53v'), 20)
+        self.assertEqual(g6s2shim.image_span(178, 178, 'glm53v'), 8010)
+        self.assertEqual(g6s2shim.image_span(16000, 2, 'glm53v'), 16000)
+        self.assertIsNone(g6s2shim.image_span(2, 16002, 'glm53v'))
         # Inkling-2-Small geometry (vision.s2 says ink2): <|unused_200054|> rows, one per 2 x 2 patches of 20 px, 1 to 6400
         K = g6s2shim.INK2_IMAGE_TOKEN
         self.assertEqual(K, 200054)
@@ -206,7 +216,7 @@ class UnitTests(unittest.TestCase):
         self.assertIsNone(g6s2shim.image_span(258, 256, 'qw38'))
         import tempfile
         with tempfile.TemporaryDirectory() as d:
-            for text, want in (('glm5v\n', 'glm5v'), ('1\n', 'ds41'), ('ink2\n', 'ink2'), ('qw38\n', 'qw38')):
+            for text, want in (('glm5v\n', 'glm5v'), ('glm53v\n', 'glm53v'), ('1\n', 'ds41'), ('ink2\n', 'ink2'), ('qw38\n', 'qw38')):
                 with open(f'{d}/vision.s2', 'w') as fh:
                     fh.write(text)
                 self.assertEqual(g6s2shim.vision_model(f'{d}/vision.s2'), want)

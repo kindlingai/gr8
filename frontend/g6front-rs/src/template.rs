@@ -408,6 +408,61 @@ impl ChatTemplate {
         if n == 0 {
             return if placed.is_empty() { Ok((text, Vec::new())) } else { Err(literal()) };
         }
+        // A text-only chat template (such as GLM-5.3's shipped chat_template.jinja, which replaces image parts with a
+        // text reminder instead of emitting `<|image|>`) produces zero image marks on the first render. Substitute
+        // unique ASCII text sentinels for each image part so the template preserves its own message structure and
+        // literal-content protection, then expand each sentinel to `<|begin_of_image|><|image|><|end_of_image|>` (or
+        // `self.image_mark` for non-GLM templates) in rendered order.
+        if placed.is_empty() {
+            let mut prefix = "[[g6_img_slot_".to_string();
+            while text.contains(&prefix) || self.image_mark.contains(&prefix) {
+                prefix.push('_');
+            }
+            let mut i = 0usize;
+            let mut m = msgs.clone();
+            for_each_image(&mut m, &mut |p| {
+                p.clear();
+                p.insert("type".into(), Value::from("text"));
+                p.insert("text".into(), Value::from(format!("{prefix}{i}]]")));
+                i += 1;
+            });
+            let rendered = self.render(Some(&m), tools, kw)?;
+            if rendered.contains(VIDEO_MARK) || rendered.contains("<|video_pad|>") {
+                return Err("the prompt holds a video placeholder; videos are not supported".into());
+            }
+            if rendered.contains(&self.image_mark) {
+                return Err(literal());
+            }
+            let replacement = if self.image_mark == IMAGE_MARK {
+                "<|begin_of_image|><|image|><|end_of_image|>".to_string()
+            } else {
+                self.image_mark.clone()
+            };
+            let mut out = String::with_capacity(rendered.len() + n * replacement.len());
+            let mut ordered = Vec::with_capacity(n);
+            let mut rest = rendered.as_str();
+            while let Some(pos) = rest.find(&prefix) {
+                out.push_str(&rest[..pos]);
+                let after = &rest[pos + prefix.len()..];
+                let Some(end) = after.find("]]") else {
+                    return Err("the chat template places the images inconsistently".into());
+                };
+                let idx: usize = after[..end]
+                    .parse()
+                    .map_err(|_| TemplateError("the chat template places the images inconsistently".into()))?;
+                if idx >= n {
+                    return Err("the chat template places the images inconsistently".into());
+                }
+                out.push_str(&replacement);
+                ordered.push(blocks[idx].clone());
+                rest = &after[end + 2..];
+            }
+            out.push_str(rest);
+            if ordered.len() != n {
+                return Err("the chat template places the images inconsistently".into());
+            }
+            return Ok((out, ordered));
+        }
         // The sentinel must be the probes' own: lengthen it until neither the prompt nor the image mark holds it.
         let mut off_mark = if self.video_parts { VIDEO_MARK.to_string() } else { OFF_MARK.to_string() };
         while !self.video_parts && (text.contains(&off_mark) || self.image_mark.contains(&off_mark)) {
@@ -1478,5 +1533,38 @@ mod tests {
         assert_eq!(rendered.matches("<|vision_start|><|image_pad|><|vision_end|>").count(), 2);
         assert_eq!(blocks.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_images_falls_back_on_glm53_text_only_template() {
+        // Mirrors kindlingai/glm-5.3-exlr8-k2-k3-k4/chat_template.jinja which emits a text reminder for image parts.
+        let src = "{%- for m in messages -%}<|{{ m.role }}|>\n\
+            {%- if m.content is string -%}{{ m.content }}\
+            {%- else -%}{%- for item in m.content -%}\
+            {%- if item.type == 'text' -%}{{ item.text }}\
+            {%- elif item.type in ['image', 'image_url'] -%}<reminder>You are unable to process this image.</reminder>\
+            {%- endif -%}{%- endfor -%}{%- endif -%}{%- endfor -%}<|assistant|>\n";
+        let t = ChatTemplate::from_source(src.to_string(), Value::Null, Value::Null).unwrap();
+        let img = |k: u32| json!({"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{k}")}});
+        let msgs = json!([
+            {"role": "user", "content": [img(0), {"type": "text", "text": " and "}, {"type": "input_image", "image_url": "data:image/png;base64,1"}, {"type": "text", "text": "?"}]}
+        ]);
+        let (rendered, blocks) = t.render_images(Some(&msgs), None, Map::new()).unwrap();
+        assert_eq!(
+            rendered,
+            "<|user|>\n<|begin_of_image|><|image|><|end_of_image|> and <|begin_of_image|><|image|><|end_of_image|>?<|assistant|>\n"
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(crate::vision::block_b64(&blocks[0]).unwrap(), "0");
+        assert_eq!(crate::vision::block_b64(&blocks[1]).unwrap(), "1");
+        // Literal <|image|> in user text is still refused.
+        let lit = json!([{"role": "user", "content": [img(0), {"type": "text", "text": "see <|image|>"}]}]);
+        assert!(t.render_images(Some(&lit), None, Map::new()).is_err());
+        // Literal sentinel text in user text does not confuse fallback ordering.
+        let sent = json!([{"role": "user", "content": [img(0), {"type": "text", "text": "[[g6_img_slot_0]]"}, img(1)]}]);
+        let (rendered, blocks) = t.render_images(Some(&sent), None, Map::new()).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(rendered.contains("[[g6_img_slot_0]]"), "{rendered}");
+        assert_eq!(rendered.matches("<|begin_of_image|><|image|><|end_of_image|>").count(), 2);
     }
 }

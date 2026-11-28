@@ -563,6 +563,11 @@ struct Prefill
     bool qp_built = false;            //   built with GR8_PF_OWN=4 (qp is then chosen per request, pf_qp_select)
     int qp_ctx = 0;                   //   largest prompt + gen that may run OWN=4: the QO key / RoPE table size
     uint16_t* part[2] = {nullptr, nullptr};
+    // image input (GR8_GLM53_VISION, glm53_vision_stage.cuh): a launch with image rows (vis_n > 0) embeds row r from
+    // vis_pool[vis_row[r]] when vis_row[r] >= 0; text-only launches keep vis_n == 0 and run k_embed_norm unchanged.
+    int* vis_row = nullptr;                   // [Mmax] device row map (-1 = text token)
+    const __nv_bfloat16* vis_pool = nullptr;  // [pool_rows][HID] shared across lanes of one quantum
+    int vis_n = 0;
     int *tok = nullptr, *pos = nullptr;
     void* scratch = nullptr;
     bindp::Scratch sc;
@@ -1136,6 +1141,13 @@ inline void pf_inputs(Prefill& P, int M, const int* tok, const int* pos)
 }
 inline void pf_embed(Model& m, Prefill& P, int M, cudaStream_t st)
 {
+    if (P.vis_n > 0)
+    {
+        glue::EmbedVisArgs a{P.tok, m.emb, m.layers[0].attn_norm, P.resid, P.x, glue::RMS_EPS,
+                             m.emb_i8, m.emb_scale, P.vis_row, P.vis_pool};
+        glue::k_embed_norm_vis<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
+        return;
+    }
     glue::EmbedArgs a{P.tok, m.emb, m.layers[0].attn_norm, P.resid, P.x, glue::RMS_EPS, m.emb_i8, m.emb_scale};
     glue::k_embed_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(a);
 }
