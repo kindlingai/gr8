@@ -750,7 +750,26 @@ __global__ void k_moe_finalize_res_f32(const float* __restrict__ routed_f32,
     }
 }
 
-// On-GPU zero-host-sync Ref MoE fallback kernels for CUDA-graph-capturable decode on store-0 (FP8_BLOCK) or BF16 experts.
+// Dequantize 4 packed FP8 E4M3 bytes in `w4` scaled by `s` into 4 FP32 values.
+__device__ __forceinline__ float4 tts_deq4_e4m3(uint32_t w4, float s) {
+    const uint16_t lo = static_cast<uint16_t>(w4 & 0xffffu);
+    const uint16_t hi = static_cast<uint16_t>(w4 >> 16);
+    uint32_t h0 = 0, h1 = 0;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h0) : "h"(lo));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h1) : "h"(hi));
+    const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&h0));
+    const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&h1));
+    return make_float4(f0.x * s, f0.y * s, f1.x * s, f1.y * s);
+}
+
+__device__ __forceinline__ float tts_dot4_bf16_f4(uint2 xv, float4 w) {
+    const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+    const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+    return fmaf(x01.x, w.x, fmaf(x01.y, w.y, fmaf(x23.x, w.z, x23.y * w.w)));
+}
+
+// On-GPU zero-host-sync Ref MoE kernels for store-0 (FP8_BLOCK) or BF16 experts.
+// Single-token / ungrouped path (used for M == 1, 8 distinct experts) with 128-bit LDG.E.128 loads.
 // Grid: (M * TOPK, I / 4), Block: 128 (4 warps, 1 warp per intermediate channel).
 __global__ void __launch_bounds__(128) k_ref_moe_fc1_route(
     const bf16* __restrict__ x_norm,
@@ -779,43 +798,41 @@ __global__ void __launch_bounds__(128) k_ref_moe_fc1_route(
         const size_t sc_base = (size_t(e) * bo + (i >> 7)) * bi;
         const uint8_t* gr = gate_fp8 + size_t(e) * mat_elems + size_t(i) * H;
         const uint8_t* ur = up_fp8 + size_t(e) * mat_elems + size_t(i) * H;
-        for (int k = lane * 4; k < H; k += 128) {
-            const uint2 xv = *reinterpret_cast<const uint2*>(xr + k);
-            const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
-            const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+        // 16 elements/lane * 32 lanes = 512 elements/iter; each uint4 sits strictly inside one 128-elem scale block.
+        for (int k = lane * 16; k < H; k += 512) {
             const float gs = gate_sc[sc_base + (k >> 7)];
             const float us = up_sc[sc_base + (k >> 7)];
-            const uint32_t gw = *reinterpret_cast<const uint32_t*>(gr + k);
-            const uint32_t uw = *reinterpret_cast<const uint32_t*>(ur + k);
-            const uint16_t g0 = static_cast<uint16_t>(gw & 0xffffu), g1 = static_cast<uint16_t>(gw >> 16);
-            const uint16_t u0 = static_cast<uint16_t>(uw & 0xffffu), u1 = static_cast<uint16_t>(uw >> 16);
-            uint32_t gh0 = 0, gh1 = 0, uh0 = 0, uh1 = 0;
-            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(gh0) : "h"(g0));
-            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(gh1) : "h"(g1));
-            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(uh0) : "h"(u0));
-            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(uh1) : "h"(u1));
-            const float2 gf0 = __half22float2(*reinterpret_cast<const __half2*>(&gh0));
-            const float2 gf1 = __half22float2(*reinterpret_cast<const __half2*>(&gh1));
-            const float2 uf0 = __half22float2(*reinterpret_cast<const __half2*>(&uh0));
-            const float2 uf1 = __half22float2(*reinterpret_cast<const __half2*>(&uh1));
-            ag += gs * (x01.x * gf0.x + x01.y * gf0.y + x23.x * gf1.x + x23.y * gf1.y);
-            au += us * (x01.x * uf0.x + x01.y * uf0.y + x23.x * uf1.x + x23.y * uf1.y);
+            const uint4 gw = *reinterpret_cast<const uint4*>(gr + k);
+            const uint4 uw = *reinterpret_cast<const uint4*>(ur + k);
+            const uint4 xv0 = *reinterpret_cast<const uint4*>(xr + k);
+            const uint4 xv1 = *reinterpret_cast<const uint4*>(xr + k + 8);
+            ag += tts_dot4_bf16_f4(make_uint2(xv0.x, xv0.y), tts_deq4_e4m3(gw.x, gs));
+            ag += tts_dot4_bf16_f4(make_uint2(xv0.z, xv0.w), tts_deq4_e4m3(gw.y, gs));
+            ag += tts_dot4_bf16_f4(make_uint2(xv1.x, xv1.y), tts_deq4_e4m3(gw.z, gs));
+            ag += tts_dot4_bf16_f4(make_uint2(xv1.z, xv1.w), tts_deq4_e4m3(gw.w, gs));
+            au += tts_dot4_bf16_f4(make_uint2(xv0.x, xv0.y), tts_deq4_e4m3(uw.x, us));
+            au += tts_dot4_bf16_f4(make_uint2(xv0.z, xv0.w), tts_deq4_e4m3(uw.y, us));
+            au += tts_dot4_bf16_f4(make_uint2(xv1.x, xv1.y), tts_deq4_e4m3(uw.z, us));
+            au += tts_dot4_bf16_f4(make_uint2(xv1.z, xv1.w), tts_deq4_e4m3(uw.w, us));
         }
     } else {
         const bf16* gr = gate_bf16 + size_t(e) * mat_elems + size_t(i) * H;
         const bf16* ur = up_bf16 + size_t(e) * mat_elems + size_t(i) * H;
-        for (int k = lane * 4; k < H; k += 128) {
-            const uint2 xv = *reinterpret_cast<const uint2*>(xr + k);
-            const uint2 gv = *reinterpret_cast<const uint2*>(gr + k);
-            const uint2 uv = *reinterpret_cast<const uint2*>(ur + k);
-            const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
-            const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
-            const float2 gf0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gv.x));
-            const float2 gf1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gv.y));
-            const float2 uf0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uv.x));
-            const float2 uf1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uv.y));
-            ag += x01.x * gf0.x + x01.y * gf0.y + x23.x * gf1.x + x23.y * gf1.y;
-            au += x01.x * uf0.x + x01.y * uf0.y + x23.x * uf1.x + x23.y * uf1.y;
+        for (int k = lane * 8; k < H; k += 256) {
+            const uint4 xv = *reinterpret_cast<const uint4*>(xr + k);
+            const uint4 gv = *reinterpret_cast<const uint4*>(gr + k);
+            const uint4 uv = *reinterpret_cast<const uint4*>(ur + k);
+            const uint32_t xa[4] = {xv.x, xv.y, xv.z, xv.w};
+            const uint32_t ga[4] = {gv.x, gv.y, gv.z, gv.w};
+            const uint32_t ua[4] = {uv.x, uv.y, uv.z, uv.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 xf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xa[j]));
+                const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ga[j]));
+                const float2 uf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ua[j]));
+                ag = fmaf(xf.x, gf.x, fmaf(xf.y, gf.y, ag));
+                au = fmaf(xf.x, uf.x, fmaf(xf.y, uf.y, au));
+            }
         }
     }
 
@@ -853,36 +870,211 @@ __global__ void __launch_bounds__(128) k_ref_moe_fc2_route(
         const int bi = (I + 127) / 128;
         const size_t sc_base = (size_t(e) * bo + (h >> 7)) * bi;
         const uint8_t* dr = down_fp8 + size_t(e) * mat_elems + size_t(h) * I;
-        for (int k = lane * 4; k < I; k += 128) {
-            const uint2 av = *reinterpret_cast<const uint2*>(ar + k);
-            const float2 a01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av.x));
-            const float2 a23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av.y));
+        for (int k = lane * 16; k < I; k += 512) {
             const float ds = down_sc[sc_base + (k >> 7)];
-            const uint32_t dw = *reinterpret_cast<const uint32_t*>(dr + k);
-            const uint16_t d0 = static_cast<uint16_t>(dw & 0xffffu), d1 = static_cast<uint16_t>(dw >> 16);
-            uint32_t dh0 = 0, dh1 = 0;
-            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(dh0) : "h"(d0));
-            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(dh1) : "h"(d1));
-            const float2 df0 = __half22float2(*reinterpret_cast<const __half2*>(&dh0));
-            const float2 df1 = __half22float2(*reinterpret_cast<const __half2*>(&dh1));
-            ad += ds * (a01.x * df0.x + a01.y * df0.y + a23.x * df1.x + a23.y * df1.y);
+            const uint4 dw = *reinterpret_cast<const uint4*>(dr + k);
+            const uint4 av0 = *reinterpret_cast<const uint4*>(ar + k);
+            const uint4 av1 = *reinterpret_cast<const uint4*>(ar + k + 8);
+            ad += tts_dot4_bf16_f4(make_uint2(av0.x, av0.y), tts_deq4_e4m3(dw.x, ds));
+            ad += tts_dot4_bf16_f4(make_uint2(av0.z, av0.w), tts_deq4_e4m3(dw.y, ds));
+            ad += tts_dot4_bf16_f4(make_uint2(av1.x, av1.y), tts_deq4_e4m3(dw.z, ds));
+            ad += tts_dot4_bf16_f4(make_uint2(av1.z, av1.w), tts_deq4_e4m3(dw.w, ds));
         }
     } else {
         const bf16* dr = down_bf16 + size_t(e) * mat_elems + size_t(h) * I;
-        for (int k = lane * 4; k < I; k += 128) {
-            const uint2 av = *reinterpret_cast<const uint2*>(ar + k);
-            const uint2 dv = *reinterpret_cast<const uint2*>(dr + k);
-            const float2 a01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av.x));
-            const float2 a23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av.y));
-            const float2 df0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&dv.x));
-            const float2 df1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&dv.y));
-            ad += a01.x * df0.x + a01.y * df0.y + a23.x * df1.x + a23.y * df1.y;
+        for (int k = lane * 8; k < I; k += 256) {
+            const uint4 av = *reinterpret_cast<const uint4*>(ar + k);
+            const uint4 dv = *reinterpret_cast<const uint4*>(dr + k);
+            const uint32_t aa[4] = {av.x, av.y, av.z, av.w};
+            const uint32_t da[4] = {dv.x, dv.y, dv.z, dv.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 af = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&aa[j]));
+                const float2 df = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&da[j]));
+                ad = fmaf(af.x, df.x, fmaf(af.y, df.y, ad));
+            }
         }
     }
 
     ad = tts_warp_sum(ad);
     if (lane == 0) {
         route_out[size_t(route) * H + h] = rw * ad;
+    }
+}
+
+// Grouped zero-host-sync Ref MoE FC1 for M >= 2 (prefill M=2..128 AND batched decode M=2,4,8).
+// Reads each active expert's gate+up weights ONCE from DRAM per group of up to 8 tokens!
+// Grid: (max_groups, I / 4), Block: 128 (4 warps, 1 warp per intermediate channel).
+__global__ void __launch_bounds__(128) k_ref_moe_fc1_grouped(
+    const bf16* __restrict__ x_norm,
+    const int32_t* __restrict__ d_n_groups,
+    const int32_t* __restrict__ grp_exp,
+    const int32_t* __restrict__ grp_cnt,
+    const int32_t* __restrict__ grp_routes,
+    const uint8_t* __restrict__ gate_fp8, const float* __restrict__ gate_sc,
+    const uint8_t* __restrict__ up_fp8,   const float* __restrict__ up_sc,
+    const bf16* __restrict__ gate_bf16,   const bf16* __restrict__ up_bf16,
+    bf16* __restrict__ route_act,
+    int H, int I, int topk, bool is_fp8) {
+    const int g = blockIdx.x;
+    if (g >= d_n_groups[0]) return;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int i = blockIdx.y * 4 + warp;
+    if (i >= I) return;
+
+    const int e = grp_exp[g];
+    const int cnt = grp_cnt[g]; // 1..8
+    int r_ids[8];
+    int m_ids[8];
+    #pragma unroll
+    for (int b = 0; b < 8; ++b) {
+        if (b < cnt) {
+            r_ids[b] = grp_routes[g * 8 + b];
+            m_ids[b] = r_ids[b] / topk;
+        } else {
+            r_ids[b] = 0;
+            m_ids[b] = 0;
+        }
+    }
+
+    float ag[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float au[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const size_t mat_elems = size_t(I) * H;
+
+    if (is_fp8) {
+        const int bo = (I + 127) / 128;
+        const int bi = (H + 127) / 128;
+        const size_t sc_base = (size_t(e) * bo + (i >> 7)) * bi;
+        const uint8_t* gr = gate_fp8 + size_t(e) * mat_elems + size_t(i) * H;
+        const uint8_t* ur = up_fp8 + size_t(e) * mat_elems + size_t(i) * H;
+        for (int k = lane * 16; k < H; k += 512) {
+            const float gs = gate_sc[sc_base + (k >> 7)];
+            const float us = up_sc[sc_base + (k >> 7)];
+            const uint4 gw = *reinterpret_cast<const uint4*>(gr + k);
+            const uint4 uw = *reinterpret_cast<const uint4*>(ur + k);
+            const uint32_t gwa[4] = {gw.x, gw.y, gw.z, gw.w};
+            const uint32_t uwa[4] = {uw.x, uw.y, uw.z, uw.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float4 gf = tts_deq4_e4m3(gwa[j], gs);
+                const float4 uf = tts_deq4_e4m3(uwa[j], us);
+                const int kj = k + j * 4;
+                for (int b = 0; b < cnt; ++b) {
+                    const uint2 xv = *reinterpret_cast<const uint2*>(x_norm + size_t(m_ids[b]) * H + kj);
+                    ag[b] += tts_dot4_bf16_f4(xv, gf);
+                    au[b] += tts_dot4_bf16_f4(xv, uf);
+                }
+            }
+        }
+    } else {
+        const bf16* gr = gate_bf16 + size_t(e) * mat_elems + size_t(i) * H;
+        const bf16* ur = up_bf16 + size_t(e) * mat_elems + size_t(i) * H;
+        for (int k = lane * 8; k < H; k += 256) {
+            const uint4 gv = *reinterpret_cast<const uint4*>(gr + k);
+            const uint4 uv = *reinterpret_cast<const uint4*>(ur + k);
+            const uint32_t ga[4] = {gv.x, gv.y, gv.z, gv.w};
+            const uint32_t ua[4] = {uv.x, uv.y, uv.z, uv.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ga[j]));
+                const float2 uf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ua[j]));
+                const int kj = k + j * 2;
+                for (int b = 0; b < cnt; ++b) {
+                    const uint32_t xv = *reinterpret_cast<const uint32_t*>(x_norm + size_t(m_ids[b]) * H + kj);
+                    const float2 xf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv));
+                    ag[b] = fmaf(xf.x, gf.x, fmaf(xf.y, gf.y, ag[b]));
+                    au[b] = fmaf(xf.x, uf.x, fmaf(xf.y, uf.y, au[b]));
+                }
+            }
+        }
+    }
+
+    for (int b = 0; b < cnt; ++b) {
+        const float g_sum = tts_warp_sum(ag[b]);
+        const float u_sum = tts_warp_sum(au[b]);
+        if (lane == 0) {
+            route_act[size_t(r_ids[b]) * I + i] =
+                __float2bfloat16_rn(tts_rbf16(tts_silu(tts_rbf16(g_sum))) * tts_rbf16(u_sum));
+        }
+    }
+}
+
+// Grouped zero-host-sync Ref MoE FC2 for M >= 2.
+// Reads each active expert's down weight ONCE from DRAM per group of up to 8 tokens!
+// Grid: (max_groups, H / 4), Block: 128 (4 warps, 1 warp per hidden channel).
+__global__ void __launch_bounds__(128) k_ref_moe_fc2_grouped(
+    const bf16* __restrict__ route_act,
+    const int32_t* __restrict__ d_n_groups,
+    const int32_t* __restrict__ grp_exp,
+    const int32_t* __restrict__ grp_cnt,
+    const int32_t* __restrict__ grp_routes,
+    const float* __restrict__ topk_w,
+    const uint8_t* __restrict__ down_fp8, const float* __restrict__ down_sc,
+    const bf16* __restrict__ down_bf16,
+    float* __restrict__ route_out,
+    int H, int I, bool is_fp8) {
+    const int g = blockIdx.x;
+    if (g >= d_n_groups[0]) return;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int h = blockIdx.y * 4 + warp;
+    if (h >= H) return;
+
+    const int e = grp_exp[g];
+    const int cnt = grp_cnt[g]; // 1..8
+    int r_ids[8];
+    #pragma unroll
+    for (int b = 0; b < 8; ++b) {
+        r_ids[b] = (b < cnt) ? grp_routes[g * 8 + b] : 0;
+    }
+
+    float ad[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const size_t mat_elems = size_t(H) * I;
+
+    if (is_fp8) {
+        const int bo = (H + 127) / 128;
+        const int bi = (I + 127) / 128;
+        const size_t sc_base = (size_t(e) * bo + (h >> 7)) * bi;
+        const uint8_t* dr = down_fp8 + size_t(e) * mat_elems + size_t(h) * I;
+        for (int k = lane * 16; k < I; k += 512) {
+            const float ds = down_sc[sc_base + (k >> 7)];
+            const uint4 dw = *reinterpret_cast<const uint4*>(dr + k);
+            const uint32_t dwa[4] = {dw.x, dw.y, dw.z, dw.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float4 df = tts_deq4_e4m3(dwa[j], ds);
+                const int kj = k + j * 4;
+                for (int b = 0; b < cnt; ++b) {
+                    const uint2 av = *reinterpret_cast<const uint2*>(route_act + size_t(r_ids[b]) * I + kj);
+                    ad[b] += tts_dot4_bf16_f4(av, df);
+                }
+            }
+        }
+    } else {
+        const bf16* dr = down_bf16 + size_t(e) * mat_elems + size_t(h) * I;
+        for (int k = lane * 8; k < I; k += 256) {
+            const uint4 dv = *reinterpret_cast<const uint4*>(dr + k);
+            const uint32_t da[4] = {dv.x, dv.y, dv.z, dv.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 df = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&da[j]));
+                const int kj = k + j * 2;
+                for (int b = 0; b < cnt; ++b) {
+                    const uint32_t av = *reinterpret_cast<const uint32_t*>(route_act + size_t(r_ids[b]) * I + kj);
+                    const float2 af = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av));
+                    ad[b] = fmaf(af.x, df.x, fmaf(af.y, df.y, ad[b]));
+                }
+            }
+        }
+    }
+
+    for (int b = 0; b < cnt; ++b) {
+        const float d_sum = tts_warp_sum(ad[b]);
+        if (lane == 0) {
+            const int r = r_ids[b];
+            route_out[size_t(r) * H + h] = topk_w[r] * d_sum;
+        }
     }
 }
 
@@ -980,8 +1172,12 @@ struct BackboneRunner {
     bf16* d_deq_g = nullptr;            // [512, 2048] scratch for on-the-fly FP8 expert dequant
     bf16* d_deq_u = nullptr;            // [512, 2048]
     bf16* d_deq_d = nullptr;            // [2048, 512]
-    bf16* d_route_act = nullptr;        // [max_graph_M * top_k, I] (on-GPU Ref MoE for CUDA graph capture)
-    float* d_route_out = nullptr;       // [max_graph_M * top_k, H]
+    bf16* d_route_act = nullptr;        // [max_chunk * top_k, I] (on-GPU Ref MoE for prefill & decode)
+    float* d_route_out = nullptr;       // [max_chunk * top_k, H]
+    int32_t* d_ref_n_groups = nullptr;  // [1]
+    int32_t* d_ref_grp_exp = nullptr;   // [max_chunk * top_k]
+    int32_t* d_ref_grp_cnt = nullptr;   // [max_chunk * top_k]
+    int32_t* d_ref_grp_routes = nullptr;// [max_chunk * top_k * 8]
     int max_graph_M = 16;
     bf16* d_final_bf16 = nullptr;       // [max_chunk, H]
     float* d_final_f32 = nullptr;       // [max_chunk, H]
@@ -1002,11 +1198,16 @@ struct BackboneRunner {
     TtsMoeScratch moe_sc;
     BackboneProfile prof;
     BackboneLayerTrace trace;
-    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+    cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev_upload = nullptr;
+    bool upload_pending = false;
 
     ~BackboneRunner() { release(); }
 
     void release() {
+        if (upload_pending && ev_upload) {
+            cudaEventSynchronize(ev_upload);
+            upload_pending = false;
+        }
         auto freep = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
         auto freeh = [](auto*& p) { if (p) { cudaFreeHost(p); p = nullptr; } };
         dense_ws.release();
@@ -1025,11 +1226,13 @@ struct BackboneRunner {
         freep(d_exp_rows); freep(d_exp_w);
         freep(d_deq_g); freep(d_deq_u); freep(d_deq_d);
         freep(d_route_act); freep(d_route_out);
+        freep(d_ref_n_groups); freep(d_ref_grp_exp); freep(d_ref_grp_cnt); freep(d_ref_grp_routes);
         freep(d_final_bf16); freep(d_final_f32); freep(d_main_logits);
         freeh(h_topk_ids); freeh(h_topk_w); freeh(h_exp_rows); freeh(h_exp_w);
         freeh(h_rows_stage); freeh(h_slots); freeh(h_pos);
         if (ev0) { cudaEventDestroy(ev0); ev0 = nullptr; }
         if (ev1) { cudaEventDestroy(ev1); ev1 = nullptr; }
+        if (ev_upload) { cudaEventDestroy(ev_upload); ev_upload = nullptr; }
         if (blas) { cublasDestroy(blas); blas = nullptr; }
         freep(d_cublas_ws);
         scratch_bytes = 0;
@@ -1048,6 +1251,8 @@ struct BackboneRunner {
         scratch_bytes = CUBLAS_WS_BYTES;
         TTS_CK(cudaEventCreate(&ev0));
         TTS_CK(cudaEventCreate(&ev1));
+        TTS_CK(cudaEventCreate(&ev_upload));
+        upload_pending = false;
 
         const auto& c = W->cfg;
         const int L = c.num_layers;
@@ -1123,8 +1328,13 @@ struct BackboneRunner {
         alloc_d(d_deq_u, size_t(I) * H);
         alloc_d(d_deq_d, size_t(H) * I);
         max_graph_M = std::min(max_chunk, std::max(16, max_slots));
-        alloc_d(d_route_act, size_t(max_graph_M) * c.top_k * I);
-        alloc_d(d_route_out, size_t(max_graph_M) * c.top_k * H);
+        const size_t max_ref_routes = size_t(max_chunk) * c.top_k;
+        alloc_d(d_route_act, max_ref_routes * I);
+        alloc_d(d_route_out, max_ref_routes * H);
+        alloc_d(d_ref_n_groups, 1);
+        alloc_d(d_ref_grp_exp, max_ref_routes);
+        alloc_d(d_ref_grp_cnt, max_ref_routes);
+        alloc_d(d_ref_grp_routes, max_ref_routes * 8);
         alloc_d(d_final_bf16, size_t(max_chunk) * H);
         alloc_d(d_final_f32, size_t(max_chunk) * H);
         alloc_d(d_main_logits, size_t(max_chunk) * n_cand);
@@ -1183,6 +1393,41 @@ struct BackboneRunner {
                  M, c.main_candidates(), c.hidden_size, false, stream);
     }
 
+    // Zero-host-sync on-GPU Ref MoE (FP8_BLOCK or BF16) shared by both prefill (`forward`) and decode (`forward_device`).
+    // Uses 128-bit LDG.E.128 per-route kernels for M == 1 (8 distinct experts) and on-GPU grouped
+    // weight-sharing kernels for M >= 2 (up to 8 tokens/group, reading each active expert ONCE from DRAM).
+    void run_ref_moe(const BackboneLayerW& LW, int M, cudaStream_t stream) {
+        const auto& c = W->cfg;
+        const int H = c.hidden_size;
+        const int I = c.moe_intermediate;
+        const int n_routes = M * c.top_k;
+        if (M == 1 || c.num_experts != MOE_NEXP || c.top_k != MOE_TOPK) {
+            k_ref_moe_fc1_route<<<dim3(n_routes, (I + 3) / 4), 128, 0, stream>>>(
+                d_norm, d_topk_ids,
+                LW.exp_gate_fp8, LW.exp_gate_sc, LW.exp_up_fp8, LW.exp_up_sc,
+                LW.exp_gate_bf16, LW.exp_up_bf16, d_route_act,
+                M, H, I, c.top_k, LW.experts_fp8);
+            k_ref_moe_fc2_route<<<dim3(n_routes, (H + 3) / 4), 128, 0, stream>>>(
+                d_route_act, d_topk_ids, d_topk_w,
+                LW.exp_down_fp8, LW.exp_down_sc, LW.exp_down_bf16, d_route_out,
+                M, H, I, c.top_k, LW.experts_fp8);
+        } else {
+            const int max_groups = std::min(n_routes, MOE_NEXP + n_routes / 8);
+            k_tts_moe_build_groups<<<1, MOE_NEXP, 0, stream>>>(
+                d_topk_ids, d_ref_n_groups, d_ref_grp_exp, d_ref_grp_cnt, d_ref_grp_routes, n_routes);
+            k_ref_moe_fc1_grouped<<<dim3(max_groups, (I + 3) / 4), 128, 0, stream>>>(
+                d_norm, d_ref_n_groups, d_ref_grp_exp, d_ref_grp_cnt, d_ref_grp_routes,
+                LW.exp_gate_fp8, LW.exp_gate_sc, LW.exp_up_fp8, LW.exp_up_sc,
+                LW.exp_gate_bf16, LW.exp_up_bf16, d_route_act,
+                H, I, c.top_k, LW.experts_fp8);
+            k_ref_moe_fc2_grouped<<<dim3(max_groups, (H + 3) / 4), 128, 0, stream>>>(
+                d_route_act, d_ref_n_groups, d_ref_grp_exp, d_ref_grp_cnt, d_ref_grp_routes,
+                d_topk_w, LW.exp_down_fp8, LW.exp_down_sc, LW.exp_down_bf16, d_route_out,
+                H, I, LW.experts_fp8);
+        }
+        k_tts_moe_combine_f32<<<M * 8, 64, 0, stream>>>(d_route_out, d_moe_routed_f32, M);
+    }
+
     // 100% on-GPU, zero-host-sync, CUDA-graph-capturable batched decode forward.
     // All inputs (`dev_rows [M, 11]`, `dev_slots [M]`, `dev_pos [M]`) live on device.
     // Produces `d_final_bf16 [M, H]` (and `d_main_logits [M, 4097]` if `compute_logits`).
@@ -1194,7 +1439,6 @@ struct BackboneRunner {
         TTS_BLAS_CK(cublasSetStream(blas, stream));
         const auto& c = W->cfg;
         const int H = c.hidden_size;
-        const int I = c.moe_intermediate;
         const int qkv_dim = (2 * c.gdn_kh + c.gdn_vh) * c.gdn_kd;
         const int val_dim = c.gdn_vh * c.gdn_vd;
         const int kv_dim = c.num_kv_heads * c.head_dim;
@@ -1305,17 +1549,7 @@ struct BackboneRunner {
             if (LW.tr3.valid) {
                 tts_moe_routed_forward(LW.tr3, d_topk_ids, d_topk_w, M, moe_sc, d_moe_routed_f32, stream);
             } else {
-                const int n_routes = M * c.top_k;
-                k_ref_moe_fc1_route<<<dim3(n_routes, (I + 3) / 4), 128, 0, stream>>>(
-                    d_norm, d_topk_ids,
-                    LW.exp_gate_fp8, LW.exp_gate_sc, LW.exp_up_fp8, LW.exp_up_sc,
-                    LW.exp_gate_bf16, LW.exp_up_bf16, d_route_act,
-                    M, H, I, c.top_k, LW.experts_fp8);
-                k_ref_moe_fc2_route<<<dim3(n_routes, (H + 3) / 4), 128, 0, stream>>>(
-                    d_route_act, d_topk_ids, d_topk_w,
-                    LW.exp_down_fp8, LW.exp_down_sc, LW.exp_down_bf16, d_route_out,
-                    M, H, I, c.top_k, LW.experts_fp8);
-                k_tts_moe_combine_f32<<<M * 8, 64, 0, stream>>>(d_route_out, d_moe_routed_f32, M);
+                run_ref_moe(LW, M, stream);
             }
             k_moe_finalize_res_f32<<<M, 256, 0, stream>>>(d_moe_routed_f32, d_shared_out, d_shared_gate, d_residual, M, H);
             toc(prof.moe_ms);
@@ -1348,11 +1582,14 @@ struct BackboneRunner {
         TTS_BLAS_CK(cublasSetStream(blas, stream));
         const auto& c = W->cfg;
         const int H = c.hidden_size;
-        const int I = c.moe_intermediate;
         const int qkv_dim = (2 * c.gdn_kh + c.gdn_vh) * c.gdn_kd;
         const int val_dim = c.gdn_vh * c.gdn_vd;
         const int kv_dim = c.num_kv_heads * c.head_dim;
 
+        if (upload_pending) {
+            TTS_CK(cudaEventSynchronize(ev_upload));
+            upload_pending = false;
+        }
         std::memcpy(h_rows_stage, h_rows, size_t(M) * c.row_width() * sizeof(int32_t));
         for (int m = 0; m < M; ++m) {
             h_slots[m] = is_single_slot_seg ? seg_slot : slots_host[m];
@@ -1361,6 +1598,8 @@ struct BackboneRunner {
         TTS_CK(cudaMemcpyAsync(d_rows, h_rows_stage, size_t(M) * c.row_width() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         TTS_CK(cudaMemcpyAsync(d_slots, h_slots, size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         TTS_CK(cudaMemcpyAsync(d_pos, h_pos, size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        TTS_CK(cudaEventRecord(ev_upload, stream));
+        upload_pending = true;
 
         auto tic = [&]() { if (prof.enabled) cudaEventRecord(ev0, stream); };
         auto toc = [&](double& dst) {
@@ -1395,9 +1634,6 @@ struct BackboneRunner {
                                    cudaMemcpyDeviceToHost, stream));
             TTS_CK(cudaStreamSynchronize(stream));
         }
-
-        // Reuse grouping vectors across layers (fallback Ref MoE path)
-        std::vector<std::vector<std::pair<int32_t, float>>> exp_buckets(static_cast<size_t>(c.num_experts));
 
         for (int l = 0; l < c.num_layers; ++l) {
             const BackboneLayerW& LW = W->layers[size_t(l)];
@@ -1539,83 +1775,8 @@ struct BackboneRunner {
                 // Native grouped EXLR8 trellis routed experts (zero host sync!)
                 tts_moe_routed_forward(LW.tr3, d_topk_ids, d_topk_w, M, moe_sc, d_moe_routed_f32, stream);
             } else {
-                // Fallback Reference grouped routed experts (FP8_BLOCK or BF16)
-                TTS_CK(cudaMemsetAsync(d_moe_routed_f32, 0, size_t(M) * H * sizeof(float), stream));
-                TTS_CK(cudaMemcpyAsync(h_topk_ids, d_topk_ids, size_t(M) * c.top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-                TTS_CK(cudaMemcpyAsync(h_topk_w, d_topk_w, size_t(M) * c.top_k * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                TTS_CK(cudaStreamSynchronize(stream));
-
-                for (auto& b : exp_buckets) b.clear();
-                for (int m = 0; m < M; ++m) {
-                    for (int k = 0; k < c.top_k; ++k) {
-                        const int e = h_topk_ids[m * c.top_k + k];
-                        const float w = h_topk_w[m * c.top_k + k];
-                        exp_buckets[size_t(e)].push_back({m, w});
-                    }
-                }
-
-                const int bo_gu = (I + 127) / 128;
-                const int bi_gu = (H + 127) / 128;
-                const int bo_dn = (H + 127) / 128;
-                const int bi_dn = (I + 127) / 128;
-                const size_t gu_elems = size_t(I) * H;
-                const size_t gu_sc_elems = size_t(bo_gu) * bi_gu;
-                const size_t dn_sc_elems = size_t(bo_dn) * bi_dn;
-
-                struct ExpertSlice { int e; int off; int cnt; };
-                std::vector<ExpertSlice> active_slices;
-                active_slices.reserve(static_cast<size_t>(std::min(M * c.top_k, c.num_experts)));
-                int total_pairs = 0;
-                for (int e = 0; e < c.num_experts; ++e) {
-                    const auto& bucket = exp_buckets[size_t(e)];
-                    if (bucket.empty()) continue;
-                    const int cnt = static_cast<int>(bucket.size());
-                    active_slices.push_back({e, total_pairs, cnt});
-                    for (int i = 0; i < cnt; ++i) {
-                        h_exp_rows[total_pairs + i] = bucket[size_t(i)].first;
-                        h_exp_w[total_pairs + i] = bucket[size_t(i)].second;
-                    }
-                    total_pairs += cnt;
-                }
-                if (total_pairs > 0) {
-                    TTS_CK(cudaMemcpyAsync(d_exp_rows, h_exp_rows, size_t(total_pairs) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                    TTS_CK(cudaMemcpyAsync(d_exp_w, h_exp_w, size_t(total_pairs) * sizeof(float), cudaMemcpyHostToDevice, stream));
-                }
-
-                for (const auto& sl : active_slices) {
-                    const int e = sl.e;
-                    const int off = sl.off;
-                    const int cnt = sl.cnt;
-                    k_gather_rows_bf16<<<cnt, 256, 0, stream>>>(d_norm, d_exp_rows + off, d_exp_x, cnt, H);
-
-                    const bf16* wg = nullptr;
-                    const bf16* wu = nullptr;
-                    const bf16* wd = nullptr;
-                    if (LW.experts_fp8) {
-                        const int blocks = int((gu_elems + 255) / 256);
-                        k_dequant_fp8_block128<<<blocks, 256, 0, stream>>>(
-                            LW.exp_gate_fp8 + size_t(e) * gu_elems, LW.exp_gate_sc + size_t(e) * gu_sc_elems,
-                            d_deq_g, I, H, bi_gu);
-                        k_dequant_fp8_block128<<<blocks, 256, 0, stream>>>(
-                            LW.exp_up_fp8 + size_t(e) * gu_elems, LW.exp_up_sc + size_t(e) * gu_sc_elems,
-                            d_deq_u, I, H, bi_gu);
-                        k_dequant_fp8_block128<<<blocks, 256, 0, stream>>>(
-                            LW.exp_down_fp8 + size_t(e) * gu_elems, LW.exp_down_sc + size_t(e) * dn_sc_elems,
-                            d_deq_d, H, I, bi_dn);
-                        wg = d_deq_g; wu = d_deq_u; wd = d_deq_d;
-                    } else {
-                        wg = LW.exp_gate_bf16 + size_t(e) * gu_elems;
-                        wu = LW.exp_up_bf16 + size_t(e) * gu_elems;
-                        wd = LW.exp_down_bf16 + size_t(e) * gu_elems;
-                    }
-
-                    gemm_bf16(blas, d_exp_x, wg, d_exp_g, cnt, I, H, false, 0.0f);
-                    gemm_bf16(blas, d_exp_x, wu, d_exp_u, cnt, I, H, false, 0.0f);
-                    const size_t act_n = size_t(cnt) * I;
-                    k_silu_mul_bf16<<<int((act_n + 255) / 256), 256, 0, stream>>>(d_exp_g, d_exp_u, d_exp_g, act_n);
-                    gemm_bf16(blas, d_exp_g, wd, d_exp_out, cnt, H, I, true, 0.0f);
-                    k_scatter_add_f32<<<cnt, 256, 0, stream>>>(d_exp_out, d_exp_rows + off, d_exp_w + off, d_moe_routed_f32, cnt, H);
-                }
+                // Zero-host-sync on-GPU grouped Ref MoE (FP8_BLOCK or BF16)
+                run_ref_moe(LW, M, stream);
             }
             k_moe_finalize_res_f32<<<M, 256, 0, stream>>>(d_moe_routed_f32, d_shared_out, d_shared_gate, d_residual, M, H);
             toc(prof.moe_ms);

@@ -66,6 +66,63 @@ inline int stride_index(int s) {
 
 // ------------------------------------------------------------------------------------------------ Device glue kernels
 
+// Step 0: Zero-sync single-launch slot admission from pinned `AdmitParams`.
+struct AdmitParams {
+    int32_t last_row[16];
+    int32_t ras_ring[geom::RAS_WINDOW];
+    int32_t pos;
+    int32_t ras_pos;
+    float temperature;
+    float top_p;
+    int32_t top_k;
+    uint64_t seed;
+};
+
+// Grid: 1, Block: 256.
+__global__ void k_graph_admit_slot(
+    int slot,
+    const __nv_bfloat16* __restrict__ last_hidden,
+    const AdmitParams* __restrict__ params,
+    __nv_bfloat16* __restrict__ slot_hidden,
+    int32_t* __restrict__ slot_last_row,
+    int32_t* __restrict__ slot_pos,
+    uint32_t* __restrict__ slot_fidx,
+    uint8_t* __restrict__ slot_active,
+    float* __restrict__ slot_temp,
+    float* __restrict__ slot_top_p,
+    int32_t* __restrict__ slot_top_k,
+    uint64_t* __restrict__ slot_seed,
+    int32_t* __restrict__ ras_ring,
+    int32_t* __restrict__ ras_pos,
+    int32_t* __restrict__ code_ring_wr,
+    int H, int rw) {
+    __nv_bfloat16* dst_h = slot_hidden + size_t(slot) * H;
+    for (int d = threadIdx.x; d < H; d += blockDim.x) {
+        dst_h[d] = last_hidden[d];
+    }
+    if (threadIdx.x < rw) {
+        slot_last_row[size_t(slot) * rw + threadIdx.x] = params->last_row[threadIdx.x];
+    }
+    if (threadIdx.x < geom::RAS_WINDOW) {
+        ras_ring[size_t(slot) * geom::RAS_WINDOW + threadIdx.x] = params->ras_ring[threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        slot_pos[slot] = params->pos;
+        slot_fidx[slot] = 0u;
+        slot_active[slot] = 1u;
+        slot_temp[slot] = params->temperature;
+        slot_top_p[slot] = params->top_p;
+        slot_top_k[slot] = params->top_k;
+        slot_seed[slot] = params->seed;
+        ras_pos[slot] = params->ras_pos;
+        code_ring_wr[slot] = 0;
+    }
+}
+
+__global__ void k_graph_deactivate_slot(uint8_t* __restrict__ slot_active, int slot) {
+    slot_active[slot] = 0u;
+}
+
 // Step 1: Gather per-row inputs for bucket rows 0..M-1 from slot-indexed persistent device state.
 // Grid: (M), Block: 256.
 __global__ void k_graph_gather_step_in(
@@ -265,10 +322,13 @@ struct TtsGraphRunner {
     int32_t* h_codec_slots = nullptr;   // [max_slots]
     int32_t* h_codec_start = nullptr;   // [max_slots]
     int16_t* h_codec_pcm = nullptr;     // [max_slots * 4 * 2048]
-    int32_t* h_admit_buf = nullptr;     // [64] scratch for slot admission copies
+    AdmitParams* h_admit_params = nullptr; // [max_slots] pinned per-slot admission staging
+    AdmitParams* d_admit_params = nullptr; // [max_slots] device per-slot admission staging
 
-    // Captured CUDA graphs: frame_exec[bucket_idx], codec_exec[bucket_idx][stride_idx]
+    // Captured CUDA graphs: frame_exec[bucket_idx], split frame0 graphs, codec_exec[bucket_idx][stride_idx]
     std::array<cudaGraphExec_t, 4> frame_exec = {nullptr, nullptr, nullptr, nullptr};
+    std::array<cudaGraphExec_t, 4> frame_tower_exec = {nullptr, nullptr, nullptr, nullptr};
+    std::array<cudaGraphExec_t, 4> frame_bb_exec = {nullptr, nullptr, nullptr, nullptr};
     std::array<std::array<cudaGraphExec_t, 3>, 4> codec_exec = {{
         {nullptr, nullptr, nullptr},
         {nullptr, nullptr, nullptr},
@@ -285,6 +345,12 @@ struct TtsGraphRunner {
 
     void destroy_graphs() {
         for (auto& g : frame_exec) {
+            if (g) { cudaGraphExecDestroy(g); g = nullptr; }
+        }
+        for (auto& g : frame_tower_exec) {
+            if (g) { cudaGraphExecDestroy(g); g = nullptr; }
+        }
+        for (auto& g : frame_bb_exec) {
             if (g) { cudaGraphExecDestroy(g); g = nullptr; }
         }
         for (auto& row : codec_exec) {
@@ -309,8 +375,9 @@ struct TtsGraphRunner {
         freep(d_out_main); freep(d_out_c0); freep(d_out_sem);
         freep(d_out_res_codes); freep(d_out_rows);
         freep(d_codec_slots); freep(d_codec_start); freep(d_codec_codes); freep(d_codec_pcm);
+        freep(d_admit_params);
         freeh(h_slot_of_row); freeh(h_out_rows); freeh(h_out_active);
-        freeh(h_codec_slots); freeh(h_codec_start); freeh(h_codec_pcm); freeh(h_admit_buf);
+        freeh(h_codec_slots); freeh(h_codec_start); freeh(h_codec_pcm); freeh(h_admit_params);
         if (ev_frame) { cudaEventDestroy(ev_frame); ev_frame = nullptr; }
         if (ev_codec) { cudaEventDestroy(ev_codec); ev_codec = nullptr; }
         if (ev_p0) { cudaEventDestroy(ev_p0); ev_p0 = nullptr; }
@@ -373,6 +440,7 @@ struct TtsGraphRunner {
         alloc_d(d_codec_start, size_t(max_slots));
         alloc_d(d_codec_codes, size_t(max_slots) * 4 * geom::NCB);
         alloc_d(d_codec_pcm, size_t(max_slots) * 4 * geom::FRAME_SAMPLES);
+        alloc_d(d_admit_params, size_t(max_slots));
 
         TTS_CK(cudaHostAlloc(&h_slot_of_row, size_t(max_slots) * sizeof(int32_t), cudaHostAllocDefault));
         TTS_CK(cudaHostAlloc(&h_out_rows, size_t(max_slots) * rw * sizeof(int32_t), cudaHostAllocDefault));
@@ -380,7 +448,7 @@ struct TtsGraphRunner {
         TTS_CK(cudaHostAlloc(&h_codec_slots, size_t(max_slots) * sizeof(int32_t), cudaHostAllocDefault));
         TTS_CK(cudaHostAlloc(&h_codec_start, size_t(max_slots) * sizeof(int32_t), cudaHostAllocDefault));
         TTS_CK(cudaHostAlloc(&h_codec_pcm, size_t(max_slots) * 4 * geom::FRAME_SAMPLES * sizeof(int16_t), cudaHostAllocDefault));
-        TTS_CK(cudaHostAlloc(&h_admit_buf, 64 * sizeof(int32_t), cudaHostAllocDefault));
+        TTS_CK(cudaHostAlloc(&h_admit_params, size_t(max_slots) * sizeof(AdmitParams), cudaHostAllocDefault));
 
         TTS_CK(cudaEventCreate(&ev_frame));
         TTS_CK(cudaEventCreate(&ev_codec));
@@ -388,50 +456,38 @@ struct TtsGraphRunner {
         TTS_CK(cudaEventCreate(&ev_p1));
     }
 
-    // Admits a newly prefilled stream into physical `slot` (runs outside CUDA graph between frames).
+    // Admits a newly prefilled stream into physical `slot` (zero host sync!).
     void admit_slot(int slot, const __nv_bfloat16* d_last_hidden, const int32_t* h_last_row,
                     int pos, const int32_t* h_ras_ring16, int ras_pos,
                     float temperature, float top_p, int top_k, uint64_t seed, cudaStream_t stream) {
         const auto& c = W->cfg;
         const int rw = c.row_width();
-        TTS_CK(cudaMemcpyAsync(d_slot_hidden + size_t(slot) * c.hidden_size, d_last_hidden,
-                               size_t(c.hidden_size) * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
-        std::memcpy(h_admit_buf, h_last_row, size_t(rw) * sizeof(int32_t));
-        TTS_CK(cudaMemcpyAsync(d_slot_last_row + size_t(slot) * rw, h_admit_buf,
-                               size_t(rw) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaStreamSynchronize(stream));
-
-        std::memcpy(h_admit_buf, h_ras_ring16, size_t(geom::RAS_WINDOW) * sizeof(int32_t));
-        TTS_CK(cudaMemcpyAsync(d_ras_ring + size_t(slot) * geom::RAS_WINDOW, h_admit_buf,
-                               size_t(geom::RAS_WINDOW) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaStreamSynchronize(stream));
-
-        const int32_t p32 = pos;
-        const uint32_t f0 = 0u;
-        const uint8_t act1 = 1u;
-        const int32_t z0 = 0;
-        const int32_t rp = ras_pos;
-        TTS_CK(cudaMemcpyAsync(d_slot_pos + slot, &p32, sizeof(p32), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_slot_fidx + slot, &f0, sizeof(f0), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_slot_active + slot, &act1, sizeof(act1), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_slot_temp + slot, &temperature, sizeof(temperature), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_slot_top_p + slot, &top_p, sizeof(top_p), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_slot_top_k + slot, &top_k, sizeof(top_k), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_slot_seed + slot, &seed, sizeof(seed), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_ras_pos + slot, &rp, sizeof(rp), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaMemcpyAsync(d_code_ring_wr + slot, &z0, sizeof(z0), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaStreamSynchronize(stream));
+        AdmitParams& ap = h_admit_params[slot];
+        std::memset(&ap, 0, sizeof(ap));
+        std::memcpy(ap.last_row, h_last_row, size_t(rw) * sizeof(int32_t));
+        std::memcpy(ap.ras_ring, h_ras_ring16, size_t(geom::RAS_WINDOW) * sizeof(int32_t));
+        ap.pos = pos;
+        ap.ras_pos = ras_pos;
+        ap.temperature = temperature;
+        ap.top_p = top_p;
+        ap.top_k = top_k;
+        ap.seed = seed;
+        TTS_CK(cudaMemcpyAsync(d_admit_params + slot, &ap, sizeof(AdmitParams), cudaMemcpyHostToDevice, stream));
+        k_graph_admit_slot<<<1, 256, 0, stream>>>(
+            slot, d_last_hidden, d_admit_params + slot,
+            d_slot_hidden, d_slot_last_row, d_slot_pos, d_slot_fidx, d_slot_active,
+            d_slot_temp, d_slot_top_p, d_slot_top_k, d_slot_seed,
+            d_ras_ring, d_ras_pos, d_code_ring_wr, c.hidden_size, rw);
     }
 
-    // Marks a slot inactive on device (e.g. on cancellation or max_frames reached).
+    // Marks a slot inactive on device (zero host sync).
     void deactivate_slot(int slot, cudaStream_t stream) {
-        const uint8_t act0 = 0u;
-        TTS_CK(cudaMemcpyAsync(d_slot_active + slot, &act0, sizeof(act0), cudaMemcpyHostToDevice, stream));
-        TTS_CK(cudaStreamSynchronize(stream));
+        k_graph_deactivate_slot<<<1, 1, 0, stream>>>(d_slot_active, slot);
     }
 
-    // Records all GPU ops of ONE autoregressive frame for bucket size `M` (shared by eager & graph capture!).
-    void record_frame_ops(int M, cudaStream_t stream) {
+    // Part 1 of a frame: gather -> lm_head + main RAS -> 4 shared + 9 residual tower layers -> commit row & code ring.
+    // If `copy_d2h` is true, also copies `d_out_rows` and `d_slot_active` to pinned host buffers (for early frame-0 emit).
+    void record_frame_tower_ops(int M, bool copy_d2h, cudaStream_t stream) {
         const auto& c = W->cfg;
         const int H = c.hidden_size;
         const int rw = c.row_width();
@@ -489,15 +545,121 @@ struct TtsGraphRunner {
             d_out_rows, d_slot_last_row, d_slot_pos, d_slot_fidx, d_slot_active,
             d_code_ring, d_code_ring_wr, M, rw, c.tower_res, c.eos_token_id, cap);
 
-        // 6. 40-layer backbone forward on newly sampled [M, 11] row at pos+1 -> d_final_bf16
+        if (copy_d2h) {
+            TTS_CK(cudaMemcpyAsync(h_out_rows, d_out_rows, size_t(M) * rw * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            TTS_CK(cudaMemcpyAsync(h_out_active, d_slot_active, size_t(total_slots) * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream));
+        }
+    }
+
+    // Part 2 of a frame: 40-layer backbone forward on newly sampled [M, 11] row at pos+1 -> scatter d_slot_hidden.
+    void record_frame_backbone_ops(int M, cudaStream_t stream) {
+        const auto& c = W->cfg;
+        const int H = c.hidden_size;
         bb->forward_device(d_out_rows, d_slot_of_row, d_step_pos_bb, M, false, false, stream);
-
-        // 7. Scatter new backbone hidden state back into d_slot_hidden[slot_of_row[m]]
         k_graph_scatter_hidden<<<M, 256, 0, stream>>>(d_slot_of_row, bb->d_final_bf16, d_slot_hidden, M, H);
+    }
 
-        // 8. Async D2H copy of [M, 11] sampled rows and per-slot active mask to pinned host memory
+    // Records all GPU ops of ONE autoregressive frame for bucket size `M` (shared by eager & graph capture!).
+    void record_frame_ops(int M, cudaStream_t stream) {
+        const int rw = W->cfg.row_width();
+        record_frame_tower_ops(M, false, stream);
+        record_frame_backbone_ops(M, stream);
         TTS_CK(cudaMemcpyAsync(h_out_rows, d_out_rows, size_t(M) * rw * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         TTS_CK(cudaMemcpyAsync(h_out_active, d_slot_active, size_t(total_slots) * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream));
+    }
+
+    void ensure_frame_split_graphs(int M, cudaStream_t stream) {
+        const int bi = bucket_index(M);
+        if (bi < 0 || (frame_tower_exec[size_t(bi)] != nullptr && frame_bb_exec[size_t(bi)] != nullptr)) return;
+
+        for (int m = 0; m < M; ++m) h_slot_of_row[m] = pad_slot;
+        TTS_CK(cudaMemcpyAsync(d_slot_of_row, h_slot_of_row, size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        TTS_CK(cudaStreamSynchronize(stream));
+
+        const bool saved_bb_prof = bb->prof.enabled;
+        const bool saved_tw_prof = tower->prof.enabled;
+        const bool saved_fr_prof = prof.enabled;
+        bb->prof.enabled = false;
+        tower->prof.enabled = false;
+        prof.enabled = false;
+
+        if (!frame_tower_exec[size_t(bi)]) {
+            cudaGraph_t graph = nullptr;
+            TTS_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            record_frame_tower_ops(M, true, stream);
+            TTS_CK(cudaStreamEndCapture(stream, &graph));
+            TTS_CK(cudaGraphInstantiate(&frame_tower_exec[size_t(bi)], graph, 0));
+            TTS_CK(cudaGraphDestroy(graph));
+        }
+        if (!frame_bb_exec[size_t(bi)]) {
+            cudaGraph_t graph = nullptr;
+            TTS_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            record_frame_backbone_ops(M, stream);
+            TTS_CK(cudaStreamEndCapture(stream, &graph));
+            TTS_CK(cudaGraphInstantiate(&frame_bb_exec[size_t(bi)], graph, 0));
+            TTS_CK(cudaGraphDestroy(graph));
+        }
+
+        bb->prof.enabled = saved_bb_prof;
+        tower->prof.enabled = saved_tw_prof;
+        prof.enabled = saved_fr_prof;
+    }
+
+    // Launches ONLY part 1 (lm_head + tower + sample + commit + D2H) so frame 0 audio can be decoded and
+    // emitted BEFORE running the 40-layer backbone forward for frame 1.
+    int step_frame_tower_only(const std::vector<int>& active_slots, cudaStream_t stream) {
+        const int n_act = static_cast<int>(active_slots.size());
+        if (n_act <= 0) return 0;
+
+        const bool run_graph = use_graph && !prof.enabled && !bb->prof.enabled && !tower->prof.enabled;
+        const int M = run_graph ? pick_graph_bucket(n_act, max_slots) : n_act;
+        const int bi = bucket_index(M);
+        if (run_graph && bi >= 0) {
+            ensure_frame_split_graphs(M, stream);
+        }
+
+        for (int m = 0; m < n_act; ++m) h_slot_of_row[m] = active_slots[size_t(m)];
+        for (int m = n_act; m < M; ++m) h_slot_of_row[m] = pad_slot;
+        TTS_CK(cudaMemcpyAsync(d_slot_of_row, h_slot_of_row, size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+        if (run_graph && bi >= 0 && frame_tower_exec[size_t(bi)] != nullptr) {
+            TTS_CK(cudaGraphLaunch(frame_tower_exec[size_t(bi)], stream));
+        } else {
+            record_frame_tower_ops(M, true, stream);
+        }
+        TTS_CK(cudaEventRecord(ev_frame, stream));
+        TTS_CK(cudaEventSynchronize(ev_frame));
+        return M;
+    }
+
+    // Launches ONLY part 2 (40-layer backbone forward + scatter hidden) matching the preceding
+    // `step_frame_tower_only` bucket `M` (asynchronously pipelined on `stream`, zero host sync!).
+    void step_frame_backbone_only(int M, cudaStream_t stream) {
+        if (M <= 0) return;
+        const bool run_graph = use_graph && !prof.enabled && !bb->prof.enabled && !tower->prof.enabled;
+        const int bi = bucket_index(M);
+        if (run_graph && bi >= 0 && frame_bb_exec[size_t(bi)] != nullptr) {
+            TTS_CK(cudaGraphLaunch(frame_bb_exec[size_t(bi)], stream));
+        } else {
+            record_frame_backbone_ops(M, stream);
+        }
+    }
+
+    // Pre-captures all bucket graphs during startup using throwaway `pad_slot` so the first request pays
+    // zero cold graph-capture latency.
+    void warmup_graphs(cudaStream_t stream) {
+        if (!use_graph) return;
+        for (int b : GRAPH_BUCKETS) {
+            if (b > max_slots) break;
+            ensure_frame_graph(b, stream);
+            ensure_frame_split_graphs(b, stream);
+            if (codec && codec->loaded()) {
+                for (int s : CODEC_STRIDES) {
+                    ensure_codec_graph(b, s, stream);
+                }
+            }
+        }
+        TTS_CK(cudaStreamSynchronize(stream));
     }
 
     // Lazily captures the frame graph for bucket `M` on `stream` using throwaway `pad_slot` so real slots are untouched!
