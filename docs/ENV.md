@@ -53,6 +53,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_CP_S3` | flag | `1` |  | CP combine order: 1 = the head-group overlap order, 0 = the plain order. Same arithmetic. |
 | `GR8_CP_STEP_ROWS` | int | `0` | 0..4096 | S2 only: a decode step past R carries at most this many rows and the CP fabric is sized for it instead of the widest S2 step. Sessions past R give the same tokens. |
 | `GR8_CP_STEP_SEG` | flag | `0` | 0\|1 | With GR8_CP_STEP_ROWS, a round past R takes only sessions past R, so a short session never runs the CP path because a long one is resident. |
+| `GR8_CP_STRIPE` | flag | `0` | 0\|1 | 1 splits CP fabric payload writes of at least GR8_CP_STRIPE_MIN bytes across both rails when --ips2 is set. |
 | `GR8_DEC_BK` | int | `2048` |  | The first decode context bucket boundary in tokens. Decode graphs are captured per bucket and GR8_RT_L must be a bucket boundary. |
 | `GR8_DEC_BK_MAX` | int | `0` |  | The largest doubled decode context bucket: GR8_DEC_BK doubles up to it, then the next bucket is R under CP and the KV pool's cap. Every bucket costs a set of decode graphs (about 0.9 GiB a rank on the 4-box GLM-5.3). 0 = no bound. |
 | `GR8_DEC_DENSE_OPT` | flag | `0` |  | Runs the bit-exact fused decode dense kernels on GLM-5.3 (fused layer-input q_a/kv_a/idx_k/idx_w with last-CTA gather publish, single-pass q_a norm + rotation, fused exact idx_q + trellis q_b, and no-scratch trellis o_proj where the k-split matches stock). Same output bits. |
@@ -410,6 +411,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 
 | variable | type | unset | values | what it does |
 |---|---|---|---|---|
+| `GR8_CP_STRIPE_MIN` | int | `131072` | 8192.. | With GR8_CP_STRIPE=1, the smallest CP fabric payload write in bytes that goes out split over both rails. |
 | `GR8_DEC_EVPROF` | int | `0` |  | Prints per-stage decode step times from event nodes in the captured main-step graphs every N main steps, in the rank logs. 0: off. |
 | `GR8_DEC_PROF` | flag | `0` |  | Measures decode stages with a synchronize at every mark and prints them per rank. Plain launches only, the engine stops with --graph. |
 | `GR8_DFL_DUMP` | path | unset |  | With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for engine/ref/dflash2_replay.py. |

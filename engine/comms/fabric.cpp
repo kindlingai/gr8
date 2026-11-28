@@ -707,7 +707,7 @@ void Fabric::init(const FabricConfig& cfg) {
     read_rail_mtu(R, r, cfg.port);
     R.mr = ibv_reg_mr(R.pd, I.region, I.region_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE); FCHECK(R.mr); live(kLiveMr, 1);
   }
-  I.stripe = cfg.stripe_min > 0 && I.nrails == 2 && !I.var && !I.bulk;
+  I.stripe = cfg.stripe_min > 0 && I.nrails == 2 && !I.bulk;
   const int nq = I.stripe ? 2 : 1;                     // QP sets: [0] = qp (rail_of), [1] = qp2 (the other rail)
   auto rail_q = [&](int p, int k) -> Rail& { const int r = I.rail_of(p, cfg.rank); return I.rails[k == 0 ? r : 1 - r]; };
   I.qp.assign(nr, nullptr); I.qp2.assign(nr, nullptr); I.unsignaled.assign(nr, 0);
@@ -1006,19 +1006,28 @@ void Fabric::start_proxy() {
           const uint32_t bytes = job.sizes[c];
           char* src = dev_.send + L.send_at(c, par);
           *(volatile unsigned long long*)(src + bytes) = seq;
+          StripeW sw[8]; int ns = 0;
           for (int kk = 1; kk < nr; kk++) {
             const int p = stagger_peer(me, kk, nr);
             const int j = L.slot_of(c, p, me);
             if (j < 0) continue;
+            const size_t roff = L.recv_at(c, par, j);
+            if (I.stripe && bytes >= cfg_.stripe_min && bytes >= 8192) {
+              stripe_post(p, src, bytes, roff, xr);
+              sw[ns++] = StripeW{p, src, bytes, roff, src + bytes};
+              continue;
+            }
             Rail& R = I.rails[I.rail_of(p, me)];
             ibv_sge sge{(uint64_t)src, bytes + 8, R.mr->lkey};
             ibv_send_wr wr{}, *bad; wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE;
-            wr.wr.rdma.remote_addr = I.peer[p].addr + L.recv_at(c, par, j);
+            wr.wr.rdma.remote_addr = I.peer[p].addr + roff;
             wr.wr.rdma.rkey = I.peer[p].rkey;
             bool sig = (I.unsignaled[p] += I.wrs(p, wr)) >= 256; if (sig) I.unsignaled[p] = 0;
             wr.send_flags = sig ? IBV_SEND_SIGNALED : 0;
+            wr.wr_id = (uint64_t)p;
             (void)bad; I.post(p, wr);
           }
+          if (ns && !stripe_finish(sw, ns, xr)) return false;
         } else {
         const bool rs = mask_bit(job.rs_mask, c), flat = rs && mask_bit(job.rs_flat, c);
         const uint32_t bytes = job.sizes[c];

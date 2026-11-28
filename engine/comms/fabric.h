@@ -15,7 +15,7 @@ struct FabricConfig {
   int rank = -1;
   std::vector<std::string> ips;   // rail 0 addresses, index = rank (also used for the TCP bootstrap)
   std::vector<std::string> ips2;  // rail 1 addresses (empty = single rail)
-  // dual-rail striping (uniform layout, ips2 set, not ring/bulk): a payload write of >= stripe_min bytes goes out as two
+  // dual-rail striping (uniform or variable layout, ips2 set, not ring/bulk): a payload write of >= stripe_min bytes goes out as two
   // halves, the first on a second QP over the other rail, the second (+ tail) on the peer's QP; the proxy posts the
   // tail write only after the first half completed, so the tail still means "the whole payload landed". 0 = off.
   // A three-rank ring stripes too: the second QP is on the same port's device on the other PCIe root (no ips2).
