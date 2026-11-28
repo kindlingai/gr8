@@ -250,7 +250,8 @@ run_job s2_dsel_table 'python3 "$REPO/tools/s2_dsel_table.py" --selftest'
 i=0
 for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48" \
          "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=6" "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=1" \
-         "-DG6_MODEL_HY4=1 -DDEC_S2 -DG6_NR=1" "-DG6_MODEL_HY4=1 -DDEC_S2 -DG6_NR=2"; do
+         "-DG6_MODEL_HY4=1 -DDEC_S2 -DG6_NR=1" "-DG6_MODEL_HY4=1 -DDEC_S2 -DG6_NR=2" \
+         "-DG6_MODEL_ERNIE55=1 -DDEC_S2 -DG6_NR=1" "-DG6_MODEL_ERNIE55=1 -DDEC_S2 -DG6_NR=2"; do
   run_job "module_info_$i" "
     g++ -std=c++17 -O2 -Wall -Wextra $f -I \"\$REPO/engine/runtime\" \"\$REPO/engine/runtime/tests/module_info_test.cpp\" -o \"\$D/module_info_test\" \"\${KVLIB[@]}\"
     \"\$D/module_info_test\"
@@ -717,6 +718,13 @@ run_job hy4_unit_tests '
   g++ -std=c++20 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_hy4_math.cpp" -o "$D/test_hy4_math" && "$D/test_hy4_math"
   g++ -std=c++20 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_hy4_engram.cpp" -o "$D/test_hy4_engram" && "$D/test_hy4_engram"
   g++ -std=c++20 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_hy4_dfly.cpp" -o "$D/test_hy4_dfly" && "$D/test_hy4_dfly"
+'
+
+# ERNIE-5.5-Flash geometry and CPU math unit tests
+run_job ernie55_unit_tests '
+  g++ -std=c++20 -O2 -Wall -Wextra -DG6_MODEL_ERNIE55=1 -I "$REPO/engine" "$REPO/engine/tests/test_ernie55_geom.cpp" -o "$D/test_ernie55_geom" && "$D/test_ernie55_geom"
+  g++ -std=c++20 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_ernie55_math.cpp" -o "$D/test_ernie55_math" && "$D/test_ernie55_math"
+  g++ -std=c++20 -O2 -Wall -Wextra -pthread -I "$REPO/engine" "$REPO/engine/tests/test_ernie55_hybrid_cpu.cpp" -o "$D/test_ernie55_hybrid_cpu" && "$D/test_ernie55_hybrid_cpu"
 '
 
 wait

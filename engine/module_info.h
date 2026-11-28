@@ -10,7 +10,7 @@
 
 #define G6_MODULE_ABI 3
 
-enum G6ModelId { G6_MODEL_ID_GLM53 = 1, G6_MODEL_ID_GLM53F = 2, G6_MODEL_ID_DS41 = 3, G6_MODEL_ID_INK2 = 4, G6_MODEL_ID_QW38 = 5, G6_MODEL_ID_HY4 = 6 };
+enum G6ModelId { G6_MODEL_ID_GLM53 = 1, G6_MODEL_ID_GLM53F = 2, G6_MODEL_ID_DS41 = 3, G6_MODEL_ID_INK2 = 4, G6_MODEL_ID_QW38 = 5, G6_MODEL_ID_HY4 = 6, G6_MODEL_ID_ERNIE55 = 7 };
 
 // model behaviours host code branches on (G6ModuleInfo::caps)
 enum G6ModuleCap
@@ -72,6 +72,8 @@ constexpr uint32_t this_model()
     return G6_MODEL_ID_QW38;
 #elif defined(G6_MODEL_HY4) && G6_MODEL_HY4
     return G6_MODEL_ID_HY4;
+#elif defined(G6_MODEL_ERNIE55) && G6_MODEL_ERNIE55
+    return G6_MODEL_ID_ERNIE55;
 #elif G6_MODEL_FLASH
     return G6_MODEL_ID_GLM53F;
 #else
@@ -84,14 +86,14 @@ constexpr G6ModuleInfo make()
     G6ModuleInfo m{};
     m.abi = G6_MODULE_ABI;
     m.model = this_model();
-    const char* name = m.model == G6_MODEL_ID_HY4 ? "hy4" : m.model == G6_MODEL_ID_QW38 ? "qw38" : m.model == G6_MODEL_ID_INK2 ? "ink2" : m.model == G6_MODEL_ID_DS41 ? "ds41" : m.model == G6_MODEL_ID_GLM53F ? "glm-5.3-flash" : "glm-5.3";
+    const char* name = m.model == G6_MODEL_ID_ERNIE55 ? "ernie55" : m.model == G6_MODEL_ID_HY4 ? "hy4" : m.model == G6_MODEL_ID_QW38 ? "qw38" : m.model == G6_MODEL_ID_INK2 ? "ink2" : m.model == G6_MODEL_ID_DS41 ? "ds41" : m.model == G6_MODEL_ID_GLM53F ? "glm-5.3-flash" : "glm-5.3";
     for (int i = 0; name[i] && i < 15; ++i) m.name[i] = name[i];
     m.nr = g6nr::NR;
     m.mx = g6mx::MX;
     m.s2n = m.max_sessions = g6rt::S2N;   // the scheduler holds as many sessions as a step's S2In lays out
     m.hidden = geom::HID;
     m.layers = geom::L_MAIN;
-#if G6_MODEL_DS41 || G6_MODEL_INK2 || G6_MODEL_QW38 || (defined(G6_MODEL_HY4) && G6_MODEL_HY4)
+#if G6_MODEL_DS41 || G6_MODEL_INK2 || G6_MODEL_QW38 || (defined(G6_MODEL_HY4) && G6_MODEL_HY4) || (defined(G6_MODEL_ERNIE55) && G6_MODEL_ERNIE55)
     m.mtp_layers = geom::N_NEXTN;
 #else
     m.mtp_layers = 1;
@@ -121,6 +123,7 @@ constexpr G6ModuleInfo make()
     case G6_MODEL_ID_INK2: m.caps = G6_CAP_MTP0 | G6_CAP_DSPARK | G6_CAP_KV_STORE; break;
     case G6_MODEL_ID_QW38: m.caps = G6_CAP_MTP0 | G6_CAP_KDA | G6_CAP_KV_STORE; break;
     case G6_MODEL_ID_HY4: m.caps = G6_CAP_MTP0; break;
+    case G6_MODEL_ID_ERNIE55: m.caps = G6_CAP_MTP0; break;
     case G6_MODEL_ID_GLM53F: m.caps = G6_CAP_DFLASH2 | G6_CAP_FLASH_COST | G6_CAP_KDA | G6_CAP_GRAMMAR; break;
     default: m.caps = G6_CAP_DFLASH2 | G6_CAP_GRAMMAR | G6_CAP_KV_STORE; break;
     }

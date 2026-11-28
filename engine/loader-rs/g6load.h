@@ -62,6 +62,10 @@ void* g6l_hy4_plan(const char* release_dir, const char* widths, uint32_t nr, uin
                    const char* out_manifest, char* err, size_t errlen);
 void* g6l_hy4_plan_part(const char* release_dir, const char* widths, uint32_t nr, uint32_t rank, uint32_t part,
                         const char* out_manifest, char* err, size_t errlen);
+void* g6l_ernie55_plan(const char* release_dir, const char* widths, uint32_t nr, uint32_t rank,
+                       const char* out_manifest, char* err, size_t errlen);
+void* g6l_ernie55_plan_part(const char* release_dir, const char* widths, uint32_t nr, uint32_t rank, uint32_t part,
+                            const char* out_manifest, char* err, size_t errlen);
 void* g6l_qw38_plan(const char* release_dir, const char* widths, uint32_t nr, uint32_t rank, int with_mtp,
                     const char* layout, const char* out_manifest, char* err, size_t errlen);
 // Fills dst with image bytes off .. off + n of a planned image, without a sink (one tensor at a time, for m4sim).
