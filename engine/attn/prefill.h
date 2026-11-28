@@ -27,6 +27,9 @@ extern "C" int g6a_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding*,void* 
 // order: borrowers retain scratch after the original owner is destroyed.
 extern "C" int g6a_bind_prefill_create_shared(G6AttnPrefill** out,G6AttnBinding*,void* stream,G6AttnPrefill* storage_owner);
 extern "C" int g6a_bind_prefill_run(G6AttnPrefill*,G6AttnBinding*,const G6AttnStep*,void* stream);
+// Continuation of an uninterrupted chunk loop on the same state/binding/stream: skips repeating UK/UV conversion and
+// expands only rows [prev_context & ~31, expanded) when the workspace still holds this state at prev_context.
+extern "C" int g6a_bind_prefill_run_cont(G6AttnPrefill*,G6AttnBinding*,const G6AttnStep*,int prev_context,void* stream);
 extern "C" int g6a_bind_prefill_release(G6AttnPrefill*);
 // Accounting: private weight bytes plus scratch only for the allocating root.
 // Sum once over the states at creation to count shared storage once. Not peak

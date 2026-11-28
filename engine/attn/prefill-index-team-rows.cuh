@@ -30,6 +30,7 @@ extern "C" int g6a_bind_index_append(G6AttnBinding* b,const G6AttnStep* step,voi
 extern "C" int g6a_bind_prefill_index_rows(G6AttnPrefill* p,G6AttnBinding* b,
     const G6AttnStep* step,int* out_ids,float* out_scores,void* s){
     if(!p)return int(cudaErrorInvalidValue);
+    if(p->workspace){p->workspace->cached_p=nullptr;p->workspace->cached_ctx=0;}
     gp::profile_reset(p->profile); // No whole-prefill timing is produced here.
     if(p->profile.events)p->profile.report.status=G6_PF_PROFILE_EMPTY;
     if(p->owner!=b||!gp::index_rows_shape(b,step)||step->rows>p->maxrows)return int(cudaErrorInvalidValue);

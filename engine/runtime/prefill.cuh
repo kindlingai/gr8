@@ -577,6 +577,8 @@ struct Prefill
     int* idx_keep = nullptr;                             // two-lane form: this lane's copy [Mmax][2048] of the last full-index
                                                          //   layer's list (the other lane overwrites the binding's own)
     int attn_rows = 0;                                   // set before build_prefill: attention in chunks of this many rows
+    bool pos_seq = false;                                // last pf_inputs() wrote strictly consecutive positions starting at pos0
+    int pos0 = -1;
     __half* attn_out = nullptr;                          //   (< Mmax: GR8_PF_ATTN_ROWS) -> this lane's attention output
     int* idx_all = nullptr;                              //   [Mmax][H*256] and index lists [Mmax][2048], chunks copied in
     std::string dump_dir;                                // GR8_PF_IDDUMP=<dir> (read at build, rank 0 only): after the
@@ -1123,6 +1125,8 @@ inline void pf_inputs(Prefill& P, int M, const int* tok, const int* pos)
 {
     if (P.perm)
     {
+        P.pos_seq = false;
+        P.pos0 = -1;
         const std::vector<int> o = pf_perm_order(M, P.f.nr);
         std::vector<int> t(M), p(M);
         for (int j = 0; j < M; ++j) { t[j] = tok[o[j]]; p[j] = pos[o[j]]; }
@@ -1131,6 +1135,10 @@ inline void pf_inputs(Prefill& P, int M, const int* tok, const int* pos)
         G6RT_CK(g6h2d::copy(P.ord, o.data(), M * sizeof(int)));
         return;
     }
+    P.pos_seq = M > 0;
+    P.pos0 = M > 0 ? pos[0] : -1;
+    for (int j = 1; j < M; ++j)
+        if (pos[j] != pos[j - 1] + 1) { P.pos_seq = false; break; }
     G6RT_CK(g6h2d::copy(P.tok, tok, M * sizeof(int)));     // pageable sources: pinned staging (h2d.h)
     G6RT_CK(g6h2d::copy(P.pos, pos, M * sizeof(int)));
 }
@@ -1398,6 +1406,7 @@ inline void pf_attn_block(Model& m, Prefill& P, int i, int M, int context, cudaS
     const int H = b.heads, AR = P.attn_rows;
     const bool rix = P.ownix && y.indexer && i > 0;      // GR8_PF_OWN=2: IDs gathered into idx_all by the previous consume
     if (wait_attn) G6RT_CK(cudaStreamWaitEvent(st, wait_attn, 0));
+    int prev_ctx = 0;
     for (int c0 = 0; c0 < M; c0 += AR)
     {
         const int r = std::min(AR, M - c0);
@@ -1408,8 +1417,15 @@ inline void pf_attn_block(Model& m, Prefill& P, int i, int M, int context, cudaS
         else if (P.attn_out || P.ownix) { s.reuse_indices = P.idx_all + (size_t)c0 * 2048; s.reuse_rows = r; }
         else { s.reuse_indices = P.idx_keep ? P.idx_keep : m.layers[y.index_src].ab.args.indices; s.reuse_rows = M; }
         if (!P.pd_dir.empty() && P.pd_lay[i]) pf_pdump(m, P, i, s, st);
-        else if (P.v2) G6RT_CK(g6_attn_bind_prefill_run(P.av[i], &y.ab, &s, st));
+        else if (P.v2)
+        {
+            if (c0 > 0 && P.pos_seq && P.pos0 == context - M && prev_ctx > 0)
+                G6RT_CK(g6_attn_bind_prefill_run_cont(P.av[i], &y.ab, &s, prev_ctx, st));
+            else
+                G6RT_CK(g6_attn_bind_prefill_run(P.av[i], &y.ab, &s, st));
+        }
         else G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
+        prev_ctx = s.context;
         if (!P.attn_out && !P.ownix) continue;
         if (y.indexer && !rix)
             G6RT_CK(cudaMemcpyAsync(P.idx_all + (size_t)c0 * 2048, y.ab.args.indices, (size_t)r * 2048 * sizeof(int), cudaMemcpyDeviceToDevice, st));
