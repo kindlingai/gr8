@@ -434,6 +434,7 @@ pub(crate) fn v2_layer_split(b: &mut Builder, l: usize, w: &Widths, slices: &Sli
         (2560, 5) => nroute == 512,
         (2304, 9) => nroute == 128,
         (2048, 16) => nroute == 512,
+        (2048, 4) => nroute == 256,
         (1536, 12) => nroute == 512,
         (256, 2) => nroute == 16,
         _ => false,
@@ -482,7 +483,7 @@ pub(crate) fn v2_layer_split(b: &mut Builder, l: usize, w: &Widths, slices: &Sli
         Err(format!("layer {l}: expert {e} {} half at offset {off} of the K{k} width file is not inside its trellis \
                      tensor (the index slices and the width file disagree)", ["gate", "up", "down"][proj]))
     };
-    let bs = w.sdown > 0 || (hidden == 1536 && w.nh == 12) || (hidden == 2048 && w.nh == 16);
+    let bs = w.sdown > 0 || (hidden == 1536 && w.nh == 12) || (hidden == 2048 && w.nh == 16) || (hidden == 2048 && w.nh == 4);
     let emit_trellis = emit != RoutedEmit::MetaOnly;
     let emit_meta = emit != RoutedEmit::TrellisOnly;
     // the slice that holds unit (e, h) at width k

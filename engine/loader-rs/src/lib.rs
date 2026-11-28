@@ -24,6 +24,7 @@
 pub mod codebook;
 pub mod compact;
 pub mod dflash2;
+pub mod dr3;
 pub mod ds41;
 pub mod embed_plan;
 pub mod ernie55;
@@ -549,6 +550,48 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
         let key_text = format!("release dense={de} v2={v2} slices={sl} widths={wd} nr={nr} rank={rank} qo={qo} trellis={trellis} \
                                 kvb_fp8={kvb_fp8} kvb_rot={kvb_rot} kvb_uk_t={kvb_uk_t} qs_qa={qs_qa} qs_iq={qs_iq} qs_mtp={qs_mtp} gv_only={gv_only} layout={lp:?}\n{}\n{}", img.manifest(),
                                gencache::source_identity(&[&de, &v2, &sl, &wd, &lp]));
+        img.cache = gencache::GenCache::from_env(&key_text);
+        Ok::<_, String>(img)
+    })();
+    match r {
+        Ok(img) => Box::into_raw(Box::new((img, t0))) as *mut c_void,
+        Err(e) => {
+            write_err(err, errlen, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Plans the TP=1 trellis expert image of a Drama 3 (`fish_omni`) exlr8 release directory (src/dr3.rs).
+///
+/// # Safety
+/// `release_dir` and `manifest_name` must be valid NUL-terminated C strings; `layout` and `out_manifest` may be NULL or
+/// empty; `err` must hold `errlen` bytes when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_dr3_plan(
+    release_dir: *const c_char,
+    manifest_name: *const c_char,
+    layout: *const c_char,
+    out_manifest: *const c_char,
+    err: *mut c_char,
+    errlen: usize,
+) -> *mut c_void {
+    let t0 = Instant::now();
+    let arg = |p: *const c_char, what: &str| cstr(p).ok_or_else(|| format!("g6l_dr3_plan: missing {what}"));
+    let r = (|| {
+        let dir = arg(release_dir, "release dir")?;
+        let man = arg(manifest_name, "manifest name")?;
+        let lp = cstr(layout);
+        let mut img = dr3::plan(&dir, &man, lp.as_deref())?;
+        if let Some(out) = cstr(out_manifest) {
+            std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
+        }
+        let lp_str = lp.unwrap_or_default();
+        let key_text = format!(
+            "dr3 dir={dir} manifest={man} layout={lp_str:?}\n{}\n{}",
+            img.manifest(),
+            gencache::source_identity(&[&dir, &man, &lp_str])
+        );
         img.cache = gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)
     })();
