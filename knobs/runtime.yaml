@@ -266,7 +266,7 @@ knobs:
       GR8_GLM53_VISION_PATH) at boot before the KV pool is sized, and serves image requests (hello `vision: true`,
       `vision_model: "glm53v"`). 0 (default) never loads the tower and runs the text-only code.
   GR8_GLM53_VISION_PATH:
-    scope: agree
+    scope: local
     kind: path
     unset: "discover dense/vision-glm53-bf16.safetensors in --v2-dense"
     doc: >-
