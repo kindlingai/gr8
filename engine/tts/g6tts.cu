@@ -66,7 +66,7 @@ struct CliOpts {
 void usage() {
     std::fprintf(stderr,
                  "usage: g6tts --model-dir DIR [--manifest NAME] [--socket PATH] [--model-name NAME]\n"
-                 "             [--streams N] [--cap N] [--weight-mode ref|ref-fp16|native]\n"
+                 "             [--streams N] [--cap N] [--weight-mode ref|ref-fp16|ref-f32|native]\n"
                  "             [--codec-path PATH] [--voc-strides 1,1,2,4] [--no-hash] [--dry-run-load]\n");
 }
 
@@ -117,9 +117,10 @@ bool parse_cli(int argc, char** argv, CliOpts& o) {
             if (!v) return false;
             if (std::strcmp(v, "ref") == 0) o.weight_mode = g6tts::WeightMode::Ref;
             else if (std::strcmp(v, "ref-fp16") == 0) o.weight_mode = g6tts::WeightMode::RefFp16;
+            else if (std::strcmp(v, "ref-f32") == 0) o.weight_mode = g6tts::WeightMode::RefF32;
             else if (std::strcmp(v, "native") == 0) o.weight_mode = g6tts::WeightMode::Native;
             else {
-                std::fprintf(stderr, "g6tts: unknown --weight-mode %s (expected ref, ref-fp16, or native)\n", v);
+                std::fprintf(stderr, "g6tts: unknown --weight-mode %s (expected ref, ref-fp16, ref-f32, or native)\n", v);
                 return false;
             }
         } else if (a == "--no-hash") {
@@ -173,8 +174,8 @@ struct TtsEngine {
     std::vector<int> voc_strides;
 
     // Device state per slot for continuous decode + sampling
-    __half* d_slot_hidden = nullptr;   // [max_slots, H]
-    __half* d_step_hidden = nullptr;   // [max_slots, H]
+    g6tts::bf16* d_slot_hidden = nullptr;   // [max_slots, H]
+    g6tts::bf16* d_step_hidden = nullptr;   // [max_slots, H]
     int32_t* d_ras_ring = nullptr;     // [max_slots, 16]
     int32_t* d_ras_pos = nullptr;      // [max_slots]
     int32_t* d_step_slots = nullptr;   // [max_slots]
@@ -232,8 +233,8 @@ struct TtsEngine {
 
         const int S = opts.streams;
         const int H = weights.cfg.hidden_size;
-        TTS_CK(cudaMalloc(&d_slot_hidden, size_t(S) * H * sizeof(__half)));
-        TTS_CK(cudaMalloc(&d_step_hidden, size_t(S) * H * sizeof(__half)));
+        TTS_CK(cudaMalloc(&d_slot_hidden, size_t(S) * H * sizeof(g6tts::bf16)));
+        TTS_CK(cudaMalloc(&d_step_hidden, size_t(S) * H * sizeof(g6tts::bf16)));
         TTS_CK(cudaMalloc(&d_ras_ring, size_t(S) * g6tts::geom::RAS_WINDOW * sizeof(int32_t)));
         TTS_CK(cudaMalloc(&d_ras_pos, size_t(S) * sizeof(int32_t)));
         TTS_CK(cudaMalloc(&d_step_slots, size_t(S) * sizeof(int32_t)));
@@ -269,7 +270,7 @@ struct TtsEngine {
                        true, slot, start, nullptr, nullptr, false, false, stream);
             const int paired_end = std::min(end, T - 1);
             if (paired_end > start) {
-                tower.prefill_chunk(bb.d_final_f16,
+                tower.prefill_chunk(bb.d_final_bf16,
                                     st.req.rows.data() + size_t(start) * rw,
                                     st.req.rows.data() + size_t(start + 1) * rw,
                                     slot, start, paired_end - start, nullptr, stream);
@@ -277,8 +278,8 @@ struct TtsEngine {
             if (end == T) {
                 // Save last prompt row's backbone hidden state [H]
                 TTS_CK(cudaMemcpyAsync(d_slot_hidden + size_t(slot) * c.hidden_size,
-                                       bb.d_final_f16 + size_t(len - 1) * c.hidden_size,
-                                       size_t(c.hidden_size) * sizeof(__half),
+                                       bb.d_final_bf16 + size_t(len - 1) * c.hidden_size,
+                                       size_t(c.hidden_size) * sizeof(g6tts::bf16),
                                        cudaMemcpyDeviceToDevice, stream));
             }
         }
@@ -456,7 +457,7 @@ struct TtsEngine {
                 std::memcpy(h_frames.data() + size_t(m) * rw, st.last_frame.data(), size_t(rw) * sizeof(int32_t));
                 TTS_CK(cudaMemcpyAsync(d_step_hidden + size_t(m) * H,
                                        d_slot_hidden + size_t(s) * H,
-                                       size_t(H) * sizeof(__half),
+                                       size_t(H) * sizeof(g6tts::bf16),
                                        cudaMemcpyDeviceToDevice, stream));
             }
             TTS_CK(cudaMemcpyAsync(d_step_slots, h_slots.data(), size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
@@ -469,9 +470,7 @@ struct TtsEngine {
             TTS_CK(cudaMemcpyAsync(d_step_fidx, h_fidx.data(), size_t(M) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
 
             // 4a. Sliced lm_head + main token sampling with RAS
-            TTS_BLAS_CK(cublasSetStream(bb.blas, stream));
-            g6tts::gemm_f16(bb.blas, d_step_hidden, weights.lm_head_cand, bb.d_main_logits,
-                            M, c.main_candidates(), H, true, 0.0f);
+            bb.compute_main_logits(d_step_hidden, M, stream);
             g6tts::k_sample_main_ras<<<M, 256, 0, stream>>>(
                 bb.d_main_logits, weights.main_cand_ids_dev, d_ras_ring, d_ras_pos,
                 d_step_slots, d_step_temp, d_step_top_p, d_step_top_k, d_step_seed, d_step_fidx,
@@ -479,8 +478,8 @@ struct TtsEngine {
                 M, c.main_candidates(), c.semantic_start_id, c.semantic_end_id, c.tower_vocab);
 
             // 4b. 4 shared tower layers
-            __half* cur_hid = tower.run_shared(d_step_hidden, d_out_c0, d_out_sem,
-                                               d_step_frames, d_step_slots, d_step_pos, M, stream);
+            g6tts::bf16* cur_hid = tower.run_shared(d_step_hidden, d_out_c0, d_out_sem,
+                                                    d_step_frames, d_step_slots, d_step_pos, M, stream);
 
             // Stage main + c0 to host
             std::vector<int32_t> tmp_main(static_cast<size_t>(M)), tmp_c(static_cast<size_t>(M));
@@ -571,8 +570,8 @@ struct TtsEngine {
                 for (int i = 0; i < M_next; ++i) {
                     const int s = h_next_slots[size_t(i)];
                     TTS_CK(cudaMemcpyAsync(d_slot_hidden + size_t(s) * H,
-                                           bb.d_final_f16 + size_t(i) * H,
-                                           size_t(H) * sizeof(__half),
+                                           bb.d_final_bf16 + size_t(i) * H,
+                                           size_t(H) * sizeof(g6tts::bf16),
                                            cudaMemcpyDeviceToDevice, stream));
                 }
             }

@@ -1,4 +1,4 @@
-// Drama 3 (fish_omni) backbone forward pass in CUDA + cuBLAS FP16 (reference path).
+// Drama 3 (fish_omni) backbone forward pass in CUDA + cuBLAS BF16 (reference path).
 //
 // Exact match to fish-speech @ 0f8a12e8 (`fish_omni/{backbone,layers,moe}.py`):
 //   - Backbone input: E_LM[main], and for semantic rows (SEM0 <= main <= SEM1)
@@ -8,11 +8,12 @@
 //     l % 4 != 3 -> GatedDeltaNet (16 KH / 32 VH x 128, V_per_K=2, depthwise conv1d k=4 + SiLU, FP32 state [32,128,128],
 //     GatedRMSNorm with plain weight * silu(z), out_proj).
 //   - Every layer has SparseMoE: FP32 router softmax -> top-8 -> renormalize, 256 routed experts (either FP8_BLOCK
-//     dequantized on the fly per active expert or pre-decoded FP16), sigmoid-gated BF16/FP16 shared expert.
+//     dequantized on the fly per active expert or pre-decoded BF16), sigmoid-gated shared expert.
 //   - Final ZeroCenteredRMSNorm + sliced lm_head over the 4097 legal main-token candidates.
 #pragma once
 
 #include <cublas_v2.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -29,6 +30,8 @@
 
 namespace g6tts {
 
+using bf16 = __nv_bfloat16;
+
 inline void tts_blas_ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(std::string("g6tts cuBLAS error: ") + what + " (" + std::to_string(int(s)) + ")");
@@ -36,21 +39,62 @@ inline void tts_blas_ck(cublasStatus_t s, const char* what) {
 }
 #define TTS_BLAS_CK(x) ::g6tts::tts_blas_ck((x), #x)
 
+// Exact round-to-BF16 in FP32 value space (matches upstream fish-speech BF16 tensor ops).
+__device__ __forceinline__ float tts_rbf16(float x) {
+    return __bfloat162float(__float2bfloat16_rn(x));
+}
+
+// Lossless BF16 <-> FP32 conversion helpers for RefF32 exact-weight verification mode.
+__global__ void k_tts_bf16_to_f32_buf(const bf16* __restrict__ src, float* __restrict__ dst, size_t n) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __bfloat162float(src[i]);
+}
+
+__global__ void k_tts_f32_to_bf16_buf(const float* __restrict__ src, bf16* __restrict__ dst, size_t n) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2bfloat16_rn(src[i]);
+}
+
 // Row-major GEMM: Y[M, N] = alpha * X[M, K] @ W[N, K]^T + beta * Y[M, N]
-// W and X are FP16; Y may be FP16 (`out_f32 == false`) or FP32 (`out_f32 == true`).
-inline void gemm_f16(cublasHandle_t blas, const __half* X, const __half* W, void* Y,
-                     int M, int N, int K, bool out_f32, float beta = 0.0f) {
+// W and X are BF16; Y may be BF16 (`out_f32 == false`) or FP32 (`out_f32 == true`).
+inline void gemm_bf16(cublasHandle_t blas, const bf16* X, const bf16* W, void* Y,
+                      int M, int N, int K, bool out_f32, float beta = 0.0f) {
     if (M <= 0 || N <= 0 || K <= 0) return;
     const float alpha = 1.0f;
     TTS_BLAS_CK(cublasGemmEx(blas,
                              CUBLAS_OP_T, CUBLAS_OP_N,
                              N, M, K,
                              &alpha,
-                             W, CUDA_R_16F, K,
-                             X, CUDA_R_16F, K,
+                             W, CUDA_R_16BF, K,
+                             X, CUDA_R_16BF, K,
                              &beta,
-                             Y, out_f32 ? CUDA_R_32F : CUDA_R_16F, N,
-                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                             Y, out_f32 ? CUDA_R_32F : CUDA_R_16BF, N,
+                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+}
+
+// Unified Ref GEMM: runs exact FP32 cublasSgemm when W.f32 is populated (WeightMode::RefF32),
+// or standard BF16 cublasGemmEx when W.bf16 is populated (WeightMode::Ref / RefFp16).
+inline void gemm_ref(cublasHandle_t blas, const bf16* X, const RefMat& W, void* Y,
+                     int M, int N, int K, bool out_f32, float beta,
+                     float* d_x_f32, float* d_y_f32, cudaStream_t stream) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
+    if (W.f32 != nullptr) {
+        const size_t x_n = size_t(M) * size_t(K);
+        k_tts_bf16_to_f32_buf<<<static_cast<unsigned>((x_n + 255) / 256), 256, 0, stream>>>(X, d_x_f32, x_n);
+        const float alpha = 1.0f;
+        float* dst_f32 = out_f32 ? static_cast<float*>(Y) : d_y_f32;
+        TTS_BLAS_CK(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                N, M, K, &alpha, W.f32, K, d_x_f32, K, &beta, dst_f32, N));
+        if (!out_f32) {
+            const size_t y_n = size_t(M) * size_t(N);
+            k_tts_f32_to_bf16_buf<<<static_cast<unsigned>((y_n + 255) / 256), 256, 0, stream>>>(
+                d_y_f32, static_cast<bf16*>(Y), y_n);
+        }
+        return;
+    }
+    gemm_bf16(blas, X, W.bf16, Y, M, N, K, out_f32, beta);
 }
 
 // ------------------------------------------------------------------------------------------------ Common CUDA kernels
@@ -103,11 +147,11 @@ __device__ __forceinline__ float tts_e4m3_to_f32(uint8_t b) {
     return (b & 0x80u) ? -v : v;
 }
 
-// Dequantizes one FP8_BLOCK [out, in] matrix with 128x128 FP32 scales into FP16 [out, in].
-// Clamps to [-65504, 65504] matching fish-speech clamp_to_float16.
+// Dequantizes one FP8_BLOCK [out, in] matrix with 128x128 FP32 scales into BF16 [out, in].
+// Matches `fish_omni/moe.py:dequantize_fp8_blocks(..., torch.bfloat16)` with full FP32 exponent range.
 __global__ void k_dequant_fp8_block128(const uint8_t* __restrict__ w_fp8,
                                        const float* __restrict__ w_sc,
-                                       __half* __restrict__ out_f16,
+                                       bf16* __restrict__ out_bf16,
                                        int out_dim, int in_dim, int bi) {
     const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t total = size_t(out_dim) * size_t(in_dim);
@@ -115,9 +159,7 @@ __global__ void k_dequant_fp8_block128(const uint8_t* __restrict__ w_fp8,
     const int r = static_cast<int>(idx / size_t(in_dim));
     const int c = static_cast<int>(idx % size_t(in_dim));
     const float s = w_sc[(r >> 7) * bi + (c >> 7)];
-    float v = tts_e4m3_to_f32(w_fp8[idx]) * s;
-    v = fminf(65504.0f, fmaxf(-65504.0f, v));
-    out_f16[idx] = __float2half_rn(v);
+    out_bf16[idx] = __float2bfloat16_rn(tts_e4m3_to_f32(w_fp8[idx]) * s);
 }
 
 // Backbone input embedding into FP32 residual stream:
@@ -125,8 +167,8 @@ __global__ void k_dequant_fp8_block128(const uint8_t* __restrict__ w_fp8,
 //   if SEM0 <= main <= SEM1: (E_LM[main] + CB_EMB[4096 + c1]) / sqrt(2)
 //   else:                    E_LM[main]
 __global__ void k_backbone_embed(const int32_t* __restrict__ rows,
-                                 const __half* __restrict__ embed_tokens,
-                                 const __half* __restrict__ cb_emb,
+                                 const bf16* __restrict__ embed_tokens,
+                                 const bf16* __restrict__ cb_emb,
                                  float* __restrict__ out_f32,
                                  int M, int H, int row_w, int sem0, int sem1, int cb_vocab) {
     const int m = blockIdx.x;
@@ -135,30 +177,56 @@ __global__ void k_backbone_embed(const int32_t* __restrict__ rows,
     const int main_tok = r[0];
     const bool is_sem = (main_tok >= sem0 && main_tok <= sem1);
     const int c1 = is_sem ? max(0, min(cb_vocab - 1, r[2])) : 0;
-    const __half* e_tok = embed_tokens + size_t(main_tok) * H;
-    const __half* e_cb = cb_emb + size_t(cb_vocab + c1) * H;
+    const bf16* e_tok = embed_tokens + size_t(main_tok) * H;
+    const bf16* e_cb = cb_emb + size_t(cb_vocab + c1) * H;
     float* dst = out_f32 + size_t(m) * H;
     constexpr float inv_sqrt2 = 0.7071067811865475f;
     for (int d = threadIdx.x; d < H; d += blockDim.x) {
-        float v = __half2float(e_tok[d]);
+        float v = __bfloat162float(e_tok[d]);
         if (is_sem) {
-            v = (v + __half2float(e_cb[d])) * inv_sqrt2;
+            v = tts_rbf16(tts_rbf16(v + __bfloat162float(e_cb[d])) * inv_sqrt2);
         }
         dst[d] = v;
     }
 }
 
-// ZeroCenteredRMSNorm from FP32 input -> FP16 output: y = fp16(x * rsqrt(mean(x^2) + eps) * (1 + w)).
+// Exact FP32 backbone embedding lookup (for WeightMode::RefF32 verification).
+__global__ void k_backbone_embed_f32(const int32_t* __restrict__ rows,
+                                     const float* __restrict__ embed_f32,
+                                     const bf16* __restrict__ cb_embed,
+                                     float* __restrict__ out_f32,
+                                     int M, int H, int rw,
+                                     int sem0, int sem1, int cb_vocab) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int32_t* row = rows + size_t(m) * rw;
+    const int main_id = row[0];
+    const bool is_sem = (main_id >= sem0 && main_id <= sem1);
+    const int c1 = is_sem ? max(0, min(row[2], cb_vocab - 1)) : 0;
+    const float* te = embed_f32 + size_t(main_id) * H;
+    const bf16* ce = cb_embed + size_t(cb_vocab + c1) * H;
+    float* dst = out_f32 + size_t(m) * H;
+    constexpr float inv_sqrt2 = 0.7071067811865475f;
+    for (int d = threadIdx.x; d < H; d += blockDim.x) {
+        float v = te[d];
+        if (is_sem) {
+            v = (v + __bfloat162float(ce[d])) * inv_sqrt2;
+        }
+        dst[d] = tts_rbf16(v);
+    }
+}
+
+// ZeroCenteredRMSNorm from FP32 input -> BF16 output: y = bf16(x * rsqrt(mean(x^2) + eps) * (1 + w)).
 // Grid: (M), Block: 256.
-__global__ void k_zc_rmsnorm_f32_to_f16(const float* __restrict__ x,
-                                        const float* __restrict__ w,
-                                        __half* __restrict__ y,
-                                        int M, int H, float eps) {
+__global__ void k_zc_rmsnorm_f32_to_bf16(const float* __restrict__ x,
+                                         const float* __restrict__ w,
+                                         bf16* __restrict__ y,
+                                         int M, int H, float eps) {
     __shared__ float red[8];
     const int m = blockIdx.x;
     if (m >= M) return;
     const float* xr = x + size_t(m) * H;
-    __half* yr = y + size_t(m) * H;
+    bf16* yr = y + size_t(m) * H;
     float ss = 0.0f;
     for (int d = threadIdx.x; d < H; d += 256) {
         const float v = xr[d];
@@ -166,12 +234,11 @@ __global__ void k_zc_rmsnorm_f32_to_f16(const float* __restrict__ x,
     }
     const float rs = rsqrtf(tts_block_sum256(ss, red) / float(H) + eps);
     for (int d = threadIdx.x; d < H; d += 256) {
-        const float v = xr[d] * rs * (1.0f + w[d]);
-        yr[d] = __float2half_rn(fminf(65504.0f, fmaxf(-65504.0f, v)));
+        yr[d] = __float2bfloat16_rn(xr[d] * rs * (1.0f + w[d]));
     }
 }
 
-// ZeroCenteredRMSNorm from FP32 input -> FP32 output (for teacher-forced hidden dump).
+// ZeroCenteredRMSNorm from FP32 input -> BF16-rounded FP32 output (for teacher-forced hidden dump).
 __global__ void k_zc_rmsnorm_f32_to_f32(const float* __restrict__ x,
                                         const float* __restrict__ w,
                                         float* __restrict__ y,
@@ -188,21 +255,20 @@ __global__ void k_zc_rmsnorm_f32_to_f32(const float* __restrict__ x,
     }
     const float rs = rsqrtf(tts_block_sum256(ss, red) / float(H) + eps);
     for (int d = threadIdx.x; d < H; d += 256) {
-        yr[d] = xr[d] * rs * (1.0f + w[d]);
+        yr[d] = tts_rbf16(xr[d] * rs * (1.0f + w[d]));
     }
 }
 
-// SwiGLU activation: out[i] = fp16(silu(gate[i]) * up[i]).
-__global__ void k_silu_mul_f16(const __half* __restrict__ gate,
-                               const __half* __restrict__ up,
-                               __half* __restrict__ out,
-                               size_t n) {
+// SwiGLU activation: out[i] = bf16(bf16(silu(gate[i])) * up[i]).
+__global__ void k_silu_mul_bf16(const bf16* __restrict__ gate,
+                                const bf16* __restrict__ up,
+                                bf16* __restrict__ out,
+                                size_t n) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = __half2float(gate[i]);
-    const float u = __half2float(up[i]);
-    const float v = tts_silu(g) * u;
-    out[i] = __float2half_rn(fminf(65504.0f, fmaxf(-65504.0f, v)));
+    const float g = __bfloat162float(gate[i]);
+    const float u = __bfloat162float(up[i]);
+    out[i] = __float2bfloat16_rn(tts_rbf16(tts_silu(g)) * u);
 }
 
 // ------------------------------------------------------------------------------------------------ Full Attention kernels
@@ -212,14 +278,14 @@ __global__ void k_silu_mul_f16(const __half* __restrict__ gate,
 // k_in, v_in: [M, nkv, hd]
 // Writes Q_out: [M, nq, hd], K_cache[slot, pos, nkv, hd], V_cache[slot, pos, nkv, hd].
 // Grid: (M, nq + nkv), Block: 256 (1 thread per head_dim element for hd=256).
-__global__ void k_bb_qk_norm_rope_kv(const __half* __restrict__ qg_in,
-                                     const __half* __restrict__ k_in,
-                                     const __half* __restrict__ v_in,
+__global__ void k_bb_qk_norm_rope_kv(const bf16* __restrict__ qg_in,
+                                     const bf16* __restrict__ k_in,
+                                     const bf16* __restrict__ v_in,
                                      const float* __restrict__ q_norm_w,
                                      const float* __restrict__ k_norm_w,
-                                     __half* __restrict__ q_out,
-                                     __half* __restrict__ k_cache,
-                                     __half* __restrict__ v_cache,
+                                     bf16* __restrict__ q_out,
+                                     bf16* __restrict__ k_cache,
+                                     bf16* __restrict__ v_cache,
                                      const int* __restrict__ d_slots,
                                      const int* __restrict__ d_pos,
                                      int M, int nq, int nkv, int hd, int rotary_dim,
@@ -236,14 +302,14 @@ __global__ void k_bb_qk_norm_rope_kv(const __half* __restrict__ qg_in,
     const int slot = d_slots[m];
     const int pos = d_pos[m];
 
-    const __half* src = is_k
+    const bf16* src = is_k
         ? (k_in + (size_t(m) * nkv + h) * hd)
         : (qg_in + (size_t(m) * nq + h) * (2 * hd)); // Q is first half of [Q | Gate] per head
     const float* nw = is_k ? k_norm_w : q_norm_w;
 
-    const float xv = __half2float(src[d]);
+    const float xv = __bfloat162float(src[d]);
     const float rs = rsqrtf(tts_block_sum256(xv * xv, red) / float(hd) + eps);
-    const float normed = xv * rs * (1.0f + nw[d]);
+    const float normed = tts_rbf16(xv * rs * (1.0f + nw[d]));
     s_buf[d] = normed;
     __syncthreads();
 
@@ -261,10 +327,10 @@ __global__ void k_bb_qk_norm_rope_kv(const __half* __restrict__ qg_in,
 
     if (is_k) {
         const size_t kv_off = ((size_t(slot) * cap + pos) * nkv + h) * hd + d;
-        k_cache[kv_off] = __float2half_rn(out_v);
+        k_cache[kv_off] = __float2bfloat16_rn(out_v);
         v_cache[kv_off] = v_in[(size_t(m) * nkv + h) * hd + d];
     } else {
-        q_out[(size_t(m) * nq + h) * hd + d] = __float2half_rn(out_v);
+        q_out[(size_t(m) * nq + h) * hd + d] = __float2bfloat16_rn(out_v);
     }
 }
 
@@ -272,11 +338,11 @@ __global__ void k_bb_qk_norm_rope_kv(const __half* __restrict__ qg_in,
 // Gate layout: if `gate_interleaved_per_head == true` (Backbone): gate is second half of `gate_src[m, hq, 2*hd]`.
 //              if `gate_interleaved_per_head == false` (Tower):   gate is `gate_src[m * gate_stride + hq * hd + d]`.
 // Grid: (M, nq), Block: 256 (1 thread per head_dim element).
-__global__ void k_gqa_attn_gated(const __half* __restrict__ q_in,
-                                 const __half* __restrict__ gate_src,
-                                 const __half* __restrict__ k_cache,
-                                 const __half* __restrict__ v_cache,
-                                 __half* __restrict__ out,
+__global__ void k_gqa_attn_gated(const bf16* __restrict__ q_in,
+                                 const bf16* __restrict__ gate_src,
+                                 const bf16* __restrict__ k_cache,
+                                 const bf16* __restrict__ v_cache,
+                                 bf16* __restrict__ out,
                                  const int* __restrict__ d_slots,
                                  const int* __restrict__ d_pos,
                                  int M, int nq, int nkv, int hd, int cap,
@@ -292,7 +358,7 @@ __global__ void k_gqa_attn_gated(const __half* __restrict__ q_in,
     const int pos = d_pos[m];
     const float scale = rsqrtf(float(hd));
 
-    const float qv = __half2float(q_in[(size_t(m) * nq + hq) * hd + d]);
+    const float qv = __bfloat162float(q_in[(size_t(m) * nq + hq) * hd + d]);
     const size_t slot_base = size_t(slot) * cap * nkv * hd;
     const size_t kv_stride = size_t(nkv) * hd;
 
@@ -302,34 +368,34 @@ __global__ void k_gqa_attn_gated(const __half* __restrict__ q_in,
 
     for (int t = 0; t <= pos; ++t) {
         const size_t koff = slot_base + size_t(t) * kv_stride + size_t(hkv) * hd + d;
-        const float kv = __half2float(k_cache[koff]);
+        const float kv = __bfloat162float(k_cache[koff]);
         const float dot = tts_block_sum256(qv * kv, red) * scale;
         const float nmax = fmaxf(m_max, dot);
         const float alpha = __expf(m_max - nmax);
         const float p = __expf(dot - nmax);
         m_max = nmax;
         l_sum = l_sum * alpha + p;
-        acc = acc * alpha + p * __half2float(v_cache[koff]);
+        acc = acc * alpha + p * __bfloat162float(v_cache[koff]);
     }
 
     const float attn_v = (l_sum > 0.0f) ? (acc / l_sum) : 0.0f;
     float g_val = 0.0f;
     if (gate_interleaved_per_head) {
-        g_val = __half2float(gate_src[(size_t(m) * nq + hq) * (2 * hd) + hd + d]);
+        g_val = __bfloat162float(gate_src[(size_t(m) * nq + hq) * (2 * hd) + hd + d]);
     } else {
-        g_val = __half2float(gate_src[size_t(m) * gate_stride + gate_offset + size_t(hq) * hd + d]);
+        g_val = __bfloat162float(gate_src[size_t(m) * gate_stride + gate_offset + size_t(hq) * hd + d]);
     }
-    out[(size_t(m) * nq + hq) * hd + d] = __float2half_rn(attn_v * tts_sigmoid(g_val));
+    out[(size_t(m) * nq + hq) * hd + d] = __float2bfloat16_rn(tts_rbf16(attn_v) * tts_rbf16(tts_sigmoid(g_val)));
 }
 
 // ------------------------------------------------------------------------------------------------ GDN kernels
 
 // Causal depthwise conv1d (k=4) + SiLU over a contiguous segment of `len` rows for one slot.
 // Grid: ((qkv_dim + 255) / 256), Block: 256.
-__global__ void k_gdn_conv1d_seg(const __half* __restrict__ qkv_raw,
+__global__ void k_gdn_conv1d_seg(const bf16* __restrict__ qkv_raw,
                                  const float* __restrict__ conv_w,
                                  float* __restrict__ conv_hist,
-                                 __half* __restrict__ qkv_out,
+                                 bf16* __restrict__ qkv_out,
                                  int qkv_dim, int slot, int row0, int pos0, int len) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= qkv_dim) return;
@@ -342,9 +408,9 @@ __global__ void k_gdn_conv1d_seg(const __half* __restrict__ qkv_raw,
 
     for (int t = 0; t < len; ++t) {
         const size_t idx = size_t(row0 + t) * qkv_dim + c;
-        const float x = __half2float(qkv_raw[idx]);
+        const float x = __bfloat162float(qkv_raw[idx]);
         const float y = h0 * w0 + h1 * w1 + h2 * w2 + x * w3;
-        qkv_out[idx] = __float2half_rn(tts_silu(y));
+        qkv_out[idx] = __float2bfloat16_rn(tts_silu(tts_rbf16(y)));
         h0 = h1;
         h1 = h2;
         h2 = x;
@@ -355,10 +421,10 @@ __global__ void k_gdn_conv1d_seg(const __half* __restrict__ qkv_raw,
 }
 
 // Batched single-token decode conv1d (k=4) + SiLU for M active slots in one launch.
-__global__ void k_gdn_conv1d_dec(const __half* __restrict__ qkv_raw,
+__global__ void k_gdn_conv1d_dec(const bf16* __restrict__ qkv_raw,
                                  const float* __restrict__ conv_w,
                                  float* __restrict__ conv_hist,
-                                 __half* __restrict__ qkv_out,
+                                 bf16* __restrict__ qkv_out,
                                  const int* __restrict__ d_slots,
                                  const int* __restrict__ d_pos,
                                  int M, int qkv_dim) {
@@ -374,9 +440,9 @@ __global__ void k_gdn_conv1d_dec(const __half* __restrict__ qkv_raw,
     const float h0 = (pos > 0) ? hb[0 * qkv_dim + c] : 0.0f;
     const float h1 = (pos > 0) ? hb[1 * qkv_dim + c] : 0.0f;
     const float h2 = (pos > 0) ? hb[2 * qkv_dim + c] : 0.0f;
-    const float x = __half2float(qkv_raw[idx]);
+    const float x = __bfloat162float(qkv_raw[idx]);
     const float y = h0 * wc[0] + h1 * wc[1] + h2 * wc[2] + x * wc[3];
-    qkv_out[idx] = __float2half_rn(tts_silu(y));
+    qkv_out[idx] = __float2bfloat16_rn(tts_silu(tts_rbf16(y)));
     hb[0 * qkv_dim + c] = h1;
     hb[1 * qkv_dim + c] = h2;
     hb[2 * qkv_dim + c] = x;
@@ -384,15 +450,16 @@ __global__ void k_gdn_conv1d_dec(const __half* __restrict__ qkv_raw,
 
 // Recurrent Gated Delta Rule + GatedRMSNorm(plain weight * silu(z)) over a contiguous segment for one slot.
 // Grid: (nh_v = 32), Block: 256 (v = tid & 127, kh = tid >> 7, each thread holds 64 rows of S[128,128]).
-__global__ void k_gdn_rec_norm_seg(const __half* __restrict__ qkv_conv,
+// Uses distinct sp_kv / sp_delta / sp_out shared arrays to guarantee zero WAR/WAW hazards across kh=0/1 warps.
+__global__ void k_gdn_rec_norm_seg(const bf16* __restrict__ qkv_conv,
                                    const float* __restrict__ a_in,
                                    const float* __restrict__ b_in,
-                                   const __half* __restrict__ z_in,
+                                   const bf16* __restrict__ z_in,
                                    const float* __restrict__ A_log,
                                    const float* __restrict__ dt_bias,
                                    const float* __restrict__ norm_w,
                                    float* __restrict__ S_all,
-                                   __half* __restrict__ core_out,
+                                   bf16* __restrict__ core_out,
                                    int nh_k, int nh_v, int slot, int row0, int pos0, int len, float eps) {
     const int hv = blockIdx.x;
     if (hv >= nh_v) return;
@@ -406,7 +473,9 @@ __global__ void k_gdn_rec_norm_seg(const __half* __restrict__ qkv_conv,
 
     __shared__ float sq[128];
     __shared__ float sk[128];
-    __shared__ float sp[128];
+    __shared__ float sp_kv[128];
+    __shared__ float sp_delta[128];
+    __shared__ float sp_out[128];
     __shared__ float s_meta[2];
     __shared__ float qwarp[4];
     __shared__ float kwarp[4];
@@ -427,16 +496,16 @@ __global__ void k_gdn_rec_norm_seg(const __half* __restrict__ qkv_conv,
 
     for (int t = 0; t < len; ++t) {
         const int r = row0 + t;
-        const __half* qkv = qkv_conv + size_t(r) * qkv_dim;
-        const __half* q_ptr = qkv + size_t(hk) * 128;
-        const __half* k_ptr = qkv + size_t(nh_k + hk) * 128;
-        const __half* v_ptr = qkv + size_t(2 * nh_k + hv) * 128;
+        const bf16* qkv = qkv_conv + size_t(r) * qkv_dim;
+        const bf16* q_ptr = qkv + size_t(hk) * 128;
+        const bf16* k_ptr = qkv + size_t(nh_k + hk) * 128;
+        const bf16* v_ptr = qkv + size_t(2 * nh_k + hv) * 128;
 
-        if (kh == 0) sq[v] = __half2float(q_ptr[v]);
-        else sk[v] = __half2float(k_ptr[v]);
+        if (kh == 0) sq[v] = __bfloat162float(q_ptr[v]);
+        else sk[v] = __bfloat162float(k_ptr[v]);
         if (tid == 0) {
-            const float av = a_in[size_t(r) * nh_v + hv];
-            const float bv = b_in[size_t(r) * nh_v + hv];
+            const float av = tts_rbf16(a_in[size_t(r) * nh_v + hv]);
+            const float bv = tts_rbf16(b_in[size_t(r) * nh_v + hv]);
             s_meta[0] = expf(neg_A * tts_softplus(av + dtb));
             s_meta[1] = tts_sigmoid(bv);
         }
@@ -471,14 +540,14 @@ __global__ void k_gdn_rec_norm_seg(const __half* __restrict__ qkv_conv,
             s_col[i] = sv;
             kv_part = fmaf(sv, sk[k_base + i], kv_part);
         }
-        if (kh == 1) sp[v] = kv_part;
+        if (kh == 1) sp_kv[v] = kv_part;
         __syncthreads();
         if (kh == 0) {
-            const float vv = __half2float(v_ptr[v]);
-            sp[v] = (vv - (kv_part + sp[v])) * beta;
+            const float vv = __bfloat162float(v_ptr[v]);
+            sp_delta[v] = (vv - (kv_part + sp_kv[v])) * beta;
         }
         __syncthreads();
-        const float delta_v = sp[v];
+        const float delta_v = sp_delta[v];
 
         float out_part = 0.0f;
         #pragma unroll
@@ -487,23 +556,23 @@ __global__ void k_gdn_rec_norm_seg(const __half* __restrict__ qkv_conv,
             s_col[i] = sv;
             out_part = fmaf(sv, sq[k_base + i], out_part);
         }
-        if (kh == 1) sp[v] = out_part;
+        if (kh == 1) sp_out[v] = out_part;
         __syncthreads();
 
-        // GatedRMSNorm: plain norm_w * rmsnorm(o) * silu(z)
+        // GatedRMSNorm: bf16(norm_w * bf16(rmsnorm(bf16(o)))) * silu(z)
         float ov = 0.0f;
         if (kh == 0) {
-            ov = out_part + sp[v];
+            ov = tts_rbf16(out_part + sp_out[v]);
             const float ss = tts_warp_sum(ov * ov);
             if ((v & 31) == 0) qwarp[v >> 5] = ss;
         }
         __syncthreads();
         if (kh == 0) {
             const float inv = rsqrtf((qwarp[0] + qwarp[1] + qwarp[2] + qwarp[3]) / 128.0f + eps);
-            const float normed = ov * inv * norm_w[v];
+            const float normed = tts_rbf16(norm_w[v] * tts_rbf16(ov * inv));
             const size_t zoff = (size_t(r) * nh_v + hv) * 128 + v;
-            const float gate = tts_silu(__half2float(z_in[zoff]));
-            core_out[zoff] = __float2half_rn(normed * gate);
+            const float gate = tts_silu(__bfloat162float(z_in[zoff]));
+            core_out[zoff] = __float2bfloat16_rn(normed * gate);
         }
         __syncthreads();
     }
@@ -514,15 +583,15 @@ __global__ void k_gdn_rec_norm_seg(const __half* __restrict__ qkv_conv,
 
 // Batched single-token decode GDN recurrence + GatedRMSNorm across M slots in ONE launch.
 // Grid: (M * nh_v), Block: 256.
-__global__ void k_gdn_rec_norm_dec(const __half* __restrict__ qkv_conv,
+__global__ void k_gdn_rec_norm_dec(const bf16* __restrict__ qkv_conv,
                                    const float* __restrict__ a_in,
                                    const float* __restrict__ b_in,
-                                   const __half* __restrict__ z_in,
+                                   const bf16* __restrict__ z_in,
                                    const float* __restrict__ A_log,
                                    const float* __restrict__ dt_bias,
                                    const float* __restrict__ norm_w,
                                    float* __restrict__ S_all,
-                                   __half* __restrict__ core_out,
+                                   bf16* __restrict__ core_out,
                                    const int* __restrict__ d_slots,
                                    const int* __restrict__ d_pos,
                                    int M, int nh_k, int nh_v, float eps) {
@@ -540,17 +609,17 @@ __global__ void k_gdn_rec_norm_dec(const __half* __restrict__ qkv_conv,
     const int kh = tid >> 7;
     const int k_base = kh * 64;
 
-    __shared__ float sq[128], sk[128], sp[128], s_meta[2], qwarp[4], kwarp[4];
-    const __half* qkv = qkv_conv + size_t(m) * qkv_dim;
-    const __half* q_ptr = qkv + size_t(hk) * 128;
-    const __half* k_ptr = qkv + size_t(nh_k + hk) * 128;
-    const __half* v_ptr = qkv + size_t(2 * nh_k + hv) * 128;
+    __shared__ float sq[128], sk[128], sp_kv[128], sp_delta[128], sp_out[128], s_meta[2], qwarp[4], kwarp[4];
+    const bf16* qkv = qkv_conv + size_t(m) * qkv_dim;
+    const bf16* q_ptr = qkv + size_t(hk) * 128;
+    const bf16* k_ptr = qkv + size_t(nh_k + hk) * 128;
+    const bf16* v_ptr = qkv + size_t(2 * nh_k + hv) * 128;
 
-    if (kh == 0) sq[v] = __half2float(q_ptr[v]);
-    else sk[v] = __half2float(k_ptr[v]);
+    if (kh == 0) sq[v] = __bfloat162float(q_ptr[v]);
+    else sk[v] = __bfloat162float(k_ptr[v]);
     if (tid == 0) {
-        const float av = a_in[size_t(m) * nh_v + hv];
-        const float bv = b_in[size_t(m) * nh_v + hv];
+        const float av = tts_rbf16(a_in[size_t(m) * nh_v + hv]);
+        const float bv = tts_rbf16(b_in[size_t(m) * nh_v + hv]);
         s_meta[0] = expf(-expf(A_log[hv]) * tts_softplus(av + dt_bias[hv]));
         s_meta[1] = tts_sigmoid(bv);
     }
@@ -591,13 +660,13 @@ __global__ void k_gdn_rec_norm_dec(const __half* __restrict__ qkv_conv,
             kv_part = fmaf(sv, sk[k_base + i], kv_part);
         }
     }
-    if (kh == 1) sp[v] = kv_part;
+    if (kh == 1) sp_kv[v] = kv_part;
     __syncthreads();
     if (kh == 0) {
-        sp[v] = (__half2float(v_ptr[v]) - (kv_part + sp[v])) * beta;
+        sp_delta[v] = (__bfloat162float(v_ptr[v]) - (kv_part + sp_kv[v])) * beta;
     }
     __syncthreads();
-    const float delta_v = sp[v];
+    const float delta_v = sp_delta[v];
 
     float out_part = 0.0f;
     #pragma unroll
@@ -606,26 +675,27 @@ __global__ void k_gdn_rec_norm_dec(const __half* __restrict__ qkv_conv,
         S_head[(k_base + i) * 128 + v] = sv;
         out_part = fmaf(sv, sq[k_base + i], out_part);
     }
-    if (kh == 1) sp[v] = out_part;
+    if (kh == 1) sp_out[v] = out_part;
     __syncthreads();
 
     float ov = 0.0f;
     if (kh == 0) {
-        ov = out_part + sp[v];
+        ov = tts_rbf16(out_part + sp_out[v]);
         const float ss = tts_warp_sum(ov * ov);
         if ((v & 31) == 0) qwarp[v >> 5] = ss;
     }
     __syncthreads();
     if (kh == 0) {
         const float inv = rsqrtf((qwarp[0] + qwarp[1] + qwarp[2] + qwarp[3]) / 128.0f + eps);
+        const float normed = tts_rbf16(norm_w[v] * tts_rbf16(ov * inv));
         const size_t zoff = size_t(idx) * 128 + v;
-        core_out[zoff] = __float2half_rn(ov * inv * norm_w[v] * tts_silu(__half2float(z_in[zoff])));
+        core_out[zoff] = __float2bfloat16_rn(normed * tts_silu(__bfloat162float(z_in[zoff])));
     }
 }
 
 // ------------------------------------------------------------------------------------------------ MoE kernels
 
-// Router: FP32 softmax over 256 experts -> top-K -> optional renormalize.
+// Router: BF16-rounded gate logits -> FP32 softmax over 256 experts -> top-K -> optional renormalize -> BF16 topk_w.
 // Grid: (M), Block: 256 (one thread per expert for NEXP=256).
 __global__ void k_moe_router_topk(const float* __restrict__ logits,
                                   int32_t* __restrict__ topk_ids,
@@ -633,12 +703,12 @@ __global__ void k_moe_router_topk(const float* __restrict__ logits,
                                   int M, int nexp, int topk, bool norm_topk) {
     __shared__ float s_p[256];
     __shared__ float red[8];
+    __shared__ float s_row_max;
     const int m = blockIdx.x;
     const int e = threadIdx.x;
     if (m >= M) return;
 
-    const float v = (e < nexp) ? logits[size_t(m) * nexp + e] : -1e30f;
-    // Block max
+    const float v = (e < nexp) ? tts_rbf16(logits[size_t(m) * nexp + e]) : -1e30f;
     float mx = v;
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
@@ -648,10 +718,10 @@ __global__ void k_moe_router_topk(const float* __restrict__ logits,
         float bm = (e < 8) ? red[e] : -1e30f;
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, off));
-        if (e == 0) red[0] = bm;
+        if (e == 0) s_row_max = bm;
     }
     __syncthreads();
-    const float row_max = red[0];
+    const float row_max = s_row_max;
 
     const float ex = (e < nexp) ? expf(v - row_max) : 0.0f;
     const float sum_ex = tts_block_sum256(ex, red);
@@ -674,21 +744,21 @@ __global__ void k_moe_router_topk(const float* __restrict__ logits,
             wsum += best_p;
             s_p[best_e] = -2.0f;
         }
-        if (norm_topk && wsum > 0.0f) {
-            const float inv = 1.0f / wsum;
-            for (int k = 0; k < topk; ++k) topk_w[size_t(m) * topk + k] *= inv;
+        const float inv = (norm_topk && wsum > 0.0f) ? (1.0f / wsum) : 1.0f;
+        for (int k = 0; k < topk; ++k) {
+            topk_w[size_t(m) * topk + k] = tts_rbf16(topk_w[size_t(m) * topk + k] * inv);
         }
     }
 }
 
-__global__ void k_gather_rows_f16(const __half* __restrict__ src,
-                                  const int32_t* __restrict__ row_ids,
-                                  __half* __restrict__ dst,
-                                  int cnt, int H) {
+__global__ void k_gather_rows_bf16(const bf16* __restrict__ src,
+                                   const int32_t* __restrict__ row_ids,
+                                   bf16* __restrict__ dst,
+                                   int cnt, int H) {
     const int i = blockIdx.x;
     if (i >= cnt) return;
-    const __half* s = src + size_t(row_ids[i]) * H;
-    __half* d = dst + size_t(i) * H;
+    const bf16* s = src + size_t(row_ids[i]) * H;
+    bf16* d = dst + size_t(i) * H;
     for (int c = threadIdx.x; c < H; c += blockDim.x) d[c] = s[c];
 }
 
@@ -707,17 +777,20 @@ __global__ void k_scatter_add_f32(const float* __restrict__ src,
     }
 }
 
-__global__ void k_add_gated_shared_f32(const float* __restrict__ shared_out,
+// Fused MoE + gated shared expert + FP32 residual update.
+__global__ void k_moe_finalize_res_f32(const float* __restrict__ routed_f32,
+                                       const float* __restrict__ shared_out,
                                        const float* __restrict__ shared_gate_logit,
                                        float* __restrict__ residual,
                                        int M, int H) {
     const int m = blockIdx.x;
     if (m >= M) return;
     const float g = tts_sigmoid(shared_gate_logit[m]);
-    const float* s = shared_out + size_t(m) * H;
+    const float* rt = routed_f32 + size_t(m) * H;
+    const float* sh = shared_out + size_t(m) * H;
     float* r = residual + size_t(m) * H;
     for (int c = threadIdx.x; c < H; c += blockDim.x) {
-        r[c] += g * s[c];
+        r[c] += rt[c] + g * sh[c];
     }
 }
 
@@ -733,63 +806,104 @@ struct BackboneProfile {
     void reset() { embed_ms = attn_ms = gdn_ms = moe_ms = head_ms = 0.0; }
 };
 
+struct BackboneLayerTrace {
+    bool enabled = false;
+    bool replay_router = false;
+    std::vector<float> embed_f32;
+    std::vector<float> final_hidden_f32;
+    // Fine-grained sub-op traces for L0 (GDN) and L3 (FullAttention) Gate E1 diagnostics.
+    std::vector<float> l0_qkv_raw;
+    std::vector<float> l0_qkv_conv;
+    std::vector<float> l0_core_out;
+    std::vector<float> l3_q_ready;
+    std::vector<float> l3_attn_out;
+    std::vector<std::vector<float>> mixer_residuals;
+    std::vector<std::vector<float>> router_logits;
+    std::vector<std::vector<float>> residuals;
+    std::vector<std::vector<int32_t>> topk_ids;
+    std::vector<std::vector<float>> topk_w;
+    std::vector<std::vector<int32_t>> forced_topk_ids;
+    std::vector<std::vector<float>> forced_topk_w;
+    void reset(int L) {
+        embed_f32.clear();
+        final_hidden_f32.clear();
+        l0_qkv_raw.clear();
+        l0_qkv_conv.clear();
+        l0_core_out.clear();
+        l3_q_ready.clear();
+        l3_attn_out.clear();
+        mixer_residuals.assign(size_t(L), {});
+        router_logits.assign(size_t(L), {});
+        residuals.assign(size_t(L), {});
+        topk_ids.assign(size_t(L), {});
+        topk_w.assign(size_t(L), {});
+    }
+};
+
 struct BackboneRunner {
+    static constexpr size_t CUBLAS_WS_BYTES = size_t(32) << 20;
+
     const TtsWeights* W = nullptr;
     cublasHandle_t blas = nullptr;
+    void* d_cublas_ws = nullptr;
     int max_slots = 8;
     int cap = 4096;
     int max_chunk = 128;
 
     // Persistent per-slot caches
-    std::vector<__half*> k_caches;  // [L], non-null for full-attn layers: [max_slots, cap, 2, 256]
-    std::vector<__half*> v_caches;  // [L]
-    std::vector<float*> gdn_S;      // [L], non-null for GDN layers: [max_slots, 32, 128, 128]
-    std::vector<float*> gdn_conv;   // [L], non-null for GDN layers: [max_slots, 3, 8192]
+    std::vector<bf16*> k_caches;  // [L], non-null for full-attn layers: [max_slots, cap, 2, 256] BF16
+    std::vector<bf16*> v_caches;  // [L]
+    std::vector<float*> gdn_S;    // [L], non-null for GDN layers: [max_slots, 32, 128, 128]
+    std::vector<float*> gdn_conv; // [L], non-null for GDN layers: [max_slots, 3, 8192]
 
     // Scratch buffers (allocated for `max_chunk` rows)
     int32_t* d_rows = nullptr;          // [max_chunk, 11]
     int32_t* d_slots = nullptr;         // [max_chunk]
     int32_t* d_pos = nullptr;           // [max_chunk]
     float* d_residual = nullptr;        // [max_chunk, H]
-    __half* d_norm = nullptr;           // [max_chunk, H]
-    __half* d_qkv = nullptr;            // [max_chunk, 8192] (reused by FullAttn qg & GDN qkv_raw)
-    __half* d_qkv2 = nullptr;           // [max_chunk, 8192] (GDN qkv_conv)
-    __half* d_q_ready = nullptr;        // [max_chunk, 4096] (FullAttn Q & GDN z / core)
-    __half* d_kv_tmp = nullptr;         // [max_chunk, 1024] (K[512] + V[512])
-    __half* d_attn_out = nullptr;       // [max_chunk, 4096]
-    float* d_ab = nullptr;              // [max_chunk, 64] (GDN a[32] + b[32])
+    float* d_moe_routed_f32 = nullptr;  // [max_chunk, H]
+    float* d_ref_x_f32 = nullptr;       // [max_chunk, 4096] (WeightMode::RefF32 only)
+    float* d_ref_y_f32 = nullptr;       // [max_chunk, 8192] (WeightMode::RefF32 only)
+    bf16* d_norm = nullptr;             // [max_chunk, H]
+    bf16* d_qkv = nullptr;              // [max_chunk, 8192]
+    bf16* d_qkv2 = nullptr;             // [max_chunk, 8192]
+    bf16* d_q_ready = nullptr;          // [max_chunk, 4096]
+    bf16* d_kv_tmp = nullptr;           // [max_chunk, 1024]
+    bf16* d_attn_out = nullptr;         // [max_chunk, 4096]
+    float* d_ab = nullptr;              // [max_chunk, 64]
     float* d_router_logits = nullptr;   // [max_chunk, 256]
     int32_t* d_topk_ids = nullptr;      // [max_chunk, 8]
     float* d_topk_w = nullptr;          // [max_chunk, 8]
-    __half* d_shared_g = nullptr;       // [max_chunk, 512]
-    __half* d_shared_u = nullptr;       // [max_chunk, 512]
+    bf16* d_shared_g = nullptr;         // [max_chunk, 512]
+    bf16* d_shared_u = nullptr;         // [max_chunk, 512]
     float* d_shared_out = nullptr;      // [max_chunk, H]
     float* d_shared_gate = nullptr;     // [max_chunk]
-    __half* d_exp_x = nullptr;          // [max_chunk, H]
-    __half* d_exp_g = nullptr;          // [max_chunk, 512]
-    __half* d_exp_u = nullptr;          // [max_chunk, 512]
+    bf16* d_exp_x = nullptr;            // [max_chunk, H]
+    bf16* d_exp_g = nullptr;            // [max_chunk, 512]
+    bf16* d_exp_u = nullptr;            // [max_chunk, 512]
     float* d_exp_out = nullptr;         // [max_chunk, H]
     int32_t* d_exp_rows = nullptr;      // [max_chunk * top_k]
     float* d_exp_w = nullptr;           // [max_chunk * top_k]
-    __half* d_deq_g = nullptr;          // [512, 2048] scratch for on-the-fly FP8 expert dequant
-    __half* d_deq_u = nullptr;          // [512, 2048]
-    __half* d_deq_d = nullptr;          // [2048, 512]
-    __half* d_final_f16 = nullptr;      // [max_chunk, H]
+    bf16* d_deq_g = nullptr;            // [512, 2048]
+    bf16* d_deq_u = nullptr;            // [512, 2048]
+    bf16* d_deq_d = nullptr;            // [2048, 512]
+    bf16* d_final_bf16 = nullptr;       // [max_chunk, H]
     float* d_final_f32 = nullptr;       // [max_chunk, H]
     float* d_main_logits = nullptr;     // [max_chunk, 4097]
 
     // Pinned host scratch for tiny MoE routing table & row/slot/pos staging
     int32_t* h_topk_ids = nullptr;
     float* h_topk_w = nullptr;
-    int32_t* h_exp_rows = nullptr;      // [max_chunk * top_k]
-    float* h_exp_w = nullptr;           // [max_chunk * top_k]
-    int32_t* h_rows_stage = nullptr;    // [max_chunk, row_width]
+    int32_t* h_exp_rows = nullptr;
+    float* h_exp_w = nullptr;
+    int32_t* h_rows_stage = nullptr;
     int32_t* h_slots = nullptr;
     int32_t* h_pos = nullptr;
 
     size_t state_bytes = 0;
     size_t scratch_bytes = 0;
     BackboneProfile prof;
+    BackboneLayerTrace trace;
     cudaEvent_t ev0 = nullptr, ev1 = nullptr;
 
     ~BackboneRunner() { release(); }
@@ -802,19 +916,22 @@ struct BackboneRunner {
         for (auto*& p : gdn_S) freep(p);
         for (auto*& p : gdn_conv) freep(p);
         k_caches.clear(); v_caches.clear(); gdn_S.clear(); gdn_conv.clear();
-        freep(d_rows); freep(d_slots); freep(d_pos); freep(d_residual); freep(d_norm);
+        freep(d_rows); freep(d_slots); freep(d_pos); freep(d_residual);
+        freep(d_moe_routed_f32); freep(d_ref_x_f32); freep(d_ref_y_f32); freep(d_norm);
         freep(d_qkv); freep(d_qkv2); freep(d_q_ready); freep(d_kv_tmp); freep(d_attn_out);
         freep(d_ab); freep(d_router_logits); freep(d_topk_ids); freep(d_topk_w);
         freep(d_shared_g); freep(d_shared_u); freep(d_shared_out); freep(d_shared_gate);
         freep(d_exp_x); freep(d_exp_g); freep(d_exp_u); freep(d_exp_out);
         freep(d_exp_rows); freep(d_exp_w);
         freep(d_deq_g); freep(d_deq_u); freep(d_deq_d);
-        freep(d_final_f16); freep(d_final_f32); freep(d_main_logits);
+        freep(d_final_bf16); freep(d_final_f32); freep(d_main_logits);
         freeh(h_topk_ids); freeh(h_topk_w); freeh(h_exp_rows); freeh(h_exp_w);
         freeh(h_rows_stage); freeh(h_slots); freeh(h_pos);
         if (ev0) { cudaEventDestroy(ev0); ev0 = nullptr; }
         if (ev1) { cudaEventDestroy(ev1); ev1 = nullptr; }
         if (blas) { cublasDestroy(blas); blas = nullptr; }
+        freep(d_cublas_ws);
+        scratch_bytes = 0;
     }
 
     void init(const TtsWeights& weights, int streams, int kv_cap, int chunk = 128) {
@@ -825,6 +942,9 @@ struct BackboneRunner {
         max_chunk = std::max(16, chunk);
 
         TTS_BLAS_CK(cublasCreate(&blas));
+        TTS_CK(cudaMalloc(&d_cublas_ws, CUBLAS_WS_BYTES));
+        TTS_BLAS_CK(cublasSetWorkspace(blas, d_cublas_ws, CUBLAS_WS_BYTES));
+        scratch_bytes = CUBLAS_WS_BYTES;
         TTS_CK(cudaEventCreate(&ev0));
         TTS_CK(cudaEventCreate(&ev1));
 
@@ -844,7 +964,7 @@ struct BackboneRunner {
         state_bytes = 0;
         for (int l = 0; l < L; ++l) {
             if (c.is_full_attn[size_t(l)]) {
-                const size_t kv_b = size_t(max_slots) * cap * c.num_kv_heads * c.head_dim * sizeof(__half);
+                const size_t kv_b = size_t(max_slots) * cap * c.num_kv_heads * c.head_dim * sizeof(bf16);
                 TTS_CK(cudaMalloc(&k_caches[size_t(l)], kv_b));
                 TTS_CK(cudaMalloc(&v_caches[size_t(l)], kv_b));
                 TTS_CK(cudaMemset(k_caches[size_t(l)], 0, kv_b));
@@ -872,6 +992,11 @@ struct BackboneRunner {
         alloc_d(d_slots, size_t(max_chunk));
         alloc_d(d_pos, size_t(max_chunk));
         alloc_d(d_residual, size_t(max_chunk) * H);
+        alloc_d(d_moe_routed_f32, size_t(max_chunk) * H);
+        if (W->mode == WeightMode::RefF32) {
+            alloc_d(d_ref_x_f32, size_t(max_chunk) * 4096);
+            alloc_d(d_ref_y_f32, size_t(max_chunk) * 8192);
+        }
         alloc_d(d_norm, size_t(max_chunk) * H);
         alloc_d(d_qkv, size_t(max_chunk) * qg_dim);
         alloc_d(d_qkv2, size_t(max_chunk) * qkv_dim);
@@ -895,7 +1020,7 @@ struct BackboneRunner {
         alloc_d(d_deq_g, size_t(I) * H);
         alloc_d(d_deq_u, size_t(I) * H);
         alloc_d(d_deq_d, size_t(H) * I);
-        alloc_d(d_final_f16, size_t(max_chunk) * H);
+        alloc_d(d_final_bf16, size_t(max_chunk) * H);
         alloc_d(d_final_f32, size_t(max_chunk) * H);
         alloc_d(d_main_logits, size_t(max_chunk) * n_cand);
 
@@ -908,11 +1033,25 @@ struct BackboneRunner {
         TTS_CK(cudaHostAlloc(&h_pos, size_t(max_chunk) * sizeof(int32_t), cudaHostAllocDefault));
     }
 
+    void proj_bf16(const bf16* X, const RefMat& ref_w, bf16* Y, int M, int N, int K, cudaStream_t stream) {
+        gemm_ref(blas, X, ref_w, Y, M, N, K, false, 0.0f, d_ref_x_f32, d_ref_y_f32, stream);
+    }
+
+    void proj_f32(const bf16* X, const RefMat& ref_w, float* Y, int M, int N, int K, bool add_res, cudaStream_t stream) {
+        gemm_ref(blas, X, ref_w, Y, M, N, K, true, add_res ? 1.0f : 0.0f, d_ref_x_f32, d_ref_y_f32, stream);
+    }
+
+    void compute_main_logits(const bf16* d_hid, int M, cudaStream_t stream) {
+        TTS_BLAS_CK(cublasSetStream(blas, stream));
+        const auto& c = W->cfg;
+        proj_f32(d_hid, W->lm_head_cand, d_main_logits, M, c.main_candidates(), c.hidden_size, false, stream);
+    }
+
     // Runs backbone on `M` rows:
     //   - `is_single_slot_seg == true`: rows `0..M-1` belong to one `seg_slot` at positions `seg_pos0..seg_pos0+M-1` (prefill chunk).
     //   - `is_single_slot_seg == false`: row `m` belongs to `slots_host[m]` at position `pos_host[m]` (batched decode).
     // Produces:
-    //   - `d_final_f16` [M, H] (and `d_final_f32` [M, H] if `want_f32_hidden`)
+    //   - `d_final_bf16` [M, H] (and `d_final_f32` [M, H] if `want_f32_hidden`)
     //   - `d_main_logits` [M, 4097] FP32 if `compute_logits`
     void forward(const int32_t* h_rows, int M,
                  bool is_single_slot_seg, int seg_slot, int seg_pos0,
@@ -950,23 +1089,36 @@ struct BackboneRunner {
         };
 
         tic();
-        k_backbone_embed<<<M, 256, 0, stream>>>(
-            d_rows, W->embed_tokens, W->codebook_embeddings, d_residual,
-            M, H, c.row_width(), c.semantic_start_id, c.semantic_end_id, c.tower_vocab);
+        if (W->embed_tokens.f32 != nullptr) {
+            k_backbone_embed_f32<<<M, 256, 0, stream>>>(
+                d_rows, W->embed_tokens.f32, W->codebook_embeddings, d_residual,
+                M, H, c.row_width(), c.semantic_start_id, c.semantic_end_id, c.tower_vocab);
+        } else {
+            k_backbone_embed<<<M, 256, 0, stream>>>(
+                d_rows, W->embed_tokens.bf16, W->codebook_embeddings, d_residual,
+                M, H, c.row_width(), c.semantic_start_id, c.semantic_end_id, c.tower_vocab);
+        }
         toc(prof.embed_ms);
+        if (trace.enabled) {
+            trace.reset(c.num_layers);
+            trace.embed_f32.resize(size_t(M) * H);
+            TTS_CK(cudaMemcpyAsync(trace.embed_f32.data(), d_residual, size_t(M) * H * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream));
+            TTS_CK(cudaStreamSynchronize(stream));
+        }
 
         // Reuse grouping vectors across layers
         std::vector<std::vector<std::pair<int32_t, float>>> exp_buckets(static_cast<size_t>(c.num_experts));
 
         for (int l = 0; l < c.num_layers; ++l) {
             const BackboneLayerW& LW = W->layers[size_t(l)];
-            k_zc_rmsnorm_f32_to_f16<<<M, 256, 0, stream>>>(d_residual, LW.input_ln, d_norm, M, H, c.rms_norm_eps);
+            k_zc_rmsnorm_f32_to_bf16<<<M, 256, 0, stream>>>(d_residual, LW.input_ln, d_norm, M, H, c.rms_norm_eps);
 
             if (LW.is_full_attn) {
                 tic();
-                gemm_f16(blas, d_norm, LW.q_proj, d_qkv, M, c.num_heads * 2 * c.head_dim, H, false, 0.0f);
-                gemm_f16(blas, d_norm, LW.k_proj, d_kv_tmp, M, kv_dim, H, false, 0.0f);
-                gemm_f16(blas, d_norm, LW.v_proj, d_kv_tmp + size_t(M) * kv_dim, M, kv_dim, H, false, 0.0f);
+                proj_bf16(d_norm, LW.q_proj, d_qkv, M, c.num_heads * 2 * c.head_dim, H, stream);
+                proj_bf16(d_norm, LW.k_proj, d_kv_tmp, M, kv_dim, H, stream);
+                proj_bf16(d_norm, LW.v_proj, d_kv_tmp + size_t(M) * kv_dim, M, kv_dim, H, stream);
 
                 dim3 qk_grid(M, c.num_heads + c.num_kv_heads);
                 k_bb_qk_norm_rope_kv<<<qk_grid, 256, 0, stream>>>(
@@ -981,15 +1133,25 @@ struct BackboneRunner {
                     d_slots, d_pos, M, c.num_heads, c.num_kv_heads, c.head_dim, cap,
                     true, 0, 0);
 
-                // o_proj accumulates directly into FP32 residual
-                gemm_f16(blas, d_attn_out, LW.o_proj, d_residual, M, H, c.num_heads * c.head_dim, true, 1.0f);
+                if (trace.enabled && l == 3) {
+                    auto dl_bf = [&](const bf16* p, size_t n, std::vector<float>& dst) {
+                        std::vector<uint16_t> raw(n);
+                        TTS_CK(cudaMemcpyAsync(raw.data(), p, n * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
+                        TTS_CK(cudaStreamSynchronize(stream));
+                        dst.resize(n);
+                        for (size_t i = 0; i < n; ++i) dst[i] = host_bf16_to_f32(raw[i]);
+                    };
+                    dl_bf(d_q_ready, size_t(M) * c.num_heads * c.head_dim, trace.l3_q_ready);
+                    dl_bf(d_attn_out, size_t(M) * c.num_heads * c.head_dim, trace.l3_attn_out);
+                }
+                proj_f32(d_attn_out, LW.o_proj, d_residual, M, H, c.num_heads * c.head_dim, true, stream);
                 toc(prof.attn_ms);
             } else {
                 tic();
-                gemm_f16(blas, d_norm, LW.in_proj_qkv, d_qkv, M, qkv_dim, H, false, 0.0f);
-                gemm_f16(blas, d_norm, LW.in_proj_z, d_q_ready, M, val_dim, H, false, 0.0f);
-                gemm_f16(blas, d_norm, LW.in_proj_a, d_ab, M, c.gdn_vh, H, true, 0.0f);
-                gemm_f16(blas, d_norm, LW.in_proj_b, d_ab + size_t(M) * c.gdn_vh, M, c.gdn_vh, H, true, 0.0f);
+                proj_bf16(d_norm, LW.in_proj_qkv, d_qkv, M, qkv_dim, H, stream);
+                proj_bf16(d_norm, LW.in_proj_z, d_q_ready, M, val_dim, H, stream);
+                proj_f32(d_norm, LW.in_proj_a, d_ab, M, c.gdn_vh, H, false, stream);
+                proj_f32(d_norm, LW.in_proj_b, d_ab + size_t(M) * c.gdn_vh, M, c.gdn_vh, H, false, stream);
 
                 if (is_single_slot_seg) {
                     k_gdn_conv1d_seg<<<(qkv_dim + 255) / 256, 256, 0, stream>>>(
@@ -1007,30 +1169,65 @@ struct BackboneRunner {
                         LW.A_log, LW.dt_bias, LW.gdn_norm, gdn_S[size_t(l)], d_attn_out,
                         d_slots, d_pos, M, c.gdn_kh, c.gdn_vh, c.rms_norm_eps);
                 }
-                // out_proj accumulates directly into FP32 residual
-                gemm_f16(blas, d_attn_out, LW.out_proj, d_residual, M, H, val_dim, true, 1.0f);
+                if (trace.enabled && l == 0) {
+                    auto dl_bf = [&](const bf16* p, size_t n, std::vector<float>& dst) {
+                        std::vector<uint16_t> raw(n);
+                        TTS_CK(cudaMemcpyAsync(raw.data(), p, n * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
+                        TTS_CK(cudaStreamSynchronize(stream));
+                        dst.resize(n);
+                        for (size_t i = 0; i < n; ++i) dst[i] = host_bf16_to_f32(raw[i]);
+                    };
+                    dl_bf(d_qkv, size_t(M) * qkv_dim, trace.l0_qkv_raw);
+                    dl_bf(d_qkv2, size_t(M) * qkv_dim, trace.l0_qkv_conv);
+                    dl_bf(d_attn_out, size_t(M) * val_dim, trace.l0_core_out);
+                }
+                proj_f32(d_attn_out, LW.out_proj, d_residual, M, H, val_dim, true, stream);
                 toc(prof.gdn_ms);
             }
 
             // Sparse MoE + Shared Expert
+            if (trace.enabled) {
+                trace.mixer_residuals[size_t(l)].resize(size_t(M) * H);
+                TTS_CK(cudaMemcpyAsync(trace.mixer_residuals[size_t(l)].data(), d_residual,
+                                       size_t(M) * H * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            }
             tic();
-            k_zc_rmsnorm_f32_to_f16<<<M, 256, 0, stream>>>(d_residual, LW.post_attn_ln, d_norm, M, H, c.rms_norm_eps);
+            k_zc_rmsnorm_f32_to_bf16<<<M, 256, 0, stream>>>(d_residual, LW.post_attn_ln, d_norm, M, H, c.rms_norm_eps);
 
             // Shared expert
-            gemm_f16(blas, d_norm, LW.shared_gate_proj, d_shared_g, M, c.shared_intermediate, H, false, 0.0f);
-            gemm_f16(blas, d_norm, LW.shared_up_proj, d_shared_u, M, c.shared_intermediate, H, false, 0.0f);
+            proj_bf16(d_norm, LW.shared_gate_proj, d_shared_g, M, c.shared_intermediate, H, stream);
+            proj_bf16(d_norm, LW.shared_up_proj, d_shared_u, M, c.shared_intermediate, H, stream);
             const size_t sh_n = size_t(M) * c.shared_intermediate;
-            k_silu_mul_f16<<<int((sh_n + 255) / 256), 256, 0, stream>>>(d_shared_g, d_shared_u, d_shared_g, sh_n);
-            gemm_f16(blas, d_shared_g, LW.shared_down_proj, d_shared_out, M, H, c.shared_intermediate, true, 0.0f);
-            gemm_f16(blas, d_norm, LW.shared_expert_gate, d_shared_gate, M, 1, H, true, 0.0f);
-            k_add_gated_shared_f32<<<M, 256, 0, stream>>>(d_shared_out, d_shared_gate, d_residual, M, H);
+            k_silu_mul_bf16<<<int((sh_n + 255) / 256), 256, 0, stream>>>(d_shared_g, d_shared_u, d_shared_g, sh_n);
+            proj_f32(d_shared_g, LW.shared_down_proj, d_shared_out, M, H, c.shared_intermediate, false, stream);
+            proj_f32(d_norm, LW.shared_expert_gate, d_shared_gate, M, 1, H, false, stream);
 
             // Router
-            gemm_f16(blas, d_norm, LW.router_gate, d_router_logits, M, c.num_experts, H, true, 0.0f);
+            proj_f32(d_norm, LW.router_gate, d_router_logits, M, c.num_experts, H, false, stream);
             k_moe_router_topk<<<M, 256, 0, stream>>>(
                 d_router_logits, d_topk_ids, d_topk_w, M, c.num_experts, c.top_k, c.norm_topk_prob);
+            if (trace.enabled) {
+                trace.router_logits[size_t(l)].resize(size_t(M) * c.num_experts);
+                TTS_CK(cudaMemcpyAsync(trace.router_logits[size_t(l)].data(), d_router_logits,
+                                       size_t(M) * c.num_experts * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                trace.topk_ids[size_t(l)].resize(size_t(M) * c.top_k);
+                trace.topk_w[size_t(l)].resize(size_t(M) * c.top_k);
+                TTS_CK(cudaMemcpyAsync(trace.topk_ids[size_t(l)].data(), d_topk_ids,
+                                       size_t(M) * c.top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                TTS_CK(cudaMemcpyAsync(trace.topk_w[size_t(l)].data(), d_topk_w,
+                                       size_t(M) * c.top_k * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                TTS_CK(cudaStreamSynchronize(stream));
+            }
+            if (trace.replay_router && size_t(l) < trace.forced_topk_ids.size() &&
+                trace.forced_topk_ids[size_t(l)].size() == size_t(M) * c.top_k) {
+                TTS_CK(cudaMemcpyAsync(d_topk_ids, trace.forced_topk_ids[size_t(l)].data(),
+                                       size_t(M) * c.top_k * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                TTS_CK(cudaMemcpyAsync(d_topk_w, trace.forced_topk_w[size_t(l)].data(),
+                                       size_t(M) * c.top_k * sizeof(float), cudaMemcpyHostToDevice, stream));
+            }
 
-            // Reference grouped routed experts (syncs tiny M*8 routing table)
+            // Reference grouped routed experts (FP8_BLOCK or BF16)
+            TTS_CK(cudaMemsetAsync(d_moe_routed_f32, 0, size_t(M) * H * sizeof(float), stream));
             TTS_CK(cudaMemcpyAsync(h_topk_ids, d_topk_ids, size_t(M) * c.top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
             TTS_CK(cudaMemcpyAsync(h_topk_w, d_topk_w, size_t(M) * c.top_k * sizeof(float), cudaMemcpyDeviceToHost, stream));
             TTS_CK(cudaStreamSynchronize(stream));
@@ -1052,7 +1249,6 @@ struct BackboneRunner {
             const size_t gu_sc_elems = size_t(bo_gu) * bi_gu;
             const size_t dn_sc_elems = size_t(bo_dn) * bi_dn;
 
-            // Pack all active (row, weight) pairs contiguously and upload once so async DMA cannot be overwritten.
             struct ExpertSlice { int e; int off; int cnt; };
             std::vector<ExpertSlice> active_slices;
             active_slices.reserve(static_cast<size_t>(std::min(M * c.top_k, c.num_experts)));
@@ -1077,11 +1273,11 @@ struct BackboneRunner {
                 const int e = sl.e;
                 const int off = sl.off;
                 const int cnt = sl.cnt;
-                k_gather_rows_f16<<<cnt, 256, 0, stream>>>(d_norm, d_exp_rows + off, d_exp_x, cnt, H);
+                k_gather_rows_bf16<<<cnt, 256, 0, stream>>>(d_norm, d_exp_rows + off, d_exp_x, cnt, H);
 
-                const __half* wg = nullptr;
-                const __half* wu = nullptr;
-                const __half* wd = nullptr;
+                const bf16* wg = nullptr;
+                const bf16* wu = nullptr;
+                const bf16* wd = nullptr;
                 if (LW.experts_fp8) {
                     const int blocks = int((gu_elems + 255) / 256);
                     k_dequant_fp8_block128<<<blocks, 256, 0, stream>>>(
@@ -1095,29 +1291,42 @@ struct BackboneRunner {
                         d_deq_d, H, I, bi_dn);
                     wg = d_deq_g; wu = d_deq_u; wd = d_deq_d;
                 } else {
-                    wg = LW.exp_gate_f16 + size_t(e) * gu_elems;
-                    wu = LW.exp_up_f16 + size_t(e) * gu_elems;
-                    wd = LW.exp_down_f16 + size_t(e) * gu_elems;
+                    wg = LW.exp_gate_bf16 + size_t(e) * gu_elems;
+                    wu = LW.exp_up_bf16 + size_t(e) * gu_elems;
+                    wd = LW.exp_down_bf16 + size_t(e) * gu_elems;
                 }
 
-                gemm_f16(blas, d_exp_x, wg, d_exp_g, cnt, I, H, false, 0.0f);
-                gemm_f16(blas, d_exp_x, wu, d_exp_u, cnt, I, H, false, 0.0f);
+                gemm_bf16(blas, d_exp_x, wg, d_exp_g, cnt, I, H, false, 0.0f);
+                gemm_bf16(blas, d_exp_x, wu, d_exp_u, cnt, I, H, false, 0.0f);
                 const size_t act_n = size_t(cnt) * I;
-                k_silu_mul_f16<<<int((act_n + 255) / 256), 256, 0, stream>>>(d_exp_g, d_exp_u, d_exp_g, act_n);
-                gemm_f16(blas, d_exp_g, wd, d_exp_out, cnt, H, I, true, 0.0f);
-                k_scatter_add_f32<<<cnt, 256, 0, stream>>>(d_exp_out, d_exp_rows + off, d_exp_w + off, d_residual, cnt, H);
+                k_silu_mul_bf16<<<int((act_n + 255) / 256), 256, 0, stream>>>(d_exp_g, d_exp_u, d_exp_g, act_n);
+                gemm_bf16(blas, d_exp_g, wd, d_exp_out, cnt, H, I, true, 0.0f);
+                k_scatter_add_f32<<<cnt, 256, 0, stream>>>(d_exp_out, d_exp_rows + off, d_exp_w + off, d_moe_routed_f32, cnt, H);
             }
+            k_moe_finalize_res_f32<<<M, 256, 0, stream>>>(d_moe_routed_f32, d_shared_out, d_shared_gate, d_residual, M, H);
             toc(prof.moe_ms);
+            if (trace.enabled) {
+                trace.residuals[size_t(l)].resize(size_t(M) * H);
+                TTS_CK(cudaMemcpyAsync(trace.residuals[size_t(l)].data(), d_residual,
+                                       size_t(M) * H * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                TTS_CK(cudaStreamSynchronize(stream));
+            }
         }
 
         // Final norm + optional sliced lm_head
         tic();
-        k_zc_rmsnorm_f32_to_f16<<<M, 256, 0, stream>>>(d_residual, W->final_norm, d_final_f16, M, H, c.rms_norm_eps);
+        k_zc_rmsnorm_f32_to_bf16<<<M, 256, 0, stream>>>(d_residual, W->final_norm, d_final_bf16, M, H, c.rms_norm_eps);
         if (want_f32_hidden) {
             k_zc_rmsnorm_f32_to_f32<<<M, 256, 0, stream>>>(d_residual, W->final_norm, d_final_f32, M, H, c.rms_norm_eps);
+            if (trace.enabled) {
+                trace.final_hidden_f32.resize(size_t(M) * H);
+                TTS_CK(cudaMemcpyAsync(trace.final_hidden_f32.data(), d_final_f32,
+                                       size_t(M) * H * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                TTS_CK(cudaStreamSynchronize(stream));
+            }
         }
         if (compute_logits) {
-            gemm_f16(blas, d_final_f16, W->lm_head_cand, d_main_logits, M, c.main_candidates(), H, true, 0.0f);
+            compute_main_logits(d_final_bf16, M, stream);
         }
         toc(prof.head_ms);
     }

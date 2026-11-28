@@ -57,6 +57,7 @@ struct BenchOpts {
 
     std::string teacher_in;
     std::string dump_out;
+    std::string verify_rows;
 
     bool verify_kernels = false;
     bool run_scenarios = false;
@@ -74,9 +75,9 @@ struct BenchOpts {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: g6tts_bench --model-dir DIR [--manifest NAME] [--weight-mode ref|ref-fp16|native] [--no-hash]\n"
+                 "usage: g6tts_bench --model-dir DIR [--manifest NAME] [--weight-mode ref|ref-fp16|ref-f32|native] [--no-hash]\n"
                  "                   [--teacher ROWS.bin --dump OUT.bin]\n"
-                 "                   [--verify-kernels] [--scenarios [m1,m4]] [--profile]\n"
+                 "                   [--verify-kernels [--rows ROWS.bin]] [--scenarios [m1,m4]] [--profile]\n"
                  "                   [--prompt-len N] [--frames N] [--cap N]\n"
                  "                   [--codec-decode CODES.bin --out PCM.bin [--codec-path PATH] [--codec-strides 1,1,2,4]]\n"
                  "                   [--codec-encode PCM.bin --out CODES.bin [--codec-path PATH]]\n");
@@ -102,6 +103,7 @@ bool parse_cli(int argc, char** argv, BenchOpts& o) {
             const char* v = need("--weight-mode"); if (!v) return false;
             if (std::strcmp(v, "ref") == 0) o.weight_mode = g6tts::WeightMode::Ref;
             else if (std::strcmp(v, "ref-fp16") == 0) o.weight_mode = g6tts::WeightMode::RefFp16;
+            else if (std::strcmp(v, "ref-f32") == 0) o.weight_mode = g6tts::WeightMode::RefF32;
             else if (std::strcmp(v, "native") == 0) o.weight_mode = g6tts::WeightMode::Native;
             else return false;
         } else if (a == "--no-hash") {
@@ -110,6 +112,8 @@ bool parse_cli(int argc, char** argv, BenchOpts& o) {
             const char* v = need("--teacher"); if (!v) return false; o.teacher_in = v;
         } else if (a == "--dump") {
             const char* v = need("--dump"); if (!v) return false; o.dump_out = v;
+        } else if (a == "--rows") {
+            const char* v = need("--rows"); if (!v) return false; o.verify_rows = v;
         } else if (a == "--verify-kernels") {
             o.verify_kernels = true;
         } else if (a == "--scenarios") {
@@ -204,7 +208,7 @@ TeacherSeqOut run_teacher_seq(g6tts::BackboneRunner& bb, g6tts::TowerRunner& tow
         const int paired_end = std::min(end, T - 1);
         if (paired_end > start) {
             const int plen = paired_end - start;
-            tower.prefill_chunk(bb.d_final_f16,
+            tower.prefill_chunk(bb.d_final_bf16,
                                 rows.data() + size_t(start) * rw,
                                 rows.data() + size_t(start + 1) * rw,
                                 0, start, plen,
@@ -214,6 +218,54 @@ TeacherSeqOut run_teacher_seq(g6tts::BackboneRunner& bb, g6tts::TowerRunner& tow
         TTS_CK(cudaStreamSynchronize(stream));
     }
     return out;
+}
+
+void write_layer_trace(const std::string& path, const g6tts::TtsConfig& c, int T,
+                       const g6tts::BackboneLayerTrace& bb_tr, const g6tts::TowerLayerTrace& tw_tr) {
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) throw std::runtime_error("cannot open layer trace output: " + path);
+    const char magic[4] = {'G', '6', 'L', '2'};
+    const uint32_t uT = static_cast<uint32_t>(T);
+    const uint32_t H = static_cast<uint32_t>(c.hidden_size);
+    const uint32_t L = static_cast<uint32_t>(c.num_layers);
+    const uint32_t K = static_cast<uint32_t>(c.top_k);
+    const uint32_t n_tw = static_cast<uint32_t>(c.tower_shared + c.tower_res);
+    ofs.write(magic, 4);
+    ofs.write(reinterpret_cast<const char*>(&uT), 4);
+    ofs.write(reinterpret_cast<const char*>(&H), 4);
+    ofs.write(reinterpret_cast<const char*>(&L), 4);
+    ofs.write(reinterpret_cast<const char*>(&K), 4);
+    ofs.write(reinterpret_cast<const char*>(&n_tw), 4);
+    auto wr_f32 = [&](const std::vector<float>& v) {
+        ofs.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * sizeof(float)));
+    };
+    wr_f32(bb_tr.embed_f32);
+    wr_f32(bb_tr.final_hidden_f32);
+    wr_f32(bb_tr.l0_qkv_raw);
+    wr_f32(bb_tr.l0_qkv_conv);
+    wr_f32(bb_tr.l0_core_out);
+    wr_f32(bb_tr.l3_q_ready);
+    wr_f32(bb_tr.l3_attn_out);
+    for (uint32_t l = 0; l < L; ++l) {
+        wr_f32(bb_tr.mixer_residuals[l]);
+        wr_f32(bb_tr.residuals[l]);
+        ofs.write(reinterpret_cast<const char*>(bb_tr.topk_ids[l].data()),
+                  std::streamsize(bb_tr.topk_ids[l].size() * sizeof(int32_t)));
+    }
+    for (uint32_t tl = 0; tl < n_tw; ++tl) {
+        wr_f32(tw_tr.hiddens[tl]);
+    }
+    for (int s = 0; s < 2; ++s) {
+        wr_f32(tw_tr.sub[s].eh_cat);
+        wr_f32(tw_tr.sub[s].eh_proj);
+        wr_f32(tw_tr.sub[s].wqkv);
+        wr_f32(tw_tr.sub[s].q_ready);
+        wr_f32(tw_tr.sub[s].attn_out);
+        wr_f32(tw_tr.sub[s].wo_res);
+        wr_f32(tw_tr.sub[s].ffn_act);
+        wr_f32(tw_tr.sub[s].w2_res);
+    }
+    if (!ofs) throw std::runtime_error("failed writing layer trace output: " + path);
 }
 
 void write_teacher_dump(const std::string& path, const g6tts::TtsConfig& c,
@@ -378,6 +430,19 @@ int main(int argc, char** argv) {
                 outs.push_back(run_teacher_seq(bb, tower, seqs[i], stream));
             }
             write_teacher_dump(opts.dump_out, W.cfg, outs);
+            if (!seqs.empty()) {
+                const int rw = W.cfg.row_width();
+                const int T0 = std::min(64, int(seqs[0].size()) / rw);
+                if (T0 >= 2) {
+                    std::vector<int32_t> s0(seqs[0].begin(), seqs[0].begin() + size_t(T0) * rw);
+                    bb.trace.enabled = true;
+                    tower.trace.enabled = true;
+                    (void)run_teacher_seq(bb, tower, s0, stream);
+                    bb.trace.enabled = false;
+                    tower.trace.enabled = false;
+                    write_layer_trace(opts.dump_out + ".trace0", W.cfg, T0, bb.trace, tower.trace);
+                }
+            }
             std::fprintf(stderr, "g6tts_bench: dumped %zu teacher-forced sequences -> %s\n",
                          outs.size(), opts.dump_out.c_str());
             cudaStreamDestroy(stream);
@@ -385,12 +450,21 @@ int main(int argc, char** argv) {
         }
 
         if (opts.verify_kernels) {
-            // Compare Ref (FP8-on-device experts) vs RefFp16 (or Native vs Ref once Wave 3.2 lands)
-            const auto rows = make_synthetic_rows(32, 42);
+            // Compare RefF32 exact weights vs requested test mode (Ref / RefFp16).
+            std::vector<int32_t> rows;
+            if (!opts.verify_rows.empty()) {
+                const auto seqs = read_teacher_rows(opts.verify_rows);
+                if (seqs.empty()) throw std::runtime_error("--rows file contains no sequences");
+                const int rw = g6tts::geom::ROW_WIDTH;
+                const int T = std::min(32, int(seqs[0].size()) / rw);
+                rows.assign(seqs[0].begin(), seqs[0].begin() + size_t(T) * rw);
+            } else {
+                rows = make_synthetic_rows(32, 42);
+            }
             TeacherSeqOut ref_out, test_out;
             {
                 auto W = g6tts::load_tts_weights(opts.model_dir, opts.manifest, opts.verify_checksums,
-                                                 g6tts::WeightMode::Ref);
+                                                 g6tts::WeightMode::RefF32);
                 g6tts::BackboneRunner bb; g6tts::TowerRunner tw;
                 bb.init(W, 1, 256, 128); tw.init(W, 1, 256, 128);
                 ref_out = run_teacher_seq(bb, tw, rows, stream);
@@ -431,10 +505,10 @@ int main(int argc, char** argv) {
 
                 const int H = W.cfg.hidden_size;
                 const int rw = W.cfg.row_width();
-                __half* d_hid = nullptr;
+                g6tts::bf16* d_hid = nullptr;
                 int32_t *d_sl = nullptr, *d_ps = nullptr, *d_fr = nullptr, *d_c0 = nullptr, *d_cd = nullptr;
                 uint8_t* d_sem = nullptr;
-                TTS_CK(cudaMalloc(&d_hid, size_t(M) * H * sizeof(__half)));
+                TTS_CK(cudaMalloc(&d_hid, size_t(M) * H * sizeof(g6tts::bf16)));
                 TTS_CK(cudaMalloc(&d_sl, size_t(M) * sizeof(int32_t)));
                 TTS_CK(cudaMalloc(&d_ps, size_t(M) * sizeof(int32_t)));
                 TTS_CK(cudaMalloc(&d_fr, size_t(M) * rw * sizeof(int32_t)));
@@ -452,9 +526,9 @@ int main(int argc, char** argv) {
                     prompts[size_t(m)] = make_synthetic_rows(opts.prompt_len, uint32_t(100 + m));
                     const auto& pr = prompts[size_t(m)];
                     bb.forward(pr.data(), opts.prompt_len, true, m, 0, nullptr, nullptr, false, false, stream);
-                    tw.prefill_chunk(bb.d_final_f16, pr.data(), pr.data() + rw, m, 0, opts.prompt_len - 1, nullptr, stream);
-                    TTS_CK(cudaMemcpyAsync(d_hid + size_t(m) * H, bb.d_final_f16 + size_t(opts.prompt_len - 1) * H,
-                                           size_t(H) * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+                    tw.prefill_chunk(bb.d_final_bf16, pr.data(), pr.data() + rw, m, 0, opts.prompt_len - 1, nullptr, stream);
+                    TTS_CK(cudaMemcpyAsync(d_hid + size_t(m) * H, bb.d_final_bf16 + size_t(opts.prompt_len - 1) * H,
+                                           size_t(H) * sizeof(g6tts::bf16), cudaMemcpyDeviceToDevice, stream));
                     h_slots[size_t(m)] = m;
                     std::memcpy(h_rows.data() + size_t(m) * rw, pr.data() + size_t(opts.prompt_len - 1) * rw,
                                 size_t(rw) * sizeof(int32_t));
@@ -482,13 +556,13 @@ int main(int argc, char** argv) {
                     const int32_t* pos_tw = h_pos_steps.data() + size_t(step) * M;
                     const int32_t* pos_bb = h_pos_steps.data() + size_t(step + 1) * M;
                     TTS_CK(cudaMemcpyAsync(d_ps, pos_tw, size_t(M) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-                    g6tts::gemm_f16(bb.blas, d_hid, W.lm_head_cand, bb.d_main_logits, M, W.cfg.main_candidates(), H, true, 0.0f);
-                    __half* ch = tw.run_shared(d_hid, d_c0, d_sem, d_fr, d_sl, d_ps, M, stream);
+                    bb.compute_main_logits(d_hid, M, stream);
+                    g6tts::bf16* ch = tw.run_shared(d_hid, d_c0, d_sem, d_fr, d_sl, d_ps, M, stream);
                     for (int i = 0; i < W.cfg.tower_res; ++i) {
                         ch = tw.run_residual_step(i, ch, d_cd, d_sem, d_sl, d_ps, M, g6tts::geom::RES_CB_SIZE, true, stream);
                     }
                     bb.forward(h_rows.data(), M, false, 0, 0, h_slots.data(), pos_bb, false, false, stream);
-                    TTS_CK(cudaMemcpyAsync(d_hid, bb.d_final_f16, size_t(M) * H * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+                    TTS_CK(cudaMemcpyAsync(d_hid, bb.d_final_bf16, size_t(M) * H * sizeof(g6tts::bf16), cudaMemcpyDeviceToDevice, stream));
                 }
                 TTS_CK(cudaEventRecord(ev1, stream));
                 TTS_CK(cudaEventSynchronize(ev1));

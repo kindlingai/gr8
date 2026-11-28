@@ -286,7 +286,7 @@ fn tts_dev_ref_groups_fp8_experts_and_capi() {
 
     // Open through C ABI
     let c_dir = CString::new(dir.to_str().unwrap()).unwrap();
-    let mut err = [0i8; 256];
+    let mut err = [0 as c_char; 256];
     let handle = unsafe { g6load::g6l_tts_open(c_dir.as_ptr(), std::ptr::null(), 1, err.as_mut_ptr(), err.len()) };
     assert!(!handle.is_null(), "g6l_tts_open failed: {:?}", unsafe { CStr::from_ptr(err.as_ptr()) });
 
@@ -316,6 +316,34 @@ fn tts_dev_ref_groups_fp8_experts_and_capi() {
             "model.language_model.norm.weight",
         ] {
             assert!(names.iter().any(|n| n == want), "missing expected HF tensor {want}");
+        }
+
+        // Verify g6l_tts_dense_decode_f32 on FP8_ROW matrix (`audio_decoder_mtp.heads.0.weight`)
+        let head_idx = names
+            .iter()
+            .position(|n| n == "audio_decoder_mtp.heads.0.weight")
+            .expect("missing head item");
+        let mut head_f32 = vec![0u8; 128 * h * 4];
+        assert_eq!(
+            g6load::g6l_tts_dense_decode_f32(
+                handle,
+                head_idx,
+                head_f32.as_mut_ptr() as *mut c_void,
+                head_f32.len(),
+                2,
+                err.as_mut_ptr(),
+                err.len(),
+            ),
+            0
+        );
+        for r in 0..128 {
+            let sc = 0.02f32 * (r as f32 + 1.0);
+            for c in 0..h {
+                let idx = r * h + c;
+                let want = e4m3_to_f32(((idx * 29 + 7) % 112) as u8) * sc;
+                let got = f32::from_le_bytes(head_f32[4 * idx..4 * idx + 4].try_into().unwrap());
+                assert_eq!(got.to_bits(), want.to_bits(), "dense_decode_f32 mismatch at ({r},{c})");
+            }
         }
 
         // Verify raw FP8_BLOCK read for expert 0 gate_proj
@@ -621,7 +649,7 @@ fn tts_trellis_expert_decode_matches_hadamard_reference() {
 
 #[test]
 fn tts_null_args_fail_safely() {
-    let mut err = [0i8; 128];
+    let mut err = [0 as c_char; 128];
     unsafe {
         let h = g6load::g6l_tts_open(std::ptr::null(), std::ptr::null(), 1, err.as_mut_ptr(), err.len());
         assert!(h.is_null());

@@ -86,9 +86,10 @@ constexpr int DEFAULT_TOP_K = 30;
 } // namespace geom
 
 enum class WeightMode {
-    Ref = 0,     // FP16 dense + FP8-on-device routed experts when store==0 (~37 GB, dequant on the fly)
-    RefFp16 = 1, // All weights (including routed experts) pre-decoded to FP16 on load (~72 GB)
-    Native = 2,  // Keep native stored formats (trellis/FP8_ROW; Wave 3.2, falls back to Ref in Wave 1.6)
+    Ref = 0,     // BF16 dense + FP8-on-device routed experts when store==0 (~37 GB, dequant on the fly)
+    RefFp16 = 1, // All weights (including routed experts) pre-decoded to BF16 on load (~72 GB)
+    Native = 2,  // Keep native stored formats (trellis/FP8_ROW/INT4/BF16; Wave 3.2, falls back to Ref in Wave 1.6)
+    RefF32 = 3,  // Exact FP32 dense weights + FP8-on-device routed experts (exact kernel reference)
 };
 
 inline const char* weight_mode_name(WeightMode m) {
@@ -96,6 +97,7 @@ inline const char* weight_mode_name(WeightMode m) {
         case WeightMode::Ref: return "ref";
         case WeightMode::RefFp16: return "ref-fp16";
         case WeightMode::Native: return "native";
+        case WeightMode::RefF32: return "ref-f32";
     }
     return "unknown";
 }

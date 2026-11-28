@@ -139,6 +139,8 @@ int g6l_tts_dense_decode_bf16(const void* h, size_t idx, void* dst, size_t dst_b
                               char* err, size_t errlen);
 int g6l_tts_dense_decode_f16(const void* h, size_t idx, void* dst, size_t dst_bytes, uint32_t threads,
                              char* err, size_t errlen);
+int g6l_tts_dense_decode_f32(const void* h, size_t idx, void* dst, size_t dst_bytes, uint32_t threads,
+                             char* err, size_t errlen);
 // Returns 0 for FP8_BLOCK dense records, 1 for trellis width files, -1 if layer has no experts.
 int g6l_tts_expert_store(const void* h, uint32_t layer);
 // Decodes expert `expert` (0..n_routed-1, or n_routed for shared) projection `proj` (0=gate, 1=up, 2=down)

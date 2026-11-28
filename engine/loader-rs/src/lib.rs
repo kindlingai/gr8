@@ -1206,6 +1206,35 @@ pub unsafe extern "C" fn g6l_tts_dense_decode_f16(
     }
 }
 
+/// Decodes dense matrix item `idx` into row-major FP32 bytes `[out, inp]`.
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`; `dst` must hold `out * inp * 4` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_dense_decode_f32(
+    h: *const c_void,
+    idx: usize,
+    dst: *mut c_void,
+    dst_bytes: usize,
+    threads: u32,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32 {
+    if h.is_null() || (dst.is_null() && dst_bytes > 0) {
+        return write_err(err, errlen, "g6l_tts_dense_decode_f32: null argument");
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    let buf = if dst_bytes == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(dst as *mut u8, dst_bytes)
+    };
+    match rel.embed.decode_f32(idx, buf, threads as usize) {
+        Ok(()) => 0,
+        Err(e) => write_err(err, errlen, &e),
+    }
+}
+
 /// Returns the expert store kind for `layer`: 0 = FP8_BLOCK dense records, 1 = trellis, -1 = none.
 ///
 /// # Safety

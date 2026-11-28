@@ -196,7 +196,9 @@ __device__ int device_sample_row(const float* __restrict__ logits, int V,
             s_idx[0] = best_id;
         }
         __syncthreads();
-        return s_idx[0];
+        const int chosen_k = s_idx[0];
+        __syncthreads();
+        return chosen_k;
     }
 
     // 3b. Uncapped or large top_k path: find top_p cutoff threshold (if top_p < 1.0) and run exp-race over all V

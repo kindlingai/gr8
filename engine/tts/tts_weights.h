@@ -1,10 +1,11 @@
-// Drama 3 (fish_omni) weight structs and 64K-page-safe pinned-staging GPU loader for g6tts.
+// Drama 3 (fish_omni) weight structs and 64K-page-safe pinned-staging GPU loader for g6tts (reference path).
 //
 // Memory modes:
-//   - WeightMode::Ref (default): dense/tower/vocab/shared in FP16 (~5 GB); store-0 routed experts kept
+//   - WeightMode::Ref (default): dense/tower/vocab/shared in BF16 (~5 GB); store-0 routed experts kept
 //     in block-128 FP8 E4M3 + F32 scales on GPU (~32.2 GB, ~37 GB total!) and dequantized on the fly
-//     for only the active routed experts per step. Store-1 (trellis) layers decode to FP16 on load.
-//   - WeightMode::RefFp16: all matrices including every routed expert pre-decoded to FP16 on load (~72 GB).
+//     for only the active routed experts per step. Store-1 (trellis) layers decode to BF16 on load.
+//   - WeightMode::RefFp16: all matrices including every routed expert pre-decoded to BF16 on load (~72 GB).
+//   - WeightMode::RefF32: exact FP32 dense weights + FP8-on-device routed experts (exact kernel reference).
 //   - WeightMode::Native: placeholder for Wave 3.2 (currently routes through Ref path).
 #pragma once
 
@@ -38,13 +39,58 @@ inline void tts_ck(cudaError_t e, const char* what) {
 
 inline size_t align256(size_t n) { return (n + 255u) & ~size_t(255u); }
 
-// Host BF16 -> FP32 exact conversion (all 1D norms, conv1d, A_log, dt_bias live in FP32 on GPU).
+// Host BF16/FP16 conversion helpers (pure C++17, zero CUDA host-overload dependency).
 inline float host_bf16_to_f32(uint16_t b) {
     uint32_t u = uint32_t(b) << 16;
     float f = 0.0f;
     std::memcpy(&f, &u, sizeof(f));
     return f;
 }
+
+inline float host_f16_to_f32(uint16_t h) {
+    const uint32_t s = uint32_t(h & 0x8000u) << 16;
+    const uint32_t e = (h >> 10) & 0x1fu;
+    const uint32_t m = h & 0x03ffu;
+    uint32_t u = 0;
+    if (e == 0) {
+        if (m == 0) {
+            u = s;
+        } else {
+            uint32_t mm = m;
+            int32_t ee = -14;
+            while ((mm & 0x0400u) == 0) { mm <<= 1; --ee; }
+            mm &= 0x03ffu;
+            u = s | (uint32_t(ee + 127) << 23) | (mm << 13);
+        }
+    } else if (e == 31) {
+        u = s | 0x7f800000u | (m << 13);
+    } else {
+        u = s | ((e + 112u) << 23) | (m << 13);
+    }
+    float f = 0.0f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+inline uint16_t host_f32_to_bf16(float f) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7fffffffu) > 0x7f800000u) return static_cast<uint16_t>((u >> 16) | 0x0040u);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return static_cast<uint16_t>(u >> 16);
+}
+
+inline void host_f16_buf_to_bf16_inplace(void* buf, size_t n_elems) {
+    uint16_t* p = static_cast<uint16_t*>(buf);
+    for (size_t i = 0; i < n_elems; ++i) p[i] = host_f32_to_bf16(host_f16_to_f32(p[i]));
+}
+
+// Reference decoded dense matrix pointer: BF16 in Ref/RefFp16 mode, or exact FP32 in RefF32 mode.
+struct RefMat {
+    const __nv_bfloat16* bf16 = nullptr;
+    const float* f32 = nullptr;
+    bool valid() const { return bf16 != nullptr || f32 != nullptr; }
+};
 
 struct BackboneLayerW {
     bool is_full_attn = false;
@@ -54,33 +100,32 @@ struct BackboneLayerW {
     const float* post_attn_ln = nullptr; // [H]
 
     // Full attention (l % 4 == 3)
-    const __half* q_proj = nullptr; // [HEADS * 2 * HEAD_DIM, H] = [8192, 2048]
-    const __half* k_proj = nullptr; // [KV_HEADS * HEAD_DIM, H] = [512, 2048]
-    const __half* v_proj = nullptr; // [KV_HEADS * HEAD_DIM, H] = [512, 2048]
-    const __half* o_proj = nullptr; // [H, HEADS * HEAD_DIM] = [2048, 4096]
-    const float* q_norm = nullptr;  // [HEAD_DIM] = [256]
-    const float* k_norm = nullptr;  // [HEAD_DIM] = [256]
+    RefMat q_proj; // [HEADS * 2 * HEAD_DIM, H] = [8192, 2048]
+    RefMat k_proj; // [KV_HEADS * HEAD_DIM, H] = [512, 2048]
+    RefMat v_proj; // [KV_HEADS * HEAD_DIM, H] = [512, 2048]
+    RefMat o_proj; // [H, HEADS * HEAD_DIM] = [2048, 4096]
+    const float* q_norm = nullptr; // [HEAD_DIM] = [256]
+    const float* k_norm = nullptr; // [HEAD_DIM] = [256]
 
     // Gated DeltaNet (l % 4 != 3)
-    const __half* in_proj_qkv = nullptr; // [8192, 2048]
-    const __half* in_proj_z = nullptr;   // [4096, 2048]
-    const __half* in_proj_a = nullptr;   // [32, 2048]
-    const __half* in_proj_b = nullptr;   // [32, 2048]
-    const __half* out_proj = nullptr;    // [2048, 4096]
-    const float* conv1d = nullptr;       // [8192, 4]
-    const float* A_log = nullptr;        // [32]
-    const float* dt_bias = nullptr;      // [32]
-    const float* gdn_norm = nullptr;     // [128] (plain weight, NOT 1+w)
+    RefMat in_proj_qkv; // [8192, 2048]
+    RefMat in_proj_z;   // [4096, 2048]
+    RefMat in_proj_a;   // [32, 2048]
+    RefMat in_proj_b;   // [32, 2048]
+    RefMat out_proj;    // [2048, 4096]
+    const float* conv1d = nullptr;   // [8192, 4]
+    const float* A_log = nullptr;    // [32]
+    const float* dt_bias = nullptr;  // [32]
+    const float* gdn_norm = nullptr; // [128] (plain weight, NOT 1+w)
 
-    // MoE router & shared expert (all FP16)
-    const __half* router_gate = nullptr;        // [NEXP, H] = [256, 2048]
-    const __half* shared_gate_proj = nullptr;   // [SHARED_I, H] = [512, 2048]
-    const __half* shared_up_proj = nullptr;     // [SHARED_I, H] = [512, 2048]
-    const __half* shared_down_proj = nullptr;   // [H, SHARED_I] = [2048, 512]
-    const __half* shared_expert_gate = nullptr; // [1, H] = [1, 2048]
+    // MoE router & shared expert
+    RefMat router_gate;        // [NEXP, H] = [256, 2048]
+    RefMat shared_gate_proj;   // [SHARED_I, H] = [512, 2048]
+    RefMat shared_up_proj;     // [SHARED_I, H] = [512, 2048]
+    RefMat shared_down_proj;   // [H, SHARED_I] = [2048, 512]
+    RefMat shared_expert_gate; // [1, H] = [1, 2048]
 
-    // Routed experts: either FP8_BLOCK (`experts_fp8 == true`) OR pre-decoded FP16 (`experts_fp8 == false`)
-    // FP8_BLOCK contiguous across experts [NEXP, out, in] and scales [NEXP, out/128, in/128]
+    // Routed experts: either FP8_BLOCK (`experts_fp8 == true`) OR pre-decoded BF16 (`experts_fp8 == false`)
     const uint8_t* exp_gate_fp8 = nullptr;
     const float* exp_gate_sc = nullptr;
     const uint8_t* exp_up_fp8 = nullptr;
@@ -88,29 +133,28 @@ struct BackboneLayerW {
     const uint8_t* exp_down_fp8 = nullptr;
     const float* exp_down_sc = nullptr;
 
-    // FP16 contiguous across experts [NEXP, out, in]
-    const __half* exp_gate_f16 = nullptr;
-    const __half* exp_up_f16 = nullptr;
-    const __half* exp_down_f16 = nullptr;
+    const __nv_bfloat16* exp_gate_bf16 = nullptr;
+    const __nv_bfloat16* exp_up_bf16 = nullptr;
+    const __nv_bfloat16* exp_down_bf16 = nullptr;
 };
 
 struct TowerLayerW {
     bool is_shared = false;
-    const __half* embedding = nullptr; // [4096, 2048] (semantic_embedding or codebook_embedding)
-    const float* enorm = nullptr;      // [2048]
-    const float* hnorm = nullptr;      // [2048]
-    const __half* eh_proj = nullptr;   // [2048, 4096]
+    const __nv_bfloat16* embedding = nullptr; // [4096, 2048] BF16 (semantic_embedding or codebook_embedding)
+    const float* enorm = nullptr;             // [2048]
+    const float* hnorm = nullptr;             // [2048]
+    RefMat eh_proj;                           // [2048, 4096]
 
     const float* attn_norm = nullptr; // [2048]
-    const __half* wqkv = nullptr;     // [9216, 2048] = [Q 4096 | Gate 4096 | K 512 | V 512]
-    const __half* wo = nullptr;       // [2048, 4096]
+    RefMat wqkv;                      // [9216, 2048] = [Q 4096 | Gate 4096 | K 512 | V 512]
+    RefMat wo;                        // [2048, 4096]
     const float* q_norm = nullptr;    // [256]
     const float* k_norm = nullptr;    // [256]
 
     const float* ffn_norm = nullptr; // [2048]
-    const __half* w1 = nullptr;      // [6144, 2048]
-    const __half* w3 = nullptr;      // [6144, 2048]
-    const __half* w2 = nullptr;      // [2048, 6144] (computed with FP32 output!)
+    RefMat w1;                       // [6144, 2048]
+    RefMat w3;                       // [6144, 2048]
+    RefMat w2;                       // [2048, 6144] (computed with FP32 output!)
 
     const float* final_ln = nullptr; // [2048]
 };
@@ -125,16 +169,16 @@ struct TtsWeights {
     size_t expert_bytes = 0;
 
     // Global backbone + tower weights
-    const __half* embed_tokens = nullptr;        // [VOCAB_SIZE, H] FP16
-    const float* final_norm = nullptr;           // [H] FP32
-    const __half* lm_head_cand = nullptr;        // [MAIN_CANDIDATES (4097), H] FP16 (sorted {EOS} U [SEM0..SEM1])
-    const int32_t* main_cand_ids_dev = nullptr;  // [MAIN_CANDIDATES (4097)] INT32 on GPU
-    const __half* codebook_embeddings = nullptr; // [NCB * 4096, H] = [40960, 2048] FP16
+    RefMat embed_tokens;                                // [VOCAB_SIZE, H] BF16 or FP32
+    const float* final_norm = nullptr;                  // [H] FP32
+    RefMat lm_head_cand;                                // [MAIN_CANDIDATES (4097), H] BF16 or FP32
+    const int32_t* main_cand_ids_dev = nullptr;         // [MAIN_CANDIDATES (4097)] INT32 on GPU
+    const __nv_bfloat16* codebook_embeddings = nullptr; // [NCB * 4096, H] = [40960, 2048] BF16
 
-    std::vector<BackboneLayerW> layers;      // [40]
-    std::vector<TowerLayerW> shared_layers;  // [4]
-    std::vector<TowerLayerW> res_layers;     // [9]
-    std::vector<const __half*> heads;        // [9], each [4096, 2048] FP16
+    std::vector<BackboneLayerW> layers;     // [40]
+    std::vector<TowerLayerW> shared_layers; // [4]
+    std::vector<TowerLayerW> res_layers;    // [9]
+    std::vector<RefMat> heads;              // [9], each [4096, 2048] BF16 or FP32
 
     int n_fp8_expert_layers = 0;
     int n_f16_expert_layers = 0;
@@ -185,6 +229,12 @@ inline bool is_routed_expert_name(const std::string& name) {
     return name.find(".mlp.experts.") != std::string::npos;
 }
 
+inline bool is_small_embedding_name(const std::string& name) {
+    return name == "audio_decoder.codebook_embeddings.weight" ||
+           name.find(".semantic_embedding.weight") != std::string::npos ||
+           name.find(".codebook_embedding.weight") != std::string::npos;
+}
+
 // Loads a Drama 3 exlr8 release into GPU arenas via `g6l_tts_*` and pinned host staging (zero mmap).
 inline TtsWeights load_tts_weights(const std::string& release_dir,
                                    const std::string& manifest_name = "",
@@ -207,13 +257,15 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
 
     const auto cand_ids = W.cfg.build_main_candidate_ids();
     const int n_cand = static_cast<int>(cand_ids.size());
+    const bool use_f32_dense = (mode == WeightMode::RefF32);
 
-    // 1. Plan dense arena: all non-routed-expert items (matrices -> FP16; raw vectors -> FP32; lm_head -> sliced [4097, H]).
+    // 1. Plan dense arena: all non-routed-expert items (matrices -> BF16 or FP32; raw vectors -> FP32; lm_head -> sliced [4097, H]).
     struct DensePlan {
         size_t item_idx = 0;
         std::string name;
         bool is_matrix = false;
         bool is_lm_head = false;
+        bool decode_f32 = false;
         std::string raw_dtype;
         size_t raw_bytes = 0;
         size_t out = 0, inp = 0;
@@ -246,11 +298,13 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
         if (p.is_matrix) {
             p.out = static_cast<size_t>(it.shape[0]);
             p.inp = static_cast<size_t>(it.shape[1]);
-            const size_t full_f16 = p.out * p.inp * 2;
+            p.decode_f32 = use_f32_dense && !is_small_embedding_name(name);
+            const size_t elem_b = p.decode_f32 ? 4 : 2;
+            const size_t full_b = p.out * p.inp * elem_b;
             p.dev_off = dense_total;
-            p.dev_bytes = p.is_lm_head ? (size_t(n_cand) * p.inp * 2) : full_f16;
+            p.dev_bytes = p.is_lm_head ? (size_t(n_cand) * p.inp * elem_b) : full_b;
             dense_total += align256(p.dev_bytes);
-            max_stage = std::max(max_stage, full_f16);
+            max_stage = std::max(max_stage, full_b);
         } else {
             p.raw_dtype = it.dtype ? it.dtype : "BF16";
             p.raw_bytes = static_cast<size_t>(it.comps[0].nbytes);
@@ -349,34 +403,57 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
     W.main_cand_ids_dev = reinterpret_cast<const int32_t*>(W.dense_arena + cand_ids_off);
 
     // 3. Upload dense / vocab / tower items
-    std::unordered_map<std::string, const __half*> mat_map;
+    std::unordered_map<std::string, RefMat> mat_map;
     std::unordered_map<std::string, const float*> vec_map;
     std::vector<uint8_t> raw_tmp;
 
     for (const auto& p : dplans) {
         if (p.is_matrix) {
-            const size_t full_f16 = p.out * p.inp * 2;
-            if (g6l_tts_dense_decode_f16(h, p.item_idx, stage, full_f16, decode_threads, err, sizeof(err)) != 0) {
-                throw std::runtime_error(std::string("g6l_tts_dense_decode_f16(") + p.name + "): " + err);
-            }
-            if (p.is_lm_head) {
-                // Gather only the 4097 legal main-token rows into a compact FP16 matrix
-                std::vector<uint8_t> sliced(size_t(n_cand) * p.inp * 2);
-                const uint8_t* src = static_cast<const uint8_t*>(stage);
-                for (int c = 0; c < n_cand; ++c) {
-                    const int row = cand_ids[size_t(c)];
-                    if (row < 0 || size_t(row) >= p.out) {
-                        throw std::runtime_error("g6tts: lm_head candidate id out of range");
-                    }
-                    std::memcpy(sliced.data() + size_t(c) * p.inp * 2, src + size_t(row) * p.inp * 2, p.inp * 2);
+            if (p.decode_f32) {
+                const size_t full_f32 = p.out * p.inp * 4;
+                if (g6l_tts_dense_decode_f32(h, p.item_idx, stage, full_f32, decode_threads, err, sizeof(err)) != 0) {
+                    throw std::runtime_error(std::string("g6l_tts_dense_decode_f32(") + p.name + "): " + err);
                 }
-                std::memcpy(stage, sliced.data(), sliced.size());
-                TTS_CK(cudaMemcpyAsync(W.dense_arena + p.dev_off, stage, sliced.size(), cudaMemcpyHostToDevice, st));
+                if (p.is_lm_head) {
+                    std::vector<uint8_t> sliced(size_t(n_cand) * p.inp * 4);
+                    const uint8_t* src = static_cast<const uint8_t*>(stage);
+                    for (int c = 0; c < n_cand; ++c) {
+                        const int row = cand_ids[size_t(c)];
+                        if (row < 0 || size_t(row) >= p.out) {
+                            throw std::runtime_error("g6tts: lm_head candidate id out of range");
+                        }
+                        std::memcpy(sliced.data() + size_t(c) * p.inp * 4, src + size_t(row) * p.inp * 4, p.inp * 4);
+                    }
+                    std::memcpy(stage, sliced.data(), sliced.size());
+                    TTS_CK(cudaMemcpyAsync(W.dense_arena + p.dev_off, stage, sliced.size(), cudaMemcpyHostToDevice, st));
+                } else {
+                    TTS_CK(cudaMemcpyAsync(W.dense_arena + p.dev_off, stage, full_f32, cudaMemcpyHostToDevice, st));
+                }
+                TTS_CK(cudaStreamSynchronize(st));
+                mat_map[p.name] = RefMat{nullptr, reinterpret_cast<const float*>(W.dense_arena + p.dev_off)};
             } else {
-                TTS_CK(cudaMemcpyAsync(W.dense_arena + p.dev_off, stage, full_f16, cudaMemcpyHostToDevice, st));
+                const size_t full_bf16 = p.out * p.inp * 2;
+                if (g6l_tts_dense_decode_bf16(h, p.item_idx, stage, full_bf16, decode_threads, err, sizeof(err)) != 0) {
+                    throw std::runtime_error(std::string("g6l_tts_dense_decode_bf16(") + p.name + "): " + err);
+                }
+                if (p.is_lm_head) {
+                    std::vector<uint8_t> sliced(size_t(n_cand) * p.inp * 2);
+                    const uint8_t* src = static_cast<const uint8_t*>(stage);
+                    for (int c = 0; c < n_cand; ++c) {
+                        const int row = cand_ids[size_t(c)];
+                        if (row < 0 || size_t(row) >= p.out) {
+                            throw std::runtime_error("g6tts: lm_head candidate id out of range");
+                        }
+                        std::memcpy(sliced.data() + size_t(c) * p.inp * 2, src + size_t(row) * p.inp * 2, p.inp * 2);
+                    }
+                    std::memcpy(stage, sliced.data(), sliced.size());
+                    TTS_CK(cudaMemcpyAsync(W.dense_arena + p.dev_off, stage, sliced.size(), cudaMemcpyHostToDevice, st));
+                } else {
+                    TTS_CK(cudaMemcpyAsync(W.dense_arena + p.dev_off, stage, full_bf16, cudaMemcpyHostToDevice, st));
+                }
+                TTS_CK(cudaStreamSynchronize(st));
+                mat_map[p.name] = RefMat{reinterpret_cast<const __nv_bfloat16*>(W.dense_arena + p.dev_off), nullptr};
             }
-            TTS_CK(cudaStreamSynchronize(st));
-            mat_map[p.name] = reinterpret_cast<const __half*>(W.dense_arena + p.dev_off);
         } else {
             raw_tmp.resize(p.raw_bytes);
             if (g6l_tts_dense_read_component(h, p.item_idx, 0, raw_tmp.data(), p.raw_bytes, err, sizeof(err)) != 0) {
@@ -390,8 +467,8 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
                 const uint16_t* src = reinterpret_cast<const uint16_t*>(raw_tmp.data());
                 for (size_t k = 0; k < elems; ++k) dst[k] = host_bf16_to_f32(src[k]);
             } else if (p.raw_dtype == "F16") {
-                const __half* src = reinterpret_cast<const __half*>(raw_tmp.data());
-                for (size_t k = 0; k < elems; ++k) dst[k] = __half2float(src[k]);
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(raw_tmp.data());
+                for (size_t k = 0; k < elems; ++k) dst[k] = host_f16_to_f32(src[k]);
             } else {
                 throw std::runtime_error("g6tts: unsupported raw vector dtype " + p.raw_dtype + " for " + p.name);
             }
@@ -401,10 +478,15 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
         }
     }
 
-    auto req_mat = [&](const std::string& k) -> const __half* {
+    auto req_mat = [&](const std::string& k) -> RefMat {
         auto it = mat_map.find(k);
-        if (it == mat_map.end()) throw std::runtime_error("g6tts: missing matrix " + k);
+        if (it == mat_map.end() || !it->second.valid()) throw std::runtime_error("g6tts: missing matrix " + k);
         return it->second;
+    };
+    auto req_bf16 = [&](const std::string& k) -> const __nv_bfloat16* {
+        const RefMat m = req_mat(k);
+        if (!m.bf16) throw std::runtime_error("g6tts: missing BF16 matrix " + k);
+        return m.bf16;
     };
     auto req_vec = [&](const std::string& k) -> const float* {
         auto it = vec_map.find(k);
@@ -415,7 +497,7 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
     W.embed_tokens = req_mat("model.language_model.embed_tokens.weight");
     W.final_norm = req_vec("model.language_model.norm.weight");
     W.lm_head_cand = req_mat("lm_head.weight");
-    W.codebook_embeddings = req_mat("audio_decoder.codebook_embeddings.weight");
+    W.codebook_embeddings = req_bf16("audio_decoder.codebook_embeddings.weight");
 
     // 4. Bind backbone layers + upload routed experts (in parallel across CPU workers per chunk)
     W.layers.resize(size_t(L));
@@ -465,12 +547,13 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
                     throw std::runtime_error("g6tts: shared expert decode failed at layer " +
                                              std::to_string(l) + ": " + err);
                 }
+                host_f16_buf_to_bf16_inplace(stage, sh_f16 / 2);
                 TTS_CK(cudaMemcpyAsync(W.expert_arena + sh_offs[proj], stage, sh_f16, cudaMemcpyHostToDevice, st));
                 TTS_CK(cudaStreamSynchronize(st));
             }
-            LW.shared_gate_proj = reinterpret_cast<const __half*>(W.expert_arena + ep.off_sg);
-            LW.shared_up_proj = reinterpret_cast<const __half*>(W.expert_arena + ep.off_su);
-            LW.shared_down_proj = reinterpret_cast<const __half*>(W.expert_arena + ep.off_sd);
+            LW.shared_gate_proj = RefMat{reinterpret_cast<const __nv_bfloat16*>(W.expert_arena + ep.off_sg), nullptr};
+            LW.shared_up_proj = RefMat{reinterpret_cast<const __nv_bfloat16*>(W.expert_arena + ep.off_su), nullptr};
+            LW.shared_down_proj = RefMat{reinterpret_cast<const __nv_bfloat16*>(W.expert_arena + ep.off_sd), nullptr};
         } else {
             throw std::runtime_error("g6tts: shared expert missing from dense arena at layer " + std::to_string(l));
         }
@@ -531,9 +614,9 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
                 TTS_CK(cudaStreamSynchronize(st));
             }
         } else {
-            LW.exp_gate_f16 = reinterpret_cast<const __half*>(W.expert_arena + ep.off_g);
-            LW.exp_up_f16 = reinterpret_cast<const __half*>(W.expert_arena + ep.off_u);
-            LW.exp_down_f16 = reinterpret_cast<const __half*>(W.expert_arena + ep.off_d);
+            LW.exp_gate_bf16 = reinterpret_cast<const __nv_bfloat16*>(W.expert_arena + ep.off_g);
+            LW.exp_up_bf16 = reinterpret_cast<const __nv_bfloat16*>(W.expert_arena + ep.off_u);
+            LW.exp_down_bf16 = reinterpret_cast<const __nv_bfloat16*>(W.expert_arena + ep.off_d);
             const size_t dev_offs[3] = {ep.off_g, ep.off_u, ep.off_d};
 
             for (int proj = 0; proj < 3; ++proj) {
@@ -556,6 +639,7 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
                                     if (failed.exchange(1) == 0) first_err = terr;
                                     return;
                                 }
+                                host_f16_buf_to_bf16_inplace(dst, one_exp_f16 / 2);
                             }
                         });
                     }
@@ -575,7 +659,7 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
     auto bind_tower = [&](const std::string& p, bool is_shared) -> TowerLayerW {
         TowerLayerW T;
         T.is_shared = is_shared;
-        T.embedding = req_mat(p + (is_shared ? "semantic_embedding.weight" : "codebook_embedding.weight"));
+        T.embedding = req_bf16(p + (is_shared ? "semantic_embedding.weight" : "codebook_embedding.weight"));
         T.enorm = req_vec(p + "enorm.weight");
         T.hnorm = req_vec(p + "hnorm.weight");
         T.eh_proj = req_mat(p + "eh_proj.weight");
@@ -606,7 +690,7 @@ inline TtsWeights load_tts_weights(const std::string& release_dir,
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr,
                  "g6tts: loaded %s (%dL, %d+%d tower) in %.2f s: %.2f GiB VRAM "
-                 "(dense=%.2f GiB, experts=%.2f GiB [fp8=%dL f16=%dL], mode=%s, verify=%d)\n",
+                 "(dense=%.2f GiB, experts=%.2f GiB [fp8=%dL bf16=%dL], mode=%s, verify=%d)\n",
                  W.cfg.model_name.c_str(), W.cfg.num_layers, W.cfg.tower_shared, W.cfg.tower_res, secs,
                  double(W.dense_bytes + W.expert_bytes) / double(1ull << 30),
                  double(W.dense_bytes) / double(1ull << 30),

@@ -279,4 +279,25 @@ impl EmbedRelease {
         }
         Ok(())
     }
+
+    /// Decodes a quantized matrix item `item_idx` directly into row-major FP32 bytes `[out, inp]`.
+    pub fn decode_f32(&self, item_idx: usize, dst: &mut [u8], threads: usize) -> Result<(), String> {
+        let item = self.items.get(item_idx).ok_or_else(|| format!("embed item index {item_idx} out of range"))?;
+        if !item.is_matrix {
+            return Err(format!("{:?}: decode_f32 requires a matrix item", item.hf_name));
+        }
+        let path = &self.files[item.file_idx].path;
+        let f = StFile::open(path)?;
+        let mx = Matrix::open(&f, &item.stored_name)?;
+        let want = mx.rec.out * mx.rec.inp * 4;
+        if dst.len() != want {
+            return Err(format!("{:?}: dst len {} != expected FP32 bytes {want}", item.hf_name, dst.len()));
+        }
+        let v = exlr8::decode_par(&mx, 0..mx.rec.out, 0..mx.rec.inp, threads.max(1))?;
+        for (i, &x) in v.iter().enumerate() {
+            let b = x.to_le_bytes();
+            dst[4 * i..4 * i + 4].copy_from_slice(&b);
+        }
+        Ok(())
+    }
 }
