@@ -227,6 +227,9 @@ struct Planner<'a> {
     qs_iq: bool,
     /// shard L078 q_a.mx.gv, idx.wq_b.mx.gv, and eh.mx.gv output tiles across ranks for GR8_MTP_SPLIT=1
     qs_mtp: bool,
+    /// omit redundant prefill copies (.mx.codes/.mx.scales for q_a, kv_a, idx.wq_b and raw BF16 for idx.wk,
+    /// idx.weights_proj, router.w) and keep full decode records (.mx.gv/.gv) that prefill unpacks on the fly
+    gv_only: bool,
 }
 
 /// Output-row range of `rank` at TP `nr` and layer `l` for a replicated decode GEMV split by 16-row output tiles
@@ -404,23 +407,28 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// A BF16 matrix as stored + its BF16 decode record.
+    /// A BF16 matrix as stored (unless `self.gv_only`) + its BF16 decode record.
     fn bf16(&mut self, l: usize, what: &'static str, p: &str, f: &Arc<StFile>, m: &str) -> Result<(), String> {
         let mx = Matrix::open(f, m)?;
         let (o, k) = (mx.rec.out, mx.rec.inp);
+        let form = if self.gv_only { "BF16 decode record" } else { "BF16 + decode record" };
         match mx.rec.fmt {
             exlr8::BF16 => {
-                self.copy(p.to_string(), "bf16", vec![o as i64, k as i64], f, &format!("{m}.bf16"), 0)?;
-                self.note(l, Form { what, src: "BF16".into(), form: "BF16 + decode record", exact: EXACT });
+                if !self.gv_only {
+                    self.copy(p.to_string(), "bf16", vec![o as i64, k as i64], f, &format!("{m}.bf16"), 0)?;
+                }
+                self.note(l, Form { what, src: "BF16".into(), form, exact: EXACT });
             }
             MXFP8 | INT8 => {
-                let (f2, m2) = (f.clone(), m.to_string());
-                let t = self.threads;
-                self.gen(p.to_string(), vec![(p.to_string(), "bf16", vec![o as i64, k as i64])], move || {
-                    let w = exlr8::decode_par(&Matrix::open(&f2, &m2)?, 0..o, 0..k, t)?;
-                    Ok(vec![le16(&bf16v(&w))])
-                });
-                self.note(l, Form { what, src: fmt_name(&mx), form: "BF16 + decode record",
+                if !self.gv_only {
+                    let (f2, m2) = (f.clone(), m.to_string());
+                    let t = self.threads;
+                    self.gen(p.to_string(), vec![(p.to_string(), "bf16", vec![o as i64, k as i64])], move || {
+                        let w = exlr8::decode_par(&Matrix::open(&f2, &m2)?, 0..o, 0..k, t)?;
+                        Ok(vec![le16(&bf16v(&w))])
+                    });
+                }
+                self.note(l, Form { what, src: fmt_name(&mx), form,
                                     exact: if mx.rec.fmt == MXFP8 { EXACT } else { BF16_OF } });
             }
             _ => return Err(format!("{}: {m} is {}, gr8 reads it as BF16", f.path, fmt_name(&mx))),
@@ -443,9 +451,10 @@ impl Planner<'_> {
         let t = self.threads;
         self.vector(format!("{p}.attn_norm"), &f, "input_layernorm.weight")?;
         // q_a has only its MXFP8 record. Decode reads it as the MTP layer always did
-        self.mxfp8_sharded(l, "q_a", &format!("{p}.q_a"), &f, "self_attn.q_a_proj", false, if mtp { self.qs_mtp } else { self.qs_qa })?;
+        let shard_qa = !self.gv_only && if mtp { self.qs_mtp } else { self.qs_qa };
+        self.mxfp8_sharded(l, "q_a", &format!("{p}.q_a"), &f, "self_attn.q_a_proj", self.gv_only, shard_qa)?;
         self.vector(format!("{p}.q_a_norm"), &f, "self_attn.q_a_layernorm.weight")?;
-        self.mxfp8(l, "kv_a", &format!("{p}.kv_a"), &f, "self_attn.kv_a_proj_with_mqa", false)?;
+        self.mxfp8(l, "kv_a", &format!("{p}.kv_a"), &f, "self_attn.kv_a_proj_with_mqa", self.gv_only)?;
         self.vector(format!("{p}.kv_a_norm"), &f, "self_attn.kv_a_layernorm.weight")?;
 
         // q_b: this rank's heads, output rows h*256..
@@ -514,8 +523,8 @@ impl Planner<'_> {
         }
 
         if f.info("self_attn.indexer.wq_b.record").is_ok() {
-            self.mxfp8_sharded(l, "indexer wq_b", &format!("{p}.idx.wq_b"), &f, "self_attn.indexer.wq_b", false,
-                               if mtp { self.qs_mtp } else { self.qs_iq })?;
+            let shard_iq = !self.gv_only && if mtp { self.qs_mtp } else { self.qs_iq };
+            self.mxfp8_sharded(l, "indexer wq_b", &format!("{p}.idx.wq_b"), &f, "self_attn.indexer.wq_b", self.gv_only, shard_iq)?;
             self.bf16(l, "indexer wk", &format!("{p}.idx.wk"), &f, "self_attn.indexer.wk")?;
             self.vector(format!("{p}.idx.k_norm.w"), &f, "self_attn.indexer.k_norm.weight")?;
             self.vector(format!("{p}.idx.k_norm.b"), &f, "self_attn.indexer.k_norm.bias")?;
@@ -981,6 +990,8 @@ pub struct Opts {
     pub qs_iq: bool,
     /// shard L078 q_a.mx.gv, idx.wq_b.mx.gv, and eh.mx.gv output tiles across ranks for GR8_MTP_SPLIT=1
     pub qs_mtp: bool,
+    /// omit redundant prefill copies of q_a, kv_a, idx.wq_b, idx.wk, idx.weights_proj, router.w (prefill unpacks .gv)
+    pub gv_only: bool,
 }
 
 fn validate_kvb_opts(opts: Opts, is_flash: bool) -> Result<(), String> {
@@ -1022,7 +1033,7 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     let workers = gr8knobs::LOAD_THREADS.get() as usize;
     let mut p = Planner { b: Builder::new(), layout, rank, threads: (cores / workers).max(1), forms: BTreeMap::new(),
                          qo: opts.qo, trellis: opts.trellis, kvb_fp8: opts.kvb_fp8, kvb_rot: opts.kvb_rot,
-                         kvb_uk_t: false, qs_qa: false, qs_iq: false, qs_mtp: false };
+                         kvb_uk_t: false, qs_qa: false, qs_iq: false, qs_mtp: false, gv_only: false };
     // the release's files name the model (their metadata); the width manifest has one format for every model
     let model = flash::model_meta(dense_dir)?;
     let is_flash = model.as_ref().and_then(|m| m.get("hidden_size")).and_then(Json::str) == Some("4096");
@@ -1032,8 +1043,9 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     validate_kvb_opts(opts, is_flash)?;
     if is_flash && opts.kvb_fp8 { return Err("GR8_KVB=fp8: Flash kv_b loads as BF16 only".into()); }
     p.kvb_uk_t = opts.kvb_uk_t && !is_flash && !opts.qo;
-    p.qs_qa = opts.qs_qa && !is_flash && nr > 1;
-    p.qs_iq = opts.qs_iq && !is_flash && nr > 1;
+    p.gv_only = opts.gv_only && !is_flash;
+    p.qs_qa = opts.qs_qa && !is_flash && !p.gv_only && nr > 1;
+    p.qs_iq = opts.qs_iq && !is_flash && !p.gv_only && nr > 1;
     p.qs_mtp = opts.qs_mtp && !is_flash && nr > 1;
     let last = if is_flash { 45 } else { L_MTP };
     if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }

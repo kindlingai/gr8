@@ -681,8 +681,6 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
     P.part[1] = lend ? lend->part[1] : dmalloc<uint16_t>(n * HID);
     P.tok = dmalloc<int>(n);
     P.pos = dmalloc<int>(n);
-    P.scratch = lend ? lend->scratch : dmalloc<char>(bindp::scratch_bytes(Mmax));
-    P.sc = bindp::scratch_at(P.scratch, Mmax);
     if (cublasCreate(&P.blas) != CUBLAS_STATUS_SUCCESS) die("cublasCreate failed");
     if (const std::optional<int64_t> r = knob::pf_blas_rows())
     {
@@ -774,6 +772,20 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
             t.sh_fp8 = 1;
             for (int i = 0; i < 6; ++i) t.sh_tr[i] = y.T.sh_tr[i];
         }
+    }
+    bool need_unp = false;
+    for (const bindp::Tensors& t : P.T)
+        if (bindp::needs_gv_unpack(t)) { need_unp = true; break; }
+    if (lend)
+    {
+        P.scratch = lend->scratch;
+        P.sc = lend->sc;
+        if (need_unp && !P.sc.unp_c0) die("borrowed prefill scratch lacks decode-record unpack buffers");
+    }
+    else
+    {
+        P.scratch = dmalloc<char>(bindp::scratch_bytes(Mmax, g6nr::EB, need_unp));
+        P.sc = bindp::scratch_at(P.scratch, Mmax, g6nr::EB, need_unp);
     }
     // the tensor-core states first: the QO states' key table is their key cache (pf_qo_table)
     if (share)
