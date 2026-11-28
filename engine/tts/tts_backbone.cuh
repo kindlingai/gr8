@@ -750,6 +750,142 @@ __global__ void k_moe_finalize_res_f32(const float* __restrict__ routed_f32,
     }
 }
 
+// On-GPU zero-host-sync Ref MoE fallback kernels for CUDA-graph-capturable decode on store-0 (FP8_BLOCK) or BF16 experts.
+// Grid: (M * TOPK, I / 4), Block: 128 (4 warps, 1 warp per intermediate channel).
+__global__ void __launch_bounds__(128) k_ref_moe_fc1_route(
+    const bf16* __restrict__ x_norm,
+    const int32_t* __restrict__ topk_ids,
+    const uint8_t* __restrict__ gate_fp8, const float* __restrict__ gate_sc,
+    const uint8_t* __restrict__ up_fp8,   const float* __restrict__ up_sc,
+    const bf16* __restrict__ gate_bf16,   const bf16* __restrict__ up_bf16,
+    bf16* __restrict__ route_act,
+    int M, int H, int I, int topk, bool is_fp8) {
+    const int route = blockIdx.x;
+    if (route >= M * topk) return;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int i = blockIdx.y * 4 + warp;
+    if (i >= I) return;
+
+    const int m = route / topk;
+    const int e = topk_ids[route];
+    const bf16* xr = x_norm + size_t(m) * H;
+    const size_t mat_elems = size_t(I) * H;
+    float ag = 0.0f, au = 0.0f;
+
+    if (is_fp8) {
+        const int bo = (I + 127) / 128;
+        const int bi = (H + 127) / 128;
+        const size_t sc_base = (size_t(e) * bo + (i >> 7)) * bi;
+        const uint8_t* gr = gate_fp8 + size_t(e) * mat_elems + size_t(i) * H;
+        const uint8_t* ur = up_fp8 + size_t(e) * mat_elems + size_t(i) * H;
+        for (int k = lane * 4; k < H; k += 128) {
+            const uint2 xv = *reinterpret_cast<const uint2*>(xr + k);
+            const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+            const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+            const float gs = gate_sc[sc_base + (k >> 7)];
+            const float us = up_sc[sc_base + (k >> 7)];
+            const uint32_t gw = *reinterpret_cast<const uint32_t*>(gr + k);
+            const uint32_t uw = *reinterpret_cast<const uint32_t*>(ur + k);
+            const uint16_t g0 = static_cast<uint16_t>(gw & 0xffffu), g1 = static_cast<uint16_t>(gw >> 16);
+            const uint16_t u0 = static_cast<uint16_t>(uw & 0xffffu), u1 = static_cast<uint16_t>(uw >> 16);
+            uint32_t gh0 = 0, gh1 = 0, uh0 = 0, uh1 = 0;
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(gh0) : "h"(g0));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(gh1) : "h"(g1));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(uh0) : "h"(u0));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(uh1) : "h"(u1));
+            const float2 gf0 = __half22float2(*reinterpret_cast<const __half2*>(&gh0));
+            const float2 gf1 = __half22float2(*reinterpret_cast<const __half2*>(&gh1));
+            const float2 uf0 = __half22float2(*reinterpret_cast<const __half2*>(&uh0));
+            const float2 uf1 = __half22float2(*reinterpret_cast<const __half2*>(&uh1));
+            ag += gs * (x01.x * gf0.x + x01.y * gf0.y + x23.x * gf1.x + x23.y * gf1.y);
+            au += us * (x01.x * uf0.x + x01.y * uf0.y + x23.x * uf1.x + x23.y * uf1.y);
+        }
+    } else {
+        const bf16* gr = gate_bf16 + size_t(e) * mat_elems + size_t(i) * H;
+        const bf16* ur = up_bf16 + size_t(e) * mat_elems + size_t(i) * H;
+        for (int k = lane * 4; k < H; k += 128) {
+            const uint2 xv = *reinterpret_cast<const uint2*>(xr + k);
+            const uint2 gv = *reinterpret_cast<const uint2*>(gr + k);
+            const uint2 uv = *reinterpret_cast<const uint2*>(ur + k);
+            const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+            const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+            const float2 gf0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gv.x));
+            const float2 gf1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gv.y));
+            const float2 uf0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uv.x));
+            const float2 uf1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uv.y));
+            ag += x01.x * gf0.x + x01.y * gf0.y + x23.x * gf1.x + x23.y * gf1.y;
+            au += x01.x * uf0.x + x01.y * uf0.y + x23.x * uf1.x + x23.y * uf1.y;
+        }
+    }
+
+    ag = tts_warp_sum(ag);
+    au = tts_warp_sum(au);
+    if (lane == 0) {
+        route_act[size_t(route) * I + i] = __float2bfloat16_rn(tts_rbf16(tts_silu(tts_rbf16(ag))) * tts_rbf16(au));
+    }
+}
+
+// Grid: (M * TOPK, H / 4), Block: 128 (4 warps, 1 warp per hidden channel).
+__global__ void __launch_bounds__(128) k_ref_moe_fc2_route(
+    const bf16* __restrict__ route_act,
+    const int32_t* __restrict__ topk_ids,
+    const float* __restrict__ topk_w,
+    const uint8_t* __restrict__ down_fp8, const float* __restrict__ down_sc,
+    const bf16* __restrict__ down_bf16,
+    float* __restrict__ route_out,
+    int M, int H, int I, int topk, bool is_fp8) {
+    const int route = blockIdx.x;
+    if (route >= M * topk) return;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int h = blockIdx.y * 4 + warp;
+    if (h >= H) return;
+
+    const int e = topk_ids[route];
+    const float rw = topk_w[route];
+    const bf16* ar = route_act + size_t(route) * I;
+    const size_t mat_elems = size_t(H) * I;
+    float ad = 0.0f;
+
+    if (is_fp8) {
+        const int bo = (H + 127) / 128;
+        const int bi = (I + 127) / 128;
+        const size_t sc_base = (size_t(e) * bo + (h >> 7)) * bi;
+        const uint8_t* dr = down_fp8 + size_t(e) * mat_elems + size_t(h) * I;
+        for (int k = lane * 4; k < I; k += 128) {
+            const uint2 av = *reinterpret_cast<const uint2*>(ar + k);
+            const float2 a01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av.x));
+            const float2 a23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av.y));
+            const float ds = down_sc[sc_base + (k >> 7)];
+            const uint32_t dw = *reinterpret_cast<const uint32_t*>(dr + k);
+            const uint16_t d0 = static_cast<uint16_t>(dw & 0xffffu), d1 = static_cast<uint16_t>(dw >> 16);
+            uint32_t dh0 = 0, dh1 = 0;
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(dh0) : "h"(d0));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(dh1) : "h"(d1));
+            const float2 df0 = __half22float2(*reinterpret_cast<const __half2*>(&dh0));
+            const float2 df1 = __half22float2(*reinterpret_cast<const __half2*>(&dh1));
+            ad += ds * (a01.x * df0.x + a01.y * df0.y + a23.x * df1.x + a23.y * df1.y);
+        }
+    } else {
+        const bf16* dr = down_bf16 + size_t(e) * mat_elems + size_t(h) * I;
+        for (int k = lane * 4; k < I; k += 128) {
+            const uint2 av = *reinterpret_cast<const uint2*>(ar + k);
+            const uint2 dv = *reinterpret_cast<const uint2*>(dr + k);
+            const float2 a01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av.x));
+            const float2 a23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av.y));
+            const float2 df0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&dv.x));
+            const float2 df1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&dv.y));
+            ad += a01.x * df0.x + a01.y * df0.y + a23.x * df1.x + a23.y * df1.y;
+        }
+    }
+
+    ad = tts_warp_sum(ad);
+    if (lane == 0) {
+        route_out[size_t(route) * H + h] = rw * ad;
+    }
+}
+
 // ------------------------------------------------------------------------------------------------ Backbone runner
 
 struct BackboneProfile {
@@ -844,6 +980,9 @@ struct BackboneRunner {
     bf16* d_deq_g = nullptr;            // [512, 2048] scratch for on-the-fly FP8 expert dequant
     bf16* d_deq_u = nullptr;            // [512, 2048]
     bf16* d_deq_d = nullptr;            // [2048, 512]
+    bf16* d_route_act = nullptr;        // [max_graph_M * top_k, I] (on-GPU Ref MoE for CUDA graph capture)
+    float* d_route_out = nullptr;       // [max_graph_M * top_k, H]
+    int max_graph_M = 16;
     bf16* d_final_bf16 = nullptr;       // [max_chunk, H]
     float* d_final_f32 = nullptr;       // [max_chunk, H]
     float* d_main_logits = nullptr;     // [max_chunk, 4097]
@@ -885,6 +1024,7 @@ struct BackboneRunner {
         freep(d_exp_x); freep(d_exp_g); freep(d_exp_u); freep(d_exp_out);
         freep(d_exp_rows); freep(d_exp_w);
         freep(d_deq_g); freep(d_deq_u); freep(d_deq_d);
+        freep(d_route_act); freep(d_route_out);
         freep(d_final_bf16); freep(d_final_f32); freep(d_main_logits);
         freeh(h_topk_ids); freeh(h_topk_w); freeh(h_exp_rows); freeh(h_exp_w);
         freeh(h_rows_stage); freeh(h_slots); freeh(h_pos);
@@ -982,6 +1122,9 @@ struct BackboneRunner {
         alloc_d(d_deq_g, size_t(I) * H);
         alloc_d(d_deq_u, size_t(I) * H);
         alloc_d(d_deq_d, size_t(H) * I);
+        max_graph_M = std::min(max_chunk, std::max(16, max_slots));
+        alloc_d(d_route_act, size_t(max_graph_M) * c.top_k * I);
+        alloc_d(d_route_out, size_t(max_graph_M) * c.top_k * H);
         alloc_d(d_final_bf16, size_t(max_chunk) * H);
         alloc_d(d_final_f32, size_t(max_chunk) * H);
         alloc_d(d_main_logits, size_t(max_chunk) * n_cand);
@@ -1038,6 +1181,155 @@ struct BackboneRunner {
         const auto& c = W->cfg;
         proj_f32(d_hid, W->lm_head_cand, W->lm_head_nat, d_main_logits,
                  M, c.main_candidates(), c.hidden_size, false, stream);
+    }
+
+    // 100% on-GPU, zero-host-sync, CUDA-graph-capturable batched decode forward.
+    // All inputs (`dev_rows [M, 11]`, `dev_slots [M]`, `dev_pos [M]`) live on device.
+    // Produces `d_final_bf16 [M, H]` (and `d_main_logits [M, 4097]` if `compute_logits`).
+    void forward_device(const int32_t* dev_rows, const int32_t* dev_slots, const int32_t* dev_pos,
+                        int M, bool compute_logits, bool want_f32_hidden, cudaStream_t stream) {
+        if (M <= 0 || M > max_graph_M) {
+            throw std::runtime_error("BackboneRunner::forward_device: M out of bounds");
+        }
+        TTS_BLAS_CK(cublasSetStream(blas, stream));
+        const auto& c = W->cfg;
+        const int H = c.hidden_size;
+        const int I = c.moe_intermediate;
+        const int qkv_dim = (2 * c.gdn_kh + c.gdn_vh) * c.gdn_kd;
+        const int val_dim = c.gdn_vh * c.gdn_vd;
+        const int kv_dim = c.num_kv_heads * c.head_dim;
+
+        auto tic = [&]() { if (prof.enabled) cudaEventRecord(ev0, stream); };
+        auto toc = [&](double& dst) {
+            if (prof.enabled) {
+                cudaEventRecord(ev1, stream);
+                cudaEventSynchronize(ev1);
+                float ms = 0.0f;
+                cudaEventElapsedTime(&ms, ev0, ev1);
+                dst += double(ms);
+            }
+        };
+
+        tic();
+        if (W->embed_tokens_nat.valid() && W->embed_tokens_nat.fmt == g6emb::FMT_FP8_ROW) {
+            k_backbone_embed_fp8<<<M, 256, 0, stream>>>(
+                dev_rows, W->embed_tokens_nat.data, W->embed_tokens_nat.scale, W->codebook_embeddings, d_residual,
+                M, H, c.row_width(), c.semantic_start_id, c.semantic_end_id, c.tower_vocab);
+        } else if (W->embed_tokens.f32 != nullptr) {
+            k_backbone_embed_f32<<<M, 256, 0, stream>>>(
+                dev_rows, W->embed_tokens.f32, W->codebook_embeddings, d_residual,
+                M, H, c.row_width(), c.semantic_start_id, c.semantic_end_id, c.tower_vocab);
+        } else {
+            k_backbone_embed<<<M, 256, 0, stream>>>(
+                dev_rows, W->embed_tokens.bf16, W->codebook_embeddings, d_residual,
+                M, H, c.row_width(), c.semantic_start_id, c.semantic_end_id, c.tower_vocab);
+        }
+        toc(prof.embed_ms);
+
+        for (int l = 0; l < c.num_layers; ++l) {
+            const BackboneLayerW& LW = W->layers[size_t(l)];
+            k_zc_rmsnorm_f32_to_bf16<<<M, 256, 0, stream>>>(d_residual, LW.input_ln, d_norm, M, H, c.rms_norm_eps);
+
+            if (LW.is_full_attn) {
+                tic();
+                if (W->mode == WeightMode::Native && LW.q_proj_nat.valid() && LW.k_proj_nat.valid() && LW.v_proj_nat.valid()) {
+                    tts_native_linear_triple_bf16(d_norm, LW.q_proj_nat, LW.k_proj_nat, LW.v_proj_nat,
+                                                  d_qkv, d_kv_tmp, d_kv_tmp + size_t(M) * kv_dim, M, dense_ws, blas, stream);
+                } else {
+                    proj_bf16(d_norm, LW.q_proj, LW.q_proj_nat, d_qkv, M, c.num_heads * 2 * c.head_dim, H, stream);
+                    proj_bf16(d_norm, LW.k_proj, LW.k_proj_nat, d_kv_tmp, M, kv_dim, H, stream);
+                    proj_bf16(d_norm, LW.v_proj, LW.v_proj_nat, d_kv_tmp + size_t(M) * kv_dim, M, kv_dim, H, stream);
+                }
+
+                dim3 qk_grid(M, c.num_heads + c.num_kv_heads);
+                k_bb_qk_norm_rope_kv<<<qk_grid, 256, 0, stream>>>(
+                    d_qkv, d_kv_tmp, d_kv_tmp + size_t(M) * kv_dim,
+                    LW.q_norm, LW.k_norm, d_q_ready, k_caches[size_t(l)], v_caches[size_t(l)],
+                    dev_slots, dev_pos, M, c.num_heads, c.num_kv_heads, c.head_dim, c.rotary_dim,
+                    c.rms_norm_eps, c.rope_theta, cap);
+
+                dim3 attn_grid(M, c.num_heads);
+                k_gqa_attn_gated<<<attn_grid, 256, 0, stream>>>(
+                    d_q_ready, d_qkv, k_caches[size_t(l)], v_caches[size_t(l)], d_attn_out,
+                    dev_slots, dev_pos, M, c.num_heads, c.num_kv_heads, c.head_dim, cap,
+                    true, 0, 0);
+
+                proj_f32(d_attn_out, LW.o_proj, LW.o_proj_nat, d_residual, M, H, c.num_heads * c.head_dim, true, stream);
+                toc(prof.attn_ms);
+            } else {
+                tic();
+                if (W->mode == WeightMode::Native && LW.in_proj_qkv_nat.valid() && LW.in_proj_z_nat.valid()) {
+                    tts_native_linear_dual_bf16(d_norm, LW.in_proj_qkv_nat, LW.in_proj_z_nat,
+                                                d_qkv, d_q_ready, M, dense_ws, blas, stream);
+                } else {
+                    proj_bf16(d_norm, LW.in_proj_qkv, LW.in_proj_qkv_nat, d_qkv, M, qkv_dim, H, stream);
+                    proj_bf16(d_norm, LW.in_proj_z, LW.in_proj_z_nat, d_q_ready, M, val_dim, H, stream);
+                }
+                proj_f32(d_norm, LW.in_proj_a, LW.in_proj_a_nat, d_ab, M, c.gdn_vh, H, false, stream);
+                proj_f32(d_norm, LW.in_proj_b, LW.in_proj_b_nat, d_ab + size_t(M) * c.gdn_vh, M, c.gdn_vh, H, false, stream);
+
+                const size_t tot = size_t(M) * qkv_dim;
+                k_gdn_conv1d_dec<<<int((tot + 255) / 256), 256, 0, stream>>>(
+                    d_qkv, LW.conv1d, gdn_conv[size_t(l)], d_qkv2, dev_slots, dev_pos, M, qkv_dim);
+                k_gdn_rec_norm_dec<<<M * c.gdn_vh, 256, 0, stream>>>(
+                    d_qkv2, d_ab, d_ab + size_t(M) * c.gdn_vh, d_q_ready,
+                    LW.A_log, LW.dt_bias, LW.gdn_norm, gdn_S[size_t(l)], d_attn_out,
+                    dev_slots, dev_pos, M, c.gdn_kh, c.gdn_vh, c.rms_norm_eps);
+
+                proj_f32(d_attn_out, LW.out_proj, LW.out_proj_nat, d_residual, M, H, val_dim, true, stream);
+                toc(prof.gdn_ms);
+            }
+
+            // Sparse MoE + Shared Expert (100% on-GPU, zero host sync)
+            tic();
+            k_zc_rmsnorm_f32_to_bf16<<<M, 256, 0, stream>>>(d_residual, LW.post_attn_ln, d_norm, M, H, c.rms_norm_eps);
+
+            if (LW.tr3.valid) {
+                tts_moe_prepare_x_had(d_norm, LW.tr3, M, moe_sc, stream);
+            }
+            if (LW.tr3.valid && LW.tr3.has_shared) {
+                tts_moe_shared_forward(LW.tr3, M, moe_sc, d_shared_out, stream);
+            } else {
+                proj_bf16(d_norm, LW.shared_gate_proj, LW.shared_gate_nat, d_shared_g, M, c.shared_intermediate, H, stream);
+                proj_bf16(d_norm, LW.shared_up_proj, LW.shared_up_nat, d_shared_u, M, c.shared_intermediate, H, stream);
+                const size_t sh_n = size_t(M) * c.shared_intermediate;
+                k_silu_mul_bf16<<<int((sh_n + 255) / 256), 256, 0, stream>>>(d_shared_g, d_shared_u, d_shared_g, sh_n);
+                proj_f32(d_shared_g, LW.shared_down_proj, LW.shared_down_nat, d_shared_out, M, H, c.shared_intermediate, false, stream);
+            }
+            proj_f32(d_norm, LW.shared_expert_gate, LW.shared_expert_gate_nat, d_shared_gate, M, 1, H, false, stream);
+
+            proj_f32(d_norm, LW.router_gate, LW.router_gate_nat, d_router_logits, M, c.num_experts, H, false, stream);
+            k_moe_router_topk<<<M, 256, 0, stream>>>(
+                d_router_logits, d_topk_ids, d_topk_w, M, c.num_experts, c.top_k, c.norm_topk_prob);
+
+            if (LW.tr3.valid) {
+                tts_moe_routed_forward(LW.tr3, d_topk_ids, d_topk_w, M, moe_sc, d_moe_routed_f32, stream);
+            } else {
+                const int n_routes = M * c.top_k;
+                k_ref_moe_fc1_route<<<dim3(n_routes, (I + 3) / 4), 128, 0, stream>>>(
+                    d_norm, d_topk_ids,
+                    LW.exp_gate_fp8, LW.exp_gate_sc, LW.exp_up_fp8, LW.exp_up_sc,
+                    LW.exp_gate_bf16, LW.exp_up_bf16, d_route_act,
+                    M, H, I, c.top_k, LW.experts_fp8);
+                k_ref_moe_fc2_route<<<dim3(n_routes, (H + 3) / 4), 128, 0, stream>>>(
+                    d_route_act, d_topk_ids, d_topk_w,
+                    LW.exp_down_fp8, LW.exp_down_sc, LW.exp_down_bf16, d_route_out,
+                    M, H, I, c.top_k, LW.experts_fp8);
+                k_tts_moe_combine_f32<<<M * 8, 64, 0, stream>>>(d_route_out, d_moe_routed_f32, M);
+            }
+            k_moe_finalize_res_f32<<<M, 256, 0, stream>>>(d_moe_routed_f32, d_shared_out, d_shared_gate, d_residual, M, H);
+            toc(prof.moe_ms);
+        }
+
+        tic();
+        k_zc_rmsnorm_f32_to_bf16<<<M, 256, 0, stream>>>(d_residual, W->final_norm, d_final_bf16, M, H, c.rms_norm_eps);
+        if (want_f32_hidden) {
+            k_zc_rmsnorm_f32_to_f32<<<M, 256, 0, stream>>>(d_residual, W->final_norm, d_final_f32, M, H, c.rms_norm_eps);
+        }
+        if (compute_logits) {
+            compute_main_logits(d_final_bf16, M, stream);
+        }
+        toc(prof.head_ms);
     }
 
     // Runs backbone on `M` rows:
