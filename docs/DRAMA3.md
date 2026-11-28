@@ -50,6 +50,10 @@ Measured on one DGX Spark (GB10) with `bench/tts_bench.py` (`--concurrency 1,2,4
 | Pass | Description | Exactness / Tolerance Check | TTFA@1 p50 (ms) | RTF@1 | audio-s/s@4 | audio-s/s@8 | Kept |
 |---:|---|---|---:|---:|---:|---:|---|
 | Baseline | Upstream SGLang-Omni (`drama-3`) | — | 112.0 | 0.51 | 4.2 | — | ref |
+| 0 | Baseline (`g6tts` native dense + FP8 experts + FP32 codec + `g6front-rs`) | `smoketest/tts.sh` 6/6 PASS; `whisper-large-v3` WER `0.0000`; `tts_bench` 60/60 HTTP 200 | 401.2 | 0.536 | 3.42 | 4.34 | base |
+| 1 | Codec: W16A32 decoder + fused channels-last `k=7` conv + fused Snake/residual (`codec` `m1` `-7.5%`, `m4` `-32.5%`; `m4` graph `37.84 -> 35.45 ms/step`, `+6.7%`) | Gate E2 PASS (`68.48 dB` min / `70.85 dB` mean, `<= 1` LSB, `1.0000` enc, `120 dB` RT); `--verify-graph m1,m4` `0/0` mismatches; `tts_bench` 60/60 HTTP 200 | 408.1¹ | 0.559¹ (`0.525` warm) | 3.65 | 4.68 | keep |
+
+> ¹ Pass 1 ran `tts_bench.py` (`warmup=0`) cold on `c=1` run 0 (`ttfa = 1179.5 ms`, `rtf = 0.659`); across warm `c=1` runs 1–3, Pass 1 averaged `ttfa = 400.0 ms`, `rtf = 0.525` (`+2.1%` vs Pass 0), matching the deterministic `+1.8%` `m1` graph speedup (`21.56 -> 21.18 ms/step`).
 
 ## License & Attribution
 

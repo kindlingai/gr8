@@ -2,8 +2,9 @@
 //
 // Architecture (fish-speech @ 0f8a12e8, modded_dac_vq.yaml, exlr8-codec-v1 safetensors):
 //   - Sample rate: 44.1 kHz, hop 512 x quantizer factor 4 = 2048 samples/frame (21.533 Hz), zero lookahead.
-//   - Decoder (strict IEEE fp32 by default so streaming strides 1,1,2,4 match whole-sequence decode within
-//     <= 1 LSB of s16; optional fp16 GEMM fast path via init(..., fp32_decoder=false)):
+//   - Decoder (W16A32 deterministic warp-tiled GEMMs on bandwidth-bound stages post_module/upsample/dec_in/b0.trans
+//     + fused single-pass channels-last Snake+Conv1d(k=7) & in-place residual add in IEEE fp32 on b0.res..b3, preserving
+//     streaming strides 1,1,2,4 within <= 1 LSB of s16; optional all-fp16 GEMM mode via init(..., fp32_decoder=false)):
 //       10-codebook projected table sum -> 8-layer causal window-128 transformer (post_module, bf16-rounded RoPE)
 //       -> 2x [CausalTransConv1d(k=2,s=2) + ConvNeXtBlock(dwconv k=7, LN eps=1e-6, exact GELU, gamma)]
 //       -> CausalConv1d(k=7, 1024->1536)
@@ -432,11 +433,11 @@ __global__ void __launch_bounds__(256) k_rmsnorm(
 
 // LayerNorm (eps=1e-6) fp32 -> fp16 and/or fp32. Grid: (N), Block: 256.
 __global__ void __launch_bounds__(256) k_layernorm(
-    const float* __restrict__ x,
+    const float* x,
     const float* __restrict__ w,
     const float* __restrict__ b,
     __half* __restrict__ y_f16,
-    float* __restrict__ y_f32,
+    float* y_f32,
     int N, int D, float eps) {
     __shared__ float red[8];
     const int row = blockIdx.x;
@@ -731,12 +732,24 @@ __global__ void __launch_bounds__(256) k_add_bias_res(
     y[idx] = v;
 }
 
-// Bias + exact GELU -> fp16 and/or fp32 (for ConvNeXt pwconv1).
+// Fused in-place residual update: dst[idx] += src[idx] + bias[c] (eliminates separate add + cudaMemcpyAsync).
+__global__ void __launch_bounds__(256) k_add_bias_into_res(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    const float* __restrict__ bias,
+    int N, int C) {
+    const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = size_t(N) * size_t(C);
+    if (idx >= total) return;
+    dst[idx] += src[idx] + bias[idx % size_t(C)];
+}
+
+// Bias + exact GELU -> fp16 and/or fp32 (for ConvNeXt pwconv1; supports in-place x == out_f32).
 __global__ void __launch_bounds__(256) k_bias_gelu(
-    const float* __restrict__ x,
+    const float* x,
     const float* __restrict__ bias,
     __half* __restrict__ out_f16,
-    float* __restrict__ out_f32,
+    float* out_f32,
     int N, int C) {
     const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t total = size_t(N) * size_t(C);
@@ -747,13 +760,13 @@ __global__ void __launch_bounds__(256) k_bias_gelu(
     if (out_f32) out_f32[idx] = g;
 }
 
-// Bias + LayerScale gamma + residual add (for ConvNeXt pwconv2).
+// Bias + LayerScale gamma + residual add (for ConvNeXt pwconv2; supports in-place res == out).
 __global__ void __launch_bounds__(256) k_convnext_epilogue(
     const float* __restrict__ pw2,
     const float* __restrict__ bias,
     const float* __restrict__ gamma,
-    const float* __restrict__ res,
-    float* __restrict__ out,
+    const float* res,
+    float* out,
     int N, int C) {
     const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t total = size_t(N) * size_t(C);
@@ -780,16 +793,109 @@ __global__ void __launch_bounds__(256) k_snake1d(
     if (y_f16) y_f16[idx] = __float2half_rn(y);
 }
 
+// Fused channel bias + Snake1d in fp32 (supports in-place x == y_f32; optionally emitting fp16 copy too).
+__global__ void __launch_bounds__(256) k_bias_snake1d(
+    const float* x,
+    const float* __restrict__ bias,
+    const float* __restrict__ alpha,
+    float* y_f32,
+    __half* __restrict__ y_f16,
+    int N, int C) {
+    const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = size_t(N) * size_t(C);
+    if (idx >= total) return;
+    const size_t c = idx % size_t(C);
+    const float xv = x[idx] + bias[c];
+    const float a = alpha[c];
+    const float s = sinf(a * xv);
+    const float y = xv + (s * s) / (a + 1e-9f);
+    if (y_f32) y_f32[idx] = y;
+    if (y_f16) y_f16[idx] = __float2half_rn(y);
+}
+
 // Cast fp32 -> fp16.
 __global__ void __launch_bounds__(256) k_f32_to_f16(const float* __restrict__ src, __half* __restrict__ dst, size_t n) {
     const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx < n) dst[idx] = __float2half_rn(src[idx]);
 }
 
+// Deterministic W16A32 GEMM: C[R, N] = A_f32[R, K] @ B_f16[N, K]^T (FP32 accumulate, fixed K-order across R).
+// Requires K % 8 == 0 and 16-byte aligned A/B (all codec stages have K % 256 == 0 and 256B arena alignment).
+// Grid: ((N + 7) / 8, (R + RM - 1) / RM), Block: 256 (8 warps, 1 warp per output col n).
+template <int RM>
+__global__ void __launch_bounds__(256) k_w16a32_gemm(
+    const float* __restrict__ A,
+    const __half* __restrict__ B,
+    float* __restrict__ C,
+    int R, int N, int K) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = int(blockIdx.x) * 8 + warp;
+    if (n >= N) return;
+    const int r0 = int(blockIdx.y) * RM;
+
+    float acc[RM];
+    #pragma unroll
+    for (int m = 0; m < RM; ++m) acc[m] = 0.0f;
+
+    const __half* brow = B + size_t(n) * size_t(K);
+    for (int k = lane * 8; k < K; k += 256) {
+        const float4 bw = *reinterpret_cast<const float4*>(brow + k);
+        const __half2* h2 = reinterpret_cast<const __half2*>(&bw);
+        const float2 w01 = __half22float2(h2[0]);
+        const float2 w23 = __half22float2(h2[1]);
+        const float2 w45 = __half22float2(h2[2]);
+        const float2 w67 = __half22float2(h2[3]);
+
+        #pragma unroll
+        for (int m = 0; m < RM; ++m) {
+            const int r = r0 + m;
+            if (r < R) {
+                const float* arow = A + size_t(r) * size_t(K) + k;
+                const float4 a03 = *reinterpret_cast<const float4*>(arow);
+                const float4 a47 = *reinterpret_cast<const float4*>(arow + 4);
+                float s = acc[m];
+                s = fmaf(a03.x, w01.x, s);
+                s = fmaf(a03.y, w01.y, s);
+                s = fmaf(a03.z, w23.x, s);
+                s = fmaf(a03.w, w23.y, s);
+                s = fmaf(a47.x, w45.x, s);
+                s = fmaf(a47.y, w45.y, s);
+                s = fmaf(a47.z, w67.x, s);
+                s = fmaf(a47.w, w67.y, s);
+                acc[m] = s;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < RM; ++m) {
+        const float v = warp_sum(acc[m]);
+        const int r = r0 + m;
+        if (lane == 0 && r < R) {
+            C[size_t(r) * size_t(N) + size_t(n)] = v;
+        }
+    }
+}
+
+inline void launch_w16a32_gemm(const float* A, const __half* B, float* C, int R, int N, int K, cudaStream_t s) {
+    const int gx = (N + 7) / 8;
+    if (R == 1) {
+        k_w16a32_gemm<1><<<dim3(gx, 1), 256, 0, s>>>(A, B, C, R, N, K);
+    } else if (R == 2) {
+        k_w16a32_gemm<2><<<dim3(gx, 1), 256, 0, s>>>(A, B, C, R, N, K);
+    } else if (R <= 4) {
+        k_w16a32_gemm<4><<<dim3(gx, 1), 256, 0, s>>>(A, B, C, R, N, K);
+    } else {
+        k_w16a32_gemm<8><<<dim3(gx, (R + 7) / 8), 256, 0, s>>>(A, B, C, R, N, K);
+    }
+}
+
 // Prepend causal conv context [pad, C] from slot arena (or zeros if ctx_base == nullptr) + current [T, C]
-// into x_pad[M, T + pad, C] (emitting fp32 and/or fp16).
+// (optionally applying Snake1d(x, snake_alpha) inline when snake_alpha != nullptr) into x_pad[M, T + pad, C].
 __global__ void __launch_bounds__(256) k_conv_prepend_ctx(
     const float* __restrict__ x,
+    const float* __restrict__ snake_alpha,
     const float* __restrict__ slot_ctx_arena,
     const int* __restrict__ d_slots,
     size_t slot_stride_elems,
@@ -815,9 +921,59 @@ __global__ void __launch_bounds__(256) k_conv_prepend_ctx(
         }
     } else {
         v = x[(size_t(m) * size_t(T) + (t - size_t(pad))) * size_t(C) + c];
+        if (snake_alpha) {
+            const float a = snake_alpha[c];
+            const float s = sinf(a * v);
+            v = v + (s * s) / (a + 1e-9f);
+        }
     }
     if (pad_f32) pad_f32[idx] = v;
     if (pad_f16) pad_f16[idx] = __float2half_rn(v);
+}
+
+// Vectorized float4 channels-last im2col gather for dilated k=7 causal conv:
+// x_pad[M, T + 6*d, C] -> out[M * T, 7 * C] (requires C % 4 == 0).
+__global__ void __launch_bounds__(256) k_im2col_k7_f32(
+    const float* __restrict__ x_pad,
+    float* __restrict__ out,
+    int M, int T, int C, int dilation) {
+    const int C4 = C >> 2;
+    const size_t total4 = size_t(M) * size_t(T) * 7u * size_t(C4);
+    const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total4) return;
+
+    const int c4 = static_cast<int>(idx % size_t(C4));
+    const size_t rem0 = idx / size_t(C4);
+    const int k = static_cast<int>(rem0 % 7u);
+    const size_t mt = rem0 / 7u;
+    const int t = static_cast<int>(mt % size_t(T));
+    const int m = static_cast<int>(mt / size_t(T));
+
+    const int pad = 6 * dilation;
+    const size_t src_row = size_t(m) * size_t(T + pad) + size_t(t + k * dilation);
+    reinterpret_cast<float4*>(out)[idx] = reinterpret_cast<const float4*>(x_pad)[src_row * size_t(C4) + size_t(c4)];
+}
+
+// FP16 im2col gather for opt-in fp32_decoder=false mode: x_pad_f16[M, T + 6*d, C] -> out_f16[M * T, 7 * C].
+__global__ void __launch_bounds__(256) k_im2col_k7_f16(
+    const __half* __restrict__ x_pad,
+    __half* __restrict__ out,
+    int M, int T, int C, int dilation) {
+    const int C8 = C >> 3;
+    const size_t total8 = size_t(M) * size_t(T) * 7u * size_t(C8);
+    const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total8) return;
+
+    const int c8 = static_cast<int>(idx % size_t(C8));
+    const size_t rem0 = idx / size_t(C8);
+    const int k = static_cast<int>(rem0 % 7u);
+    const size_t mt = rem0 / 7u;
+    const int t = static_cast<int>(mt % size_t(T));
+    const int m = static_cast<int>(mt / size_t(T));
+
+    const int pad = 6 * dilation;
+    const size_t src_row = size_t(m) * size_t(T + pad) + size_t(t + k * dilation);
+    reinterpret_cast<float4*>(out)[idx] = reinterpret_cast<const float4*>(x_pad)[src_row * size_t(C8) + size_t(c8)];
 }
 
 // Save last `pad` fp32 frames from pad_f32[M, T + pad, C] (indices T .. T + pad - 1) back to slot arena.
@@ -929,7 +1085,7 @@ __global__ void __launch_bounds__(256) k_transconv_save_carry(
     slot_carry_arena[size_t(slot) * carry_stride_elems + carry_off + size_t(r) * size_t(C_out) + o] = gemm[src];
 }
 
-// Final decoder conv1d (C_in=96 -> 1, k=7, s=1, d=1) + bias + Tanh -> int16 PCM in fp32.
+// Final decoder conv1d (C_in=96 -> 1, k=7, s=1, d=1) + bias + Tanh -> int16 PCM in fp32 (shared weights + float4).
 // x_pad: [M, T + 6, 96], w: [7, 96], bias: [1], out_s16: [M, T].
 __global__ void __launch_bounds__(256) k_dec_final_conv_tanh_s16(
     const float* __restrict__ x_pad,
@@ -937,6 +1093,11 @@ __global__ void __launch_bounds__(256) k_dec_final_conv_tanh_s16(
     const float* __restrict__ bias,
     int16_t* __restrict__ out_s16,
     int M, int T) {
+    __shared__ float sw[7 * 96];
+    for (int i = threadIdx.x; i < 7 * 96; i += blockDim.x) sw[i] = w[i];
+    const float b0 = bias[0];
+    __syncthreads();
+
     const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t total = size_t(M) * size_t(T);
     if (idx >= total) return;
@@ -944,12 +1105,18 @@ __global__ void __launch_bounds__(256) k_dec_final_conv_tanh_s16(
     const int t = static_cast<int>(idx % size_t(T));
     const int m = static_cast<int>(idx / size_t(T));
     const float* xp = x_pad + (size_t(m) * size_t(T + 6) + size_t(t)) * 96u;
-    float acc = bias[0];
+    float acc = b0;
     for (int k = 0; k < 7; ++k) {
-        const float* xk = xp + size_t(k) * 96u;
-        const float* wk = w + size_t(k) * 96u;
-        for (int c = 0; c < 96; ++c) {
-            acc += xk[c] * wk[c];
+        const float4* xk4 = reinterpret_cast<const float4*>(xp + size_t(k) * 96u);
+        const float4* wk4 = reinterpret_cast<const float4*>(sw + size_t(k) * 96u);
+        #pragma unroll
+        for (int c4 = 0; c4 < 24; ++c4) {
+            const float4 xv = xk4[c4];
+            const float4 wv = wk4[c4];
+            acc = fmaf(xv.x, wv.x, acc);
+            acc = fmaf(xv.y, wv.y, acc);
+            acc = fmaf(xv.z, wv.z, acc);
+            acc = fmaf(xv.w, wv.w, acc);
         }
     }
     const float y = tanhf(acc);
@@ -1216,6 +1383,8 @@ struct TtsCodec {
         dec_buf_pad_f32_ = o.dec_buf_pad_f32_;
         dec_buf_pad_f16_ = o.dec_buf_pad_f16_;
         dec_buf_tmp_f16_ = o.dec_buf_tmp_f16_;
+        dec_buf_im2col_f32_ = o.dec_buf_im2col_f32_;
+        dec_buf_im2col_f16_ = o.dec_buf_im2col_f16_;
         dec_buf_qrot_f32_ = o.dec_buf_qrot_f32_;
         return *this;
     }
@@ -1304,6 +1473,16 @@ struct TtsCodec {
             total_w_bytes = u.arena_off + u.bytes.size();
             uploads.push_back(std::move(u));
         };
+        auto stage_w16_mat = [&](const std::vector<float>& src, const void** dst) {
+            UploadItem u;
+            u.bytes.resize(src.size() * sizeof(__half));
+            auto* hp = reinterpret_cast<__half*>(u.bytes.data());
+            for (size_t i = 0; i < src.size(); ++i) hp[i] = __float2half_rn(src[i]);
+            u.dst_ptr = const_cast<void**>(dst);
+            u.arena_off = DeviceArena::align256(total_w_bytes);
+            total_w_bytes = u.arena_off + u.bytes.size();
+            uploads.push_back(std::move(u));
+        };
         auto stage_dec_mat = [&](const std::vector<float>& src, const void** dst) {
             UploadItem u;
             if (fp32_decoder_) {
@@ -1324,13 +1503,26 @@ struct TtsCodec {
         };
 
         // Weight transpose helpers:
-        // Conv1d [C_out, C_in, K] -> tap-major [K, C_out, C_in]
+        // Conv1d [C_out, C_in, K] -> tap-major [K, C_out, C_in] (used by encoder and final decoder conv)
         auto pack_conv1d = [](const std::vector<float>& w, int co, int ci, int K) {
             std::vector<float> out(w.size());
             for (int o = 0; o < co; ++o) {
                 for (int i = 0; i < ci; ++i) {
                     for (int k = 0; k < K; ++k) {
                         out[(size_t(k) * size_t(co) + size_t(o)) * size_t(ci) + size_t(i)] =
+                            w[(size_t(o) * size_t(ci) + size_t(i)) * size_t(K) + size_t(k)];
+                    }
+                }
+            }
+            return out;
+        };
+        // Conv1d [C_out, C_in, K] -> [C_out, K * C_in] for single-pass channels-last im2col GEMM
+        auto pack_conv1d_k_inner = [](const std::vector<float>& w, int co, int ci, int K) {
+            std::vector<float> out(w.size());
+            for (int o = 0; o < co; ++o) {
+                for (int i = 0; i < ci; ++i) {
+                    for (int k = 0; k < K; ++k) {
+                        out[(size_t(o) * size_t(K) + size_t(k)) * size_t(ci) + size_t(i)] =
                             w[(size_t(o) * size_t(ci) + size_t(i)) * size_t(K) + size_t(k)];
                     }
                 }
@@ -1380,10 +1572,10 @@ struct TtsCodec {
                 auto w2 = read_f32(lp + ".feed_forward.w2.weight", {1024, 3072});
                 stage_f32(read_f32(lp + ".ffn_layer_scale.gamma", {1024}), &lw.ffn_gamma);
                 if (is_dec) {
-                    stage_dec_mat(wqkv, &lw.wqkv);
-                    stage_dec_mat(wo, &lw.wo);
-                    stage_dec_mat(w13, &lw.w13);
-                    stage_dec_mat(w2, &lw.w2);
+                    stage_w16_mat(wqkv, &lw.wqkv);
+                    stage_w16_mat(wo, &lw.wo);
+                    stage_w16_mat(w13, &lw.w13);
+                    stage_w16_mat(w2, &lw.w2);
                 } else {
                     stage_enc_mat(wqkv, &lw.wqkv);
                     stage_enc_mat(wo, &lw.wo);
@@ -1405,8 +1597,8 @@ struct TtsCodec {
             stage_f32(read_f32(pfx + ".pwconv2.bias", {1024}), &cw.pw2_b);
             stage_f32(read_f32(pfx + ".gamma", {1024}), &cw.gamma);
             if (is_dec) {
-                stage_dec_mat(pw1, &cw.pw1_w);
-                stage_dec_mat(pw2, &cw.pw2_w);
+                stage_w16_mat(pw1, &cw.pw1_w);
+                stage_w16_mat(pw2, &cw.pw2_w);
             } else {
                 stage_enc_mat(pw1, &cw.pw1_w);
                 stage_enc_mat(pw2, &cw.pw2_w);
@@ -1415,7 +1607,8 @@ struct TtsCodec {
 
         auto load_resunit = [&](const std::string& pfx, int C, bool is_dec, ResUnitW& rw) {
             stage_f32(read_f32(pfx + ".0.alpha", {1, C, 1}), &rw.snake0);
-            auto c7 = pack_conv1d(read_f32(pfx + ".1.conv.weight", {C, C, 7}), C, C, 7);
+            auto raw_c7 = read_f32(pfx + ".1.conv.weight", {C, C, 7});
+            auto c7 = is_dec ? pack_conv1d_k_inner(raw_c7, C, C, 7) : pack_conv1d(raw_c7, C, C, 7);
             stage_f32(read_f32(pfx + ".1.conv.bias", {C}), &rw.conv7_b);
             stage_f32(read_f32(pfx + ".2.alpha", {1, C, 1}), &rw.snake1);
             auto c1 = read_f32(pfx + ".3.conv.weight", {C, C, 1});
@@ -1455,23 +1648,24 @@ struct TtsCodec {
             uploads.push_back(std::move(u));
         }
 
-        // 4. Stage decoder weights
+        // 4. Stage decoder weights (W16A32 on bandwidth-bound post/upsample/dec_in/b0.trans; fp32/fp16 on b0.res..b3)
         load_transformer("quantizer.post_module", CODEC_POST_LAYERS, true, post_mod_);
         for (int u = 0; u < 2; ++u) {
             const std::string p = "quantizer.upsample." + std::to_string(u);
             auto tw = pack_transconv1d(read_f32(p + ".0.conv.weight", {1024, 1024, 2}), 1024, 1024, 2);
-            stage_dec_mat(tw, &up_w_[u]);
+            stage_w16_mat(tw, &up_w_[u]);
             stage_f32(read_f32(p + ".0.conv.bias", {1024}), &up_b_[u]);
             load_convnext(p + ".1", true, up_cn_[u]);
         }
-        stage_dec_mat(pack_conv1d(read_f32("decoder.model.0.conv.weight", {1536, 1024, 7}), 1536, 1024, 7), &dec_in_w_);
+        stage_w16_mat(pack_conv1d_k_inner(read_f32("decoder.model.0.conv.weight", {1536, 1024, 7}), 1536, 1024, 7), &dec_in_w_);
         stage_f32(read_f32("decoder.model.0.conv.bias", {1536}), &dec_in_b_);
         for (int b = 0; b < 4; ++b) {
             const std::string p = "decoder.model." + std::to_string(b + 1) + ".block";
             const int ic = DEC_IN_CH[b], oc = DEC_OUT_CH[b], k = 2 * DEC_STRIDES[b];
             stage_f32(read_f32(p + ".0.alpha", {1, ic, 1}), &dec_blk_[b].snake0);
             auto tw = pack_transconv1d(read_f32(p + ".1.conv.weight", {ic, oc, k}), ic, oc, k);
-            stage_dec_mat(tw, &dec_blk_[b].trans_w);
+            if (b == 0) stage_w16_mat(tw, &dec_blk_[b].trans_w);
+            else stage_dec_mat(tw, &dec_blk_[b].trans_w);
             stage_f32(read_f32(p + ".1.conv.bias", {oc}), &dec_blk_[b].trans_b);
             for (int r = 0; r < 3; ++r) {
                 load_resunit(p + "." + std::to_string(r + 2) + ".block", oc, true, dec_blk_[b].res[r]);
@@ -1582,15 +1776,20 @@ struct TtsCodec {
             (2048u * size_t(max_decode_stride_) + 54u) * 96u,
         });
         const size_t max_tmp = std::max(max_act, MS * 16384u);  // covers ConvNeXt 4*S*4096 and post_module S*6144
+        const size_t max_im2col = MS * 1376256u;                 // 7 * 2048 * 96 == 7 * 1024 * 192
         const size_t qrot_elems = MS * CODEC_LATENT_DIM;
         const size_t f16_pad_bytes = fp32_decoder_ ? 0u : DeviceArena::align256(max_pad * sizeof(__half));
         const size_t f16_tmp_bytes = fp32_decoder_ ? 0u : DeviceArena::align256(max_tmp * sizeof(__half));
+        const size_t f32_im2col_bytes = fp32_decoder_ ? DeviceArena::align256(max_im2col * sizeof(float)) : 0u;
+        const size_t f16_im2col_bytes = fp32_decoder_ ? 0u : DeviceArena::align256(max_im2col * sizeof(__half));
         const size_t sc_total =
             DeviceArena::align256(max_act * sizeof(float)) * 2u +
             DeviceArena::align256(max_gemm * sizeof(float)) +
             DeviceArena::align256(max_pad * sizeof(float)) +
             f16_pad_bytes +
             f16_tmp_bytes +
+            f32_im2col_bytes +
+            f16_im2col_bytes +
             DeviceArena::align256(qrot_elems * sizeof(float));
         scratch_arena_.alloc_bytes(sc_total);
         dec_buf_a_f32_ = static_cast<float*>(scratch_arena_.reserve(max_act * sizeof(float)));
@@ -1599,6 +1798,8 @@ struct TtsCodec {
         dec_buf_pad_f32_ = static_cast<float*>(scratch_arena_.reserve(max_pad * sizeof(float)));
         dec_buf_pad_f16_ = fp32_decoder_ ? nullptr : static_cast<__half*>(scratch_arena_.reserve(max_pad * sizeof(__half)));
         dec_buf_tmp_f16_ = fp32_decoder_ ? nullptr : static_cast<__half*>(scratch_arena_.reserve(max_tmp * sizeof(__half)));
+        dec_buf_im2col_f32_ = fp32_decoder_ ? static_cast<float*>(scratch_arena_.reserve(max_im2col * sizeof(float))) : nullptr;
+        dec_buf_im2col_f16_ = fp32_decoder_ ? nullptr : static_cast<__half*>(scratch_arena_.reserve(max_im2col * sizeof(__half)));
         dec_buf_qrot_f32_ = static_cast<float*>(scratch_arena_.reserve(qrot_elems * sizeof(float)));
 
         // 10. Create cuBLAS handle with fixed pre-allocated workspace (CUDA-graph-safe!)
@@ -1653,8 +1854,8 @@ struct TtsCodec {
                                          fp32_decoder_ ? nullptr : dec_buf_tmp_f16_,
                                          fp32_decoder_ ? dec_buf_b_f32_ : nullptr,
                                          MS, CODEC_LATENT_DIM, CODEC_RMS_EPS);
-            // QKV GEMM -> dec_buf_gemm_f32_ [MS, 3072]
-            dec_gemm(dec_buf_tmp_f16_, dec_buf_b_f32_, lw.wqkv, dec_buf_gemm_f32_, MS, 3072, 1024, 0.0f);
+            // QKV GEMM -> dec_buf_gemm_f32_ [MS, 3072] (W16A32 deterministic warp-tiled)
+            w16a32_gemm(dec_buf_tmp_f16_, dec_buf_b_f32_, lw.wqkv, dec_buf_gemm_f32_, MS, 3072, 1024, s);
             // RoPE + KV ring scatter
             k_post_rope_kv_scatter<<<dim3(MS, CODEC_N_HEAD), 32, 0, s>>>(
                 dec_buf_gemm_f32_, rope_tbl_, d_slots, d_slot_pos_,
@@ -1666,7 +1867,7 @@ struct TtsCodec {
                 fp32_decoder_ ? dec_buf_b_f32_ : nullptr,
                 M, stride, l);
             // Output projection -> dec_buf_gemm_f32_ [MS, 1024]
-            dec_gemm(dec_buf_tmp_f16_, dec_buf_b_f32_, lw.wo, dec_buf_gemm_f32_, MS, 1024, 1024, 0.0f);
+            w16a32_gemm(dec_buf_tmp_f16_, dec_buf_b_f32_, lw.wo, dec_buf_gemm_f32_, MS, 1024, 1024, s);
             k_layerscale_add<<<(MS * 1024 + 255) / 256, 256, 0, s>>>(
                 dec_buf_a_f32_, dec_buf_gemm_f32_, lw.attn_gamma, MS, 1024);
 
@@ -1676,14 +1877,14 @@ struct TtsCodec {
                                          fp32_decoder_ ? dec_buf_b_f32_ : nullptr,
                                          MS, CODEC_LATENT_DIM, CODEC_RMS_EPS);
             // w13 GEMM -> dec_buf_gemm_f32_ [MS, 6144]
-            dec_gemm(dec_buf_tmp_f16_, dec_buf_b_f32_, lw.w13, dec_buf_gemm_f32_, MS, 6144, 1024, 0.0f);
+            w16a32_gemm(dec_buf_tmp_f16_, dec_buf_b_f32_, lw.w13, dec_buf_gemm_f32_, MS, 6144, 1024, s);
             k_swiglu<<<(MS * CODEC_FFN_DIM + 255) / 256, 256, 0, s>>>(
                 dec_buf_gemm_f32_,
                 fp32_decoder_ ? nullptr : dec_buf_tmp_f16_,
                 fp32_decoder_ ? dec_buf_b_f32_ : nullptr,
                 MS, CODEC_FFN_DIM);
             // w2 GEMM -> dec_buf_gemm_f32_ [MS, 1024]
-            dec_gemm(dec_buf_tmp_f16_, dec_buf_b_f32_, lw.w2, dec_buf_gemm_f32_, MS, 1024, CODEC_FFN_DIM, 0.0f);
+            w16a32_gemm(dec_buf_tmp_f16_, dec_buf_b_f32_, lw.w2, dec_buf_gemm_f32_, MS, 1024, CODEC_FFN_DIM, s);
             k_layerscale_add<<<(MS * 1024 + 255) / 256, 256, 0, s>>>(
                 dec_buf_a_f32_, dec_buf_gemm_f32_, lw.ffn_gamma, MS, 1024);
         }
@@ -1702,7 +1903,7 @@ struct TtsCodec {
             const int MT = M * T;
             if (!fp32_decoder_) k_f32_to_f16<<<(size_t(MT) * 1024 + 255) / 256, 256, 0, s>>>(cur, dec_buf_tmp_f16_, size_t(MT) * 1024);
             // TransConv k=2, s=2 (carry=0): [MT, 1024] @ [2048, 1024]^T -> [MT, 2, 1024] = [M, 2T, 1024]
-            dec_gemm(dec_buf_tmp_f16_, cur, up_w_[u], alt, MT, 2048, 1024, 0.0f);
+            w16a32_gemm(dec_buf_tmp_f16_, cur, up_w_[u], alt, MT, 2048, 1024, s);
             T *= 2;
             const int MT2 = M * T;
             k_add_bias_res<<<(size_t(MT2) * 1024 + 255) / 256, 256, 0, s>>>(alt, up_b_[u], nullptr, MT2, 1024);
@@ -1712,7 +1913,7 @@ struct TtsCodec {
             const int ctx_id = (u == 0) ? CTX_UP0_DW : CTX_UP1_DW;
             const size_t coff = dec_ctx_offset(ctx_id);
             k_conv_prepend_ctx<<<(size_t(M) * size_t(T + 6) * 1024 + 255) / 256, 256, 0, s>>>(
-                cur, d_slot_conv_ctx_, d_slots, ctx_stride, coff, dec_buf_pad_f32_, nullptr, M, T, 6, 1024);
+                cur, nullptr, d_slot_conv_ctx_, d_slots, ctx_stride, coff, dec_buf_pad_f32_, nullptr, M, T, 6, 1024);
             k_conv_save_ctx<<<(size_t(M) * 6u * 1024 + 255) / 256, 256, 0, s>>>(
                 dec_buf_pad_f32_, d_slot_conv_ctx_, d_slots, ctx_stride, coff, M, T, 6, 1024);
             k_dwconv_k7<<<(size_t(MT2) * 1024 + 255) / 256, 256, 0, s>>>(
@@ -1721,21 +1922,21 @@ struct TtsCodec {
                                             fp32_decoder_ ? nullptr : dec_buf_tmp_f16_,
                                             fp32_decoder_ ? alt : nullptr,
                                             MT2, 1024, CODEC_LN_EPS);
-            dec_gemm(dec_buf_tmp_f16_, alt, up_cn_[u].pw1_w, dec_buf_gemm_f32_, MT2, 4096, 1024, 0.0f);
+            w16a32_gemm(dec_buf_tmp_f16_, alt, up_cn_[u].pw1_w, dec_buf_gemm_f32_, MT2, 4096, 1024, s);
             k_bias_gelu<<<(size_t(MT2) * 4096 + 255) / 256, 256, 0, s>>>(
                 dec_buf_gemm_f32_, up_cn_[u].pw1_b,
                 fp32_decoder_ ? nullptr : dec_buf_tmp_f16_,
                 fp32_decoder_ ? dec_buf_gemm_f32_ : nullptr,
                 MT2, 4096);
-            dec_gemm(dec_buf_tmp_f16_, dec_buf_gemm_f32_, up_cn_[u].pw2_w, alt, MT2, 1024, 4096, 0.0f);
+            w16a32_gemm(dec_buf_tmp_f16_, dec_buf_gemm_f32_, up_cn_[u].pw2_w, alt, MT2, 1024, 4096, s);
             k_convnext_epilogue<<<(size_t(MT2) * 1024 + 255) / 256, 256, 0, s>>>(
                 alt, up_cn_[u].pw2_b, up_cn_[u].gamma, cur, cur, MT2, 1024);
         }
 
-        // 4. decoder.model.0: CausalConv1d(1024 -> 1536, k=7, s=1, d=1, pad=6)
-        dec_causal_conv_batched(cur, dec_in_w_, dec_in_b_, alt, nullptr, M, T, 1024, 1536, 7, 1,
-                                d_slot_conv_ctx_, d_slots, ctx_stride, dec_ctx_offset(CTX_DEC_IN),
-                                dec_buf_pad_f32_, dec_buf_pad_f16_, s);
+        // 4. decoder.model.0: CausalConv1d(1024 -> 1536, k=7, s=1, d=1, pad=6), single-pass W16A32
+        dec_causal_conv7_fused(cur, nullptr, dec_in_w_, dec_in_b_, nullptr, alt, nullptr, M, T, 1024, 1536, 1,
+                               true, d_slot_conv_ctx_, d_slots, ctx_stride, dec_ctx_offset(CTX_DEC_IN),
+                               dec_buf_pad_f32_, dec_buf_pad_f16_, dec_buf_im2col_f32_, dec_buf_im2col_f16_, s);
         std::swap(cur, alt);  // cur: [M, 4*stride, 1536]
 
         // 5. decoder.model.{1..4}
@@ -1749,7 +1950,11 @@ struct TtsCodec {
                 fp32_decoder_ ? nullptr : dec_buf_tmp_f16_,
                 MT_in, ic);
             // TransConv GEMM: [MT_in, ic] @ [k*oc, ic]^T -> dec_buf_gemm_f32_ [M, T, k, oc]
-            dec_gemm(dec_buf_tmp_f16_, alt, dec_blk_[b].trans_w, dec_buf_gemm_f32_, MT_in, k * oc, ic, 0.0f);
+            if (b == 0) {
+                w16a32_gemm(dec_buf_tmp_f16_, alt, dec_blk_[b].trans_w, dec_buf_gemm_f32_, MT_in, k * oc, ic, s);
+            } else {
+                dec_gemm(dec_buf_tmp_f16_, alt, dec_blk_[b].trans_w, dec_buf_gemm_f32_, MT_in, k * oc, ic, 0.0f);
+            }
             const size_t carry_off = dec_carry_offset(b);
             k_transconv_overlap_add<<<(size_t(MT_in) * size_t(st) * size_t(oc) + 255) / 256, 256, 0, s>>>(
                 dec_buf_gemm_f32_, dec_blk_[b].trans_b, d_slot_carry_, d_slots, carry_stride, carry_off,
@@ -1759,39 +1964,30 @@ struct TtsCodec {
             T *= st;
             const int MT_out = M * T;
 
-            // 3 ResidualUnits (dilations 1, 3, 9)
+            // 3 ResidualUnits (dilations 1, 3, 9): fused Snake0+ctx+im2col+conv7 -> fused bias+Snake1 -> conv1 -> in-place res
             for (int r = 0; r < 3; ++r) {
                 const int d = RES_DILATIONS[r];
                 const int ctx_id = CTX_DEC_B0_R0 + b * 3 + r;
-                // Snake0(cur) -> alt
-                k_snake1d<<<(size_t(MT_out) * size_t(oc) + 255) / 256, 256, 0, s>>>(
-                    cur, dec_blk_[b].res[r].snake0, alt, nullptr, MT_out, oc);
-                // CausalConv1d(k=7, d=d) -> dec_buf_gemm_f32_
-                dec_causal_conv_batched(alt, dec_blk_[b].res[r].conv7_w, dec_blk_[b].res[r].conv7_b,
-                                        dec_buf_gemm_f32_, nullptr, M, T, oc, oc, 7, d,
-                                        d_slot_conv_ctx_, d_slots, ctx_stride, dec_ctx_offset(ctx_id),
-                                        dec_buf_pad_f32_, dec_buf_pad_f16_, s);
-                // Snake1 -> dec_buf_tmp_f16_ (or alt)
-                k_snake1d<<<(size_t(MT_out) * size_t(oc) + 255) / 256, 256, 0, s>>>(
-                    dec_buf_gemm_f32_, dec_blk_[b].res[r].snake1,
-                    fp32_decoder_ ? alt : nullptr,
-                    fp32_decoder_ ? nullptr : dec_buf_tmp_f16_,
-                    MT_out, oc);
-                // Conv1x1 -> dec_buf_gemm_f32_, then + bias + residual(cur) -> cur
+                dec_causal_conv7_fused(cur, dec_blk_[b].res[r].snake0,
+                                       dec_blk_[b].res[r].conv7_w, dec_blk_[b].res[r].conv7_b,
+                                       dec_blk_[b].res[r].snake1,
+                                       fp32_decoder_ ? alt : dec_buf_gemm_f32_,
+                                       fp32_decoder_ ? nullptr : dec_buf_tmp_f16_,
+                                       M, T, oc, oc, d, false,
+                                       d_slot_conv_ctx_, d_slots, ctx_stride, dec_ctx_offset(ctx_id),
+                                       dec_buf_pad_f32_, dec_buf_pad_f16_, dec_buf_im2col_f32_, dec_buf_im2col_f16_, s);
+                // Conv1x1 -> dec_buf_gemm_f32_, then fused in-place cur += gemm + bias (zero cudaMemcpyAsync!)
                 dec_gemm(dec_buf_tmp_f16_, alt, dec_blk_[b].res[r].conv1_w, dec_buf_gemm_f32_, MT_out, oc, oc, 0.0f);
-                k_add_bias_res<<<(size_t(MT_out) * size_t(oc) + 255) / 256, 256, 0, s>>>(
-                    dec_buf_gemm_f32_, dec_blk_[b].res[r].conv1_b, cur, MT_out, oc);
-                G6TTS_CODEC_CK(cudaMemcpyAsync(cur, dec_buf_gemm_f32_, size_t(MT_out) * size_t(oc) * sizeof(float),
-                                               cudaMemcpyDeviceToDevice, s));
+                k_add_bias_into_res<<<(size_t(MT_out) * size_t(oc) + 255) / 256, 256, 0, s>>>(
+                    cur, dec_buf_gemm_f32_, dec_blk_[b].res[r].conv1_b, MT_out, oc);
             }
         }
 
-        // 6. decoder.model.5 (Snake 96) -> model.6 (Conv k=7 96->1 fp32) -> model.7 (Tanh) -> s16
+        // 6. decoder.model.5 (Snake 96 fused into prepend) -> model.6 (Conv k=7 96->1 fp32) -> model.7 (Tanh) -> s16
         const int MT_fin = M * T;  // T == stride * 2048
-        k_snake1d<<<(size_t(MT_fin) * 96u + 255) / 256, 256, 0, s>>>(cur, dec_out_snake_, alt, nullptr, MT_fin, 96);
         const size_t fin_coff = dec_ctx_offset(CTX_DEC_OUT);
         k_conv_prepend_ctx<<<(size_t(M) * size_t(T + 6) * 96u + 255) / 256, 256, 0, s>>>(
-            alt, d_slot_conv_ctx_, d_slots, ctx_stride, fin_coff, dec_buf_pad_f32_, nullptr, M, T, 6, 96);
+            cur, dec_out_snake_, d_slot_conv_ctx_, d_slots, ctx_stride, fin_coff, dec_buf_pad_f32_, nullptr, M, T, 6, 96);
         k_conv_save_ctx<<<(size_t(M) * 6u * 96u + 255) / 256, 256, 0, s>>>(
             dec_buf_pad_f32_, d_slot_conv_ctx_, d_slots, ctx_stride, fin_coff, M, T, 6, 96);
         k_dec_final_conv_tanh_s16<<<(size_t(MT_fin) + 255) / 256, 256, 0, s>>>(
@@ -1826,12 +2022,15 @@ struct TtsCodec {
             (2048u * size_t(F) + 54u) * 96u,
         });
         const size_t max_tmp = std::max(max_act, size_t(F) * 16384u);
+        const size_t max_im2col = size_t(F) * 1376256u;
         const size_t qkv_f = size_t(F) * CODEC_LATENT_DIM;
         const size_t codes_bytes = h_codes_Fx10.size() * sizeof(int32_t);
         const size_t pcm_bytes = size_t(F) * CODEC_FRAME_SAMPLES * sizeof(int16_t);
 
         const size_t f16_pad_bytes = fp32_decoder_ ? 0u : DeviceArena::align256(max_pad * sizeof(__half));
         const size_t f16_tmp_bytes = fp32_decoder_ ? 0u : DeviceArena::align256(max_tmp * sizeof(__half));
+        const size_t f32_im2col_bytes = fp32_decoder_ ? DeviceArena::align256(max_im2col * sizeof(float)) : 0u;
+        const size_t f16_im2col_bytes = fp32_decoder_ ? 0u : DeviceArena::align256(max_im2col * sizeof(__half));
         DeviceArena ws;
         ws.alloc_bytes(
             DeviceArena::align256(codes_bytes) +
@@ -1841,6 +2040,8 @@ struct TtsCodec {
             DeviceArena::align256(max_pad * sizeof(float)) +
             f16_pad_bytes +
             f16_tmp_bytes +
+            f32_im2col_bytes +
+            f16_im2col_bytes +
             DeviceArena::align256(qkv_f * sizeof(float)) * 3u);
 
         auto* d_codes = static_cast<int32_t*>(ws.reserve(codes_bytes));
@@ -1851,6 +2052,8 @@ struct TtsCodec {
         auto* buf_pad_f32 = static_cast<float*>(ws.reserve(max_pad * sizeof(float)));
         auto* buf_pad_f16 = fp32_decoder_ ? nullptr : static_cast<__half*>(ws.reserve(max_pad * sizeof(__half)));
         auto* buf_tmp_f16 = fp32_decoder_ ? nullptr : static_cast<__half*>(ws.reserve(max_tmp * sizeof(__half)));
+        auto* buf_im2col_f32 = fp32_decoder_ ? static_cast<float*>(ws.reserve(max_im2col * sizeof(float))) : nullptr;
+        auto* buf_im2col_f16 = fp32_decoder_ ? nullptr : static_cast<__half*>(ws.reserve(max_im2col * sizeof(__half)));
         auto* buf_q = static_cast<float*>(ws.reserve(qkv_f * sizeof(float)));
         auto* buf_k = static_cast<float*>(ws.reserve(qkv_f * sizeof(float)));
         auto* buf_v = static_cast<float*>(ws.reserve(qkv_f * sizeof(float)));
@@ -1867,27 +2070,27 @@ struct TtsCodec {
                                         fp32_decoder_ ? nullptr : buf_tmp_f16,
                                         fp32_decoder_ ? buf_b : nullptr,
                                         F, CODEC_LATENT_DIM, CODEC_RMS_EPS);
-            dec_gemm(buf_tmp_f16, buf_b, lw.wqkv, buf_gemm, F, 3072, 1024, 0.0f);
+            w16a32_gemm(buf_tmp_f16, buf_b, lw.wqkv, buf_gemm, F, 3072, 1024, s);
             k_whole_rope_split<<<dim3(F, CODEC_N_HEAD), 32, 0, s>>>(buf_gemm, rope_tbl_, buf_q, buf_k, buf_v, F);
             k_whole_window_attn<<<dim3(F, CODEC_N_HEAD), 64, 0, s>>>(
                 buf_q, buf_k, buf_v,
                 fp32_decoder_ ? nullptr : buf_tmp_f16,
                 fp32_decoder_ ? buf_b : nullptr,
                 F, CODEC_POST_WINDOW);
-            dec_gemm(buf_tmp_f16, buf_b, lw.wo, buf_gemm, F, 1024, 1024, 0.0f);
+            w16a32_gemm(buf_tmp_f16, buf_b, lw.wo, buf_gemm, F, 1024, 1024, s);
             k_layerscale_add<<<(F * 1024 + 255) / 256, 256, 0, s>>>(buf_a, buf_gemm, lw.attn_gamma, F, 1024);
 
             k_rmsnorm<<<F, 256, 0, s>>>(buf_a, lw.ffn_norm,
                                         fp32_decoder_ ? nullptr : buf_tmp_f16,
                                         fp32_decoder_ ? buf_b : nullptr,
                                         F, CODEC_LATENT_DIM, CODEC_RMS_EPS);
-            dec_gemm(buf_tmp_f16, buf_b, lw.w13, buf_gemm, F, 6144, 1024, 0.0f);
+            w16a32_gemm(buf_tmp_f16, buf_b, lw.w13, buf_gemm, F, 6144, 1024, s);
             k_swiglu<<<(F * CODEC_FFN_DIM + 255) / 256, 256, 0, s>>>(
                 buf_gemm,
                 fp32_decoder_ ? nullptr : buf_tmp_f16,
                 fp32_decoder_ ? buf_b : nullptr,
                 F, CODEC_FFN_DIM);
-            dec_gemm(buf_tmp_f16, buf_b, lw.w2, buf_gemm, F, 1024, CODEC_FFN_DIM, 0.0f);
+            w16a32_gemm(buf_tmp_f16, buf_b, lw.w2, buf_gemm, F, 1024, CODEC_FFN_DIM, s);
             k_layerscale_add<<<(F * 1024 + 255) / 256, 256, 0, s>>>(buf_a, buf_gemm, lw.ffn_gamma, F, 1024);
         }
         k_rmsnorm<<<F, 256, 0, s>>>(buf_a, post_mod_.final_norm, nullptr, buf_b, F, CODEC_LATENT_DIM, CODEC_RMS_EPS);
@@ -1899,33 +2102,34 @@ struct TtsCodec {
         // 3. quantizer.upsample
         for (int u = 0; u < 2; ++u) {
             if (!fp32_decoder_) k_f32_to_f16<<<(size_t(T) * 1024 + 255) / 256, 256, 0, s>>>(cur, buf_tmp_f16, size_t(T) * 1024);
-            dec_gemm(buf_tmp_f16, cur, up_w_[u], alt, T, 2048, 1024, 0.0f);
+            w16a32_gemm(buf_tmp_f16, cur, up_w_[u], alt, T, 2048, 1024, s);
             T *= 2;
             k_add_bias_res<<<(size_t(T) * 1024 + 255) / 256, 256, 0, s>>>(alt, up_b_[u], nullptr, T, 1024);
             std::swap(cur, alt);
 
             k_conv_prepend_ctx<<<(size_t(T + 6) * 1024 + 255) / 256, 256, 0, s>>>(
-                cur, nullptr, nullptr, 0, 0, buf_pad_f32, nullptr, 1, T, 6, 1024);
+                cur, nullptr, nullptr, nullptr, 0, 0, buf_pad_f32, nullptr, 1, T, 6, 1024);
             k_dwconv_k7<<<(size_t(T) * 1024 + 255) / 256, 256, 0, s>>>(
                 buf_pad_f32, up_cn_[u].dw_w, up_cn_[u].dw_b, alt, 1, T, 1024);
             k_layernorm<<<T, 256, 0, s>>>(alt, up_cn_[u].ln_w, up_cn_[u].ln_b,
                                           fp32_decoder_ ? nullptr : buf_tmp_f16,
                                           fp32_decoder_ ? alt : nullptr,
                                           T, 1024, CODEC_LN_EPS);
-            dec_gemm(buf_tmp_f16, alt, up_cn_[u].pw1_w, buf_gemm, T, 4096, 1024, 0.0f);
+            w16a32_gemm(buf_tmp_f16, alt, up_cn_[u].pw1_w, buf_gemm, T, 4096, 1024, s);
             k_bias_gelu<<<(size_t(T) * 4096 + 255) / 256, 256, 0, s>>>(
                 buf_gemm, up_cn_[u].pw1_b,
                 fp32_decoder_ ? nullptr : buf_tmp_f16,
                 fp32_decoder_ ? buf_gemm : nullptr,
                 T, 4096);
-            dec_gemm(buf_tmp_f16, buf_gemm, up_cn_[u].pw2_w, alt, T, 1024, 4096, 0.0f);
+            w16a32_gemm(buf_tmp_f16, buf_gemm, up_cn_[u].pw2_w, alt, T, 1024, 4096, s);
             k_convnext_epilogue<<<(size_t(T) * 1024 + 255) / 256, 256, 0, s>>>(
                 alt, up_cn_[u].pw2_b, up_cn_[u].gamma, cur, cur, T, 1024);
         }
 
         // 4. decoder.model.0
-        dec_causal_conv_batched(cur, dec_in_w_, dec_in_b_, alt, nullptr, 1, T, 1024, 1536, 7, 1,
-                                nullptr, nullptr, 0, 0, buf_pad_f32, buf_pad_f16, s);
+        dec_causal_conv7_fused(cur, nullptr, dec_in_w_, dec_in_b_, nullptr, alt, nullptr, 1, T, 1024, 1536, 1,
+                               true, nullptr, nullptr, 0, 0,
+                               buf_pad_f32, buf_pad_f16, buf_im2col_f32, buf_im2col_f16, s);
         std::swap(cur, alt);
 
         // 5. decoder.model.{1..4}
@@ -1936,34 +2140,33 @@ struct TtsCodec {
                 fp32_decoder_ ? alt : nullptr,
                 fp32_decoder_ ? nullptr : buf_tmp_f16,
                 T, ic);
-            dec_gemm(buf_tmp_f16, alt, dec_blk_[b].trans_w, buf_gemm, T, k * oc, ic, 0.0f);
+            if (b == 0) {
+                w16a32_gemm(buf_tmp_f16, alt, dec_blk_[b].trans_w, buf_gemm, T, k * oc, ic, s);
+            } else {
+                dec_gemm(buf_tmp_f16, alt, dec_blk_[b].trans_w, buf_gemm, T, k * oc, ic, 0.0f);
+            }
             k_transconv_overlap_add<<<(size_t(T) * size_t(st) * size_t(oc) + 255) / 256, 256, 0, s>>>(
                 buf_gemm, dec_blk_[b].trans_b, nullptr, nullptr, 0, 0, cur, 1, T, st, oc);
             T *= st;
             for (int r = 0; r < 3; ++r) {
                 const int d = RES_DILATIONS[r];
-                k_snake1d<<<(size_t(T) * size_t(oc) + 255) / 256, 256, 0, s>>>(
-                    cur, dec_blk_[b].res[r].snake0, alt, nullptr, T, oc);
-                dec_causal_conv_batched(alt, dec_blk_[b].res[r].conv7_w, dec_blk_[b].res[r].conv7_b,
-                                        buf_gemm, nullptr, 1, T, oc, oc, 7, d,
-                                        nullptr, nullptr, 0, 0, buf_pad_f32, buf_pad_f16, s);
-                k_snake1d<<<(size_t(T) * size_t(oc) + 255) / 256, 256, 0, s>>>(
-                    buf_gemm, dec_blk_[b].res[r].snake1,
-                    fp32_decoder_ ? alt : nullptr,
-                    fp32_decoder_ ? nullptr : buf_tmp_f16,
-                    T, oc);
+                dec_causal_conv7_fused(cur, dec_blk_[b].res[r].snake0,
+                                       dec_blk_[b].res[r].conv7_w, dec_blk_[b].res[r].conv7_b,
+                                       dec_blk_[b].res[r].snake1,
+                                       fp32_decoder_ ? alt : buf_gemm,
+                                       fp32_decoder_ ? nullptr : buf_tmp_f16,
+                                       1, T, oc, oc, d, false,
+                                       nullptr, nullptr, 0, 0,
+                                       buf_pad_f32, buf_pad_f16, buf_im2col_f32, buf_im2col_f16, s);
                 dec_gemm(buf_tmp_f16, alt, dec_blk_[b].res[r].conv1_w, buf_gemm, T, oc, oc, 0.0f);
-                k_add_bias_res<<<(size_t(T) * size_t(oc) + 255) / 256, 256, 0, s>>>(
-                    buf_gemm, dec_blk_[b].res[r].conv1_b, cur, T, oc);
-                G6TTS_CODEC_CK(cudaMemcpyAsync(cur, buf_gemm, size_t(T) * size_t(oc) * sizeof(float),
-                                               cudaMemcpyDeviceToDevice, s));
+                k_add_bias_into_res<<<(size_t(T) * size_t(oc) + 255) / 256, 256, 0, s>>>(
+                    cur, buf_gemm, dec_blk_[b].res[r].conv1_b, T, oc);
             }
         }
 
         // 6. decoder.model.5..7
-        k_snake1d<<<(size_t(T) * 96u + 255) / 256, 256, 0, s>>>(cur, dec_out_snake_, alt, nullptr, T, 96);
         k_conv_prepend_ctx<<<(size_t(T + 6) * 96u + 255) / 256, 256, 0, s>>>(
-            alt, nullptr, nullptr, 0, 0, buf_pad_f32, nullptr, 1, T, 6, 96);
+            cur, dec_out_snake_, nullptr, nullptr, 0, 0, buf_pad_f32, nullptr, 1, T, 6, 96);
         k_dec_final_conv_tanh_s16<<<(size_t(T) + 255) / 256, 256, 0, s>>>(
             buf_pad_f32, dec_out_w_, dec_out_b_, d_pcm, 1, T);
 
@@ -2127,7 +2330,7 @@ struct TtsCodec {
             std::swap(cur, alt);  // cur holds residual input for ConvNeXt
 
             k_conv_prepend_ctx<<<(size_t(T + 6) * 1024u + 255) / 256, 256, 0, s>>>(
-                cur, nullptr, nullptr, 0, 0, buf_pad, nullptr, 1, T, 6, 1024);
+                cur, nullptr, nullptr, nullptr, 0, 0, buf_pad, nullptr, 1, T, 6, 1024);
             k_dwconv_k7<<<(size_t(T) * 1024u + 255) / 256, 256, 0, s>>>(
                 buf_pad, dn_cn_[u].dw_w, dn_cn_[u].dw_b, alt, 1, T, 1024);
             k_layernorm<<<T, 256, 0, s>>>(alt, dn_cn_[u].ln_w, dn_cn_[u].ln_b, nullptr, alt, T, 1024, CODEC_LN_EPS);
@@ -2160,7 +2363,23 @@ struct TtsCodec {
     }
 
 private:
-    // Row-major C[R, N] = A[R, K] @ B[N, K]^T + beta * C[R, N] (strict IEEE fp32 by default, or fp16 TensorOp)
+    // Deterministic W16A32 GEMM (FP16 weights, FP32 activations/accum) or FP16 TensorOp when !fp32_decoder_
+    void w16a32_gemm(const __half* A_f16, const float* A_f32, const void* B_f16, float* C_f32,
+                     int R, int N, int K, cudaStream_t s) {
+        if (fp32_decoder_) {
+            codec_detail::launch_w16a32_gemm(A_f32, static_cast<const __half*>(B_f16), C_f32, R, N, K, s);
+        } else {
+            const float alpha = 1.0f, beta = 0.0f;
+            G6TTS_CUBLAS_CK(cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
+                                         N, R, K, &alpha,
+                                         B_f16, CUDA_R_16F, K,
+                                         A_f16, CUDA_R_16F, K,
+                                         &beta, C_f32, CUDA_R_32F, N,
+                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+    }
+
+    // Row-major C[R, N] = A[R, K] @ B[N, K]^T + beta * C[R, N] (IEEE fp32 CUBLAS_COMPUTE_32F by default, or fp16)
     void dec_gemm(const __half* A_f16, const float* A_f32, const void* B_w, float* C_f32,
                   int R, int N, int K, float beta) {
         const float alpha = 1.0f;
@@ -2170,7 +2389,7 @@ private:
                                          B_w, CUDA_R_32F, K,
                                          A_f32, CUDA_R_32F, K,
                                          &beta, C_f32, CUDA_R_32F, N,
-                                         CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         } else {
             G6TTS_CUBLAS_CK(cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
                                          N, R, K, &alpha,
@@ -2193,17 +2412,22 @@ private:
                                      CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
     }
 
-    // Batched decoder causal conv1d (stride=1, dilation=d, k=7): x[M, T, C_in] -> y[M, T, C_out] (+ optional res)
-    void dec_causal_conv_batched(const float* x, const void* w_taps, const float* bias,
-                                 float* y, const float* res,
-                                 int M, int T, int C_in, int C_out, int K, int dilation,
-                                 float* slot_ctx_arena, const int* d_slots, size_t ctx_stride, size_t ctx_off,
-                                 float* buf_pad_f32, __half* buf_pad_f16, cudaStream_t s) {
+    // Single-pass channels-last fused causal Conv1d(k=7, stride=1, dilation=d):
+    //   1. Fused optional Snake0 + causal left-context prepend (+ save ctx when streaming)
+    //   2. Vectorized im2col_k7 [M*T, 7*C_in] + ONE GEMM (W16A32 or IEEE FP32) -> out_f32 [M*T, C_out]
+    //   3. Fused bias (+ optional Snake1 epilogue emitting out_f32 / out_f16)
+    void dec_causal_conv7_fused(const float* x, const float* pre_snake,
+                                const void* w_k_inner, const float* bias, const float* post_snake,
+                                float* y_f32, __half* y_f16,
+                                int M, int T, int C_in, int C_out, int dilation, bool use_w16a32,
+                                float* slot_ctx_arena, const int* d_slots, size_t ctx_stride, size_t ctx_off,
+                                float* buf_pad_f32, __half* buf_pad_f16,
+                                float* buf_im2col_f32, __half* buf_im2col_f16, cudaStream_t s) {
         using namespace codec_detail;
-        const int pad = (K - 1) * dilation;
+        const int pad = 6 * dilation;
         const size_t pad_elems = size_t(M) * size_t(T + pad) * size_t(C_in);
         k_conv_prepend_ctx<<<(pad_elems + 255) / 256, 256, 0, s>>>(
-            x, slot_ctx_arena, d_slots, ctx_stride, ctx_off,
+            x, pre_snake, slot_ctx_arena, d_slots, ctx_stride, ctx_off,
             (slot_ctx_arena || fp32_decoder_) ? buf_pad_f32 : nullptr,
             fp32_decoder_ ? nullptr : buf_pad_f16,
             M, T, pad, C_in);
@@ -2212,36 +2436,34 @@ private:
                 buf_pad_f32, slot_ctx_arena, d_slots, ctx_stride, ctx_off, M, T, pad, C_in);
         }
 
-        const float alpha = 1.0f;
-        const long long strideB = static_cast<long long>(T + pad) * static_cast<long long>(C_in);
-        const long long strideC = static_cast<long long>(T) * static_cast<long long>(C_out);
-        const size_t tap_elems = size_t(C_out) * size_t(C_in);
-
-        for (int k = 0; k < K; ++k) {
-            const float beta = (k == 0) ? 0.0f : 1.0f;
-            const size_t x_off = size_t(k) * size_t(dilation) * size_t(C_in);
-            if (fp32_decoder_) {
-                const float* wk = static_cast<const float*>(w_taps) + size_t(k) * tap_elems;
-                G6TTS_CUBLAS_CK(cublasGemmStridedBatchedEx(
-                    cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                    C_out, T, C_in, &alpha,
-                    wk, CUDA_R_32F, C_in, 0,
-                    buf_pad_f32 + x_off, CUDA_R_32F, C_in, strideB,
-                    &beta, y, CUDA_R_32F, C_out, strideC, M,
-                    CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+        const int MT = M * T;
+        const int K_full = 7 * C_in;
+        if (fp32_decoder_) {
+            const size_t n4 = size_t(MT) * 7u * size_t(C_in >> 2);
+            k_im2col_k7_f32<<<(n4 + 255) / 256, 256, 0, s>>>(buf_pad_f32, buf_im2col_f32, M, T, C_in, dilation);
+            if (use_w16a32) {
+                w16a32_gemm(nullptr, buf_im2col_f32, w_k_inner, y_f32, MT, C_out, K_full, s);
             } else {
-                const __half* wk = static_cast<const __half*>(w_taps) + size_t(k) * tap_elems;
-                G6TTS_CUBLAS_CK(cublasGemmStridedBatchedEx(
-                    cublas_, CUBLAS_OP_T, CUBLAS_OP_N,
-                    C_out, T, C_in, &alpha,
-                    wk, CUDA_R_16F, C_in, 0,
-                    buf_pad_f16 + x_off, CUDA_R_16F, C_in, strideB,
-                    &beta, y, CUDA_R_32F, C_out, strideC, M,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                dec_gemm(nullptr, buf_im2col_f32, w_k_inner, y_f32, MT, C_out, K_full, 0.0f);
+            }
+        } else {
+            const size_t n8 = size_t(MT) * 7u * size_t(C_in >> 3);
+            k_im2col_k7_f16<<<(n8 + 255) / 256, 256, 0, s>>>(buf_pad_f16, buf_im2col_f16, M, T, C_in, dilation);
+            if (use_w16a32) {
+                w16a32_gemm(buf_im2col_f16, nullptr, w_k_inner, y_f32, MT, C_out, K_full, s);
+            } else {
+                dec_gemm(buf_im2col_f16, nullptr, w_k_inner, y_f32, MT, C_out, K_full, 0.0f);
             }
         }
-        k_add_bias_res<<<(size_t(M) * size_t(T) * size_t(C_out) + 255) / 256, 256, 0, s>>>(
-            y, bias, res, M * T, C_out);
+
+        const size_t out_elems = size_t(MT) * size_t(C_out);
+        if (post_snake) {
+            // Note: y_f32 may alias input/output when fp32_decoder_=true (elementwise same idx, safe!).
+            k_bias_snake1d<<<(out_elems + 255) / 256, 256, 0, s>>>(
+                y_f32, bias, post_snake, fp32_decoder_ ? y_f32 : nullptr, y_f16, MT, C_out);
+        } else {
+            k_add_bias_res<<<(out_elems + 255) / 256, 256, 0, s>>>(y_f32, bias, nullptr, MT, C_out);
+        }
     }
 
     // Encoder causal conv1d in fp32 (any K, stride, dilation; M=1, T divisible by stride)
@@ -2254,7 +2476,7 @@ private:
         const float* x_src = x;
         if (pad > 0) {
             k_conv_prepend_ctx<<<(size_t(T_in + pad) * size_t(C_in) + 255) / 256, 256, 0, s>>>(
-                x, nullptr, nullptr, 0, 0, buf_pad, nullptr, 1, T_in, pad, C_in);
+                x, nullptr, nullptr, nullptr, 0, 0, buf_pad, nullptr, 1, T_in, pad, C_in);
             x_src = buf_pad;
         }
         const size_t tap_elems = size_t(C_out) * size_t(C_in);
@@ -2348,6 +2570,8 @@ private:
     float* dec_buf_pad_f32_ = nullptr;
     __half* dec_buf_pad_f16_ = nullptr;
     __half* dec_buf_tmp_f16_ = nullptr;
+    float* dec_buf_im2col_f32_ = nullptr;
+    __half* dec_buf_im2col_f16_ = nullptr;
     float* dec_buf_qrot_f32_ = nullptr;
 };
 
