@@ -125,4 +125,31 @@ int g6l_embed_read_component(const void* h, size_t idx, size_t comp, void* dst, 
 int g6l_embed_decode_bf16(const void* h, size_t idx, void* dst, size_t dst_bytes, uint32_t threads,
                           char* err, size_t errlen);
 void g6l_embed_close(void* h);
+
+// Drama 3 (`fish_omni`) TTS release loader (src/tts_plan.rs, used by g6tts).
+// Dense/vocab access delegates to `embed_plan.rs` with the same `g6l_embed_item` descriptor.
+void* g6l_tts_open(const char* release_dir, const char* manifest_name, int verify_checksums,
+                   char* err, size_t errlen);
+const char* g6l_tts_profile(const void* h);
+size_t g6l_tts_dense_item_count(const void* h);
+int g6l_tts_dense_item_info(const void* h, size_t idx, g6l_embed_item* out);
+int g6l_tts_dense_read_component(const void* h, size_t idx, size_t comp, void* dst, size_t dst_bytes,
+                                 char* err, size_t errlen);
+int g6l_tts_dense_decode_bf16(const void* h, size_t idx, void* dst, size_t dst_bytes, uint32_t threads,
+                              char* err, size_t errlen);
+int g6l_tts_dense_decode_f16(const void* h, size_t idx, void* dst, size_t dst_bytes, uint32_t threads,
+                             char* err, size_t errlen);
+int g6l_tts_dense_decode_f32(const void* h, size_t idx, void* dst, size_t dst_bytes, uint32_t threads,
+                             char* err, size_t errlen);
+// Returns 0 for FP8_BLOCK dense records, 1 for trellis width files, -1 if layer has no experts.
+int g6l_tts_expert_store(const void* h, uint32_t layer);
+// Decodes expert `expert` (0..n_routed-1, or n_routed for shared) projection `proj` (0=gate, 1=up, 2=down)
+// of `layer` to row-major FP16 [out, in] in `dst`.
+int g6l_tts_expert_decode_f16(const void* h, uint32_t layer, uint32_t expert, uint32_t proj,
+                              void* dst, size_t dst_bytes, char* err, size_t errlen);
+// Reads raw FP8_BLOCK (fp8 U8 + scale F32) for a store-0 expert projection (low-RAM ref-fp8 path).
+int g6l_tts_expert_read_fp8(const void* h, uint32_t layer, uint32_t expert, uint32_t proj,
+                            void* dst_fp8, size_t fp8_bytes, void* dst_scale, size_t scale_bytes,
+                            char* err, size_t errlen);
+void g6l_tts_close(void* h);
 }

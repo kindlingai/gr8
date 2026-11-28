@@ -41,6 +41,7 @@ pub mod records;
 pub mod release;
 pub mod sha256;
 mod sys;
+pub mod tts_plan;
 pub mod v2plan;
 pub mod xxh64;
 
@@ -1042,6 +1043,287 @@ pub unsafe extern "C" fn g6l_embed_decode_bf16(
 pub unsafe extern "C" fn g6l_embed_close(h: *mut c_void) {
     if !h.is_null() {
         drop(Box::from_raw(h as *mut embed_plan::EmbedRelease));
+    }
+}
+
+/// Opens a Drama 3 (`fish_omni`) TTS release directory for `g6tts`.
+/// `manifest_name` may be NULL or "" when experts are stored in dense `FP8_BLOCK` files (`dev-ref`).
+///
+/// # Safety
+/// `release_dir` must be a valid NUL-terminated C string; `manifest_name` may be NULL; `err` holds `errlen` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_open(
+    release_dir: *const c_char,
+    manifest_name: *const c_char,
+    verify_checksums: i32,
+    err: *mut c_char,
+    errlen: usize,
+) -> *mut c_void {
+    if release_dir.is_null() {
+        write_err(err, errlen, "g6l_tts_open: null release_dir");
+        return std::ptr::null_mut();
+    }
+    let dir = match CStr::from_ptr(release_dir).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            write_err(err, errlen, "g6l_tts_open: non-UTF-8 release_dir");
+            return std::ptr::null_mut();
+        }
+    };
+    let manifest = cstr(manifest_name);
+    match tts_plan::TtsRelease::open(dir, manifest.as_deref(), verify_checksums != 0) {
+        Ok(rel) => Box::into_raw(Box::new(rel)) as *mut c_void,
+        Err(e) => {
+            write_err(err, errlen, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Returns the discovered dense profile name (e.g. `"fish_omni"`).
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_profile(h: *const c_void) -> *const c_char {
+    if h.is_null() {
+        return std::ptr::null();
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    rel.embed.profile.as_ptr()
+}
+
+/// Returns the number of dense/vocab items discovered in the TTS release.
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_dense_item_count(h: *const c_void) -> usize {
+    if h.is_null() {
+        return 0;
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    rel.embed.items.len()
+}
+
+/// Populates `*out` with metadata for dense item `idx` (same struct as `g6l_embed_item_info`).
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`; `out` must be non-null.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_dense_item_info(h: *const c_void, idx: usize, out: *mut G6lEmbedItem) -> i32 {
+    if h.is_null() || out.is_null() {
+        return 1;
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    g6l_embed_item_info(&rel.embed as *const embed_plan::EmbedRelease as *const c_void, idx, out)
+}
+
+/// Reads raw component `comp` of dense item `idx` via `pread`.
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`; `dst` must hold `dst_bytes` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_dense_read_component(
+    h: *const c_void,
+    idx: usize,
+    comp: usize,
+    dst: *mut c_void,
+    dst_bytes: usize,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32 {
+    if h.is_null() {
+        return write_err(err, errlen, "g6l_tts_dense_read_component: null handle");
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    g6l_embed_read_component(
+        &rel.embed as *const embed_plan::EmbedRelease as *const c_void,
+        idx,
+        comp,
+        dst,
+        dst_bytes,
+        err,
+        errlen,
+    )
+}
+
+/// Decodes dense matrix item `idx` into row-major BF16 bytes `[out, inp]`.
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`; `dst` must hold `out * inp * 2` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_dense_decode_bf16(
+    h: *const c_void,
+    idx: usize,
+    dst: *mut c_void,
+    dst_bytes: usize,
+    threads: u32,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32 {
+    if h.is_null() {
+        return write_err(err, errlen, "g6l_tts_dense_decode_bf16: null handle");
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    g6l_embed_decode_bf16(
+        &rel.embed as *const embed_plan::EmbedRelease as *const c_void,
+        idx,
+        dst,
+        dst_bytes,
+        threads,
+        err,
+        errlen,
+    )
+}
+
+/// Decodes dense matrix item `idx` into row-major FP16 bytes `[out, inp]`.
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`; `dst` must hold `out * inp * 2` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_dense_decode_f16(
+    h: *const c_void,
+    idx: usize,
+    dst: *mut c_void,
+    dst_bytes: usize,
+    threads: u32,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32 {
+    if h.is_null() || (dst.is_null() && dst_bytes > 0) {
+        return write_err(err, errlen, "g6l_tts_dense_decode_f16: null argument");
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    let buf = if dst_bytes == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(dst as *mut u8, dst_bytes)
+    };
+    match rel.embed.decode_f16(idx, buf, threads as usize) {
+        Ok(()) => 0,
+        Err(e) => write_err(err, errlen, &e),
+    }
+}
+
+/// Decodes dense matrix item `idx` into row-major FP32 bytes `[out, inp]`.
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`; `dst` must hold `out * inp * 4` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_dense_decode_f32(
+    h: *const c_void,
+    idx: usize,
+    dst: *mut c_void,
+    dst_bytes: usize,
+    threads: u32,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32 {
+    if h.is_null() || (dst.is_null() && dst_bytes > 0) {
+        return write_err(err, errlen, "g6l_tts_dense_decode_f32: null argument");
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    let buf = if dst_bytes == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(dst as *mut u8, dst_bytes)
+    };
+    match rel.embed.decode_f32(idx, buf, threads as usize) {
+        Ok(()) => 0,
+        Err(e) => write_err(err, errlen, &e),
+    }
+}
+
+/// Returns the expert store kind for `layer`: 0 = FP8_BLOCK dense records, 1 = trellis, -1 = none.
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_expert_store(h: *const c_void, layer: u32) -> i32 {
+    if h.is_null() {
+        return -1;
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    rel.expert_store(layer as usize)
+}
+
+/// Decodes expert `expert` (0..n_routed-1, or n_routed for shared) projection `proj` (0=gate, 1=up, 2=down)
+/// of `layer` to row-major FP16 `[out, inp]` bytes in `dst`.
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`; `dst` must hold `out * inp * 2` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_expert_decode_f16(
+    h: *const c_void,
+    layer: u32,
+    expert: u32,
+    proj: u32,
+    dst: *mut c_void,
+    dst_bytes: usize,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32 {
+    if h.is_null() || (dst.is_null() && dst_bytes > 0) {
+        return write_err(err, errlen, "g6l_tts_expert_decode_f16: null argument");
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    let buf = if dst_bytes == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(dst as *mut u8, dst_bytes)
+    };
+    match rel.expert_decode_f16(layer as usize, expert as usize, proj as usize, buf) {
+        Ok(()) => 0,
+        Err(e) => write_err(err, errlen, &e),
+    }
+}
+
+/// Reads raw FP8_BLOCK bytes (`fp8` U8 + `scale` F32) for a store-0 expert projection.
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open`; `dst_fp8` and `dst_scale` must be writable buffers of exact component sizes.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_expert_read_fp8(
+    h: *const c_void,
+    layer: u32,
+    expert: u32,
+    proj: u32,
+    dst_fp8: *mut c_void,
+    fp8_bytes: usize,
+    dst_scale: *mut c_void,
+    scale_bytes: usize,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32 {
+    if h.is_null() || (dst_fp8.is_null() && fp8_bytes > 0) || (dst_scale.is_null() && scale_bytes > 0) {
+        return write_err(err, errlen, "g6l_tts_expert_read_fp8: null argument");
+    }
+    let rel = &*(h as *const tts_plan::TtsRelease);
+    let b_fp8 = if fp8_bytes == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(dst_fp8 as *mut u8, fp8_bytes)
+    };
+    let b_sc = if scale_bytes == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(dst_scale as *mut u8, scale_bytes)
+    };
+    match rel.expert_read_fp8(layer as usize, expert as usize, proj as usize, b_fp8, b_sc) {
+        Ok(()) => 0,
+        Err(e) => write_err(err, errlen, &e),
+    }
+}
+
+/// Frees a handle returned by `g6l_tts_open`.
+///
+/// # Safety
+/// `h` must come from `g6l_tts_open` and must not be used again.
+#[no_mangle]
+pub unsafe extern "C" fn g6l_tts_close(h: *mut c_void) {
+    if !h.is_null() {
+        drop(Box::from_raw(h as *mut tts_plan::TtsRelease));
     }
 }
 
