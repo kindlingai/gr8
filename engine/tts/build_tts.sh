@@ -26,7 +26,7 @@ fi
 
 NVCC=${NVCC:-nvcc}
 FLAGS=(-O3 -std=c++17 -lineinfo -gencode="arch=compute_${ARCH},code=sm_${ARCH}"
-       -I "$REPO/engine/tts" -I "$REPO/engine/loader-rs" -I "$REPO/engine/runtime")
+       -I "$REPO/engine/tts" -I "$REPO/engine/embed" -I "$REPO/engine/loader-rs" -I "$REPO/engine/runtime")
 LIBS=("$GL" -lcublas -lpthread -ldl -lm)
 
 echo "build_tts.sh: compiling g6tts and g6tts_bench for sm_${ARCH} -> $OUT"

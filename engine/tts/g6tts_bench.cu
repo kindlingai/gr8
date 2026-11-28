@@ -53,6 +53,7 @@ struct BenchOpts {
     std::string manifest;
     std::string codec_path;
     g6tts::WeightMode weight_mode = g6tts::WeightMode::Ref;
+    bool weight_mode_explicit = false;
     bool verify_checksums = true;
 
     std::string teacher_in;
@@ -101,6 +102,7 @@ bool parse_cli(int argc, char** argv, BenchOpts& o) {
             const char* v = need("--codec-path"); if (!v) return false; o.codec_path = v;
         } else if (a == "--weight-mode") {
             const char* v = need("--weight-mode"); if (!v) return false;
+            o.weight_mode_explicit = true;
             if (std::strcmp(v, "ref") == 0) o.weight_mode = g6tts::WeightMode::Ref;
             else if (std::strcmp(v, "ref-fp16") == 0) o.weight_mode = g6tts::WeightMode::RefFp16;
             else if (std::strcmp(v, "ref-f32") == 0) o.weight_mode = g6tts::WeightMode::RefF32;
@@ -450,7 +452,9 @@ int main(int argc, char** argv) {
         }
 
         if (opts.verify_kernels) {
-            // Compare RefF32 exact weights vs requested test mode (Ref / RefFp16).
+            // Gate E3: compare Native (default) vs exact RefF32 on the exact same release across backbone, all 9 heads,
+            // controlled router/tower probes, and standalone per-format + 78-matrix tower linear unit probes.
+            const g6tts::WeightMode test_mode = opts.weight_mode_explicit ? opts.weight_mode : g6tts::WeightMode::Native;
             std::vector<int32_t> rows;
             if (!opts.verify_rows.empty()) {
                 const auto seqs = read_teacher_rows(opts.verify_rows);
@@ -461,28 +465,347 @@ int main(int argc, char** argv) {
             } else {
                 rows = make_synthetic_rows(32, 42);
             }
-            TeacherSeqOut ref_out, test_out;
+
+            constexpr int OP_M = 31;
+            constexpr int OP_K = 6144;
+            std::vector<uint16_t> h_x_bf16(size_t(OP_M) * OP_K);
+            {
+                uint32_t s = 0x51a7b3c9u;
+                for (size_t i = 0; i < h_x_bf16.size(); ++i) {
+                    s = s * 1664525u + 1013904223u;
+                    const float fv = (float(int32_t(s >> 8) - 8388608) / 8388608.0f) * 0.5f;
+                    h_x_bf16[i] = g6tts::host_f32_to_bf16(fv);
+                }
+            }
+            struct OpProbeSet {
+                std::vector<float> tr_out, tr_in, tr_dual, tr_triple;
+                std::vector<float> int4_op, fp8_row, lm_head_op, bf16_op;
+                std::vector<float> gdn0_dual, gdn0_out, gdn2_out_i4, sh0_w2_i4, sh1_w2_tr;
+                std::vector<float> w2_outlier_tr, w2_sparse_outlier_tr;
+                std::vector<std::vector<float>> tw_all;
+                std::vector<std::string> tw_all_names;
+                std::vector<int> tw_all_fmts;
+            };
+            std::vector<uint16_t> h_x_outlier_bf16(size_t(OP_M) * OP_K);
+            std::vector<uint16_t> h_x_sparse_bf16 = h_x_bf16;
+            for (size_t i = 0; i < h_x_outlier_bf16.size(); ++i) {
+                h_x_outlier_bf16[i] = g6tts::host_f32_to_bf16(g6tts::host_bf16_to_f32(h_x_bf16[i]) * 200000.0f);
+            }
+            for (int m = 0; m < OP_M; ++m) {
+                h_x_sparse_bf16[size_t(m) * OP_K + ((m * 137) % OP_K)] = g6tts::host_f32_to_bf16(100000.0f);
+            }
+            auto run_op_probes = [&](const g6tts::TtsWeights& W, g6tts::BackboneRunner& bb,
+                                     g6tts::TowerRunner& tw) -> OpProbeSet {
+                OpProbeSet out;
+                const int H = W.cfg.hidden_size;
+                const int n_cand = W.cfg.main_candidates();
+                g6tts::bf16 *d_x = nullptr, *d_y0 = nullptr, *d_y1 = nullptr, *d_y2 = nullptr;
+                float* d_yf = nullptr;
+                TTS_CK(cudaMalloc(&d_x, size_t(OP_M) * OP_K * sizeof(g6tts::bf16)));
+                TTS_CK(cudaMalloc(&d_y0, size_t(OP_M) * 9216 * sizeof(g6tts::bf16)));
+                TTS_CK(cudaMalloc(&d_y1, size_t(OP_M) * 6144 * sizeof(g6tts::bf16)));
+                TTS_CK(cudaMalloc(&d_y2, size_t(OP_M) * 1024 * sizeof(g6tts::bf16)));
+                TTS_CK(cudaMalloc(&d_yf, size_t(OP_M) * std::max(4096, n_cand) * sizeof(float)));
+                TTS_CK(cudaMemcpyAsync(d_x, h_x_bf16.data(), h_x_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice, stream));
+
+                auto dl_bf16 = [&](const g6tts::bf16* d_p, size_t n) -> std::vector<float> {
+                    std::vector<uint16_t> raw(n);
+                    TTS_CK(cudaMemcpyAsync(raw.data(), d_p, n * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
+                    TTS_CK(cudaStreamSynchronize(stream));
+                    std::vector<float> v(n);
+                    for (size_t i = 0; i < n; ++i) v[i] = g6tts::host_bf16_to_f32(raw[i]);
+                    return v;
+                };
+                auto dl_f32 = [&](const float* d_p, size_t n) -> std::vector<float> {
+                    std::vector<float> v(n);
+                    TTS_CK(cudaMemcpyAsync(v.data(), d_p, n * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    TTS_CK(cudaStreamSynchronize(stream));
+                    return v;
+                };
+
+                TTS_BLAS_CK(cublasSetStream(bb.blas, stream));
+                TTS_BLAS_CK(cublasSetStream(tw.blas, stream));
+                const auto& tw0 = W.res_layers[0];
+                const auto& sh0 = W.shared_layers[0];
+                const auto& sh1 = W.shared_layers[1];
+                const auto& att3 = W.layers[3];
+                const auto& gdn0 = W.layers[0];
+                const auto& gdn2 = W.layers[2];
+
+                tw.proj_bf16(d_x, tw0.wqkv, tw0.wqkv_nat, d_y0, OP_M, 9216, H, stream);
+                out.tr_out = dl_bf16(d_y0, size_t(OP_M) * 9216);
+
+                tw.proj_f32(d_x, tw0.eh_proj, tw0.eh_proj_nat, d_yf, OP_M, H, 2 * H, false, stream);
+                out.tr_in = dl_f32(d_yf, size_t(OP_M) * H);
+
+                if (W.mode == g6tts::WeightMode::Native && tw0.w1_nat.valid() && tw0.w3_nat.valid()) {
+                    g6tts::tts_native_linear_dual_bf16(d_x, tw0.w1_nat, tw0.w3_nat, d_y0, d_y1, OP_M, tw.dense_ws, tw.blas, stream);
+                } else {
+                    tw.proj_bf16(d_x, tw0.w1, tw0.w1_nat, d_y0, OP_M, 6144, H, stream);
+                    tw.proj_bf16(d_x, tw0.w3, tw0.w3_nat, d_y1, OP_M, 6144, H, stream);
+                }
+                out.tr_dual = dl_bf16(d_y0, size_t(OP_M) * 6144);
+                auto d1 = dl_bf16(d_y1, size_t(OP_M) * 6144);
+                out.tr_dual.insert(out.tr_dual.end(), d1.begin(), d1.end());
+
+                if (W.mode == g6tts::WeightMode::Native && att3.q_proj_nat.valid() && att3.k_proj_nat.valid() && att3.v_proj_nat.valid()) {
+                    g6tts::tts_native_linear_triple_bf16(d_x, att3.q_proj_nat, att3.k_proj_nat, att3.v_proj_nat,
+                                                         d_y0, d_y1, d_y2, OP_M, bb.dense_ws, bb.blas, stream);
+                } else {
+                    bb.proj_bf16(d_x, att3.q_proj, att3.q_proj_nat, d_y0, OP_M, 8192, H, stream);
+                    bb.proj_bf16(d_x, att3.k_proj, att3.k_proj_nat, d_y1, OP_M, 512, H, stream);
+                    bb.proj_bf16(d_x, att3.v_proj, att3.v_proj_nat, d_y2, OP_M, 512, H, stream);
+                }
+                out.tr_triple = dl_bf16(d_y0, size_t(OP_M) * 8192);
+                auto tk = dl_bf16(d_y1, size_t(OP_M) * 512);
+                auto tv = dl_bf16(d_y2, size_t(OP_M) * 512);
+                out.tr_triple.insert(out.tr_triple.end(), tk.begin(), tk.end());
+                out.tr_triple.insert(out.tr_triple.end(), tv.begin(), tv.end());
+
+                bb.proj_f32(d_x, att3.o_proj, att3.o_proj_nat, d_yf, OP_M, H, 2 * H, false, stream);
+                out.int4_op = dl_f32(d_yf, size_t(OP_M) * H);
+
+                tw.proj_f32(d_x, W.heads[0], W.heads_nat[0], d_yf, OP_M, g6tts::geom::RES_CB_SIZE, H, false, stream);
+                out.fp8_row = dl_f32(d_yf, size_t(OP_M) * g6tts::geom::RES_CB_SIZE);
+
+                bb.proj_f32(d_x, W.lm_head_cand, W.lm_head_nat, d_yf, OP_M, n_cand, H, false, stream);
+                out.lm_head_op = dl_f32(d_yf, size_t(OP_M) * n_cand);
+
+                bb.proj_f32(d_x, gdn0.router_gate, gdn0.router_gate_nat, d_yf, OP_M, W.cfg.num_experts, H, false, stream);
+                out.bf16_op = dl_f32(d_yf, size_t(OP_M) * W.cfg.num_experts);
+
+                if (W.mode == g6tts::WeightMode::Native && gdn0.in_proj_qkv_nat.valid() && gdn0.in_proj_z_nat.valid()) {
+                    g6tts::tts_native_linear_dual_bf16(d_x, gdn0.in_proj_qkv_nat, gdn0.in_proj_z_nat, d_y0, d_y1, OP_M, bb.dense_ws, bb.blas, stream);
+                } else {
+                    bb.proj_bf16(d_x, gdn0.in_proj_qkv, gdn0.in_proj_qkv_nat, d_y0, OP_M, 8192, H, stream);
+                    bb.proj_bf16(d_x, gdn0.in_proj_z, gdn0.in_proj_z_nat, d_y1, OP_M, 4096, H, stream);
+                }
+                out.gdn0_dual = dl_bf16(d_y0, size_t(OP_M) * 8192);
+                auto gz = dl_bf16(d_y1, size_t(OP_M) * 4096);
+                out.gdn0_dual.insert(out.gdn0_dual.end(), gz.begin(), gz.end());
+
+                bb.proj_f32(d_x, gdn0.out_proj, gdn0.out_proj_nat, d_yf, OP_M, H, 2 * H, false, stream);
+                out.gdn0_out = dl_f32(d_yf, size_t(OP_M) * H);
+
+                bb.proj_f32(d_x, gdn2.out_proj, gdn2.out_proj_nat, d_yf, OP_M, H, 2 * H, false, stream);
+                out.gdn2_out_i4 = dl_f32(d_yf, size_t(OP_M) * H);
+
+                tw.proj_f32(d_x, sh0.w2, sh0.w2_nat, d_yf, OP_M, H, W.cfg.tower_intermediate, false, stream);
+                out.sh0_w2_i4 = dl_f32(d_yf, size_t(OP_M) * H);
+
+                tw.proj_f32(d_x, sh1.w2, sh1.w2_nat, d_yf, OP_M, H, W.cfg.tower_intermediate, false, stream);
+                out.sh1_w2_tr = dl_f32(d_yf, size_t(OP_M) * H);
+
+                TTS_CK(cudaMemcpyAsync(d_x, h_x_outlier_bf16.data(), h_x_outlier_bf16.size() * sizeof(uint16_t),
+                                       cudaMemcpyHostToDevice, stream));
+                tw.proj_f32(d_x, tw0.w2, tw0.w2_nat, d_yf, OP_M, H, W.cfg.tower_intermediate, false, stream);
+                out.w2_outlier_tr = dl_f32(d_yf, size_t(OP_M) * H);
+
+                TTS_CK(cudaMemcpyAsync(d_x, h_x_sparse_bf16.data(), h_x_sparse_bf16.size() * sizeof(uint16_t),
+                                       cudaMemcpyHostToDevice, stream));
+                tw.proj_f32(d_x, tw0.w2, tw0.w2_nat, d_yf, OP_M, H, W.cfg.tower_intermediate, false, stream);
+                out.w2_sparse_outlier_tr = dl_f32(d_yf, size_t(OP_M) * H);
+
+                TTS_CK(cudaMemcpyAsync(d_x, h_x_bf16.data(), h_x_bf16.size() * sizeof(uint16_t),
+                                       cudaMemcpyHostToDevice, stream));
+                auto sweep_layer = [&](const g6tts::TowerLayerW& tl, const std::string& pfx) {
+                    auto add_f32 = [&](const char* nm, const g6tts::RefMat& rm, const g6emb::DevMatrix& dm, int N, int K) {
+                        tw.proj_f32(d_x, rm, dm, d_yf, OP_M, N, K, false, stream);
+                        out.tw_all.push_back(dl_f32(d_yf, size_t(OP_M) * N));
+                        out.tw_all_names.push_back(pfx + "." + nm);
+                        out.tw_all_fmts.push_back(dm.valid() ? dm.fmt : -1);
+                    };
+                    auto add_bf16 = [&](const char* nm, const g6tts::RefMat& rm, const g6emb::DevMatrix& dm, int N, int K) {
+                        tw.proj_bf16(d_x, rm, dm, d_y0, OP_M, N, K, stream);
+                        out.tw_all.push_back(dl_bf16(d_y0, size_t(OP_M) * N));
+                        out.tw_all_names.push_back(pfx + "." + nm);
+                        out.tw_all_fmts.push_back(dm.valid() ? dm.fmt : -1);
+                    };
+                    add_f32("eh_proj", tl.eh_proj, tl.eh_proj_nat, H, 2 * H);
+                    add_bf16("wqkv", tl.wqkv, tl.wqkv_nat, 9216, H);
+                    add_f32("wo", tl.wo, tl.wo_nat, H, 2 * H);
+                    add_bf16("w1", tl.w1, tl.w1_nat, W.cfg.tower_intermediate, H);
+                    add_bf16("w3", tl.w3, tl.w3_nat, W.cfg.tower_intermediate, H);
+                    add_f32("w2", tl.w2, tl.w2_nat, H, W.cfg.tower_intermediate);
+                };
+                for (int i = 0; i < W.cfg.tower_shared; ++i) sweep_layer(W.shared_layers[size_t(i)], "sh" + std::to_string(i));
+                for (int i = 0; i < W.cfg.tower_res; ++i) sweep_layer(W.res_layers[size_t(i)], "res" + std::to_string(i));
+
+                cudaFree(d_x); cudaFree(d_y0); cudaFree(d_y1); cudaFree(d_y2); cudaFree(d_yf);
+                return out;
+            };
+
+            TeacherSeqOut ref_out, test_out, test_same_router_out;
+            OpProbeSet ref_ops, test_ops;
+            g6tts::BackboneLayerTrace ref_bb_tr, test_bb_tr, test_sr_bb_tr;
+            g6tts::TowerLayerTrace ref_tw_tr, test_tw_tr, test_iso_tw_tr;
+            std::vector<float> test_iso_heads;
             {
                 auto W = g6tts::load_tts_weights(opts.model_dir, opts.manifest, opts.verify_checksums,
                                                  g6tts::WeightMode::RefF32);
                 g6tts::BackboneRunner bb; g6tts::TowerRunner tw;
                 bb.init(W, 1, 256, 128); tw.init(W, 1, 256, 128);
+                ref_ops = run_op_probes(W, bb, tw);
+                bb.trace.enabled = true;
+                tw.trace.enabled = true;
+                tw.trace.sub_kv[0] = 8;
+                tw.trace.sub_kv[1] = 11;
                 ref_out = run_teacher_seq(bb, tw, rows, stream);
+                ref_bb_tr = std::move(bb.trace);
+                ref_tw_tr = std::move(tw.trace);
             }
             {
-                auto W = g6tts::load_tts_weights(opts.model_dir, opts.manifest, opts.verify_checksums,
-                                                 opts.weight_mode);
+                auto W = g6tts::load_tts_weights(opts.model_dir, opts.manifest, opts.verify_checksums, test_mode);
                 g6tts::BackboneRunner bb; g6tts::TowerRunner tw;
                 bb.init(W, 1, 256, 128); tw.init(W, 1, 256, 128);
+                test_ops = run_op_probes(W, bb, tw);
+                bb.trace.enabled = true;
+                tw.trace.enabled = true;
+                tw.trace.sub_kv[0] = 8;
+                tw.trace.sub_kv[1] = 11;
                 test_out = run_teacher_seq(bb, tw, rows, stream);
+                test_bb_tr = std::move(bb.trace);
+                test_tw_tr = std::move(tw.trace);
+
+                bb.trace.enabled = true;
+                bb.trace.replay_router = true;
+                bb.trace.forced_topk_ids = ref_bb_tr.topk_ids;
+                bb.trace.forced_topk_w = ref_bb_tr.topk_w;
+                tw.trace.enabled = false;
+                test_same_router_out = run_teacher_seq(bb, tw, rows, stream);
+                test_sr_bb_tr = std::move(bb.trace);
+
+                const int T = ref_out.T;
+                const int H = W.cfg.hidden_size;
+                const int rw = W.cfg.row_width();
+                std::vector<uint16_t> h_ref_bf16(size_t(T) * H);
+                for (size_t i = 0; i < h_ref_bf16.size(); ++i) h_ref_bf16[i] = g6tts::host_f32_to_bf16(ref_out.final_hidden[i]);
+                g6tts::bf16* d_ref_hid = nullptr;
+                TTS_CK(cudaMalloc(&d_ref_hid, h_ref_bf16.size() * sizeof(uint16_t)));
+                TTS_CK(cudaMemcpyAsync(d_ref_hid, h_ref_bf16.data(), h_ref_bf16.size() * sizeof(uint16_t),
+                                       cudaMemcpyHostToDevice, stream));
+                test_iso_heads.resize(size_t(T - 1) * W.cfg.tower_res * g6tts::geom::RES_CB_SIZE);
+                tw.trace.enabled = true;
+                tw.trace.sub_kv[0] = 8;
+                tw.trace.sub_kv[1] = 11;
+                tw.prefill_chunk(d_ref_hid, rows.data(), rows.data() + rw, 0, 0, T - 1, test_iso_heads.data(), stream);
+                TTS_CK(cudaStreamSynchronize(stream));
+                test_iso_tw_tr = std::move(tw.trace);
+                cudaFree(d_ref_hid);
             }
             const double c_hid = cosine_sim(ref_out.final_hidden, test_out.final_hidden);
             const double c_main = cosine_sim(ref_out.main_logits, test_out.main_logits);
             const double c_head = cosine_sim(ref_out.head_logits, test_out.head_logits);
-            std::printf("{\"verify_kernels\":true,\"hidden_cos\":%.8f,\"main_cos\":%.8f,\"heads_cos\":%.8f}\n",
-                        c_hid, c_main, c_head);
+            const double c_hid_sr = cosine_sim(ref_out.final_hidden, test_same_router_out.final_hidden);
+            const double c_main_sr = cosine_sim(ref_out.main_logits, test_same_router_out.main_logits);
+            const int n_heads = g6tts::geom::TOW_RES;
+            const int hv = g6tts::geom::RES_CB_SIZE;
+            const int n_rows = std::max(0, ref_out.T - 1);
+            double head_cos[g6tts::geom::TOW_RES], head_iso_cos[g6tts::geom::TOW_RES];
+            double head_min = 1.0, head_iso_min = 1.0;
+            for (int h = 0; h < n_heads; ++h) {
+                std::vector<float> ra, ta, ia;
+                ra.reserve(size_t(n_rows) * hv); ta.reserve(size_t(n_rows) * hv); ia.reserve(size_t(n_rows) * hv);
+                for (int r = 0; r < n_rows; ++r) {
+                    const size_t base = (size_t(r) * n_heads + h) * hv;
+                    ra.insert(ra.end(), ref_out.head_logits.begin() + base, ref_out.head_logits.begin() + base + hv);
+                    ta.insert(ta.end(), test_out.head_logits.begin() + base, test_out.head_logits.begin() + base + hv);
+                    ia.insert(ia.end(), test_iso_heads.begin() + base, test_iso_heads.begin() + base + hv);
+                }
+                head_cos[h] = cosine_sim(ra, ta);
+                head_iso_cos[h] = cosine_sim(ra, ia);
+                head_min = std::min(head_min, head_cos[h]);
+                head_iso_min = std::min(head_iso_min, head_iso_cos[h]);
+            }
+
+            const int n_bb = static_cast<int>(std::min(ref_bb_tr.residuals.size(), test_bb_tr.residuals.size()));
+            std::vector<double> bb_lcos(size_t(n_bb), 0.0), bb_lcos_sr(size_t(n_bb), 0.0);
+            int bb_first_div = -1, router_first_div = -1;
+            double bb_lcos_min = 1.0, bb_sr_min = 1.0;
+            size_t router_hit = 0, router_tot = 0;
+            for (int l = 0; l < n_bb; ++l) {
+                bb_lcos[size_t(l)] = cosine_sim(ref_bb_tr.residuals[size_t(l)], test_bb_tr.residuals[size_t(l)]);
+                bb_lcos_sr[size_t(l)] = cosine_sim(ref_bb_tr.residuals[size_t(l)], test_sr_bb_tr.residuals[size_t(l)]);
+                bb_lcos_min = std::min(bb_lcos_min, bb_lcos[size_t(l)]);
+                bb_sr_min = std::min(bb_sr_min, bb_lcos_sr[size_t(l)]);
+                if (bb_first_div < 0 && bb_lcos[size_t(l)] < 0.9999) bb_first_div = l;
+                const auto& ra = ref_bb_tr.topk_ids[size_t(l)];
+                const auto& ta = test_bb_tr.topk_ids[size_t(l)];
+                const int K = g6tts::geom::TOPK;
+                const int n_m = static_cast<int>(std::min(ra.size(), ta.size())) / K;
+                size_t l_hit = 0, l_tot = size_t(n_m) * K;
+                for (int m = 0; m < n_m; ++m) {
+                    for (int k = 0; k < K; ++k) {
+                        const int id = ra[size_t(m) * K + k];
+                        for (int j = 0; j < K; ++j) if (ta[size_t(m) * K + j] == id) { ++l_hit; break; }
+                    }
+                }
+                router_hit += l_hit; router_tot += l_tot;
+                if (router_first_div < 0 && l_hit < l_tot) router_first_div = l;
+            }
+            const double router_agree = (router_tot > 0) ? (double(router_hit) / double(router_tot)) : 1.0;
+
+            const int n_tw = static_cast<int>(std::min(ref_tw_tr.hiddens.size(), test_tw_tr.hiddens.size()));
+            std::vector<double> tw_lcos(size_t(n_tw), 0.0), tw_iso_lcos(size_t(n_tw), 0.0);
+            int tw_first_div = -1;
+            double tw_lcos_min = 1.0, tw_iso_min = 1.0;
+            for (int l = 0; l < n_tw; ++l) {
+                tw_lcos[size_t(l)] = cosine_sim(ref_tw_tr.hiddens[size_t(l)], test_tw_tr.hiddens[size_t(l)]);
+                tw_iso_lcos[size_t(l)] = cosine_sim(ref_tw_tr.hiddens[size_t(l)], test_iso_tw_tr.hiddens[size_t(l)]);
+                tw_lcos_min = std::min(tw_lcos_min, tw_lcos[size_t(l)]);
+                tw_iso_min = std::min(tw_iso_min, tw_iso_lcos[size_t(l)]);
+                if (tw_first_div < 0 && tw_lcos[size_t(l)] < 0.9999) tw_first_div = l;
+            }
+
+            double tw_all_min = 1.0;
+            std::string tw_all_worst_name = "none";
+            int tw_all_worst_fmt = -1;
+            const size_t n_tw_ops = std::min(ref_ops.tw_all.size(), test_ops.tw_all.size());
+            for (size_t i = 0; i < n_tw_ops; ++i) {
+                const double c = cosine_sim(ref_ops.tw_all[i], test_ops.tw_all[i]);
+                if (c < tw_all_min) { tw_all_min = c; tw_all_worst_name = test_ops.tw_all_names[i]; tw_all_worst_fmt = test_ops.tw_all_fmts[i]; }
+            }
+
+            const bool ok = (c_hid >= 0.9999 && c_main >= 0.9999 && head_min >= 0.9999);
+            std::printf("{\"verify_kernels\":true,\"gate\":\"E3\",\"pass\":%s,\"mode\":\"%s\",\"rows_src\":\"%s\","
+                        "\"hidden_cos\":%.8f,\"main_cos\":%.8f,\"heads_cos\":%.8f,\"head_cos_min\":%.8f,\"head_cos\":[",
+                        ok ? "true" : "false", g6tts::weight_mode_name(test_mode),
+                        opts.verify_rows.empty() ? "synthetic" : "file",
+                        c_hid, c_main, c_head, head_min);
+            for (int h = 0; h < n_heads; ++h) std::printf("%s%.8f", h ? "," : "", head_cos[h]);
+            std::printf("],\"same_router\":{\"hidden_cos\":%.8f,\"main_cos\":%.8f,\"bb_layer_cos_min\":%.8f},"
+                        "\"tower_isolated\":{\"layer_cos_min\":%.8f,\"head_cos_min\":%.8f,\"layer_cos\":[",
+                        c_hid_sr, c_main_sr, bb_sr_min, tw_iso_min, head_iso_min);
+            for (int l = 0; l < n_tw; ++l) std::printf("%s%.8f", l ? "," : "", tw_iso_lcos[size_t(l)]);
+            std::printf("],\"head_cos\":[");
+            for (int h = 0; h < n_heads; ++h) std::printf("%s%.8f", h ? "," : "", head_iso_cos[h]);
+            std::printf("]},\"tower_all_op_cos_min\":%.8f,\"tower_all_op_worst\":{\"name\":\"%s\",\"fmt\":%d,\"count\":%zu},"
+                        "\"op_cos\":{\"embed_fp8\":%.8f,\"trellis_out\":%.8f,\"trellis_in\":%.8f,\"trellis_dual\":%.8f,"
+                        "\"trellis_triple\":%.8f,\"int4\":%.8f,\"fp8_row\":%.8f,\"lm_head_fp8\":%.8f,\"bf16\":%.8f,"
+                        "\"gdn0_dual\":%.8f,\"gdn0_out\":%.8f,\"gdn2_out_i4\":%.8f,\"sh0_w2_i4\":%.8f,\"sh1_w2_tr\":%.8f,"
+                        "\"w2_outlier_tr\":%.8f,\"w2_sparse_outlier_tr\":%.8f},"
+                        "\"router_topk_agree\":%.6f,\"router_first_div_layer\":%d,"
+                        "\"bb_first_div_layer\":%d,\"bb_layer_cos_min\":%.8f,\"tower_first_div_layer\":%d,\"tower_layer_cos_min\":%.8f}\n",
+                        tw_all_min, tw_all_worst_name.c_str(), tw_all_worst_fmt, n_tw_ops,
+                        cosine_sim(ref_bb_tr.embed_f32, test_bb_tr.embed_f32),
+                        cosine_sim(ref_ops.tr_out, test_ops.tr_out),
+                        cosine_sim(ref_ops.tr_in, test_ops.tr_in),
+                        cosine_sim(ref_ops.tr_dual, test_ops.tr_dual),
+                        cosine_sim(ref_ops.tr_triple, test_ops.tr_triple),
+                        cosine_sim(ref_ops.int4_op, test_ops.int4_op),
+                        cosine_sim(ref_ops.fp8_row, test_ops.fp8_row),
+                        cosine_sim(ref_ops.lm_head_op, test_ops.lm_head_op),
+                        cosine_sim(ref_ops.bf16_op, test_ops.bf16_op),
+                        cosine_sim(ref_ops.gdn0_dual, test_ops.gdn0_dual),
+                        cosine_sim(ref_ops.gdn0_out, test_ops.gdn0_out),
+                        cosine_sim(ref_ops.gdn2_out_i4, test_ops.gdn2_out_i4),
+                        cosine_sim(ref_ops.sh0_w2_i4, test_ops.sh0_w2_i4),
+                        cosine_sim(ref_ops.sh1_w2_tr, test_ops.sh1_w2_tr),
+                        cosine_sim(ref_ops.w2_outlier_tr, test_ops.w2_outlier_tr),
+                        cosine_sim(ref_ops.w2_sparse_outlier_tr, test_ops.w2_sparse_outlier_tr),
+                        router_agree, router_first_div, bb_first_div, bb_lcos_min, tw_first_div, tw_lcos_min);
             cudaStreamDestroy(stream);
-            return (c_hid >= 0.9999 && c_main >= 0.9999 && c_head >= 0.9999) ? 0 : 1;
+            return ok ? 0 : 1;
         }
 
         if (opts.run_scenarios) {

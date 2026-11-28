@@ -1,4 +1,4 @@
-// Drama 3 Codebook-MTP tower forward pass in CUDA + cuBLAS BF16 (reference path).
+// Drama 3 Codebook-MTP tower forward pass in CUDA + cuBLAS BF16 (reference & native paths).
 //
 // Exact match to fish-speech @ 0f8a12e8 (`fish_omni/tower.py`):
 //   - 4 shared layers (`audio_decoder_mtp_shared.layers.0..3`) + 9 residual layers (`audio_decoder_mtp.layers.0..8`)
@@ -123,8 +123,8 @@ __global__ void k_tower_qk_norm_rope_kv(const bf16* __restrict__ wqkv_out,
     const int d = threadIdx.x;
     if (m >= M || h_glob >= nq + nkv || d >= hd) return;
 
-    const int q_width = nq * hd;                    // 4096
-    const int kv_width = nkv * hd;                  // 512
+    const int q_width = nq * hd;    // 4096
+    const int kv_width = nkv * hd;  // 512
     const int total_w = 2 * q_width + 2 * kv_width; // 9216
 
     const bool is_k = (h_glob >= nq);
@@ -203,11 +203,8 @@ struct TowerLayerTrace {
 };
 
 struct TowerRunner {
-    static constexpr size_t CUBLAS_WS_BYTES = size_t(32) << 20;
-
     const TtsWeights* W = nullptr;
     cublasHandle_t blas = nullptr;
-    void* d_cublas_ws = nullptr;
     int max_slots = 8;
     int cap = 4096;
     int max_chunk = 128;
@@ -221,9 +218,10 @@ struct TowerRunner {
     bf16* d_hid_a = nullptr;        // [max_chunk, H]
     bf16* d_hid_b = nullptr;        // [max_chunk, H]
     bf16* d_eh_cat = nullptr;       // [max_chunk, 2*H]
-    float* d_res_f32 = nullptr;     // [max_chunk, H]
-    float* d_ref_x_f32 = nullptr;   // [max_chunk, 6144] (WeightMode::RefF32 only)
-    float* d_ref_y_f32 = nullptr;   // [max_chunk, 9216] (WeightMode::RefF32 only)
+    float* d_res_f32 = nullptr;     // [max_chunk, H] (holds BF16-rounded residual values)
+    bf16* d_res_delta = nullptr;    // [max_chunk, H] scratch for BF16 residual delta
+    float* d_ref_x_f32 = nullptr;   // [max_chunk, 6144] FP32 scratch (WeightMode::RefF32 only)
+    float* d_ref_y_f32 = nullptr;   // [max_chunk, 9216] FP32 scratch (WeightMode::RefF32 only)
     bf16* d_norm = nullptr;         // [max_chunk, H]
     bf16* d_wqkv = nullptr;         // [max_chunk, 9216]
     bf16* d_q_ready = nullptr;      // [max_chunk, 4096]
@@ -238,15 +236,18 @@ struct TowerRunner {
     int32_t* d_pos = nullptr;       // [max_chunk]
 
     // Persistent pinned host staging for async prefill uploads & optional head logit readback
-    int32_t* h_slots = nullptr;
-    int32_t* h_pos = nullptr;
-    uint8_t* h_sem = nullptr;
-    int32_t* h_codes = nullptr;
-    int32_t* h_frames = nullptr;
-    float* h_head_tmp = nullptr;
+    int32_t* h_slots = nullptr;     // [max_chunk]
+    int32_t* h_pos = nullptr;       // [max_chunk]
+    uint8_t* h_sem = nullptr;       // [max_chunk]
+    int32_t* h_codes = nullptr;     // [tower_res, max_chunk]
+    int32_t* h_frames = nullptr;    // [max_chunk, 11]
+    float* h_head_tmp = nullptr;    // [max_chunk, RES_CB_SIZE]
 
     size_t state_bytes = 0;
     size_t scratch_bytes = 0;
+    static constexpr size_t CUBLAS_WS_BYTES = size_t(32) << 20;
+    void* d_cublas_ws = nullptr;
+    DenseWorkspace dense_ws;
     TowerProfile prof;
     TowerLayerTrace trace;
     cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev_upload = nullptr;
@@ -259,13 +260,14 @@ struct TowerRunner {
             cudaEventSynchronize(ev_upload);
             upload_pending = false;
         }
+        dense_ws.release();
         auto freep = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
         auto freeh = [](auto*& p) { if (p) { cudaFreeHost(p); p = nullptr; } };
         for (auto*& p : k_caches) freep(p);
         for (auto*& p : v_caches) freep(p);
         k_caches.clear(); v_caches.clear();
         freep(d_unseen); freep(d_hid_a); freep(d_hid_b); freep(d_eh_cat);
-        freep(d_res_f32); freep(d_ref_x_f32); freep(d_ref_y_f32); freep(d_norm); freep(d_wqkv); freep(d_q_ready);
+        freep(d_res_f32); freep(d_res_delta); freep(d_ref_x_f32); freep(d_ref_y_f32); freep(d_norm); freep(d_wqkv); freep(d_q_ready);
         freep(d_attn_out); freep(d_ffn_1); freep(d_ffn_3); freep(d_head_logits);
         freep(d_codes); freep(d_sem); freep(d_frames); freep(d_slots); freep(d_pos);
         freeh(h_slots); freeh(h_pos); freeh(h_sem); freeh(h_codes); freeh(h_frames); freeh(h_head_tmp);
@@ -320,6 +322,7 @@ struct TowerRunner {
         alloc_d(d_hid_b, size_t(max_chunk) * H);
         alloc_d(d_eh_cat, size_t(max_chunk) * 2 * H);
         alloc_d(d_res_f32, size_t(max_chunk) * H);
+        alloc_d(d_res_delta, size_t(max_chunk) * H);
         if (W->mode == WeightMode::RefF32) {
             alloc_d(d_ref_x_f32, size_t(max_chunk) * c.tower_intermediate);
             alloc_d(d_ref_y_f32, size_t(max_chunk) * (2 * qw + 2 * kvw));
@@ -343,14 +346,37 @@ struct TowerRunner {
         TTS_CK(cudaHostAlloc(&h_codes, size_t(c.tower_res) * max_chunk * sizeof(int32_t), cudaHostAllocDefault));
         TTS_CK(cudaHostAlloc(&h_frames, size_t(max_chunk) * c.row_width() * sizeof(int32_t), cudaHostAllocDefault));
         TTS_CK(cudaHostAlloc(&h_head_tmp, size_t(max_chunk) * geom::RES_CB_SIZE * sizeof(float), cudaHostAllocDefault));
+
+        if (W->mode == WeightMode::Native) {
+            dense_ws.init(max_chunk);
+            scratch_bytes += dense_ws.scratch_bytes;
+        }
     }
 
-    void proj_bf16(const bf16* X, const RefMat& ref_w, bf16* Y, int M, int N, int K, cudaStream_t stream) {
-        gemm_ref(blas, X, ref_w, Y, M, N, K, false, 0.0f, d_ref_x_f32, d_ref_y_f32, stream);
+    void proj_bf16(const bf16* X, const RefMat& ref_w, const g6emb::DevMatrix& nat_w,
+                   bf16* Y, int M, int N, int K, cudaStream_t stream) {
+        if (W->mode == WeightMode::Native && nat_w.valid()) {
+            tts_native_linear_bf16(X, nat_w, Y, M, dense_ws, blas, stream);
+        } else {
+            gemm_ref(blas, X, ref_w, Y, M, N, K, false, 0.0f, d_ref_x_f32, d_ref_y_f32, stream);
+        }
     }
 
-    void proj_f32(const bf16* X, const RefMat& ref_w, float* Y, int M, int N, int K, bool add_res, cudaStream_t stream) {
-        gemm_ref(blas, X, ref_w, Y, M, N, K, true, add_res ? 1.0f : 0.0f, d_ref_x_f32, d_ref_y_f32, stream);
+    void proj_f32(const bf16* X, const RefMat& ref_w, const g6emb::DevMatrix& nat_w,
+                  float* Y, int M, int N, int K, bool add_res, cudaStream_t stream) {
+        if (W->mode == WeightMode::Native && nat_w.valid()) {
+            tts_native_linear_f32(X, nat_w, Y, M, N, add_res, dense_ws, blas, stream);
+        } else {
+            gemm_ref(blas, X, ref_w, Y, M, N, K, true, add_res ? 1.0f : 0.0f, d_ref_x_f32, d_ref_y_f32, stream);
+        }
+    }
+
+    void proj_res_bf16(const bf16* X, const RefMat& ref_w, const g6emb::DevMatrix& nat_w,
+                       float* Y_res, int M, int N, int K, bool add_res, cudaStream_t stream) {
+        proj_bf16(X, ref_w, nat_w, d_res_delta, M, N, K, stream);
+        const size_t y_n = size_t(M) * size_t(N);
+        k_tts_res_update_bf16<<<static_cast<unsigned>((y_n + 255) / 256), 256, 0, stream>>>(
+            d_res_delta, Y_res, y_n, add_res ? 1 : 0);
     }
 
     // Runs one TowerLayer (shared or residual) on `M` rows.
@@ -392,7 +418,7 @@ struct TowerRunner {
         k_tower_eh_cat_norm<<<M, 256, 0, stream>>>(
             hidden_in, dev_codes, dev_sem, TW.embedding, dev_unseen,
             TW.enorm, TW.hnorm, d_eh_cat, M, H, c.tower_vocab, c.tower_norm_eps);
-        proj_f32(d_eh_cat, TW.eh_proj, d_res_f32, M, H, 2 * H, false, stream);
+        proj_f32(d_eh_cat, TW.eh_proj, TW.eh_proj_nat, d_res_f32, M, H, 2 * H, false, stream);
         if (sub_slot >= 0) {
             cap_bf(d_eh_cat, size_t(M) * 2 * H, trace.sub[sub_slot].eh_cat);
             cap_f32(d_res_f32, size_t(M) * H, trace.sub[sub_slot].eh_proj);
@@ -400,7 +426,7 @@ struct TowerRunner {
 
         // 2. Attention
         k_zc_rmsnorm_f32_to_bf16<<<M, 256, 0, stream>>>(d_res_f32, TW.attn_norm, d_norm, M, H, c.tower_norm_eps);
-        proj_bf16(d_norm, TW.wqkv, d_wqkv, M, wqkv_dim, H, stream);
+        proj_bf16(d_norm, TW.wqkv, TW.wqkv_nat, d_wqkv, M, wqkv_dim, H, stream);
 
         dim3 qk_grid(M, c.tower_heads + c.tower_kv_heads);
         k_tower_qk_norm_rope_kv<<<qk_grid, 256, 0, stream>>>(
@@ -415,7 +441,8 @@ struct TowerRunner {
             dev_slots, dev_pos, M, c.tower_heads, c.tower_kv_heads, c.tower_head_dim, cap,
             false, wqkv_dim, qw);
 
-        proj_f32(d_attn_out, TW.wo, d_res_f32, M, H, qw, true, stream);
+        // wo accumulates into FP32 residual
+        proj_f32(d_attn_out, TW.wo, TW.wo_nat, d_res_f32, M, H, qw, true, stream);
         if (sub_slot >= 0) {
             cap_bf(d_wqkv, size_t(M) * wqkv_dim, trace.sub[sub_slot].wqkv);
             cap_bf(d_q_ready, size_t(M) * qw, trace.sub[sub_slot].q_ready);
@@ -423,13 +450,17 @@ struct TowerRunner {
             cap_f32(d_res_f32, size_t(M) * H, trace.sub[sub_slot].wo_res);
         }
 
-        // 3. SwiGLU FFN with FP32-output w2 into FP32 residual
+        // 3. SwiGLU FFN with true FP32-output w2 into FP32 residual (prevents >65504 BF16 ULP cancellation errors!)
         k_zc_rmsnorm_f32_to_bf16<<<M, 256, 0, stream>>>(d_res_f32, TW.ffn_norm, d_norm, M, H, c.tower_norm_eps);
-        proj_bf16(d_norm, TW.w1, d_ffn_1, M, c.tower_intermediate, H, stream);
-        proj_bf16(d_norm, TW.w3, d_ffn_3, M, c.tower_intermediate, H, stream);
+        if (W->mode == WeightMode::Native && TW.w1_nat.valid() && TW.w3_nat.valid()) {
+            tts_native_linear_dual_bf16(d_norm, TW.w1_nat, TW.w3_nat, d_ffn_1, d_ffn_3, M, dense_ws, blas, stream);
+        } else {
+            proj_bf16(d_norm, TW.w1, TW.w1_nat, d_ffn_1, M, c.tower_intermediate, H, stream);
+            proj_bf16(d_norm, TW.w3, TW.w3_nat, d_ffn_3, M, c.tower_intermediate, H, stream);
+        }
         const size_t fn = size_t(M) * c.tower_intermediate;
         k_silu_mul_bf16<<<int((fn + 255) / 256), 256, 0, stream>>>(d_ffn_1, d_ffn_3, d_ffn_1, fn);
-        proj_f32(d_ffn_1, TW.w2, d_res_f32, M, H, c.tower_intermediate, true, stream);
+        proj_f32(d_ffn_1, TW.w2, TW.w2_nat, d_res_f32, M, H, c.tower_intermediate, true, stream);
         if (sub_slot >= 0) {
             cap_bf(d_ffn_1, fn, trace.sub[sub_slot].ffn_act);
             cap_f32(d_res_f32, size_t(M) * H, trace.sub[sub_slot].w2_res);
@@ -452,7 +483,7 @@ struct TowerRunner {
         }
     }
 
-    // Runs all 4 shared layers; returns pointer to active hidden buffer.
+    // Runs all 4 shared layers; result lands in `d_hid_a` (returns pointer to active hidden buffer).
     bf16* run_shared(const bf16* bb_hidden,
                      const int32_t* dev_c0, const uint8_t* dev_sem,
                      const int32_t* dev_frames,
@@ -507,7 +538,8 @@ struct TowerRunner {
             cudaEventRecord(ev0, stream);
         }
         if (compute_head) {
-            proj_f32(next_hid, W->heads[size_t(res_idx)], d_head_logits, M, head_out_rows, c.hidden_size, false, stream);
+            proj_f32(next_hid, W->heads[size_t(res_idx)], W->heads_nat[size_t(res_idx)],
+                     d_head_logits, M, head_out_rows, c.hidden_size, false, stream);
         }
         if (prof.enabled) {
             cudaEventRecord(ev1, stream);
@@ -529,6 +561,7 @@ struct TowerRunner {
         if (M > max_chunk) {
             throw std::runtime_error("TowerRunner::prefill_chunk: M exceeds max_chunk");
         }
+        // Ensure previous async H2D copies from our persistent pinned staging buffers have completed.
         if (upload_pending) {
             TTS_CK(cudaEventSynchronize(ev_upload));
             upload_pending = false;
@@ -542,6 +575,7 @@ struct TowerRunner {
             const int main_nxt = h_next_frames[size_t(m) * rw + 0];
             h_sem[m] = c.is_semantic(main_nxt) ? 1 : 0;
         }
+        // Pack all `c.tower_res` code rows [i, m] contiguously so a single H2D upload feeds shared (c0 = i=0) + all 9 residual layers.
         for (int i = 0; i < c.tower_res; ++i) {
             int32_t* dst = h_codes + size_t(i) * M;
             for (int m = 0; m < M; ++m) {
