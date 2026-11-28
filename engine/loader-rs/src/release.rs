@@ -219,6 +219,8 @@ struct Planner<'a> {
     /// kv_b (UK / UV) as the release's block FP8 bytes and scales (#50); false: BF16
     kvb_fp8: bool,
     kvb_rot: bool,
+    /// emit L*.kv_b.uk pre-transposed to [nh, 512, 192] (and .scale [nh, 4, 192]) so attn/bind.cu binds zero-copy
+    kvb_uk_t: bool,
 }
 
 /// A tensor of a planned group: name, manifest dtype, shape, bytes.
@@ -434,17 +436,32 @@ impl Planner<'_> {
         } else {
             self.note(l, Form { what: "kv_b", src: fmt_name(&kvb), form: if self.kvb_rot { "BF16 (UK H, UV H; GR8_KV4_FOLD)" } else { "BF16 (UK, UV)" },
                                 exact: if kvb.rec.fmt == FP8_BLOCK { BF16_OF } else { ROUNDED } });
-            let (f2, kv_rows, kvb_rot) = (f.clone(), runs(&heads, 448), self.kvb_rot);
+            let (f2, kv_rows, kvb_rot, kvb_uk_t) = (f.clone(), runs(&heads, 448), self.kvb_rot, self.kvb_uk_t);
+            let uk_shape = if kvb_uk_t { vec![nh as i64, 512, 192] } else { vec![nh as i64, 192, 512] };
             self.gen(format!("{p}.kv_b"), vec![
-                (format!("{p}.kv_b.uk"), "bf16", vec![nh as i64, 192, 512]),
+                (format!("{p}.kv_b.uk"), "bf16", uk_shape),
                 (format!("{p}.kv_b.uv"), "bf16", vec![nh as i64, 256, 512])], move || {
                 let mut raw = decode_runs(&Matrix::open(&f2, "self_attn.kv_b_proj")?, &kv_rows, &[0..512], t)?;
                 if kvb_rot { fwht512_rows(&mut raw); }
                 let w = bf16v(&raw);
-                let (mut uk, mut uv) = (Vec::new(), Vec::new());
-                for h in 0..nh {
-                    uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
-                    uv.extend_from_slice(&w[(h * 448 + 192) * 512..][..256 * 512]);
+                let (mut uk, mut uv) = (Vec::with_capacity(nh * 192 * 512), Vec::with_capacity(nh * 256 * 512));
+                if kvb_uk_t {
+                    uk.resize(nh * 512 * 192, 0);
+                    for h in 0..nh {
+                        let src = &w[h * 448 * 512..][..192 * 512];
+                        let dst = &mut uk[h * 512 * 192..][..512 * 192];
+                        for r in 0..192 {
+                            for c in 0..512 {
+                                dst[c * 192 + r] = src[r * 512 + c];
+                            }
+                        }
+                        uv.extend_from_slice(&w[(h * 448 + 192) * 512..][..256 * 512]);
+                    }
+                } else {
+                    for h in 0..nh {
+                        uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
+                        uv.extend_from_slice(&w[(h * 448 + 192) * 512..][..256 * 512]);
+                    }
                 }
                 Ok(vec![le16(&uk), le16(&uv)])
             });
@@ -598,7 +615,7 @@ impl Planner<'_> {
             return Err(format!("{}: kv_b is {} [{} x {}]: GR8_KVB=fp8 needs the release's block FP8 [28672 x 512]",
                                f.path, fmt_name(kvb), kvb.rec.out, kvb.rec.inp));
         }
-        let kvb_rot = self.kvb_rot;
+        let (kvb_rot, kvb_uk_t) = (self.kvb_rot, self.kvb_uk_t);
         self.note(l, Form {
             what: "kv_b",
             src: fmt_name(kvb),
@@ -606,19 +623,45 @@ impl Planner<'_> {
             exact: if kvb_rot { ROUNDED } else { EXACT },
         });
         let f2 = f.clone();
+        let uk_shape = if kvb_uk_t { vec![nh as i64, 512, 192] } else { vec![nh as i64, 192, 512] };
+        let uks_shape = if kvb_uk_t { vec![nh as i64, 4, 192] } else { vec![nh as i64, 192, 4] };
         self.gen(format!("{p}.kv_b"), vec![
-            (format!("{p}.kv_b.uk"), "u8", vec![nh as i64, 192, 512]),
+            (format!("{p}.kv_b.uk"), "u8", uk_shape),
             (format!("{p}.kv_b.uv"), "u8", vec![nh as i64, 256, 512]),
-            (format!("{p}.kv_b.uk.scale"), "f32", vec![nh as i64, 192, 4]),
+            (format!("{p}.kv_b.uk.scale"), "f32", uks_shape),
             (format!("{p}.kv_b.uv.scale"), "f32", vec![nh as i64, 256, 4])], move || {
             let (w, s) = Matrix::open(&f2, "self_attn.kv_b_proj")?.fp8_rows(&(h0 * 448..(h0 + nh) * 448))?;
             let (w, s) = if kvb_rot { fp8_fold_rows(&w, &s) } else { (w, s) };
-            let (mut uk, mut uv, mut uks, mut uvs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            for h in 0..nh {
-                uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
-                uv.extend_from_slice(&w[(h * 448 + 192) * 512..][..256 * 512]);
-                uks.extend_from_slice(&s[h * 448 * 4..][..192 * 4]);
-                uvs.extend_from_slice(&s[(h * 448 + 192) * 4..][..256 * 4]);
+            let (mut uk, mut uv, mut uks, mut uvs) = (Vec::with_capacity(nh * 192 * 512), Vec::with_capacity(nh * 256 * 512),
+                                                      Vec::with_capacity(nh * 192 * 4), Vec::with_capacity(nh * 256 * 4));
+            if kvb_uk_t {
+                uk.resize(nh * 512 * 192, 0);
+                uks.resize(nh * 4 * 192, 0.0);
+                for h in 0..nh {
+                    let src = &w[h * 448 * 512..][..192 * 512];
+                    let dst = &mut uk[h * 512 * 192..][..512 * 192];
+                    for r in 0..192 {
+                        for c in 0..512 {
+                            dst[c * 192 + r] = src[r * 512 + c];
+                        }
+                    }
+                    let ssrc = &s[h * 448 * 4..][..192 * 4];
+                    let sdst = &mut uks[h * 4 * 192..][..4 * 192];
+                    for r in 0..192 {
+                        for g in 0..4 {
+                            sdst[g * 192 + r] = ssrc[r * 4 + g];
+                        }
+                    }
+                    uv.extend_from_slice(&w[(h * 448 + 192) * 512..][..256 * 512]);
+                    uvs.extend_from_slice(&s[(h * 448 + 192) * 4..][..256 * 4]);
+                }
+            } else {
+                for h in 0..nh {
+                    uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
+                    uv.extend_from_slice(&w[(h * 448 + 192) * 512..][..256 * 512]);
+                    uks.extend_from_slice(&s[h * 448 * 4..][..192 * 4]);
+                    uvs.extend_from_slice(&s[(h * 448 + 192) * 4..][..256 * 4]);
+                }
             }
             let le32 = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
             Ok(vec![uk, uv, le32(&uks), le32(&uvs)])
@@ -894,6 +937,8 @@ pub struct Opts {
     /// kv_b (UK / UV) as the release's block FP8 bytes and scales (#50, GR8_KVB=fp8); false: BF16 of them
     pub kvb_fp8: bool,
     pub kvb_rot: bool,
+    /// emit L*.kv_b.uk pre-transposed to [nh, 512, 192] (and .scale [nh, 4, 192]) for zero-copy binder attach (GLM-5.3 non-QO)
+    pub kvb_uk_t: bool,
 }
 
 fn validate_kvb_opts(opts: Opts, is_flash: bool) -> Result<(), String> {
@@ -934,7 +979,8 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     let workers = gr8knobs::LOAD_THREADS.get() as usize;
     let mut p = Planner { b: Builder::new(), layout, rank, threads: (cores / workers).max(1), forms: BTreeMap::new(),
-                         qo: opts.qo, trellis: opts.trellis, kvb_fp8: opts.kvb_fp8, kvb_rot: opts.kvb_rot };
+                         qo: opts.qo, trellis: opts.trellis, kvb_fp8: opts.kvb_fp8, kvb_rot: opts.kvb_rot,
+                         kvb_uk_t: false };
     // the release's files name the model (their metadata); the width manifest has one format for every model
     let model = flash::model_meta(dense_dir)?;
     let is_flash = model.as_ref().and_then(|m| m.get("hidden_size")).and_then(Json::str) == Some("4096");
@@ -943,6 +989,7 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     if is_flash && opts.qo { return Err("Flash full-head QO prefill copies are not implemented".into()); }
     validate_kvb_opts(opts, is_flash)?;
     if is_flash && opts.kvb_fp8 { return Err("GR8_KVB=fp8: Flash kv_b loads as BF16 only".into()); }
+    p.kvb_uk_t = opts.kvb_uk_t && !is_flash && !opts.qo;
     let last = if is_flash { 45 } else { L_MTP };
     if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }
     let mut moe = 0;

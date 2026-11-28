@@ -515,11 +515,13 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
     let r = (|| {
         let kvb_fp8 = kvb_fp8()?;
         let kvb_rot = kvb_rot();
+        // Pre-transpose L*.kv_b.uk when prefill does not assemble QO/pair-owner BF16 copies from L*.kv_b.uk (PF_OWN < 3).
+        let kvb_uk_t = qo == 0 && gr8knobs::PF_OWN.get() < 3;
         let layout_path: Option<String> = cstr(layout);
         let layout = cstr(layout).map(|p| layout::Layout::read(&p)).transpose()?;
         let (img, table) = release::plan(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
                                          &arg(widths, "width manifest")?, nr as usize, rank as usize, layout.as_ref(),
-                                         release::Opts { qo: qo != 0, trellis: trellis != 0, kvb_fp8, kvb_rot })?;
+                                         release::Opts { qo: qo != 0, trellis: trellis != 0, kvb_fp8, kvb_rot, kvb_uk_t })?;
         let out = arg(out_manifest, "output manifest")?;
         std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
         if rank == 0 {
@@ -535,7 +537,7 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
                                 arg(widths, "width manifest")?);
         let lp = layout_path.clone().unwrap_or_default();
         let key_text = format!("release dense={de} v2={v2} slices={sl} widths={wd} nr={nr} rank={rank} qo={qo} trellis={trellis} \
-                                kvb_fp8={kvb_fp8} kvb_rot={kvb_rot} layout={lp:?}\n{}\n{}", img.manifest(),
+                                kvb_fp8={kvb_fp8} kvb_rot={kvb_rot} kvb_uk_t={kvb_uk_t} layout={lp:?}\n{}\n{}", img.manifest(),
                                gencache::source_identity(&[&de, &v2, &sl, &wd, &lp]));
         img.cache = gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)
