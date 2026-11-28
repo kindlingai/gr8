@@ -127,6 +127,10 @@ def load_clips(clips_dir: Path | None, n_clips: int) -> list[tuple[str, np.ndarr
 
 
 def load_fish_dac(fish_speech_dir: Path, codec_pth: Path, device: str) -> Any:
+    # Enforce true IEEE FP32 for the PyTorch reference (PyTorch enables cuDNN TF32 by default on SM80+).
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
     sys.path.insert(0, str(fish_speech_dir))
     import hydra
     from omegaconf import OmegaConf
