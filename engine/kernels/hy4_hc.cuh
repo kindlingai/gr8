@@ -169,12 +169,14 @@ inline void launch_bf16_gemv_smallm(const __nv_bfloat16* A, const __nv_bfloat16*
         if (M <= 1)      k_hy4_bf16_gemv_smallm<1,  OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
         else if (M <= 2) k_hy4_bf16_gemv_smallm<2,  OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
         else if (M <= 4) k_hy4_bf16_gemv_smallm<4,  OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+        else if (M <= 6) k_hy4_bf16_gemv_smallm<6,  OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
         else if (M <= 8) k_hy4_bf16_gemv_smallm<8,  OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
         else             k_hy4_bf16_gemv_smallm<12, OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
     } else {
         if (M <= 1)      k_hy4_bf16_gemv_smallm<1,  OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
         else if (M <= 2) k_hy4_bf16_gemv_smallm<2,  OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
         else if (M <= 4) k_hy4_bf16_gemv_smallm<4,  OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+        else if (M <= 6) k_hy4_bf16_gemv_smallm<6,  OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
         else if (M <= 8) k_hy4_bf16_gemv_smallm<8,  OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
         else             k_hy4_bf16_gemv_smallm<12, OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
     }

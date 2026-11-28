@@ -664,19 +664,34 @@ __global__ void __launch_bounds__(256) k_hy4_mx8_dequant_bf16(
     const uint8_t* __restrict__ sc,
     __nv_bfloat16* __restrict__ out,
     size_t total_blocks) {
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const size_t blk = static_cast<size_t>(blockIdx.x) * 8 + warp;
-    if (blk >= total_blocks) return;
-    const float s = __uint_as_float(static_cast<uint32_t>(sc[blk]) << 23);
-    const size_t idx = blk * 32 + lane;
-    const __nv_fp8_e4m3 f = *reinterpret_cast<const __nv_fp8_e4m3*>(q + idx);
-    out[idx] = __float2bfloat16(static_cast<float>(f) * s);
+    // 1 thread = 16 FP8 elements (half of a 32-elem MXFP8 block) -> 1x uint4 load + 2x uint4 BF16 stores!
+    const size_t hb = static_cast<size_t>(blockIdx.x) * 256 + threadIdx.x;
+    if (hb >= total_blocks * 2) return;
+    const float s = __uint_as_float(static_cast<uint32_t>(__ldg(sc + (hb >> 1))) << 23);
+    const uint4 qv = __ldg(reinterpret_cast<const uint4*>(q) + hb);
+    float2 f[8];
+    fp8x4_unpack(qv.x, f[0], f[1]);
+    fp8x4_unpack(qv.y, f[2], f[3]);
+    fp8x4_unpack(qv.z, f[4], f[5]);
+    fp8x4_unpack(qv.w, f[6], f[7]);
+    uint4 o0, o1;
+    o0.x = pack_bf16x2(f[0].x * s, f[0].y * s);
+    o0.y = pack_bf16x2(f[1].x * s, f[1].y * s);
+    o0.z = pack_bf16x2(f[2].x * s, f[2].y * s);
+    o0.w = pack_bf16x2(f[3].x * s, f[3].y * s);
+    o1.x = pack_bf16x2(f[4].x * s, f[4].y * s);
+    o1.y = pack_bf16x2(f[5].x * s, f[5].y * s);
+    o1.z = pack_bf16x2(f[6].x * s, f[6].y * s);
+    o1.w = pack_bf16x2(f[7].x * s, f[7].y * s);
+    uint4* dst4 = reinterpret_cast<uint4*>(out) + hb * 2;
+    dst4[0] = o0;
+    dst4[1] = o1;
 }
 
 inline void dequant_to_bf16(const Mx8Mat& m, __nv_bfloat16* dst, cudaStream_t st) {
     const size_t nblk = static_cast<size_t>(m.N) * (m.K >> 5);
-    k_hy4_mx8_dequant_bf16<<<static_cast<unsigned>((nblk + 7) / 8), 256, 0, st>>>(m.q, m.sc, dst, nblk);
+    const size_t nhb = nblk * 2;
+    k_hy4_mx8_dequant_bf16<<<static_cast<unsigned>((nhb + 255) / 256), 256, 0, st>>>(m.q, m.sc, dst, nblk);
 }
 
 // Contiguous arena allocator for boot-time MXFP8 dense quantization.

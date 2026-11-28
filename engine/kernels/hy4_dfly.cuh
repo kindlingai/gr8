@@ -88,6 +88,22 @@ struct RankWeights {
     LayerWeights         layers[NUM_LAYERS]{};
 };
 
+struct alignas(16) DflyGraphMeta {
+    int slot;
+    int bonus_tok;
+    int anchor;
+    int rope_delta;
+    int snap_row;
+    int pad[3];
+};
+
+struct alignas(16) DflyArgPair {
+    float val;
+    int id;
+    int pad0;
+    int pad1;
+};
+
 struct Scratch {
     int max_W = 0;
     __nv_bfloat16* h          = nullptr; // [max_W, 3072]
@@ -100,9 +116,11 @@ struct Scratch {
     __nv_bfloat16* hc_gate    = nullptr; // [3072]
     __nv_bfloat16* hc_up      = nullptr; // [3072]
     int*           d_q_pos    = nullptr; // [max_W]
-    int*           d_draft_id = nullptr; // [max_W] (GPU-side argmax chain for zero-sync TP=1 greedy!)
+    int*           d_draft_id = nullptr; // [max_W] (GPU-side argmax chain for zero-sync TP=1/TP=2 greedy!)
     float*         d_max_v    = nullptr; // [256] (partial argmax vals)
     int*           d_max_i    = nullptr; // [256] (partial argmax ids)
+    DflyGraphMeta* d_meta     = nullptr; // [1] (device metadata for CUDA-Graph DFly2!)
+    DflyArgPair*   d_arg_pair = nullptr; // [1] (16B local argmax pair for TP=2 GPU-side RDMA merge!)
 };
 
 // =================================================================================================
@@ -115,18 +133,29 @@ __global__ void k_dfly_bf16_to_f32(const __nv_bfloat16* __restrict__ src, float*
 }
 
 // Initialize DFly2 query block h[0..W-1, 3072] and positions d_q_pos[0..W-1] = anchor + 0..W-1.
+// When d_meta != nullptr, reads (bonus_tok, anchor, rope_delta) on device and seeds d_draft_id[0] = bonus_tok (graph-safe!).
 // Grid: (W * 12), Block: 256.
 __global__ void __launch_bounds__(256) k_dfly_init_block(
     const __nv_bfloat16* __restrict__ embed,
     __nv_bfloat16* __restrict__ h,
     int* __restrict__ d_q_pos,
-    int bonus_tok, int anchor, int rope_delta, int W) {
+    int bonus_tok, int anchor, int rope_delta, int W,
+    const DflyGraphMeta* __restrict__ d_meta = nullptr,
+    int* __restrict__ d_draft_id = nullptr) {
     const int w = blockIdx.x / 12;
     const int d = (blockIdx.x % 12) * 256 + threadIdx.x;
     if (w >= W || d >= geom::HID) return;
+    if (d_meta != nullptr) {
+        bonus_tok  = d_meta->bonus_tok;
+        anchor     = d_meta->anchor;
+        rope_delta = d_meta->rope_delta;
+    }
     const int tok = (w == 0) ? bonus_tok : MASK_TOK;
     h[static_cast<size_t>(w) * geom::HID + d] = embed[static_cast<size_t>(tok) * geom::HID + d];
-    if (d == 0) d_q_pos[w] = anchor + w + rope_delta;
+    if (d == 0) {
+        d_q_pos[w] = anchor + w + rope_delta;
+        if (w == 0 && d_draft_id != nullptr) d_draft_id[0] = bonus_tok;
+    }
 }
 
 // Compute cat(rmsnorm(a, w_a), rmsnorm(b, w_b)) -> out[6144] BF16 (2 blocks: block 0 does a -> [0..3071], block 1 does b -> [3072..6143]).
@@ -134,9 +163,11 @@ __global__ void __launch_bounds__(256) k_dfly_init_block(
 __global__ void __launch_bounds__(256) k_dfly_cat_norms(
     const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ wa,
     const __nv_bfloat16* __restrict__ b, const __nv_bfloat16* __restrict__ wb,
-    __nv_bfloat16* __restrict__ out) {
+    __nv_bfloat16* __restrict__ out,
+    const DflyGraphMeta* __restrict__ d_meta = nullptr) {
     const int which = blockIdx.x;
-    const __nv_bfloat16* x = (which == 0) ? a : b;
+    const __nv_bfloat16* b_eff = (d_meta != nullptr) ? (b + static_cast<size_t>(d_meta->snap_row) * geom::HID) : b;
+    const __nv_bfloat16* x = (which == 0) ? a : b_eff;
     const __nv_bfloat16* w = (which == 0) ? wa : wb;
     __nv_bfloat16* y = out + static_cast<size_t>(which) * geom::HID;
     const int tid = threadIdx.x;
@@ -332,6 +363,35 @@ __global__ void __launch_bounds__(256) k_dfly_argmax_p2(
     }
 }
 
+// Stage-2 argmax producing a 16B (max_val, global_max_id) pair for zero-sync TP=2 GPU RDMA merge!
+__global__ void __launch_bounds__(256) k_dfly_argmax_p2_pair(
+    const float* __restrict__ pval, const int* __restrict__ pid,
+    int v_offset, DflyArgPair* __restrict__ out_pair, int nb) {
+    const int tid = threadIdx.x;
+    float bv = (tid < nb) ? pval[tid] : -INFINITY;
+    int bi   = (tid < nb) ? pid[tid]  : 0;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+        const int oi   = __shfl_xor_sync(0xffffffffu, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; }
+    __syncthreads();
+    if (tid == 0) {
+        float mv = sv[0]; int mi = si[0];
+        for (int w = 1; w < 8; ++w) {
+            if (sv[w] > mv || (sv[w] == mv && si[w] < mi)) { mv = sv[w]; mi = si[w]; }
+        }
+        out_pair->val  = mv;
+        out_pair->id   = mi + v_offset;
+        out_pair->pad0 = 0;
+        out_pair->pad1 = 0;
+    }
+}
+
 // =================================================================================================
 // Tensor-Core DFly2 Absorbed MLA Kernel (mma.m16n8k16):
 //   Attends causally over [target DSA history (< anchor)] + [kv_draft[0..q_off]]!
@@ -352,13 +412,22 @@ __global__ void __launch_bounds__(256) k_dfly_mla_tc(
     float* __restrict__ split_m,                  // [W, NS, nh] (NS > 1)
     float* __restrict__ split_l,
     float* __restrict__ split_o,                  // [W, NS, nh, 512]
-    int slot, int W, int nh, int max_pps, int NS) {
+    int slot, int W, int nh, int max_pps, int NS,
+    const DflyGraphMeta* __restrict__ d_meta = nullptr) {
     const int n_hg = nh >> 4; // 32/nr / 16 -> 2 at TP=1, 1 at TP=2
     const int split_id = blockIdx.x % NS;
     const int rem = blockIdx.x / NS;
     const int hg = rem % n_hg;
     const int q_off = rem / n_hg;
     if (q_off >= W) return;
+
+    if (d_meta != nullptr) {
+        const int s_idx = d_meta->snap_row;
+        slot         = d_meta->slot;
+        snap_grp     = snap_grp + static_cast<size_t>(s_idx) * (geom::IDX_GROUP_TOPK - 1);
+        snap_cnt_ptr = snap_cnt_ptr + s_idx;
+        snap_pos_ptr = snap_pos_ptr + s_idx;
+    }
 
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;
@@ -630,15 +699,17 @@ inline void forward_body(
     int slot, int bonus_tok, int anchor, int W, int max_pps,
     cudaStream_t st,
     const std::function<void(int c, int M, const __nv_bfloat16* post_ln)>& on_ar_add = nullptr,
-    int rope_delta = 0) {
+    int rope_delta = 0,
+    const DflyGraphMeta* d_meta = nullptr) {
 
     ensure_dfly_mla_smem();
     const RankWeights& w0 = rw[0];
     // 1. Embed [bonus_tok, MASK, ..., MASK] + positions [anchor + rope_delta .. anchor + W - 1 + rope_delta]
-    k_dfly_init_block<<<W * 12, 256, 0, st>>>(embed, sc.h, sc.d_q_pos, bonus_tok, anchor, rope_delta, W);
+    k_dfly_init_block<<<W * 12, 256, 0, st>>>(
+        embed, sc.h, sc.d_q_pos, bonus_tok, anchor, rope_delta, W, d_meta, d_meta ? sc.d_draft_id : nullptr);
 
     // 2. Slot-0 mtp_fusion: h[0] += gate * eh_proj(cat(enorm(h[0]), hnorm(target_hidden)))
-    k_dfly_cat_norms<<<2, 256, 0, st>>>(sc.h, w0.mtp_enorm, target_hidden, w0.mtp_hnorm, sc.cat6144);
+    k_dfly_cat_norms<<<2, 256, 0, st>>>(sc.h, w0.mtp_enorm, target_hidden, w0.mtp_hnorm, sc.cat6144, d_meta);
     mx8::linear_w(blas, sc.cat6144, w0.mtp_eh_proj, sc.tmp3072, 1, geom::HID, 2 * geom::HID, x8_scratch, nullptr, st);
     k_dfly_mtp_add<<<12, 256, 0, st>>>(sc.h, w0.mtp_gate, sc.tmp3072);
 
@@ -676,19 +747,19 @@ inline void forward_body(
                     attn_sc.q_full, lw.sinks, tkv->kv_pool, d_page_table,
                     snap_grp_ptrs[d], snap_cnt_ptrs[d], snap_pos_ptrs[d],
                     sc.kv_draft, attn_sc.u_h, attn_sc.split_m, attn_sc.split_l, attn_sc.split_o,
-                    slot, W, nh, max_pps, NS);
+                    slot, W, nh, max_pps, NS, d_meta);
             } else if (tkv->fmt == KvFmt::INT4) {
                 k_dfly_mla_tc<KvFmt::INT4><<<grid_mla, 256, DFLY_MLA_SMEM, st>>>(
                     attn_sc.q_full, lw.sinks, tkv->kv_pool, d_page_table,
                     snap_grp_ptrs[d], snap_cnt_ptrs[d], snap_pos_ptrs[d],
                     sc.kv_draft, attn_sc.u_h, attn_sc.split_m, attn_sc.split_l, attn_sc.split_o,
-                    slot, W, nh, max_pps, NS);
+                    slot, W, nh, max_pps, NS, d_meta);
             } else {
                 k_dfly_mla_tc<KvFmt::BF16><<<grid_mla, 256, DFLY_MLA_SMEM, st>>>(
                     attn_sc.q_full, lw.sinks, tkv->kv_pool, d_page_table,
                     snap_grp_ptrs[d], snap_cnt_ptrs[d], snap_pos_ptrs[d],
                     sc.kv_draft, attn_sc.u_h, attn_sc.split_m, attn_sc.split_l, attn_sc.split_o,
-                    slot, W, nh, max_pps, NS);
+                    slot, W, nh, max_pps, NS, d_meta);
             }
             if (NS > 1) {
                 k_hy4_mla_split_reduce<<<W * nh, 256, 0, st>>>(attn_sc.split_m, attn_sc.split_l, attn_sc.split_o, attn_sc.u_h, W, nh, NS);

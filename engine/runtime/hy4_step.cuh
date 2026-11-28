@@ -594,14 +594,17 @@ struct Engine {
         bool ready = false;
     };
     std::map<GraphKey, SegGraph> graphs;
+    std::map<int, cudaGraphExec_t> dfly_graphs; // keyed by W (full DFly2 body + K greedy steps in 1 graph!)
+    hy4::dfly::DflyGraphMeta* h_dfly_meta_pinned = nullptr;
 
     // Optional collective hooks (set by g6m4_hy4 for TP=2 over RDMA)
     std::function<void(int M, bool skip_head)> on_step_begin;
     std::function<void(int c, int M, const __nv_bfloat16* post_ln_w)> on_ar_norm_inject;
     std::function<void(int c, int M, uint8_t* host_parts, size_t row_bytes)> on_head_gather;
     std::function<void()> on_step_end;
-    std::function<void(int M)> on_dfly_begin;
+    std::function<void(int M, bool dev_argmax)> on_dfly_begin;
     std::function<void(int c, int M, const __nv_bfloat16* post_ln_w)> on_dfly_ar_add;
+    std::function<void(int c, const hy4::dfly::DflyArgPair* local_pair, int* dst_id)> on_dfly_argmax_tp2;
     std::function<void(int c, int M, uint8_t* host_parts, size_t row_bytes)> on_dfly_head_gather;
     std::function<void()> on_dfly_end;
 
@@ -622,6 +625,7 @@ struct Engine {
         if (head_host_parts) cudaFreeHost(head_host_parts);
         if (h_meta_pinned) cudaFreeHost(h_meta_pinned);
         if (h_eng_mask_pinned) cudaFreeHost(h_eng_mask_pinned);
+        if (h_dfly_meta_pinned) cudaFreeHost(h_dfly_meta_pinned);
         for (auto* p : dfly_perm_bf16) if (p) cudaFree(p);
         for (auto* p : dfly_sinks_f32) if (p) cudaFree(p);
         if (ev_a) cudaEventDestroy(ev_a);
@@ -638,6 +642,10 @@ struct Engine {
             }
         }
         graphs.clear();
+        for (auto& kv : dfly_graphs) {
+            if (kv.second) { cudaGraphExecDestroy(kv.second); kv.second = nullptr; }
+        }
+        dfly_graphs.clear();
     }
 
     static std::string lname(int l, const std::string& suf) {
@@ -1295,6 +1303,9 @@ struct Engine {
             dfly_sc.d_draft_id = dalloc<int>(size_t(dfly_w_max));
             dfly_sc.d_max_v    = dalloc<float>(256);
             dfly_sc.d_max_i    = dalloc<int>(256);
+            dfly_sc.d_meta     = dalloc<hy4::dfly::DflyGraphMeta>(1);
+            dfly_sc.d_arg_pair = dalloc<hy4::dfly::DflyArgPair>(1);
+            HY4_CK(cudaMallocHost(&h_dfly_meta_pinned, sizeof(hy4::dfly::DflyGraphMeta)));
 
             constexpr int KSEL = geom::IDX_GROUP_TOPK - 1;
             for (int d = 0; d < hy4::dfly::NUM_LAYERS; ++d) {
@@ -1825,49 +1836,97 @@ struct Engine {
         const int s_idx = slot * dfly_w_max + snap_off;
 
         const auto td0 = std::chrono::steady_clock::now();
-        if (on_dfly_begin) on_dfly_begin(W);
+        const int rdelta = (slot >= 0 && size_t(slot) < slot_mrope_delta.size())
+            ? slot_mrope_delta[size_t(slot)] : 0;
+        const bool fast_gpu_greedy = ((o.nr == 1 || (o.nr == 2 && static_cast<bool>(on_dfly_argmax_tp2))) &&
+                                      o.nloc == 1 &&
+                                      (!sm_base || !(sm_base->inv_temp > 0.f)) &&
+                                      out_draft_rows == nullptr);
+        const bool use_dfly_graph = fast_gpu_greedy && o.use_graphs && !o.profile;
 
-        // Gather target DSA KV pointers & snapshot pointers for layers [25, 29, 33, 37, 41]
+        if (on_dfly_begin) on_dfly_begin(W, fast_gpu_greedy);
+
+        // Gather target DSA KV pointers for layers [25, 29, 33, 37, 41]
         std::vector<const hy4::DsaLayerKv*> tkv(size_t(hy4::dfly::NUM_LAYERS * o.nloc));
-        std::array<const int*, hy4::dfly::NUM_LAYERS> sg_p{}, sc_p{}, sp_p{};
-        constexpr int KSEL = geom::IDX_GROUP_TOPK - 1;
         for (int d = 0; d < hy4::dfly::NUM_LAYERS; ++d) {
             const int tl = hy4::dfly::TARGET_DSA_LAYERS[d];
             for (int i = 0; i < o.nloc; ++i) tkv[size_t(d * o.nloc + i)] = &L[size_t(tl)].rk[size_t(i)].dsa_kv;
-            sg_p[size_t(d)] = dfly_snap_grp[size_t(d)] + size_t(s_idx) * KSEL;
-            sc_p[size_t(d)] = dfly_snap_cnt[size_t(d)] + s_idx;
-            sp_p[size_t(d)] = dfly_snap_pos[size_t(d)] + s_idx;
         }
-        const __nv_bfloat16* tgt_h = dfly_target_hidden + size_t(s_idx) * geom::HID;
 
-        const int rdelta = (slot >= 0 && size_t(slot) < slot_mrope_delta.size())
-            ? slot_mrope_delta[size_t(slot)] : 0;
-        hy4::dfly::forward_body(
-            blas, dfly_w, dfly_sc, attn_sc, tkv.data(),
-            sg_p.data(), sc_p.data(), sp_p.data(),
-            embed, tgt_h, parts, d_page_table, mx8_x8,
-            o.nr, o.rank0, o.nloc, slot, bonus_tok, anchor, W, max_pps, stream, on_dfly_ar_add, rdelta);
-
-        const bool fast_gpu_greedy = (o.nr == 1 && o.nloc == 1 &&
-                                      (!sm_base || !(sm_base->inv_temp > 0.f)) &&
-                                      out_draft_rows == nullptr);
         drafts.resize(size_t(K));
 
         if (fast_gpu_greedy) {
-            // Zero-sync TP=1 greedy chain on GPU: all K hidden_correction + lm_head + argmax steps in ONE unbroken stream!
-            HY4_CK(cudaMemcpyAsync(dfly_sc.d_draft_id, &bonus_tok, sizeof(int), cudaMemcpyHostToDevice, stream));
-            for (int step = 0; step < K; ++step) {
-                const __nv_bfloat16* h_step = dfly_sc.h + size_t(step + 1) * geom::HID;
-                hy4::dfly::hidden_correction_step(
-                    blas, dfly_w[0], dfly_sc, h_step, embed, 0, dfly_sc.d_draft_id + step,
-                    mixed_ln, mx8_x8, stream);
-                hy4::mx8::linear_w_f32(blas, mixed_ln, dfly_lm_head[0], head_logits, 1, v_rows[0], geom::HID, mx8_x8, nullptr, stream);
-                hy4::dfly::k_dfly_argmax_p1<<<256, 256, 0, stream>>>(head_logits, dfly_sc.d_max_v, dfly_sc.d_max_i, v_rows[0]);
-                hy4::dfly::k_dfly_argmax_p2<<<1, 256, 0, stream>>>(dfly_sc.d_max_v, dfly_sc.d_max_i, dfly_sc.d_draft_id + step + 1, 256);
+            // Zero-sync TP=1 & TP=2 greedy DFly2: entire 5-layer body + K hidden_correction + MXFP8 lm_head + argmax
+            // (with 16B GPU-side RDMA argmax merge on TP=2) runs in ONE unbroken stream or ONE CUDA Graph!
+            *h_dfly_meta_pinned = hy4::dfly::DflyGraphMeta{slot, bonus_tok, anchor, rdelta, s_idx, {0, 0, 0}};
+            HY4_CK(cudaMemcpyAsync(dfly_sc.d_meta, h_dfly_meta_pinned, sizeof(hy4::dfly::DflyGraphMeta),
+                                   cudaMemcpyHostToDevice, stream));
+
+            std::array<const int*, hy4::dfly::NUM_LAYERS> sg_base{}, sc_base{}, sp_base{};
+            for (int d = 0; d < hy4::dfly::NUM_LAYERS; ++d) {
+                sg_base[size_t(d)] = dfly_snap_grp[size_t(d)];
+                sc_base[size_t(d)] = dfly_snap_cnt[size_t(d)];
+                sp_base[size_t(d)] = dfly_snap_pos[size_t(d)];
             }
+
+            auto emit_dfly_greedy = [&]() {
+                hy4::dfly::forward_body(
+                    blas, dfly_w, dfly_sc, attn_sc, tkv.data(),
+                    sg_base.data(), sc_base.data(), sp_base.data(),
+                    embed, dfly_target_hidden, parts, d_page_table, mx8_x8,
+                    o.nr, o.rank0, o.nloc, 0, 0, 0, W, max_pps, stream, on_dfly_ar_add, 0, dfly_sc.d_meta);
+                int coll = 2 * hy4::dfly::NUM_LAYERS;
+                for (int step = 0; step < K; ++step) {
+                    const __nv_bfloat16* h_step = dfly_sc.h + size_t(step + 1) * geom::HID;
+                    hy4::dfly::hidden_correction_step(
+                        blas, dfly_w[0], dfly_sc, h_step, embed, 0, dfly_sc.d_draft_id + step,
+                        mixed_ln, mx8_x8, stream);
+                    hy4::mx8::linear_w_f32(blas, mixed_ln, dfly_lm_head[0], head_logits, 1, v_rows[0], geom::HID, mx8_x8, nullptr, stream);
+                    hy4::dfly::k_dfly_argmax_p1<<<256, 256, 0, stream>>>(head_logits, dfly_sc.d_max_v, dfly_sc.d_max_i, v_rows[0]);
+                    if (o.nr == 1) {
+                        hy4::dfly::k_dfly_argmax_p2<<<1, 256, 0, stream>>>(dfly_sc.d_max_v, dfly_sc.d_max_i, dfly_sc.d_draft_id + step + 1, 256);
+                    } else {
+                        hy4::dfly::k_dfly_argmax_p2_pair<<<1, 256, 0, stream>>>(
+                            dfly_sc.d_max_v, dfly_sc.d_max_i, v_lo[0], dfly_sc.d_arg_pair, 256);
+                        on_dfly_argmax_tp2(coll++, dfly_sc.d_arg_pair, dfly_sc.d_draft_id + step + 1);
+                    }
+                }
+            };
+
+            if (use_dfly_graph) {
+                auto it = dfly_graphs.find(W);
+                if (it == dfly_graphs.end()) {
+                    cudaGraph_t gr = nullptr;
+                    cudaGraphExec_t ex = nullptr;
+                    HY4_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                    emit_dfly_greedy();
+                    HY4_CK(cudaStreamEndCapture(stream, &gr));
+                    HY4_CK(cudaGraphInstantiate(&ex, gr, nullptr, nullptr, 0));
+                    HY4_CK(cudaGraphDestroy(gr));
+                    it = dfly_graphs.emplace(W, ex).first;
+                }
+                HY4_CK(cudaGraphLaunch(it->second, stream));
+            } else {
+                emit_dfly_greedy();
+            }
+
             HY4_CK(cudaMemcpyAsync(drafts.data(), dfly_sc.d_draft_id + 1, size_t(K) * sizeof(int), cudaMemcpyDeviceToHost, stream));
             HY4_CK(cudaStreamSynchronize(stream));
+            if (on_dfly_end) on_dfly_end();
         } else {
+            std::array<const int*, hy4::dfly::NUM_LAYERS> sg_p{}, sc_p{}, sp_p{};
+            constexpr int KSEL = geom::IDX_GROUP_TOPK - 1;
+            for (int d = 0; d < hy4::dfly::NUM_LAYERS; ++d) {
+                sg_p[size_t(d)] = dfly_snap_grp[size_t(d)] + size_t(s_idx) * KSEL;
+                sc_p[size_t(d)] = dfly_snap_cnt[size_t(d)] + s_idx;
+                sp_p[size_t(d)] = dfly_snap_pos[size_t(d)] + s_idx;
+            }
+            const __nv_bfloat16* tgt_h = dfly_target_hidden + size_t(s_idx) * geom::HID;
+            hy4::dfly::forward_body(
+                blas, dfly_w, dfly_sc, attn_sc, tkv.data(),
+                sg_p.data(), sc_p.data(), sp_p.data(),
+                embed, tgt_h, parts, d_page_table, mx8_x8,
+                o.nr, o.rank0, o.nloc, slot, bonus_tok, anchor, W, max_pps, stream, on_dfly_ar_add, rdelta);
             if (out_draft_rows) out_draft_rows->resize(size_t(K));
             const size_t rb = head_row_bytes(o.nc);
             std::vector<uint8_t> row_buf(size_t(o.nr) * rb);

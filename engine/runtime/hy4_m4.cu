@@ -217,6 +217,20 @@ __global__ void __launch_bounds__(256) k_hy4_ar_recv_sum_norm_add1_tp2(
     }
 }
 
+// Zero-sync TP=2 GPU-side 16B argmax merge for DFly2 greedy drafting (deterministic tie-break: smaller id wins!).
+__global__ void k_hy4_dfly_argmax_merge_tp2(
+    g6::FabricDev f, const unsigned long long* __restrict__ d_step, int c,
+    const hy4::dfly::DflyArgPair* __restrict__ local_pair,
+    int* __restrict__ dst_id) {
+    const int par = static_cast<int>((*d_step) & 1ULL);
+    const int peer = 1 - f.rank;
+    const hy4::dfly::DflyArgPair loc = *local_pair;
+    const hy4::dfly::DflyArgPair rem = *reinterpret_cast<const hy4::dfly::DflyArgPair*>(
+        f.recv + g6::fab_recv_off(f, par, c, peer));
+    const bool rem_wins = (rem.val > loc.val) || (rem.val == loc.val && rem.id < loc.id);
+    dst_id[0] = rem_wins ? rem.id : loc.id;
+}
+
 struct Hy4Wire {
     g6::Fabric fab;
     g6::FabricDev f{};
@@ -261,10 +275,10 @@ struct Hy4Wire {
         HY4_CK(cudaMemcpyAsync(d_step, &step, sizeof(step), cudaMemcpyHostToDevice, st));
     }
 
-    void begin_dfly(int W, int K, cudaStream_t st) {
+    void begin_dfly(int W, int K, bool dev_argmax, cudaStream_t st) {
         if (nr <= 1) return;
         const uint32_t wire_part = static_cast<uint32_t>(((size_t(W) * geom::HID * 2 + 15) / 16) * 16);
-        const uint32_t wire_head = static_cast<uint32_t>(((head_rb + 7) / 8) * 8);
+        const uint32_t wire_head = dev_argmax ? 16u : static_cast<uint32_t>(((head_rb + 7) / 8) * 8);
         std::vector<uint32_t> sizes(static_cast<size_t>(2 * hy4::dfly::NUM_LAYERS + K), wire_part);
         for (int k = 0; k < K; ++k) sizes[static_cast<size_t>(2 * hy4::dfly::NUM_LAYERS + k)] = wire_head;
         fab.enqueue_step(step, sizes);
@@ -293,6 +307,14 @@ struct Hy4Wire {
         const __nv_bfloat16* loc = parts + static_cast<size_t>(rank) * M * geom::HID;
         send_and_wait_dev(c, M, loc, st);
         k_hy4_ar_recv_sum_norm_add1_tp2<<<M, 256, 0, st>>>(f, d_step, c, loc, post_ln, h, M);
+    }
+
+    void dfly_argmax_tp2(int c, const hy4::dfly::DflyArgPair* local_pair, int* dst_id, cudaStream_t st) const {
+        if (nr <= 1) return;
+        k_hy4_ar_send_dev<<<1, 32, 0, st>>>(f, d_step, c, reinterpret_cast<const uint4*>(local_pair), 1);
+        Hy4ArWait a{f, 16, d_step, ink2::INK2_ERR_AR | (static_cast<unsigned>(c) << 8), c};
+        k_hy4_ar_ring_wait<<<1, 32, 0, st>>>(a);
+        k_hy4_dfly_argmax_merge_tp2<<<1, 1, 0, st>>>(f, d_step, c, local_pair, dst_id);
     }
 
     void gather_head(int c, int M, uint8_t* host_parts, size_t rb) const {
@@ -458,9 +480,12 @@ int main(int argc, char** argv) {
         e.on_head_gather = [&](int c, int M, uint8_t* hp, size_t rb) { wire.gather_head(c, M, hp, rb); };
         e.on_step_end = [&]() { wire.end(e.stream); };
 
-        e.on_dfly_begin = [&](int W) { wire.begin_dfly(W, W - 1, e.stream); };
+        e.on_dfly_begin = [&](int W, bool dev_argmax) { wire.begin_dfly(W, W - 1, dev_argmax, e.stream); };
         e.on_dfly_ar_add = [&](int c, int W, const __nv_bfloat16* post_ln) {
             wire.ar_norm_add1_tp2(c, W, e.parts, post_ln, e.dfly_sc.h, e.stream);
+        };
+        e.on_dfly_argmax_tp2 = [&](int c, const hy4::dfly::DflyArgPair* lp, int* dst) {
+            wire.dfly_argmax_tp2(c, lp, dst, e.stream);
         };
         e.on_dfly_head_gather = [&](int c, int M, uint8_t* hp, size_t rb) { wire.gather_head(c, M, hp, rb); };
         e.on_dfly_end = [&]() { wire.end(e.stream); };

@@ -1623,7 +1623,7 @@ __global__ void __launch_bounds__(128) k_hy4_q_absorb_rope_smallm(
     }
 }
 
-// MXFP8 Fused Small-M Absorbed Q + RoPE: K=192 = 12 uint4s of FP8 (6 blocks of 32)! 12 lanes/row (16-lane half-warp)!
+// MXFP8 Fused Small-M Absorbed Q + RoPE with shared-memory q_raw caching (32 rows/CTA, 4x fewer q_raw loads, 0 ULP exact!).
 template <int MAX_M>
 __global__ void __launch_bounds__(128) k_hy4_q_absorb_rope_mx8(
     const __nv_bfloat16* __restrict__ q_raw,
@@ -1634,42 +1634,57 @@ __global__ void __launch_bounds__(128) k_hy4_q_absorb_rope_mx8(
     __nv_bfloat16* __restrict__ q_full,
     int M, int nh, float theta) {
     const int h = blockIdx.x;
-    const int hwarp = threadIdx.x >> 4; // 0..7 (8 rows/CTA -> grid.y = 64!)
-    const int hlane = threadIdx.x & 15; // 0..15 (lanes 0..11 own 16 FP8 each = 192 exact!)
-    const int c = blockIdx.y * 8 + hwarp;
-    if (h >= nh || c >= geom::KV_LORA) return;
+    if (h >= nh) return;
+    const int tid = threadIdx.x;
+    const int hwarp = tid >> 4; // 0..7
+    const int hlane = tid & 15; // 0..15 (lanes 0..11 own 16 FP8 each = 192 exact!)
 
-    float acc[MAX_M];
+    // Cache q_raw[0..M-1, h, 0..191] once per CTA (24 uint4s per token, <= 4.5 KB)
+    __shared__ uint4 s_q[MAX_M][24];
+    for (int idx = tid; idx < M * 24; idx += 128) {
+        const int m = idx / 24;
+        const int k = idx % 24;
+        const uint4* qm = reinterpret_cast<const uint4*>(
+            q_raw + (static_cast<size_t>(m) * nh + h) * geom::QK_HEAD);
+        s_q[m][k] = __ldg(qm + k);
+    }
+    __syncthreads();
+
     #pragma unroll
-    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+    for (int r = 0; r < 4; ++r) {
+        const int c = blockIdx.y * 32 + r * 8 + hwarp;
+        if (c < geom::KV_LORA) {
+            float acc[MAX_M];
+            #pragma unroll
+            for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
 
-    if (hlane < 12) {
-        const size_t row_id = static_cast<size_t>(h) * geom::KV_LORA + c;
-        const uint4 wv = __ldcs(reinterpret_cast<const uint4*>(wq + row_id * geom::QK_NOPE) + hlane);
-        const float sc = __uint_as_float(static_cast<uint32_t>(__ldcs(wsc + row_id * 6 + (hlane >> 1))) << 23);
-        float2 wf[8];
-        mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
-        mx8::fp8x4_unpack(wv.y, wf[2], wf[3]);
-        mx8::fp8x4_unpack(wv.z, wf[4], wf[5]);
-        mx8::fp8x4_unpack(wv.w, wf[6], wf[7]);
-        #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (m < M) {
-                const uint4* qm = reinterpret_cast<const uint4*>(
-                    q_raw + (static_cast<size_t>(m) * nh + h) * geom::QK_HEAD);
-                acc[m] = sc * mx8::dot_bf16x16(__ldg(qm + 2 * hlane), __ldg(qm + 2 * hlane + 1), wf);
+            if (hlane < 12) {
+                const size_t row_id = static_cast<size_t>(h) * geom::KV_LORA + c;
+                const uint4 wv = __ldcs(reinterpret_cast<const uint4*>(wq + row_id * geom::QK_NOPE) + hlane);
+                const float sc = __uint_as_float(static_cast<uint32_t>(__ldcs(wsc + row_id * 6 + (hlane >> 1))) << 23);
+                float2 wf[8];
+                mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
+                mx8::fp8x4_unpack(wv.y, wf[2], wf[3]);
+                mx8::fp8x4_unpack(wv.z, wf[4], wf[5]);
+                mx8::fp8x4_unpack(wv.w, wf[6], wf[7]);
+                #pragma unroll
+                for (int m = 0; m < MAX_M; ++m) {
+                    if (m < M) {
+                        acc[m] = sc * mx8::dot_bf16x16(s_q[m][2 * hlane], s_q[m][2 * hlane + 1], wf);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (m < M) {
+                    const float s = mx8::h16_sum(acc[m]);
+                    if (hlane == 0) q_full[(static_cast<size_t>(m) * nh + h) * geom::KVA + c] = __float2bfloat16(s);
+                }
             }
         }
     }
-    #pragma unroll
-    for (int m = 0; m < MAX_M; ++m) {
-        if (m < M) {
-            const float s = mx8::h16_sum(acc[m]);
-            if (hlane == 0) q_full[(static_cast<size_t>(m) * nh + h) * geom::KVA + c] = __float2bfloat16(s);
-        }
-    }
-    if (blockIdx.y == 0 && threadIdx.x < 32) {
-        const int lane = threadIdx.x;
+    if (blockIdx.y == 0 && tid < 32) {
+        const int lane = tid;
         #pragma unroll
         for (int m = 0; m < MAX_M; ++m) {
             if (m < M) {
@@ -1695,7 +1710,7 @@ inline void launch_q_absorb_rope_smallm(const __nv_bfloat16* q_raw, const mx8::L
         const int3*          dm = d_mrope ? (d_mrope + m0) : nullptr;
         __nv_bfloat16*       qf = q_full + static_cast<size_t>(m0) * nh * geom::KVA;
         if (w_uk_t.is_mx8()) {
-            const dim3 grid(nh, geom::KV_LORA / 8);
+            const dim3 grid(nh, geom::KV_LORA / 32);
             if (nm <= 1)      k_hy4_q_absorb_rope_mx8<1> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, dm, qf, nm, nh, theta);
             else if (nm <= 2) k_hy4_q_absorb_rope_mx8<2> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, dm, qf, nm, nh, theta);
             else if (nm <= 4) k_hy4_q_absorb_rope_mx8<4> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, dm, qf, nm, nh, theta);
@@ -1768,48 +1783,63 @@ __global__ void __launch_bounds__(128) k_hy4_v_expand_gate_mx8(
     __nv_bfloat16* __restrict__ attn_out,
     int M_stride, int m0, int nm, int nh) {
     const int h = blockIdx.x;
-    const int hwarp = threadIdx.x >> 4; // 0..7 -> grid.y = 32
-    const int hlane = threadIdx.x & 15; // 16 lanes x 2 passes x 16 FP8 = 512 exact!
-    const int d = blockIdx.y * 8 + hwarp;
-    if (h >= nh || d >= geom::V_HEAD) return;
+    if (h >= nh) return;
+    const int tid = threadIdx.x;
+    const int hwarp = tid >> 4; // 0..7
+    const int hlane = tid & 15; // 16 lanes x 2 passes x 16 FP8 = 512 exact!
 
-    const size_t row_id = static_cast<size_t>(h) * geom::V_HEAD + d;
-    const uint4* qrow = reinterpret_cast<const uint4*>(wq + row_id * geom::KV_LORA);
-    const uint8_t* srow = wsc + row_id * 16;
-
-    float acc[MAX_M];
-    #pragma unroll
-    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
-
-    #pragma unroll
-    for (int pass = 0; pass < 2; ++pass) {
-        const int i = pass * 16 + hlane;
-        const uint4 wv = __ldcs(qrow + i);
-        const float sc = __uint_as_float(static_cast<uint32_t>(__ldcs(srow + (i >> 1))) << 23);
-        float2 wf[8];
-        mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
-        mx8::fp8x4_unpack(wv.y, wf[2], wf[3]);
-        mx8::fp8x4_unpack(wv.z, wf[4], wf[5]);
-        mx8::fp8x4_unpack(wv.w, wf[6], wf[7]);
-        #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            if (m < nm) {
-                const uint4* um = reinterpret_cast<const uint4*>(
-                    u_h + (static_cast<size_t>(h) * M_stride + (m0 + m)) * geom::KV_LORA);
-                acc[m] = fmaf(sc, mx8::dot_bf16x16(__ldg(um + 2 * i), __ldg(um + 2 * i + 1), wf), acc[m]);
-            }
-        }
+    // Cache u_h[h, m0..m0+nm-1, 0..511] once per CTA (64 uint4s per token, <= 12 KB)
+    __shared__ uint4 s_u[MAX_M][64];
+    for (int idx = tid; idx < nm * 64; idx += 128) {
+        const int m = idx >> 6;
+        const int k = idx & 63;
+        const uint4* um = reinterpret_cast<const uint4*>(
+            u_h + (static_cast<size_t>(h) * M_stride + (m0 + m)) * geom::KV_LORA);
+        s_u[m][k] = __ldg(um + k);
     }
+    __syncthreads();
+
     #pragma unroll
-    for (int m = 0; m < MAX_M; ++m) {
-        if (m < nm) {
-            const float s = mx8::h16_sum(acc[m]);
-            if (hlane == 0) {
-                const size_t oidx = (static_cast<size_t>(m0 + m) * nh + h) * geom::V_HEAD + d;
-                const float vbf = __bfloat162float(__float2bfloat16(s));
-                const float g = __bfloat162float(gate[oidx]);
-                const float sg = __bfloat162float(__float2bfloat16(sigmoid_f(g)));
-                attn_out[oidx] = __float2bfloat16(vbf * sg);
+    for (int r = 0; r < 4; ++r) {
+        const int d = blockIdx.y * 32 + r * 8 + hwarp;
+        if (d < geom::V_HEAD) {
+            const size_t row_id = static_cast<size_t>(h) * geom::V_HEAD + d;
+            const uint4* qrow = reinterpret_cast<const uint4*>(wq + row_id * geom::KV_LORA);
+            const uint8_t* srow = wsc + row_id * 16;
+
+            float acc[MAX_M];
+            #pragma unroll
+            for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+
+            #pragma unroll
+            for (int pass = 0; pass < 2; ++pass) {
+                const int i = pass * 16 + hlane;
+                const uint4 wv = __ldcs(qrow + i);
+                const float sc = __uint_as_float(static_cast<uint32_t>(__ldcs(srow + (i >> 1))) << 23);
+                float2 wf[8];
+                mx8::fp8x4_unpack(wv.x, wf[0], wf[1]);
+                mx8::fp8x4_unpack(wv.y, wf[2], wf[3]);
+                mx8::fp8x4_unpack(wv.z, wf[4], wf[5]);
+                mx8::fp8x4_unpack(wv.w, wf[6], wf[7]);
+                #pragma unroll
+                for (int m = 0; m < MAX_M; ++m) {
+                    if (m < nm) {
+                        acc[m] = fmaf(sc, mx8::dot_bf16x16(s_u[m][2 * i], s_u[m][2 * i + 1], wf), acc[m]);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (m < nm) {
+                    const float s = mx8::h16_sum(acc[m]);
+                    if (hlane == 0) {
+                        const size_t oidx = (static_cast<size_t>(m0 + m) * nh + h) * geom::V_HEAD + d;
+                        const float vbf = __bfloat162float(__float2bfloat16(s));
+                        const float g = __bfloat162float(gate[oidx]);
+                        const float sg = __bfloat162float(__float2bfloat16(sigmoid_f(g)));
+                        attn_out[oidx] = __float2bfloat16(vbf * sg);
+                    }
+                }
             }
         }
     }
@@ -1821,7 +1851,7 @@ inline void launch_v_expand_gate_smallm(const __nv_bfloat16* u_h, const mx8::Lin
     for (int m0 = 0; m0 < M; m0 += 12) {
         const int nm = std::min(12, M - m0);
         if (w_uv.is_mx8()) {
-            const dim3 grid(nh, geom::V_HEAD / 8);
+            const dim3 grid(nh, geom::V_HEAD / 32);
             if (nm <= 1)      k_hy4_v_expand_gate_mx8<1> <<<grid, 128, 0, st>>>(u_h, w_uv.mx8.q, w_uv.mx8.sc, gate, attn_out, M, m0, nm, nh);
             else if (nm <= 2) k_hy4_v_expand_gate_mx8<2> <<<grid, 128, 0, st>>>(u_h, w_uv.mx8.q, w_uv.mx8.sc, gate, attn_out, M, m0, nm, nh);
             else if (nm <= 4) k_hy4_v_expand_gate_mx8<4> <<<grid, 128, 0, st>>>(u_h, w_uv.mx8.q, w_uv.mx8.sc, gate, attn_out, M, m0, nm, nh);
