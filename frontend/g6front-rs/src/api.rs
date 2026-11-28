@@ -966,10 +966,12 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         .then(|| guard::Guard::new(st.guard, guard_on, body.get("messages")))
         .flatten();
     let guard_names = guard.as_ref().map(guard::Guard::names).unwrap_or_default();
+    let single_call = matches!(cr.choice, ToolChoice::Named(_));
     let new_parser = || {
         let p = AnyParser::new(st.dialect, cr.tools.as_ref(), &choice_value, include_reasoning)
             .emit_undeclared(st.emit_undeclared)
-            .guard_names(guard_names.clone());
+            .guard_names(guard_names.clone())
+            .single_call(single_call);
         if matches!(st.dialect, Dialect::Hf | Dialect::Qwen) {
             if prompt_think_open {
                 p.in_think()
@@ -1084,7 +1086,7 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let created = now_secs();
     // a second parser watches the reply as it arrives, so a closed call block ends the generation (chat_full parses the
     // whole text afterwards, which reads the same call), and the guard reads a held call before the reply ends
-    let mut watch = (st.dialect == Dialect::Ds41 || guard.is_some()).then(new_parser);
+    let mut watch = (st.dialect == Dialect::Ds41 || guard.is_some() || single_call).then(new_parser);
     if let Err(e) = run_to_end(st, &mut gen, watch.as_mut(), guard.as_mut()).await {
         if let Some((id, created, _)) = &session {
             st.sessions.as_ref().unwrap().abort(id, *created);

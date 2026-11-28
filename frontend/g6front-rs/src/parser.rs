@@ -139,6 +139,8 @@ pub struct GlmParser {
     undeclared: bool,   // a call may name a tool the request did not declare (`emit_undeclared`)
     guard: Vec<String>, // names whose calls are held until the reply ends (the repeated-tool-call guard)
     fed: usize,         // bytes fed so far, a position in the reply's text
+    single_call: bool,  // stop after the first valid tool call closes (ToolChoice::Named)
+    call_closed: bool,  // first valid call has closed under single_call
 }
 
 impl GlmParser {
@@ -174,7 +176,20 @@ impl GlmParser {
             undeclared: false,
             guard: Vec::new(),
             fed: 0,
+            single_call: false,
+            call_closed: false,
         }
+    }
+
+    /// Stop after the first valid tool call closes (used for `tool_choice` naming one function).
+    pub fn single_call(mut self, on: bool) -> GlmParser {
+        self.single_call = on;
+        self
+    }
+
+    /// Whether a single-call reply has closed its call and generation should end.
+    pub fn call_closed(&self) -> bool {
+        self.call_closed
     }
 
     /// The repeated-tool-call guard (guard.rs): a call to one of `names` is never live, so the reply ends before the
@@ -278,6 +293,9 @@ impl GlmParser {
     }
 
     fn feed(&mut self, text: &str, final_: bool) -> (String, String, Vec<ToolDelta>) {
+        if self.call_closed {
+            return (String::new(), String::new(), Vec::new());
+        }
         let (mut reasoning, mut content, mut tools) = (String::new(), String::new(), Vec::new());
         self.buf.push_str(text);
         self.fed += text.len();
@@ -307,6 +325,9 @@ impl GlmParser {
                     Step::Calls => {
                         // the reply ended with the run: the calls are real, and their deltas go out together
                         self.emit_calls(reg.slot0, &mut tools);
+                        if self.single_call && self.slots[reg.slot0..].iter().any(|s| s.valid) {
+                            self.call_closed = true;
+                        }
                         if reg.state == State::Reasoning {
                             self.reasoning_ended = true;
                         }
@@ -314,7 +335,11 @@ impl GlmParser {
                         break;
                     }
                     Step::Done => {
-                        // a live call ended: what follows it is ordinary text
+                        // a live call ended: stop immediately for a named single-call choice
+                        if self.single_call {
+                            self.call_closed = true;
+                            break;
+                        }
                         let rest = reg.text.split_off(reg.at);
                         self.fresh = true;
                         self.buf.push_str(&rest);
@@ -428,6 +453,9 @@ impl GlmParser {
                         self.last = Some('>');
                         if !self.close_call(body) {
                             return Step::Text; // a name no tool of this request has: the text stays prose
+                        }
+                        if self.single_call {
+                            return Step::Calls;
                         }
                     }
                     (None, Some(_)) => return Step::Text,
@@ -1617,6 +1645,58 @@ mod tests {
                     "chunk {chunk} of {text:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn single_call_stops_after_first_closed_tool_call() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "set_alarm", "parameters": {"type": "object", "properties": {"hour": {"type": "integer"}, "label": {"type": "string"}}}}},
+            {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}
+        ]);
+        let tc_named = serde_json::json!({"type": "function", "function": {"name": "set_alarm"}});
+        let tc_req = serde_json::json!("required");
+        let reply = "</think><tool_call>set_alarm<arg_key>hour</arg_key><arg_value>7</arg_value><arg_key>label</arg_key><arg_value>standup</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>";
+
+        // Without single_call (e.g. tool_choice=required), parallel calls are preserved.
+        let mut p_multi = GlmParser::new(Some(&tools), &tc_req, true);
+        let multi = p_multi.parse_full(reply);
+        assert!(!p_multi.call_closed());
+        assert_eq!(multi.calls.len(), 2);
+
+        // Full parse with single_call(true) drops a second parallel call even in the same burst.
+        let mut p_full = GlmParser::new(Some(&tools), &tc_named, true).single_call(true);
+        let full = p_full.parse_full(reply);
+        assert!(p_full.call_closed());
+        assert_eq!(full.calls.len(), 1);
+        assert_eq!(full.calls[0].1, "set_alarm");
+        assert_eq!(serde_json::from_str::<Value>(&full.calls[0].2).unwrap(), serde_json::json!({"hour": 7, "label": "standup"}));
+
+        // Streaming across arbitrary chunk sizes signals call_closed at the first closer and drops any later call.
+        for chunk_len in [1usize, 2, 3, 5, 11, reply.len()] {
+            let mut p = GlmParser::new(Some(&tools), &tc_named, true).single_call(true);
+            let mut names = Vec::new();
+            let mut args = String::new();
+            let mut at = 0;
+            while at < reply.len() {
+                let end = (at + chunk_len).min(reply.len());
+                if let Some(d) = p.delta(&reply[at..end], false) {
+                    for td in d.tool_calls {
+                        if let Some(n) = td.name { names.push(n); }
+                        if let Some(a) = td.arguments { args.push_str(&a); }
+                    }
+                }
+                at = end;
+            }
+            if let Some(d) = p.delta("", true) {
+                for td in d.tool_calls {
+                    if let Some(n) = td.name { names.push(n); }
+                    if let Some(a) = td.arguments { args.push_str(&a); }
+                }
+            }
+            assert!(p.call_closed(), "chunk_len={chunk_len}");
+            assert_eq!(names, vec!["set_alarm"], "chunk_len={chunk_len}");
+            assert_eq!(serde_json::from_str::<Value>(&args).unwrap(), serde_json::json!({"hour": 7, "label": "standup"}), "chunk_len={chunk_len}");
         }
     }
 }

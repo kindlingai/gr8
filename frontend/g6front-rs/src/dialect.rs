@@ -179,6 +179,14 @@ impl AnyParser {
         }
     }
 
+    /// Stop after the first valid tool call closes (used for `tool_choice` naming one function).
+    pub fn single_call(self, on: bool) -> AnyParser {
+        match self {
+            AnyParser::Glm(p) => AnyParser::Glm(p.single_call(on)),
+            p => p,
+        }
+    }
+
     pub fn glm_mut(&mut self) -> Option<&mut GlmParser> {
         match self {
             AnyParser::Glm(p) => Some(p),
@@ -213,12 +221,14 @@ impl AnyParser {
         }
     }
 
-    /// A live call block has closed: the reply is complete and the generation should end. Only DeepSeek's format has a
-    /// closer to stop on; the model sometimes goes on writing after it (the 10,559-line `</function>` runaway).
+    /// A live call block has closed: the reply is complete and the generation should end. DeepSeek's format has a
+    /// closer to stop on (the model sometimes goes on writing after it), and GLM's parser stops after the first call
+    /// closes when `single_call` is enabled for a named `tool_choice`.
     pub fn call_closed(&self) -> bool {
         match self {
-            AnyParser::Glm(_) | AnyParser::Hf(_) | AnyParser::Ink(_) => false,
+            AnyParser::Glm(p) => p.call_closed(),
             AnyParser::Ds(p) => p.call_closed(),
+            AnyParser::Hf(_) | AnyParser::Ink(_) => false,
         }
     }
 }
