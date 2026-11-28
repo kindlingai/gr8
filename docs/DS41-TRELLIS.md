@@ -1,8 +1,9 @@
 # DS41 trellis experts
 
-DeepSeek-V4.1-Flash layers can carry exlr8 trellis experts (kindlingai/deepseek-v4.1-flash-exlr8, manifest `pmcgx-k4`: layers
-0-7 at K4 with the pmcgx codebook, routed and shared; the other layers keep the official MXFP4 / FP8 experts). This note
-describes how the DS41 engine runs them.
+DeepSeek-V4.1-Flash layers can carry exlr8 trellis experts (kindlingai/deepseek-v4.1-flash-exlr8). Manifest `k4` loads
+layers 0-7 and 38-39 at K4 with the pmcgx codebook, routed and shared, and the official MXFP4 / FP8 experts elsewhere.
+Manifest `k3` loads every main layer at K3: pmcgx for layers 0-7 and 38-39, mul1 for layers 8-37. This note describes
+how the DS41 engine runs them.
 
 ## Layout
 
@@ -36,7 +37,8 @@ its own pass first, and the routed pass's finalize adds it into the BF16 partial
 
 ## Measured
 
-TP4, four GB10 boxes, the launcher defaults plus GR8_DS_MANIFEST=pmcgx-k4, RigMark 1.0.0 at reasoning effort low. The
+TP4, four GB10 boxes, the launcher defaults plus GR8_DS_MANIFEST=pmcgx-k4 (release commit 8b39b467, where that manifest
+loaded layers 0-7 at K4; it is `k4` since a5dfa3d0), RigMark 1.0.0 at reasoning effort low. The
 boxes' GPU clocks follow a thermal cap (1500-2400 MHz by temperature; tools/trace/nicprof.py records them): these
 runs sat at 2050-2120 MHz mean per box with the GPUs at 68-83 C.
 
