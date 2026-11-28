@@ -45,6 +45,7 @@ struct TtsCodec {
 #endif
 
 #include "tts_graph.cuh"
+#include "tts_prefix_cache.cuh"
 
 namespace {
 
@@ -60,6 +61,7 @@ struct CliOpts {
     std::string voc_strides = "1,1,2,4";
     int streams = 8;
     int cap = 4096;
+    int prefix_cache_entries = 8;
     bool verify_checksums = true;
     bool dry_run_load = false;
     bool use_graph = true;
@@ -69,7 +71,8 @@ struct CliOpts {
 void usage() {
     std::fprintf(stderr,
                  "usage: g6tts --model-dir DIR [--manifest NAME] [--socket PATH] [--model-name NAME]\n"
-                 "             [--streams N] [--cap N] [--weight-mode ref|ref-fp16|native]\n"
+                 "             [--streams N] [--cap N] [--prefix-cache-entries N]\n"
+                 "             [--weight-mode ref|ref-fp16|native]\n"
                  "             [--codec-path PATH] [--voc-strides 1,1,2,4] [--graph|--no-graph]\n"
                  "             [--no-hash] [--dry-run-load]\n");
 }
@@ -108,6 +111,10 @@ bool parse_cli(int argc, char** argv, CliOpts& o) {
             const char* v = need("--cap");
             if (!v) return false;
             o.cap = std::max(64, std::atoi(v));
+        } else if (a == "--prefix-cache-entries") {
+            const char* v = need("--prefix-cache-entries");
+            if (!v) return false;
+            o.prefix_cache_entries = std::max(0, std::atoi(v));
         } else if (a == "--codec-path") {
             const char* v = need("--codec-path");
             if (!v) return false;
@@ -180,6 +187,7 @@ struct TtsEngine {
     g6tts::TowerRunner tower;
     g6tts::TtsCodec codec;
     g6tts::TtsGraphRunner<g6tts::TtsCodec> graph;
+    g6tts::TtsPrefixCache prefix_cache;
     std::vector<int> voc_strides;
 
     __nv_bfloat16* d_prefill_hid = nullptr; // [H] scratch for last prefill hidden state
@@ -190,6 +198,7 @@ struct TtsEngine {
     ~TtsEngine() { release(); }
 
     void release() {
+        prefix_cache.release();
         graph.release();
         if (d_prefill_hid) { cudaFree(d_prefill_hid); d_prefill_hid = nullptr; }
         if (stream) { cudaStreamDestroy(stream); stream = nullptr; }
@@ -219,7 +228,13 @@ struct TtsEngine {
         }
 
         graph.init(weights, bb, tower, codec, opts.streams, opts.cap, opts.use_graph);
+        prefix_cache.init(weights.cfg, opts.prefix_cache_entries);
         TTS_CK(cudaMalloc(&d_prefill_hid, size_t(weights.cfg.hidden_size) * sizeof(__nv_bfloat16)));
+        if (opts.use_graph) {
+            graph.warmup_graphs(stream);
+            std::fprintf(stderr, "g6tts: pre-captured CUDA graphs for streams<=%d (prefix_cache=%d)\n",
+                         opts.streams, opts.prefix_cache_entries);
+        }
     }
 
     void prefill_slot(int slot, SlotState& st) {
@@ -228,39 +243,72 @@ struct TtsEngine {
         const int T = st.req.num_rows;
         const int rw = c.row_width();
         const int chunk = bb.max_chunk;
+        const int32_t* rows = st.req.rows.data();
 
         codec.reset_slot(slot, stream);
 
-        for (int start = 0; start < T; start += chunk) {
-            const int end = std::min(start + chunk, T);
-            const int len = end - start;
-            bb.forward(st.req.rows.data() + size_t(start) * rw, len,
-                       true, slot, start, nullptr, nullptr, false, false, stream);
-            const int paired_end = std::min(end, T - 1);
-            if (paired_end > start) {
-                tower.prefill_chunk(bb.d_final_bf16,
-                                    st.req.rows.data() + size_t(start) * rw,
-                                    st.req.rows.data() + size_t(start + 1) * rw,
-                                    slot, start, paired_end - start, nullptr, stream);
+        int hit_P = 0;
+        const int hit_idx = prefix_cache.find_longest_prefix(rows, T, rw, hit_P);
+        if (hit_idx >= 0) {
+            prefix_cache.restore_to_slot(hit_idx, slot, bb, tower, d_prefill_hid, stream);
+            if (hit_P < T) {
+                // Bridge tower position `hit_P - 1` using restored `bb_hid[hit_P - 1]` and new `rows[hit_P]`.
+                tower.prefill_chunk(d_prefill_hid,
+                                    rows + size_t(hit_P - 1) * rw,
+                                    rows + size_t(hit_P) * rw,
+                                    slot, hit_P - 1, 1, nullptr, stream);
             }
-            if (end == T) {
-                TTS_CK(cudaMemcpyAsync(d_prefill_hid,
-                                       bb.d_final_bf16 + size_t(len - 1) * c.hidden_size,
-                                       size_t(c.hidden_size) * sizeof(__nv_bfloat16),
-                                       cudaMemcpyDeviceToDevice, stream));
-            }
+        } else {
+            ++prefix_cache.misses;
         }
+
+        if (hit_P < T) {
+            const int lcp = prefix_cache.find_recent_common_prefix(rows, T, rw);
+            const int split_P = (lcp >= g6tts::TtsPrefixCache::MIN_PREFIX_LEN && lcp < T && lcp > hit_P) ? lcp : 0;
+
+            auto run_range = [&](int from, int to) {
+                for (int start = from; start < to; start += chunk) {
+                    const int end = std::min(start + chunk, to);
+                    const int len = end - start;
+                    bb.forward(rows + size_t(start) * rw, len,
+                               true, slot, start, nullptr, nullptr, false, false, stream);
+                    const int paired_end = std::min(end, T - 1);
+                    if (paired_end > start) {
+                        tower.prefill_chunk(bb.d_final_bf16,
+                                            rows + size_t(start) * rw,
+                                            rows + size_t(start + 1) * rw,
+                                            slot, start, paired_end - start, nullptr, stream);
+                    }
+                    if (end == to) {
+                        TTS_CK(cudaMemcpyAsync(d_prefill_hid,
+                                               bb.d_final_bf16 + size_t(len - 1) * c.hidden_size,
+                                               size_t(c.hidden_size) * sizeof(__nv_bfloat16),
+                                               cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+            };
+
+            if (split_P > hit_P) {
+                run_range(hit_P, split_P);
+                prefix_cache.save_from_slot(rows, split_P, rw, slot, bb, tower, d_prefill_hid, stream);
+                run_range(split_P, T);
+            } else {
+                run_range(hit_P, T);
+            }
+            prefix_cache.save_from_slot(rows, T, rw, slot, bb, tower, d_prefill_hid, stream);
+        }
+        prefix_cache.record_prompt(rows, T, rw);
 
         // Initialize slot's 16-entry RAS ring from the last min(16, T) prompt main tokens
         int32_t ring[g6tts::geom::RAS_WINDOW];
         std::fill(std::begin(ring), std::end(ring), -1);
         const int take = std::min(T, g6tts::geom::RAS_WINDOW);
         for (int i = 0; i < take; ++i) {
-            ring[i] = st.req.rows[size_t(T - take + i) * rw];
+            ring[i] = rows[size_t(T - take + i) * rw];
         }
 
         graph.admit_slot(slot, d_prefill_hid,
-                         st.req.rows.data() + size_t(T - 1) * rw,
+                         rows + size_t(T - 1) * rw,
                          T - 1, ring, take,
                          st.req.temperature, st.req.top_p, st.req.top_k, st.req.seed,
                          stream);
@@ -399,8 +447,22 @@ struct TtsEngine {
                 continue;
             }
 
-            // 4. Launch ONE fused CUDA graph (or identical eager sequence) for the entire frame; wait on ONE event.
-            graph.step_frame(active_slots, stream);
+            // 4. Launch frame step:
+            //    When all active slots are on frame 0 and first stride is 1, split frame 0 into
+            //    (tower+sample -> immediate stride-1 codec + safe_send -> pipelined backbone forward)
+            //    so first-audio arrives before the 40L backbone runs for frame 1 (bit-identical state).
+            bool all_frame0 = (!voc_strides.empty() && voc_strides[0] == 1);
+            if (all_frame0) {
+                for (int s : active_slots) {
+                    if (slots[size_t(s)].frames_done != 0) {
+                        all_frame0 = false;
+                        break;
+                    }
+                }
+            }
+            const int step_M = all_frame0
+                ? graph.step_frame_tower_only(active_slots, stream)
+                : graph.step_frame(active_slots, stream);
             const int n_act = static_cast<int>(active_slots.size());
 
             // 5. Inspect pinned [n_act, 11] results; group codec-ready slots by stride in {1, 2, 4}.
@@ -513,6 +575,20 @@ struct TtsEngine {
                 metrics.gen_frames.fetch_add(uint64_t(st.frames_done));
                 safe_send(g6tts::make_finish_json(st.req.id, "length", st.req.num_rows, st.frames_done,
                                                   -1, "", 0, st.prefill_s, dec_s));
+            }
+
+            // 8. Complete pipelined frame-0 backbone forward after first audio chunk has been sent.
+            if (all_frame0) {
+                bool any_still_active = false;
+                for (int s : active_slots) {
+                    if (slots[size_t(s)].active) {
+                        any_still_active = true;
+                        break;
+                    }
+                }
+                if (any_still_active) {
+                    graph.step_frame_backbone_only(step_M, stream);
+                }
             }
         }
     }
