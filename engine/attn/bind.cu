@@ -121,8 +121,10 @@ static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, 
     const int h = g6nr::width(g6nr::HEADS, group);
     const bool full = geom::full_index(layer);
     const bool fp8 = p->uks.data || p->uvs.data;   // #50: E4M3 UK / UV with block scales
-    if (!shape(p->uk, {h,192,512}) || !shape(p->uv, {h,256,512}) ||
-        (fp8 && (!shape(p->uks, {h,192,4}) || !shape(p->uvs, {h,256,4}))) ||
+    const bool uk_t = shape(p->uk, {h,512,192});
+    const bool uks_t = fp8 && shape(p->uks, {h,4,192});
+    if ((!uk_t && !shape(p->uk, {h,192,512})) || !shape(p->uv, {h,256,512}) ||
+        (fp8 && ((!uks_t && !shape(p->uks, {h,192,4})) || !shape(p->uvs, {h,256,4}) || uk_t != uks_t)) ||
         !shape(p->kv_norm, {512}) ||
         (full && (!shape(p->index_norm, {128}) || !shape(p->index_bias, {128})))) return invalid;
 
@@ -180,8 +182,8 @@ static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, 
     }
     size_t used = 0;
     auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return at; };
-    const size_t uk = take((size_t)h * 512 * 192 * (fp8 ? 1 : 2));
-    const size_t uks = take(fp8 ? (size_t)h * 4 * 192 * sizeof(float) : 0);
+    const size_t uk = uk_t ? 0 : take((size_t)h * 512 * 192 * (fp8 ? 1 : 2));
+    const size_t uks = (fp8 && !uks_t) ? take((size_t)h * 4 * 192 * sizeof(float)) : 0;
     const size_t kv = take(chunked ? 0 : kv_bytes);
     const size_t ix = take(chunked ? 0 : ix_bytes);
     const size_t table = take((size_t)a.table_size * sizeof(int));
@@ -193,7 +195,8 @@ static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, 
     cudaError_t e = chunked ? cudaMalloc(&b.storage, used) : g6dispram::alloc_kv(&b.storage, used);
     if (e != cudaSuccess) return (int)e;
     char* base = (char*)b.storage;
-    a.uk = base + uk; a.uks = fp8 ? (const float*)(base + uks) : nullptr;
+    a.uk = uk_t ? p->uk.data : base + uk;
+    a.uks = fp8 ? (const float*)(uks_t ? p->uks.data : base + uks) : nullptr;
     a.mla_cache = chunked ? g6_kvc_ptr(mla) : base + kv;
     a.index_cache = full ? (chunked ? g6_kvc_ptr(idx) : base + ix) : nullptr;
     b.kv_chunks[0] = mla; b.kv_chunks[1] = full ? idx : nullptr;
@@ -203,14 +206,16 @@ static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, 
     cudaStream_t stream = (cudaStream_t)s;
     e = cudaMemsetAsync(b.storage, 0, used, stream);
     if (e == cudaSuccess) {
-        if (fp8) {
-            transpose_uk8<<<(h * 512 * 192 + 255) / 256,256,0,stream>>>(
-                (const uint8_t*)p->uk.data, (uint8_t*)const_cast<void*>(a.uk), h * 512 * 192);
-            transpose_uks<<<(h * 4 * 192 + 255) / 256,256,0,stream>>>(
-                (const float*)p->uks.data, const_cast<float*>(a.uks), h * 4 * 192);
-        } else
-        transpose_uk<<<(h * 512 * 192 + 255) / 256,256,0,stream>>>(
-            (const uint16_t*)p->uk.data, (uint16_t*)const_cast<void*>(a.uk), h * 512 * 192);
+        if (!uk_t) {
+            if (fp8) {
+                transpose_uk8<<<(h * 512 * 192 + 255) / 256,256,0,stream>>>(
+                    (const uint8_t*)p->uk.data, (uint8_t*)const_cast<void*>(a.uk), h * 512 * 192);
+                transpose_uks<<<(h * 4 * 192 + 255) / 256,256,0,stream>>>(
+                    (const float*)p->uks.data, const_cast<float*>(a.uks), h * 4 * 192);
+            } else
+            transpose_uk<<<(h * 512 * 192 + 255) / 256,256,0,stream>>>(
+                (const uint16_t*)p->uk.data, (uint16_t*)const_cast<void*>(a.uk), h * 512 * 192);
+        }
 #if defined(G6_CP) && G6_CP
         if (cp_nr) {   // after the storage memset on the same stream; synchronize: cp_table is a host temporary
             e = g6h2d::copy((void*)a.block_table, cp_table.data(), cp_table.size() * sizeof(int), stream);

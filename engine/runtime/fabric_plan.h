@@ -76,6 +76,8 @@ struct PlanKnobs
     std::optional<bool> cp;
     int64_t cp_r = 0, cp_step_rows = 0;
     bool cp_s3 = false;
+    bool cp_stripe = false;
+    int64_t cp_stripe_min = 0;
     std::optional<int64_t> cp_mmax, cp_r2;
     std::optional<std::string> ds_prefill_w, ds_pf_tail, ds_pf_pool, ds_pf_lanes;
     bool ds_pf_v2_w16k = false;
@@ -96,6 +98,7 @@ inline PlanKnobs plan_knobs()
     k.fpf_attn_p1 = knob::fpf_attn_p1(); k.fpf_dsa_p1 = knob::fpf_dsa_p1(); k.fpf_p1 = knob::fpf_p1();
     k.qa_split_cpu = knob::qa_split_cpu();
     k.cp = knob::cp(); k.cp_r = knob::cp_r(); k.cp_step_rows = knob::cp_step_rows(); k.cp_s3 = knob::cp_s3();
+    k.cp_stripe = knob::cp_stripe(); k.cp_stripe_min = knob::cp_stripe_min();
     k.cp_mmax = knob::cp_mmax(); k.cp_r2 = knob::cp_r2();
     k.ds_prefill_w = knob::ds_prefill_w(); k.ds_pf_tail = knob::ds_pf_tail(); k.ds_pf_pool = knob::ds_pf_pool();
     k.ds_pf_lanes = knob::ds_pf_lanes(); k.ds_pf_v2 = knob::ds_pf_v2();
@@ -486,6 +489,8 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
             cc.vdst_k = p.cp_colls.dst_k;
             cc.port = cfg.port + 32;
             cc.proxy_cpu = cfg.proxy_cpu > 2 ? cfg.proxy_cpu - 3 : -1;
+            if (k.cp_stripe && !cc.ring && cc.ips2.size() == cc.ips.size())
+                cc.stripe_min = (size_t)k.cp_stripe_min;
             add(FabKind::Cp, 32, cc);
         }
     }

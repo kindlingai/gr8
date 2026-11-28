@@ -768,7 +768,7 @@ int main(int argc, char** argv)
             else if (s2mode) DR[r].d.s2_pool_slots = (int)prompts.size();
             if (s2mode && !s2_below && knob::test_s2_pool()) DR[r].d.s2_pool_pages = (int)*knob::test_s2_pool();
 #endif
-            if (mtp_split) { DR[r].d.qs.mode = 1; DR[r].d.qs.iq = true; DR[r].d.qs.eh = true; }   // as g6m4
+            if (mtp_split) { DR[r].d.qs.mode = mtp_last ? 2 : 1; DR[r].d.qs.iq = true; DR[r].d.qs.eh = true; }   // as g6m4
             build_draft(DR[r], R[r], rfind(r), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
             qs_loop_attach(DR[r].d, qsl_d, stepp_d);
             build_draft_head_i4(DR[r], dhead, st);

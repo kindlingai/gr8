@@ -170,20 +170,24 @@ inline void widen_fc2(LayerTensors& T, cudaStream_t st)
 }
 // Optional (GR8_TR3_WIDE4=1), once per layer after make_shared_fp8: reorder K4 records of tr3.fc1 / tr3.fc2 in place
 // into 128-bit coalesced wide-K4 order (tr3_wide.cuh, 0 extra bytes). Same results bit for bit.
-inline void widen_k4_fc1(LayerTensors& T, cudaStream_t st)
+// routed_only: under GR8_V2_SHARED=trellis, widen routed experts 0..NEXP-1 only (fc*_wide4 = 2) so row NEXP stays in
+// stock K4 order for the trellis shared-expert prefill segment pass.
+inline void widen_k4_fc1(LayerTensors& T, cudaStream_t st, bool routed_only = false)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc1 = T.t[T_TR3_FC1];
     if (!tab.p || (!fc1.p && !T.ptab) || T.fc1_wide4) return;
+    const int n = (routed_only && tab.shape[0] > geom::NEXP) ? geom::NEXP : static_cast<int>(tab.shape[0]);
     launch_tr4_widen(const_cast<void*>(fc1.p), static_cast<const long long*>(tab.p), static_cast<const long long*>(T.t[T_TR3_KMIX].p),
-                     static_cast<int>(tab.shape[0]), g6nr::EB, st, T.ptab);
-    T.fc1_wide4 = 1;
+                     n, g6nr::EB, st, T.ptab);
+    T.fc1_wide4 = (n < tab.shape[0]) ? 2 : 1;
 }
-inline void widen_k4_fc2(LayerTensors& T, cudaStream_t st)
+inline void widen_k4_fc2(LayerTensors& T, cudaStream_t st, bool routed_only = false)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc2 = T.t[T_TR3_FC2];
     if (!tab.p || (!fc2.p && !T.ptab) || T.fc2_wide4) return;
-    launch_tr4_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st, T.ptab);
-    T.fc2_wide4 = 1;
+    const int n = (routed_only && tab.shape[0] > geom::NEXP) ? geom::NEXP : static_cast<int>(tab.shape[0]);
+    launch_tr4_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), n, g6nr::EB, st, T.ptab);
+    T.fc2_wide4 = (n < tab.shape[0]) ? 2 : 1;
 }
 
 // Host twin of tr3_unit for tr3.table row 256 (LayerTensors::sh_tr, sh_kmix): byte offset of its fc1 unit u in tr3.fc1
@@ -697,6 +701,19 @@ inline void narrow(Gv& g, int t0, int nt, int tpc)
     if (tpc > 0 && tpc < g.tpc) g.tpc = tpc;
 }
 
+// Pre-sharded variant of narrow(): g.w already holds only this rank's tiles t0 .. t0 + nt - 1 (g.O == nt * 16),
+// while the destination buffer has full row stride full_O; advance g.y to column t0 * 16 and restore g.ld = full_O.
+inline void narrow_sharded(Gv& g, int full_O, int t0, int nt, int tpc)
+{
+    if (!g.on) return;
+    if (nt <= 0) { g.on = 0; return; }
+    const int esz = g.odt == gv::O_F32 ? 4 : 2;
+    g.ld = full_O;
+    g.y = static_cast<char*>(g.y) + static_cast<size_t>(t0) * 16 * esz;
+    g.O = nt * 16;
+    if (tpc > 0 && tpc < g.tpc) g.tpc = tpc;
+}
+
 // ------------------------------------------------------------------------------------------ K1
 struct K1
 {
@@ -1167,7 +1184,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     // GR8_TR3_WIDE4=1 per-M fused dispatch (bit-exact KS1*WG partial count; works with GR8_TR3_W2ALL=1
     // because fuse_w4 already runs WG=1 with identical KS1*WG partial counts to w2all).
     int fuse_w4 = 0;
-    if (fuse == 1 && moe && sh && T.e4m3 && !T.k2 && T.fc1_wide4 && T.fc2_wide4 &&
+    if (fuse == 1 && moe && sh && T.e4m3 && !T.k2 && T.fc1_wide4 == 1 && T.fc2_wide4 == 1 &&
         (!T.k3 || (T.fc1_wide && T.fc2_wide)) && !v.split && !v.m1 && !v.m2 && !v.m4)
     {
         if constexpr (g6nr::EB == 4)
@@ -1524,7 +1541,7 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
         return "DEC_I4PAIR: int4 q_a / o_proj / q_b not repacked (bind::i4pair) for the launch's k-part count";
 #endif
     const int qbK = tq ? D.q_b.K : L.q_b.K, qbO = tq ? D.q_b.N : L.q_b.O, opK = to ? D.o_proj.K : L.o_proj.K, opO = to ? D.o_proj.N : L.o_proj.O;
-    if (L.q_a.K != HID || L.kv_a.K != HID || qbK != L.q_a.O || opO != HID || opK != qbO || qbO % 256)
+    if (L.q_a.K != HID || L.kv_a.K != HID || (L.q_a.O != qbK && !(qmx && L.q_a.O > 0 && L.q_a.O < qbK)) || opO != HID || opK != qbO || qbO % 256)
         return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K)";
     L.heads = qbO / 256;
     if (tq && (e = dtr::make_out(D.q_b, M, io.q_a_n, qbK, nullptr, io.q_b, qbO, dtr::O_F16, sc.dt, 0, 0, 1, L.q_b_t))) return e;
@@ -1536,7 +1553,7 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     L.xf_x.bf16 = L.indexer ? sc.xb_x : nullptr;
     // the fragment tables of q_a_norm (q_b, idx_q) and of the attention output (o_proj): a trellis matrix rotates its
     // input itself
-    L.xf_qa.on = L.q_b.on || L.idx_q.on; L.xf_qa.src = io.q_a_n; L.xf_qa.ld = L.q_a.O; L.xf_qa.K = L.q_a.O; L.xf_qa.f16 = sc.xf_qa;
+    L.xf_qa.on = L.q_b.on || L.idx_q.on; L.xf_qa.src = io.q_a_n; L.xf_qa.ld = qbK; L.xf_qa.K = qbK; L.xf_qa.f16 = sc.xf_qa;
     L.xf_attn.on = L.o_proj.on; L.xf_attn.src = io.attn; L.xf_attn.ld = opK; L.xf_attn.K = opK; L.xf_attn.f16 = sc.xf_attn;
     L.xf_x2.on = 1;   L.xf_x2.src = io.x2;      L.xf_x2.ld = HID;         L.xf_x2.K = HID;         L.xf_x2.f16 = sc.xf_x2;
     L.xf_x2.bf16 = L.moe ? sc.xb_x2 : nullptr;
@@ -1633,7 +1650,7 @@ inline const char* make_head(const HeadTensors& T, int rank, int M, const Scratc
     if (e) return e;
     if (!H.lm_head.on) return "no G.lm_head.mx.gv or G.lm_head.i8.gv";
     if (H.lm_head.K != HID || H.lm_head.O != H.vn) return "G.lm_head is not this rank's vocab slice";
-    if (H.eh.on && (H.eh.K != 2 * HID || H.eh.O != HID)) return "L078.eh is not [6144][12288]";
+    if (H.eh.on && (H.eh.K != 2 * HID || H.eh.O <= 0 || H.eh.O > HID)) return "L078.eh is not [<=6144][12288]";
     H.xf_h.on = 1;  H.xf_h.src = io.h;      H.xf_h.ld = HID;      H.xf_h.K = HID;      H.xf_h.f16 = sc.xf_head;  H.xf_h.M = M;
     H.xf_eh.on = H.eh.on;
     H.xf_eh.src = io.eh_in; H.xf_eh.ld = 2 * HID; H.xf_eh.K = 2 * HID; H.xf_eh.f16 = sc.xf_eh; H.xf_eh.M = M;

@@ -405,4 +405,48 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn unrecord_inverts_mxfp8_and_bf16_records() {
+        let (n, k) = (32usize, 64usize);
+        let ng = k / 32;
+        let codes: Vec<u8> = (0..n * k).map(|i| ((i * 37 + 13) % 251) as u8).collect();
+        let scales: Vec<u8> = (0..n * ng).map(|i| ((i * 19 + 5) % 254) as u8).collect();
+        let rec = mxfp8_record(&codes, &scales, k);
+        let mut out_c = vec![0u8; n * k];
+        let mut out_s = vec![0u8; n * ng];
+        for b in 0..(n / 16) * ng {
+            let (t, g) = (b / ng, b % ng);
+            let r = &rec[b * 528..(b + 1) * 528];
+            for i in 0..256usize {
+                let (l, e) = (i >> 3, i & 7);
+                let row = (l >> 2) + if (e & 2) != 0 { 8 } else { 0 };
+                let col = 2 * (l & 3) + (e & 1) + if (e & 4) != 0 { 8 } else { 0 };
+                out_c[(16 * t + row) * k + 32 * g + col] = r[i];
+                out_c[(16 * t + row) * k + 32 * g + 16 + col] = r[256 + i];
+                if i < 8 {
+                    out_s[(16 * t + i) * ng + g] = r[512 + 2 * i];
+                    out_s[(16 * t + i + 8) * ng + g] = r[512 + 2 * i + 1];
+                }
+            }
+        }
+        assert_eq!(out_c, codes);
+        assert_eq!(out_s, scales);
+
+        let ns = k / 16;
+        let bf: Vec<u16> = (0..n * k).map(|i| ((i * 257 + 17) & 0xffff) as u16).collect();
+        let brec = bf16_record(&bf, k);
+        let mut out_bf = vec![0u16; n * k];
+        for b in 0..(n / 16) * ns {
+            let (t, j) = (b / ns, b % ns);
+            let r = &brec[b * 512..(b + 1) * 512];
+            for i in 0..256usize {
+                let (l, e) = (i >> 3, i & 7);
+                let row = (l >> 2) + if (e & 2) != 0 { 8 } else { 0 };
+                let col = 2 * (l & 3) + (e & 1) + if (e & 4) != 0 { 8 } else { 0 };
+                out_bf[(16 * t + row) * k + 16 * j + col] = u16::from_le_bytes([r[2 * i], r[2 * i + 1]]);
+            }
+        }
+        assert_eq!(out_bf, bf);
+    }
 }

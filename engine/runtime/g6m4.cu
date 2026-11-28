@@ -286,7 +286,6 @@ int main(int argc, char** argv)
         fprintf(stderr, "GR8_KV4_FOLD=1 is supported on GLM-5.3 only\n"); return 2;
 #else
         if (!release) { fprintf(stderr, "GR8_KV4_FOLD=1 requires --v2-dense (release boot) so loader-rs folds kv_b\n"); return 2; }
-        if (knob::kvb() == "fp8") { fprintf(stderr, "GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8\n"); return 2; }
 #endif
     }
     if (eo.check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
@@ -432,6 +431,11 @@ int main(int argc, char** argv)
     // draft's copy when there is one), with GR8_DRAFT_HEAD_KS / _TPC. In the S2 runtime signature.
     const bool dfl_i4 = knob::dfl_head_i4();
     if (dfl_i4 && !dfl) die("GR8_DFL_HEAD_I4=1 needs --dflash-manifest");
+    // GR8_DFL_HEAD2=1 (dflash.cuh dfl_head2; default 0): two-stage 2-bit screen + MXFP8 rescore for the DFlash2 head
+    // (shares read-only screen weights with GR8_DRAFT_HEAD2 when active). Drafts only. In the S2 runtime signature.
+    const bool dfl_head2_on = knob::dfl_head2();
+    if (dfl_head2_on && !dfl) die("GR8_DFL_HEAD2=1 needs --dflash-manifest");
+    if (dfl_head2_on && dfl_i4) die("GR8_DFL_HEAD2=1 cannot be combined with GR8_DFL_HEAD_I4=1");
     // GR8_DFL_BODY_I4=1 (dflash.cuh dfl_body_i4; default 0): the DFlash2 drafter's body GEMVs read INT4 g32 copies of their
     // MXFP8 records. Drafts only; +382 MB per rank. In the S2 runtime signature
     const bool dfl_body_i4_on = knob::dfl_body_i4();
@@ -719,6 +723,24 @@ int main(int argc, char** argv)
     }
     host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
+    // Right-size the decode MoE/GEMV scratch to the widest decode step this run can execute (<= MX).
+    // bind::make_k1 checks M <= sc.rows, so any overshoot fails closed at boot.
+    int max_step_rows = 1;
+    for (int M : row_counts) max_step_rows = std::max(max_step_rows, M);
+    for (int M : draft_rows) max_step_rows = std::max(max_step_rows, M);
+    if (s2mode)
+    {
+        max_step_rows = std::max({max_step_rows, s2sess * (shared_depth + 1), plan.chunk, dfl ? dfl_k + 1 : 0});
+#if !G6_MODEL_DS41
+        if (kstop.solo) max_step_rows = std::max(max_step_rows, kstop.kmax + 1);
+        for (int M : s2::kstopb_widths(kstop.b, s2sess, mtp)) max_step_rows = std::max(max_step_rows, M);
+#endif
+    }
+#if G6_MODEL_FLASH
+    if (MP) max_step_rows = MX;
+#endif
+    max_step_rows = std::max(1, std::min(MX, max_step_rows));
+    m.scratch_rows = max_step_rows;
 #if G6_MODEL_FLASH
     if (mtp || dfl) m.kda_ring = std::max(mtp + 1, dfl ? dfl::B : 0);   // KDA state slots for the verify ring (DFlash2: B rows)
     if (s2mode) m.kda_sessions = s2sess;   // each S2 session its own ring (s2/flash_ring.h FlashSlots)
@@ -829,7 +851,7 @@ int main(int argc, char** argv)
     auto qs_enqueue = [&](unsigned long long step, int M) { if (fabg_on) fabg.enqueue_step(step, qs_sizes(m, M)); };
     // the same for a draft step (GR8_MTP_SPLIT); D is built further down, before any step
     Draft D;
-    auto qsd_enqueue = [&](unsigned long long step, int M) { if (fabdg_on) fabdg.enqueue_step(step, qs_sizes(D.d, M)); };
+    auto qsd_enqueue = [&](unsigned long long step, int M, bool solo_cache = false) { if (fabdg_on) fabdg.enqueue_step(step, qs_sizes(D.d, M, solo_cache)); };
 #if defined(G6_CP) && G6_CP
     if (cp_on)
         for (int c = 0; c < cp_colls.ncoll(); ++c)
@@ -952,11 +974,12 @@ int main(int argc, char** argv)
         fd = fabd.dev();
         G6RT_CK(cudaHostAlloc((void**)&in_d, sizeof(StepIn), cudaHostAllocMapped));
         G6RT_CK(cudaHostAlloc((void**)&out_d, sizeof(StepOut), cudaHostAllocMapped));
+        D.d.scratch_rows = max_step_rows;
 #if G6_MODEL_FLASH
         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MX);   // Flash draft prefill: decode draft steps (flash_prefill.cuh)
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
 #else
-        if (mtp_split) { D.d.qs.mode = 1; D.d.qs.iq = true; D.d.qs.eh = true; }   // GR8_MTP_SPLIT: eh_proj, q_a / kv_a / idx, idx_q
+        if (mtp_split) { D.d.qs.mode = mtp_last ? 2 : 1; D.d.qs.iq = true; D.d.qs.eh = true; }   // GR8_MTP_SPLIT: eh_proj, q_a (+ kv_a/idx when !mtp_last), idx_q
 #ifdef DEC_S2
         if (pool_pages != cap / 64) D.d.kv_pages = pool_pages;   // GR8_CAP_TOTAL: the drafter holds every session's tail
 #endif
@@ -996,6 +1019,7 @@ int main(int argc, char** argv)
         if (dfl_i4)
             dfl_head_i4(DF, D.d.dh_i4 ? D.d.dh_i4 : head_i4_records(m.head_t.lm_head, m.vn, dhead.ks, R, "GR8_DFL_HEAD_I4", st),
                         dhead.tpc, dhead.ks);
+        if (dfl_head2_on) dfl_head2(DF, m, D.d.dh2.codes ? &D.d.dh2 : nullptr, st);
         if (dfl_body_i4_on) dfl_body_i4(DF, st);
         if (dfl_alpha != 1.f && !DF.sel) die("GR8_DFL_SEL_ALPHA needs the selector walk");
         DF.sel_alpha = dfl_alpha;
@@ -2789,7 +2813,7 @@ int main(int argc, char** argv)
                 if (c || p) fprintf(stderr, "# rank %d: S2 extra error words: cp %08x cp_pf|qp %08x\n", R, c, p);
                 return c | p;
             },
-            [&](unsigned long long step, int rows) { qsd_enqueue(step, rows); }};
+            [&](unsigned long long step, int rows, bool solo_cache) { qsd_enqueue(step, rows, solo_cache); }};
         // GR8_RT_STORE: slot q's table as the attention reads it: the layers' own tables while it runs alone (solo), its
         // slot table in batched steps
         std::vector<int> rt_tab;
@@ -4019,11 +4043,12 @@ int main(int argc, char** argv)
             auto rd = [&](const StepIn& di, bool chain, int s, double& ms) {
                 const int M = di.M;
                 *in_d = di;
-                const int frows = draft_solo_cache_only(D.d, M, chain) ? 1 : M;
+                const bool solo_cache = draft_solo_cache_only(D.d, M, chain);
+                const int frows = solo_cache ? 1 : M;
                 std::vector<uint32_t> sizes(3, (uint32_t)(frows * HID * 2));
                 sizes[2] = (uint32_t)glue::head_bytes(frows, nc);
                 fabd.enqueue_step(di.step, sizes);
-                qsd_enqueue(di.step, M);
+                qsd_enqueue(di.step, M, solo_cache);
                 const auto t0 = std::chrono::steady_clock::now();
                 if (graph) G6RT_CK(cudaGraphLaunch(exec_d[bucket_of(D.d, di.context)][chain][M], st));
                 else launch_draft_step(D, M, di.context, chain, st);

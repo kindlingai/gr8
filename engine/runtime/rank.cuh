@@ -482,6 +482,8 @@ struct Model
     void *dio_ids = nullptr, *dio_out = nullptr;
     int dio_rows = 0;
     bool dscratch_lent = false;       // the MTP draft: dscratch and dio_* are the main model's (build_draft)
+    int scratch_rows = MX;            // row limit for bind::scratch_bytes / scratch_at (<= MX); default MX
+    bool scratch_lent = false;        // the MTP draft: scratch is the main model's (build_draft)
     // The main model checks GR8_MEM_MIN as its KV pool is allocated. The MTP draft is built after the prefill lanes, and
     // both are part of the rest of the boot that floor reserves, so the draft does not check it again.
     bool headroom = true;
@@ -910,8 +912,17 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.lp = dmalloc<float>(MX);
     m.lpt = dmalloc<float>(MX);
     m.tgt = dmalloc<int>(MX);
-    m.scratch = dmalloc<char>(bind::scratch_bytes());
-    m.sc = bind::scratch_at(m.scratch);
+    const int sc_rows = m.scratch_rows < 1 ? 1 : (m.scratch_rows > MX ? MX : m.scratch_rows);
+    if (m.scratch_lent)
+    {
+        if (!(m.nl == 1 && ids[0] == geom::MTP_LAYER)) die("scratch_lent: only the MTP draft borrows the main model's decode scratch");
+        if (!m.scratch || m.sc.rows < sc_rows) die("scratch_lent: the main model's decode scratch is smaller than the draft's");
+    }
+    else
+    {
+        m.scratch = dmalloc<char>(bind::scratch_bytes(sc_rows));
+        m.sc = bind::scratch_at(m.scratch, sc_rows);
+    }
     m.layers = std::vector<Layer>(m.nl);      // sized once: the attention bindings must not move
     // GR8_DEC_SHARED_SCRATCH=1 (PLAN-600K L1): ONE decode attention scratch, and one set of selected ids and attention
     // output, for every layer of the main model and the MTP draft. Their attention calls never overlap: decode runs the
@@ -977,13 +988,14 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
             bind::widen_fc1(y.T, st);
             if (!knob::nowide2()) bind::widen_fc2(y.T, st);
 #if !G6_MODEL_FLASH && !G6_MODEL_DS41
-            // GR8_TR3_WIDE4=1: in-place K4 wide order (0 extra bytes), only on block-scale expert-tile layers
-            // where prefill uses FP8 shared expert (not GR8_V2_SHARED=trellis segment pass) and fc2 is widened.
-            if (knob::tr3_wide4() && knob::pf_wt() && knob::v2_shared() != "trellis" && !knob::nowide2() &&
-                y.T.t[bind::T_TR3_SG].p)
+            // GR8_TR3_WIDE4=1: in-place K4 wide order (0 extra bytes) on block-scale expert-tile layers when fc2 is widened.
+            // Under GR8_V2_SHARED=trellis, widen routed experts only (0..NEXP-1) so row NEXP stays in stock K4 order for
+            // the trellis shared-expert prefill segment pass.
+            if (knob::tr3_wide4() && knob::pf_wt() && !knob::nowide2() && y.T.t[bind::T_TR3_SG].p)
             {
-                bind::widen_k4_fc1(y.T, st);
-                bind::widen_k4_fc2(y.T, st);
+                const bool routed_only = y.T.sh_trellis && knob::v2_shared() == "trellis";
+                bind::widen_k4_fc1(y.T, st, routed_only);
+                bind::widen_k4_fc2(y.T, st, routed_only);
             }
 #endif
             G6RT_CK(cudaStreamSynchronize(st));
@@ -1019,7 +1031,10 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
             const TensorRef r = find(name), rs = find(name + ".scale");
             if (!r.p || r.nd != 3) die("bad attention weight " + name);
             if (r.bf16) { w = at(suffix); return; }
-            if (!rs.p || rs.nd != 3 || rs.shape[0] != r.shape[0] || rs.shape[1] != r.shape[1] || rs.shape[2] != 4)
+            if (!rs.p || rs.nd != 3 || rs.shape[0] != r.shape[0])
+                die("attention weight " + name + " is not BF16 and has no .scale (GR8_KVB=fp8 form)");
+            const bool uk_t = r.shape[1] == 512 && r.shape[2] == 192 && rs.shape[1] == 4 && rs.shape[2] == 192;
+            if (!uk_t && (rs.shape[1] != r.shape[1] || rs.shape[2] != 4))
                 die("attention weight " + name + " is not BF16 and has no [h][d][4] .scale (GR8_KVB=fp8 form)");
             w.data = r.p; w.ndim = 3; s.data = rs.p; s.ndim = 3;
             for (int d = 0; d < 3; ++d) { w.shape[d] = r.shape[d]; s.shape[d] = rs.shape[d]; }
@@ -1266,20 +1281,35 @@ inline size_t qs_slot_bytes(const Model& m) { return (size_t)MX * m.qs.wmax() * 
 inline void qs_narrow(Model& m, int i, bind::Layer& L)
 {
     static const int tpc = (int)knob::qa_split_tpc();
+    const Layer& y = m.layers[i];
     if (m.qs.iq && m.qs.ciq[i] >= 0)          // GR8_IDXQ_SPLIT: idx.wq_b, alone in its launch
     {
         const QsGeo& G = m.qs.geo[m.qs.ciq[i]];
-        if (L.idx_q.O != IDXQ) die("GR8_IDXQ_SPLIT: layer " + std::to_string(m.layers[i].l) + " idx.wq_b is not [4096] outputs");
-        bind::narrow(L.idx_q, G.c0[m.rank][0] / 16, G.n[m.rank][0] / 16, tpc);
+        const int t0 = G.c0[m.rank][0] / 16, nt = G.n[m.rank][0] / 16;
+        if (L.idx_q.O == IDXQ) bind::narrow(L.idx_q, t0, nt, tpc);
+        else if (L.idx_q.O == nt * 16) bind::narrow_sharded(L.idx_q, IDXQ, t0, nt, tpc);
+        else die("GR8_IDXQ_SPLIT: layer " + std::to_string(y.l) + " idx.wq_b output width " + std::to_string(L.idx_q.O) +
+                 " is neither [4096] nor rank slice [" + std::to_string(nt * 16) + "]");
     }
-    if (!m.qs.mode) return;
+    else if (L.idx_q.on && L.idx_q.O != IDXQ)
+        die("layer " + std::to_string(y.l) + " idx.wq_b.mx.gv is pre-sharded (" + std::to_string(L.idx_q.O) + " rows) but GR8_IDXQ_SPLIT=0");
+    if (!m.qs.mode)
+    {
+        if (L.q_a.O != QA)
+            die("layer " + std::to_string(y.l) + " q_a.mx.gv is pre-sharded (" + std::to_string(L.q_a.O) + " rows) but GR8_QA_SPLIT=0");
+        return;
+    }
     const QsGeo& G = m.qs.geo[m.qs.cqa[i]];
-    const Layer& y = m.layers[i];
-    if (L.q_a.O != QA || L.kv_a.O != KVA || (y.indexer && (!L.idx_k.on || L.idx_k.O != IDXK || !L.idx_w.on || L.idx_w.O != IDXW)))
-        die("GR8_QA_SPLIT: layer " + std::to_string(y.l) + " input GEMVs are not q_a [2048] / kv_a [576] / idx.wk [128] / idx.weights_proj [32]");
+    const int qa_t0 = G.c0[m.rank][0] / 16, qa_nt = G.n[m.rank][0] / 16;
+    if ((L.q_a.O != QA && L.q_a.O != qa_nt * 16) || L.kv_a.O != KVA || (y.indexer && (!L.idx_k.on || L.idx_k.O != IDXK || !L.idx_w.on || L.idx_w.O != IDXW)))
+        die("GR8_QA_SPLIT: layer " + std::to_string(y.l) + " input GEMVs are not q_a [2048 or rank slice] / kv_a [576] / idx.wk [128] / idx.weights_proj [32]");
     const bool multi = L.x_in.n > 0;          // today's choice (M <= 8, GR8_GV_MULTI): keep it
     bind::Gv* part[QS_MAXP] = {&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w};
-    for (int p = 0; p < G.np; ++p) bind::narrow(*part[p], G.c0[m.rank][p] / 16, G.n[m.rank][p] / 16, tpc);
+    for (int p = 0; p < G.np; ++p)
+    {
+        if (p == 0 && L.q_a.O == qa_nt * 16) bind::narrow_sharded(L.q_a, QA, qa_t0, qa_nt, tpc);
+        else bind::narrow(*part[p], G.c0[m.rank][p] / 16, G.n[m.rank][p] / 16, tpc);
+    }
     L.x_in = GvMulti();
     L.x_rest = GvMulti();
     if (!multi) return;
@@ -1463,10 +1493,15 @@ __global__ void __launch_bounds__(256) k_qs_get(QsGeo a, g6::FabricDev g, const 
     }
 }
 // payload bytes of the gather collectives of a step with M rows (Fabric::enqueue_step on the gather fabric)
-inline std::vector<uint32_t> qs_sizes(const Model& m, int M)
+// solo_cache: solo GR8_MTP_LASTROW first-form draft runs eh_proj over all M rows and layer 78's q_a / idx_q over 1 row
+inline std::vector<uint32_t> qs_sizes(const Model& m, int M, bool solo_cache = false)
 {
     std::vector<uint32_t> s(m.qs.ncoll());
-    for (int c = 0; c < m.qs.ncoll(); ++c) s[c] = (uint32_t)(M * m.qs.geo[c].wmax * 2);
+    for (int c = 0; c < m.qs.ncoll(); ++c)
+    {
+        const int rows = (solo_cache && c != m.qs.ceh) ? 1 : M;
+        s[c] = (uint32_t)(rows * m.qs.geo[c].wmax * 2);
+    }
     return s;
 }
 // gather collective c: this rank's columns out (the tiles' GEMVs ran before it on the stream)
@@ -1797,7 +1832,10 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
                 cpglue::k_vget<<<G, 256, 0, st>>>(v, j, m.stepp, C.cand + (size_t)v.src[j] * M * 2048, cb);
             G6RT_CK(g6_attn_cp_merge_index(a, cell, C.cand, st));
         }
-        if (!C.s3 || cc >= 0) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
+        // At TP=2 on full-index layers (cc >= 0), peer q was already in flight during cp_index + cand exchange;
+        // compute and publish peer's partial first so local cp_group overlaps the partial's RDMA transfer.
+        const bool defer_local = nr == 2 && C.s3 && cc >= 0;
+        if ((!C.s3 || cc >= 0) && !defer_local) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
         const g6::VSlotDev& vq = C.vs[cq];
         cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
         if (C.one)
@@ -1835,6 +1873,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
             for (int k = 1; k < nr; ++k)
                 cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp + (size_t)(k - 1) * tblk, (size_t)M * cp_heads((r + k) % nr, y.l) * 514 * 4,
                                                    nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));
+        if (defer_local) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
     }
     if (phase == 1) return;
 #ifdef CP_F1A
@@ -2197,10 +2236,15 @@ inline const bind::Head& head_for(Model& m, int M)
         if (m.qs.eh)                  // GR8_MTP_SPLIT: this rank's tiles of eh_proj (same bits per tile, bind::narrow)
         {
             const QsGeo& G = m.qs.geo[m.qs.ceh];
-            if (!H.eh.on || H.eh.O != HID) die("GR8_MTP_SPLIT: no eh_proj of [6144] outputs");
+            const int t0 = G.c0[m.rank][0] / 16, nt = G.n[m.rank][0] / 16;
             static const int tpc = (int)knob::qa_split_tpc();
-            bind::narrow(H.eh, G.c0[m.rank][0] / 16, G.n[m.rank][0] / 16, tpc);
+            if (!H.eh.on) die("GR8_MTP_SPLIT: no eh_proj");
+            if (H.eh.O == HID) bind::narrow(H.eh, t0, nt, tpc);
+            else if (H.eh.O == nt * 16) bind::narrow_sharded(H.eh, HID, t0, nt, tpc);
+            else die("GR8_MTP_SPLIT: eh_proj output width " + std::to_string(H.eh.O) + " is neither [6144] nor rank slice [" + std::to_string(nt * 16) + "]");
         }
+        else if (m.eh_out && H.eh.on && H.eh.O != HID)
+            die("L078.eh.mx.gv is pre-sharded (" + std::to_string(H.eh.O) + " rows) but GR8_MTP_SPLIT=0");
         if (m.dh_i4)                  // GR8_DRAFT_HEAD_I4: the same slice's INT4 records, same fragment table and logits
         {
             bind::Tensor t;
@@ -2654,6 +2698,12 @@ inline void build_draft(Draft& D, const Model& main, const Find& find, int capac
         D.d.dio_ids = main.dio_ids; D.d.dio_out = main.dio_out; D.d.dio_rows = main.dio_rows;
         D.d.dscratch_lent = true;
     }
+    if (main.scratch && main.sc.rows >= D.d.scratch_rows)   // main and MTP draft steps never run concurrently on the GPU
+    {
+        D.d.scratch = main.scratch;
+        D.d.sc = main.sc;
+        D.d.scratch_lent = true;
+    }
     build(D.d, main.rank, std::vector<int>{geom::MTP_LAYER}, find, capacity, f, stepp, st, max_rows);
     // The draft has no CP binding, but its graph indices must use the target context buckets.
     D.d.nbk = main.nbk;
@@ -2865,7 +2915,9 @@ __global__ void __launch_bounds__(32) k_mtp_scatter_last_out(int* tok_out, float
 inline bool draft_solo_cache_only(const Model& d, int M, bool chain)
 {
 #if !G6_MODEL_FLASH && !G6_MODEL_DS41
-    return !d.s2on && d.route_last && !chain && M > 1 && !d.qs.mode && !d.qs.iq;
+    // mode == 1 splits kv_a / idx_k across ranks so rows 0..M-2 cannot append caches locally;
+    // mode == 0 (unsplit) and mode == 2 (q_a split only; kv_a / idx_k local) both support solo cache-only.
+    return !d.s2on && d.route_last && !chain && M > 1 && d.qs.mode != 1;
 #else
     (void)d; (void)M; (void)chain;
     return false;

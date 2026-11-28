@@ -14,6 +14,7 @@
 struct G6AttnPrefillScratch {
     void* data=nullptr;size_t bytes=0;int H=0,cap=0,maxrows=0,R=0,dense_limit=0,device=0;bool full_index=false;
     cublasHandle_t blas=nullptr;std::atomic<unsigned> refs{1};
+    const G6AttnPrefill* cached_p=nullptr;int cached_ctx=0;bool cached_full_idx=false;
 };
 struct G6AttnPrefill {
     gp::PrefillProfile profile;
@@ -36,8 +37,8 @@ __global__ void weight_half_uk(G6Attn a,half* dst,int n){int i=blockIdx.x*blockD
     if(i<n){const int h=i/(512*192),d=(i/192)%512,k=i%192;dst[i]=__float2half_rn(ga::wuk<true>(a,h,d,k));}}
 __global__ void weight_half_uv(G6Attn a,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n){const int h=i/(256*512),e=(i/512)%256,k=i%512;dst[i]=__float2half_rn(ga::wuv<true>(a,h,e,k));}}
-template<bool FOLD=false> __global__ void expand(G6Attn fixed,half* cache,half* ikey,float* scales,int count){
-    auto a=ga::resolve(fixed);int pos=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(pos>=count)return;
+template<bool FOLD=false> __global__ void expand(G6Attn fixed,half* cache,half* ikey,float* scales,int pos0,int count){
+    auto a=ga::resolve(fixed);int pos=pos0+blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x&31;if(pos>=count)return;
     const uint8_t* v=pos<a.context?ga::kv_at(a,pos):nullptr;
 #if G6_KV4   // the table holds the latent in the model's basis: H (stored) = the latent, so prefill Q and UV are unchanged
     {float x[16];
@@ -281,14 +282,21 @@ static ga::Work index_workspace(const G6Attn& a,void* base,bool full){
     ga::Work w{};if(!full)return w;size_t used=0,R=std::min(a.rows,a.query_tile),T=a.context;
     auto take=[&](size_t n){size_t at=used;used=(used+n+255)&~size_t(255);return (void*)((uintptr_t)base+at);};
     w.iq=(half*)take(R*32*128*2);w.weights=(float*)take(R*32*4);
-    w.si=(float*)take(R*T*4);w.ii=(int*)take(R*T*4);
+    w.si=(float*)take(R*T*4);
+#ifdef SEL32
+    const bool opt=knob::pf_attn_opt();
+    if(!opt)w.ii=(int*)take(R*T*4);
     w.selected=(uint64_t*)take(R*TOP*8);w.selection=(ga::SelectionState*)take(R*sizeof(ga::SelectionState));
     w.histogram=(int*)take(R*((std::min(T,size_t(32768))+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK)*256*4);
-#ifdef SEL32
-    // select_prefill never sorts: so holds threshold_compact32's bins (R*chunks*1 KB) or selx's candidates
-    // (min(CAPG, T) keys a row), and io, offsets and the CUB temp are unused
-    if(T>32768)w.so=(float*)take(std::max(R*((T+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK)*256*4,R*std::min(size_t(selx::CAPG),T)*8));
+    // select_prefill never sorts: so holds threshold_compact32's bins (R*chunks*1 KB) or selx/selopt2's candidates
+    // (min(CAPG, T) keys a row), and io, offsets and the CUB temp are unused. Under GR8_PF_ATTN_OPT=1, w.ii is never
+    // written and w.so serves all context lengths, saving R*T*4 bytes (~168-235 MB/rank at 164K-229K CAP).
+    if(opt||T>32768)w.so=(float*)take(std::max(R*((T+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK)*256*4,R*std::min(size_t(selx::CAPG),T)*8));
     w.total=used;return w;
+#else
+    w.ii=(int*)take(R*T*4);
+    w.selected=(uint64_t*)take(R*TOP*8);w.selection=(ga::SelectionState*)take(R*sizeof(ga::SelectionState));
+    w.histogram=(int*)take(R*((std::min(T,size_t(32768))+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK)*256*4);
 #endif
     if(T>32768){w.so=(float*)take(R*T*4);w.io=(int*)take(R*T*4);w.offsets=(int*)take((R+1)*4);
         size_t bytes=0,single=0;auto e=cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,bytes,w.si,w.so,w.ii,w.io,(int)(R*T),(int)R,w.offsets,w.offsets+1);if(e!=cudaSuccess)return ga::Work{};
@@ -401,27 +409,38 @@ extern "C" int g6a_bind_prefill_profile_read(G6AttnPrefill* p,G6AttnPrefillProfi
 }
 extern "C" size_t g6a_bind_prefill_bytes(const G6AttnPrefill* p){return p?p->bytes:0;}
 extern "C" int g6a_bind_prefill_cache(const G6AttnPrefill* p,void** cache,size_t* bytes){
-    if(!p||!cache||!bytes)return int(cudaErrorInvalidValue);*cache=p->cache;*bytes=(size_t)p->C*576*2;return int(cudaSuccess);}
-extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){
+    if(!p||!cache||!bytes)return int(cudaErrorInvalidValue);if(p->workspace){p->workspace->cached_p=nullptr;p->workspace->cached_ctx=0;}*cache=p->cache;*bytes=(size_t)p->C*576*2;return int(cudaSuccess);}
+static int g6a_bind_prefill_trace_impl(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,int prev_ctx,void* s){
     if(!p)return int(cudaErrorInvalidValue);gp::profile_reset(p->profile);
     if(p->owner!=b||!step)return int(cudaErrorInvalidValue);int rc=g6a_bind_prepare(b,step,s);if(rc)return rc;G6Attn a=b->args;if(a.rows>p->maxrows||a.context>p->cap)return int(cudaErrorInvalidValue);
+    const bool full_idx=!a.reuse_indices;
+    const bool cont=prev_ctx>0&&p->workspace->cached_p==p&&p->workspace->cached_ctx==prev_ctx&&
+        p->workspace->cached_full_idx==full_idx&&a.context>=prev_ctx;
+    p->workspace->cached_p=nullptr;p->workspace->cached_ctx=0;
     cudaStream_t st=(cudaStream_t)s;rc=gp::blas_status(cublasSetStream(p->blas,st));if(rc)return rc;
     bool profiling=false;rc=int(gp::profile_begin(p->profile,st,a.rows,a.context,a.heads,p->R,!a.reuse_indices,trace!=nullptr,profiling));if(rc)return rc;
 #define GP_PROFILE() do{if(profiling){rc=int(gp::profile_mark(p->profile,st));if(rc)return rc;}}while(0)
     G6_PF_MARK(0,st);rc=g6a_append(&a,s);if(rc)return rc;
 #if G6_NR == 2
-    if(b->args.uks){gp::weight_half_uk<<<(p->H*512*192+255)/256,256,0,st>>>(b->args,p->uk,p->H*512*192);gp::weight_half_uv<<<(p->H*256*512+255)/256,256,0,st>>>(b->args,p->uv,p->H*256*512);}
-    else{gp::weight_half<<<(p->H*512*192+255)/256,256,0,st>>>(b->args.uk,p->uk,p->H*512*192);gp::weight_half<<<(p->H*256*512+255)/256,256,0,st>>>(b->args.uv,p->uv,p->H*256*512);}
+    if(!cont){
+        if(b->args.uks){gp::weight_half_uk<<<(p->H*512*192+255)/256,256,0,st>>>(b->args,p->uk,p->H*512*192);gp::weight_half_uv<<<(p->H*256*512+255)/256,256,0,st>>>(b->args,p->uv,p->H*256*512);}
+        else{gp::weight_half<<<(p->H*512*192+255)/256,256,0,st>>>(b->args.uk,p->uk,p->H*512*192);gp::weight_half<<<(p->H*256*512+255)/256,256,0,st>>>(b->args.uv,p->uv,p->H*256*512);}
+    }
 #endif
     // Append validates the public <=64 decode scratch tile. Only the private
     // prefill workspace below uses the larger tile; no decode ABI is widened.
     a.query_tile=p->R;int expanded=(a.context+31)&~31;
+    const int pos0=cont?(prev_ctx&~31):0;
+    const int nexp=expanded-pos0;
     G6_PF_MARK(1,st);
+    if(nexp>0){
 #if G6_KV4
-    if(ga::kv4_fold())gp::expand<true><<<(expanded+7)/8,256,0,st>>>(a,p->cache,p->ikey,p->kscale,expanded);
-    else
+        if(ga::kv4_fold())gp::expand<true><<<(nexp+7)/8,256,0,st>>>(a,p->cache,p->ikey,p->kscale,pos0,expanded);
+        else
 #endif
-    gp::expand<false><<<(expanded+7)/8,256,0,st>>>(a,p->cache,p->ikey,p->kscale,expanded);auto w=gp::index_workspace(a,p->indexwork,p->full_index);float one=1,zero=0,scale=1.f/16;G6AttnTrace tr=trace?*trace:G6AttnTrace{};
+        gp::expand<false><<<(nexp+7)/8,256,0,st>>>(a,p->cache,p->ikey,p->kscale,pos0,expanded);
+    }
+    auto w=gp::index_workspace(a,p->indexwork,p->full_index);float one=1,zero=0,scale=1.f/16;G6AttnTrace tr=trace?*trace:G6AttnTrace{};
 #define GP_BLAS(call) do{rc=gp::blas_status(call);if(rc)return rc;}while(0)
     for(int start=0;start<a.rows;start+=p->R){int n=std::min(p->R,a.rows-start),R=p->R,H=a.heads;
         GP_PROFILE();G6_PF_MARK(2,st);if(a.reuse_indices)ga::reuse<<<n,256,0,st>>>(a,start);else{
@@ -464,9 +483,13 @@ extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6
     G6_PF_MARK(10,st);
 #undef GP_BLAS
 #undef GP_PROFILE
-    rc=int(cudaGetLastError());if(!rc&&profiling)p->profile.report.status=G6_PF_PROFILE_READY;return rc;
+    rc=int(cudaGetLastError());
+    if(!rc){p->workspace->cached_p=p;p->workspace->cached_ctx=a.context;p->workspace->cached_full_idx=full_idx;if(profiling)p->profile.report.status=G6_PF_PROFILE_READY;}
+    return rc;
 }
-extern "C" int g6a_bind_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s){return g6a_bind_prefill_trace(p,b,step,nullptr,s);}
+extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){return g6a_bind_prefill_trace_impl(p,b,step,trace,0,s);}
+extern "C" int g6a_bind_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s){return g6a_bind_prefill_trace_impl(p,b,step,nullptr,0,s);}
+extern "C" int g6a_bind_prefill_run_cont(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,int prev_context,void* s){return g6a_bind_prefill_trace_impl(p,b,step,nullptr,prev_context,s);}
 extern "C" int g6a_bind_baseline_trace(G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){int rc=g6a_bind_prepare(b,step,s);if(rc)return rc;auto a=b->args;auto st=(cudaStream_t)s;auto w=ga::workspace(a,b->scratch);rc=g6a_append(&a,s);if(rc)return rc;G6AttnTrace tr=trace?*trace:G6AttnTrace{};
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile),H=a.heads;
         if(a.reuse_indices)ga::reuse<<<n,256,0,st>>>(a,start);else{ga::prep_index<<<dim3(n,32),128,0,st>>>(a,start,w.iq,w.weights);ga::launch_index_scores(a,a,w,start,n,st);if(tr.index_scores)cudaMemcpyAsync(tr.index_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);auto e=ga::select_index(a,w,start,n,st);if(e!=cudaSuccess)return int(e);}

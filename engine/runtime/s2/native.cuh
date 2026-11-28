@@ -142,7 +142,7 @@ struct NativeContext {
     // optional: runtime error words the adapter does not own (CP fabric / CP staging proxy); nonzero fails the epoch
     std::function<unsigned()> extra_error;
     // optional: a draft step's extra fabric work after its draft fabric enqueue (GR8_MTP_SPLIT: the draft gathers)
-    std::function<void(unsigned long long step, int rows)> enqueue_draft_extra;
+    std::function<void(unsigned long long step, int rows, bool solo_cache)> enqueue_draft_extra;
     // optional (GR8_RT_STORE): before a main step's launch, with its inputs (spills its sessions' committed pages), and
     // before a prefill quantum of a slot, rows first .. first + rows - 1 (M1: drops its remote pages; release: spills
     // the pages before first and maps the quantum's)
@@ -278,10 +278,11 @@ class NativeDispatch {
         *(draft ? c_.draft_input : c_.input) = input;
         *(draft ? draft_layout_ : layout_) = layout;
         if (draft) {
-            const int frows = g6rt::draft_solo_cache_only(model, rows, chain) ? 1 : rows;
+            const bool solo_cache = g6rt::draft_solo_cache_only(model, rows, chain);
+            const int frows = solo_cache ? 1 : rows;
             std::vector<uint32_t> sizes(3,uint32_t(frows*::HID*2));
             sizes[2] = uint32_t(glue::head_bytes(frows,model.nc)); c_.draft_fabric.enqueue_step(input.step,sizes);
-            if (c_.enqueue_draft_extra) c_.enqueue_draft_extra(input.step,rows);
+            if (c_.enqueue_draft_extra) c_.enqueue_draft_extra(input.step,rows,solo_cache);
         } else c_.enqueue_main(input, use_cp); // preserves existing RS order/fabric layout
         const auto tl0 = tmr_ || rlog_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; // after fabric enqueue, BEFORE the solo/S2 launch branches (design r4 fix 2)
         tl.pre(c_.stream);

@@ -108,6 +108,7 @@ struct Tensors
     Tensor t[NT];                     // MXFP8 entries: the .codes tensor [N][K]
     Tensor s[NMX];                    //                the .scales tensor [N][K/32]
     Tensor i8[NMX];                   // native exlr8 int8 gG records (.i8.gv): [N/16][K/G][GR]
+    Tensor gv[NT];                    // optional decode records (.mx.gv or BF16 .gv) unpacked on the fly when prefill copies are omitted
     int fc1_wide = 0;                 // set if bind::widen_fc1 ran on this tr3.fc1 (K3 experts in the wide order, tr3_wide.cuh)
     int fc2_wide = 0;                 // set if bind::widen_fc2 ran on this tr3.fc2
     const uint8_t* const* ptab = nullptr;   // EL3 (#151): the layer's piece table (bind::LayerTensors::ptab); nullptr = the pack layout
@@ -157,6 +158,11 @@ template <class F> inline Tensors layer_tensors(int layer, F find)
                 T.i8[i] = find(n);
             }
         }
+        if (i < NMX || i == T_IDX_WK || i == T_IDX_WPROJ || i == T_ROUTER)
+        {
+            snprintf(n, sizeof n, "L%03d.%s.gv", layer, NAMES[i]);
+            T.gv[i] = find(n);
+        }
     }
     for (int i = 0; i < dtr::NMAT; ++i)
     {
@@ -186,6 +192,14 @@ template <class F> inline Tensors layer_tensors(int layer, F find)
     }
 #endif
     return T;
+}
+
+inline bool needs_gv_unpack(const Tensors& T)
+{
+    const int ids[] = {T_Q_A, T_KV_A, T_IDX_WQ_B, T_IDX_WK, T_IDX_WPROJ, T_ROUTER};
+    for (int id : ids)
+        if (!T.t[id].p && T.gv[id].p) return true;
+    return false;
 }
 
 // ------------------------------------------------------------------------------------------ MXFP8 helpers
@@ -432,10 +446,36 @@ struct Gemm
     int i8_grp = 0;
     const __half* x_f16 = nullptr;
     int ldx = 0;
+    const uint8_t* gv = nullptr;       // optional [N/16][K/32][528] MXFP8 decode record unpacked into (w, ws) before launch
 #if G6_MODEL_FLASH
     int h16 = 0;                      // 1: k_gemm_tr_h16 (fp16 m16n8k16 on shx_store_h16 A-fragments + Tr3Lane<4, true> B)
 #endif
 };
+
+// Inverse of loader-rs records::mxfp8_record: [N/16][K/32][528] -> codes [N][K] + scales [N][K/32].
+__global__ void __launch_bounds__(256) k_mx_unrecord(const uint8_t* __restrict__ rec_all, int ng, uint8_t* __restrict__ codes, int K,
+                                                     uint8_t* __restrict__ scales)
+{
+    const int t = blockIdx.x / ng, g = blockIdx.x % ng, i = threadIdx.x;
+    const uint8_t* rec = rec_all + static_cast<size_t>(blockIdx.x) * 528;
+    const int l = i >> 3, e = i & 7, r = l >> 2, c = l & 3;
+    const int row = r + ((e & 2) ? 8 : 0);
+    const int col = 2 * c + (e & 1) + ((e & 4) ? 8 : 0);
+    codes[static_cast<size_t>(16 * t + row) * K + 32 * g + col] = rec[i];
+    codes[static_cast<size_t>(16 * t + row) * K + 32 * g + 16 + col] = rec[256 + i];
+    if (i < 8)
+    {
+        scales[static_cast<size_t>(16 * t + i) * ng + g] = rec[512 + 2 * i];
+        scales[static_cast<size_t>(16 * t + i + 8) * ng + g] = rec[512 + 2 * i + 1];
+    }
+}
+inline void unpack_mx_gv(const Gemm& g, cudaStream_t st)
+{
+    if (!g.gv) return;
+    const int ng = g.K / 32;
+    k_mx_unrecord<<<static_cast<unsigned>((g.N / 16) * ng), 256, 0, st>>>(
+        g.gv, ng, const_cast<uint8_t*>(g.w), g.K, const_cast<uint8_t*>(g.ws));
+}
 
 // Gemm::osvh: the CTA's 128 output columns of each row go through H128 and svh before the store. The input is the sums
 // rounded to fp16, as the unrotated fp16 output would be, so the bits are those of an fp16 GEMM output rotated by a
@@ -1692,6 +1732,7 @@ inline Gemm with_rgrp(const Gemm& g)
 inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = RsOut())
 {
     if (!g.on) return;
+    unpack_mx_gv(g, st);
     launch(g.pre, st);
     if (g.i8_grp)
     {
@@ -1812,7 +1853,10 @@ inline void launch_pair(const Gemm& a, const Gemm& b, cudaStream_t st, int mode)
         launch(b, st, mode);
         return;
     }
+    unpack_mx_gv(a, st);
+    unpack_mx_gv(b, st);
     Gemm p = a;
+    p.gv = nullptr;
     p.w2 = b.w; p.ws2 = b.ws; p.N2 = b.N; p.y2 = b.y; p.ldy2 = b.ldy; p.bf162 = b.bf16; p.osvh2 = b.osvh; p.const_s2 = b.const_s;
     p.x8_2 = b.x8 != a.x8 ? b.x8 : nullptr;
     launch(b.pre, st);
@@ -1853,6 +1897,26 @@ inline const char* make_gemm_i8(const Tensor& rec, int M, const __half* x, int l
     g.K = static_cast<int>(rec.shape[1]) * (16 * grp);
     g.M = M;
     g.y = y; g.ldy = g.N; g.bf16 = bf16;
+    return nullptr;
+}
+
+// MXFP8 decode records [N/16][K/32][528] unpacked into scratch (unp_c, unp_s) on launch -> GEMM of M rows into y [M][N]
+inline const char* make_gemm_gv(const Tensor& gv, int M, const uint8_t* x8, void* y, int bf16,
+                                uint8_t* unp_c, uint8_t* unp_s, size_t cap_c, size_t cap_s, Gemm& g)
+{
+    g = Gemm();
+    if (!gv.p) return nullptr;
+    if (gv.nd != 3 || gv.shape[2] != 528 || gv.shape[0] <= 0 || gv.shape[1] <= 0)
+        return "MXFP8 decode record is not [N/16][K/32][528]";
+    const int N = static_cast<int>(gv.shape[0] * 16), K = static_cast<int>(gv.shape[1] * 32);
+    if (!unp_c || !unp_s || static_cast<size_t>(N) * K > cap_c || static_cast<size_t>(N) * (K / 32) > cap_s)
+        return "MXFP8 unpack scratch buffer missing or too small";
+    g.on = 1;
+    g.x8 = x8;
+    g.gv = static_cast<const uint8_t*>(gv.p);
+    g.w = unp_c; g.ws = unp_s;
+    g.N = N; g.K = K; g.M = M;
+    g.y = y; g.ldy = N; g.bf16 = bf16;
     return nullptr;
 }
 
@@ -1982,14 +2046,26 @@ inline void launch(const Act& a, cudaStream_t st)
     else k_pf_act<<<static_cast<unsigned>((static_cast<long long>(a.M) * (a.I / 2) + 255) / 256), 256, 0, st>>>(a);
 }
 
+// Inverse of loader-rs records::bf16_record: [O/16][K/16][512] -> row-major BF16 [O][K].
+__global__ void __launch_bounds__(256) k_bf16_unrecord(const uint8_t* __restrict__ rec_all, int ns, uint16_t* __restrict__ dst, int K)
+{
+    const int t = blockIdx.x / ns, j = blockIdx.x % ns, i = threadIdx.x;
+    const uint16_t* rec = reinterpret_cast<const uint16_t*>(rec_all + static_cast<size_t>(blockIdx.x) * 512);
+    const int l = i >> 3, e = i & 7, r = l >> 2, c = l & 3;
+    const int row = r + ((e & 2) ? 8 : 0);
+    const int col = 2 * c + (e & 1) + ((e & 4) ? 8 : 0);
+    dst[static_cast<size_t>(16 * t + row) * K + 16 * j + col] = rec[i];
+}
+
 // ------------------------------------------------------------------------------------------ BF16 GEMM (cuBLAS)
-// y32 [M][O] fp32 = xb [M][K] (BF16) @ w [O][K]^T (BF16 row-major from the pack); y16 != nullptr: also rounded to fp16.
+// y32 [M][O] fp32 = xb [M][K] (BF16) @ w [O][K]^T (BF16 row-major from the pack, or unpacked from gv); y16 != nullptr: also rounded to fp16.
 struct Blas
 {
     int on = 0;
     cublasHandle_t h = nullptr;
     const uint16_t* xb = nullptr;
     const uint16_t* w = nullptr;
+    const uint8_t* gv = nullptr;      // optional [O/16][K/16][512] BF16 decode record unpacked into w before launch
     int K = 0, O = 0, M = 0;
     float* y32 = nullptr;
     __half* y16 = nullptr;
@@ -2000,6 +2076,11 @@ struct Blas
 inline cublasStatus_t launch(const Blas& b, cudaStream_t st)
 {
     if (!b.on) return CUBLAS_STATUS_SUCCESS;
+    if (b.gv)
+    {
+        const int ns = b.K / 16;
+        k_bf16_unrecord<<<static_cast<unsigned>((b.O / 16) * ns), 256, 0, st>>>(b.gv, ns, const_cast<uint16_t*>(b.w), b.K);
+    }
     const float one = 1.f, zero = 0.f;
     cublasStatus_t s = cublasSetStream(b.h, st);
     if (s != CUBLAS_STATUS_SUCCESS) return s;
@@ -2025,6 +2106,23 @@ inline const char* make_blas(const Tensor& w, int K, int M, cublasHandle_t h, co
     b.on = 1; b.h = h; b.xb = xb;
     b.w = static_cast<const uint16_t*>(w.p);
     b.K = K; b.O = static_cast<int>(w.shape[0]); b.M = M;
+    b.y32 = y32; b.y16 = y16;
+    return nullptr;
+}
+inline const char* make_blas_gv(const Tensor& gv, int K, int M, cublasHandle_t h, const uint16_t* xb, float* y32, __half* y16,
+                                uint16_t* unp_bf, size_t cap_bf, Blas& b)
+{
+    b = Blas();
+    if (!gv.p) return nullptr;
+    if (gv.nd != 3 || gv.shape[2] != 512 || gv.shape[0] <= 0 || gv.shape[1] * 16 != K)
+        return "BF16 decode record is not [O/16][K/16][512]";
+    const int O = static_cast<int>(gv.shape[0] * 16);
+    if (!unp_bf || static_cast<size_t>(O) * K * 2 > cap_bf)
+        return "BF16 unpack scratch buffer missing or too small";
+    b.on = 1; b.h = h; b.xb = xb;
+    b.gv = static_cast<const uint8_t*>(gv.p);
+    b.w = unp_bf;
+    b.K = K; b.O = O; b.M = M;
     b.y32 = y32; b.y16 = y16;
     return nullptr;
 }
@@ -5745,9 +5843,17 @@ struct Scratch
     int *wtiles, *n_wtiles, *rr_wp;   // Expert::wtiles, n_wtiles, rr_wp (GR8_PF_WT)
     uint8_t *hq8, *hs8;               // Expert::hq8, hs8
     int* cnt_tg;                      // Expert::cnt_tg
+    uint8_t *unp_c0 = nullptr, *unp_s0 = nullptr;   // slot 0: q_a [2048][HID] or idx.wq_b [4096][2048]
+    uint8_t *unp_c1 = nullptr, *unp_s1 = nullptr;   // slot 1: kv_a [576][HID] (paired with q_a)
+    uint16_t* unp_bf = nullptr;                     // BF16 unpack: router.w [256][HID] / idx.wk [128][HID] / idx.weights_proj [32][HID]
 };
+static constexpr size_t UNP_C0_B = 2048ull * HID;
+static constexpr size_t UNP_S0_B = 2048ull * (HID / 32);
+static constexpr size_t UNP_C1_B = 576ull * HID;
+static constexpr size_t UNP_S1_B = 576ull * (HID / 32);
+static constexpr size_t UNP_BF_B = static_cast<size_t>(NEXP) * HID * 2;
 
-inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)     // eb = blocks per expert (EB of the launches)
+inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB, bool unp = false)     // eb = blocks per expert (EB of the launches)
 {
     size_t o = 0;
     auto take = [&](size_t bytes) { char* p = base ? base + o : nullptr; o += (bytes + 255) / 256 * 256; return p; };
@@ -5821,15 +5927,23 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)  
     t.hq8 = reinterpret_cast<uint8_t*>(take(m * HID));
     t.hs8 = reinterpret_cast<uint8_t*>(take(m * (HID / 32)));
     t.cnt_tg = reinterpret_cast<int*>(take(m * (HID / 128) * 4));
+    if (unp)
+    {
+        t.unp_c0 = reinterpret_cast<uint8_t*>(take(UNP_C0_B));
+        t.unp_s0 = reinterpret_cast<uint8_t*>(take(UNP_S0_B));
+        t.unp_c1 = reinterpret_cast<uint8_t*>(take(UNP_C1_B));
+        t.unp_s1 = reinterpret_cast<uint8_t*>(take(UNP_S1_B));
+        t.unp_bf = reinterpret_cast<uint16_t*>(take(UNP_BF_B));
+    }
     if (s) *s = t;
     return o;
 }
 // One block per rank for prefill sub-batches of up to Mmax rows: about 161 KB per row + 6.6 MB (1024 rows: 172 MB).
-inline size_t scratch_bytes(int Mmax, int eb = g6nr::EB) { return scratch_layout(nullptr, nullptr, Mmax, eb); }
-inline Scratch scratch_at(void* block, int Mmax, int eb = g6nr::EB)
+inline size_t scratch_bytes(int Mmax, int eb = g6nr::EB, bool unp = false) { return scratch_layout(nullptr, nullptr, Mmax, eb, unp); }
+inline Scratch scratch_at(void* block, int Mmax, int eb = g6nr::EB, bool unp = false)
 {
     Scratch s;
-    scratch_layout(&s, static_cast<char*>(block), Mmax, eb);
+    scratch_layout(&s, static_cast<char*>(block), Mmax, eb, unp);
     return s;
 }
 
@@ -5994,18 +6108,21 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if (M < 1 || M > sc.Mmax) return "M must be 1..Mmax of the scratch";
     L.M = M;
     L.moe = T.t[T_TR3_TAB].p != nullptr;
-    L.indexer = T.t[T_IDX_WQ_B].p != nullptr || T.i8[T_IDX_WQ_B].p != nullptr;
+    L.indexer = T.t[T_IDX_WQ_B].p != nullptr || T.i8[T_IDX_WQ_B].p != nullptr || T.gv[T_IDX_WQ_B].p != nullptr;
     const int GT = L.moe ? T_S_GATE : T_D_GATE, UT = L.moe ? T_S_UP : T_D_UP, DT = L.moe ? T_S_DOWN : T_D_DOWN;
     const char* e = nullptr;
     //                  codes            scales           records       output                              BF16
     if ((e = make_gemm(T.t[T_Q_A],      T.s[T_Q_A],      M, sc.x8_big,   io.q_a,                             0, L.q_a))) return e;
     if (!L.q_a.on && T.i8[T_Q_A].p && (e = make_gemm_i8(T.i8[T_Q_A], M, io.x, HID, io.q_a, 0, L.q_a))) return e;
+    if (!L.q_a.on && T.gv[T_Q_A].p && (e = make_gemm_gv(T.gv[T_Q_A], M, sc.x8_big, io.q_a, 0, sc.unp_c0, sc.unp_s0, UNP_C0_B, UNP_S0_B, L.q_a))) return e;
     if ((e = make_gemm(T.t[T_KV_A],     T.s[T_KV_A],     M, sc.x8_big,   io.kv_a,                            0, L.kv_a))) return e;
     if (!L.kv_a.on && T.i8[T_KV_A].p && (e = make_gemm_i8(T.i8[T_KV_A], M, io.x, HID, io.kv_a, 0, L.kv_a))) return e;
+    if (!L.kv_a.on && T.gv[T_KV_A].p && (e = make_gemm_gv(T.gv[T_KV_A], M, sc.x8_big, io.kv_a, 0, sc.unp_c1, sc.unp_s1, UNP_C1_B, UNP_S1_B, L.kv_a))) return e;
     if ((e = make_gemm(T.t[T_Q_B],      T.s[T_Q_B],      M, sc.x8_small, io.q_b,                             0, L.q_b))) return e;
     if (!L.q_b.on && T.i8[T_Q_B].p && (e = make_gemm_i8(T.i8[T_Q_B], M, io.q_a_n, L.q_a.N, io.q_b, 0, L.q_b))) return e;
     if ((e = make_gemm(T.t[T_IDX_WQ_B], T.s[T_IDX_WQ_B], M, sc.x8_small, io.idx_q,                           0, L.idx_q))) return e;
     if (!L.idx_q.on && T.i8[T_IDX_WQ_B].p && (e = make_gemm_i8(T.i8[T_IDX_WQ_B], M, io.q_a_n, L.q_a.N, io.idx_q, 0, L.idx_q))) return e;
+    if (!L.idx_q.on && T.gv[T_IDX_WQ_B].p && (e = make_gemm_gv(T.gv[T_IDX_WQ_B], M, sc.x8_small, io.idx_q, 0, sc.unp_c0, sc.unp_s0, UNP_C0_B, UNP_S0_B, L.idx_q))) return e;
     if ((e = make_gemm(T.t[T_O_PROJ],   T.s[T_O_PROJ],   M, sc.x8_small, io.attn_part,                       1, L.o_proj))) return e;
     if (!L.o_proj.on && T.i8[T_O_PROJ].p)
     {
@@ -6145,8 +6262,11 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
 #endif
 
     if ((e = make_blas(T.t[T_IDX_WK],    HID, M, blas, sc.xb, sc.y32,                         io.idx_k, L.idx_k))) return e;
+    if (!L.idx_k.on && T.gv[T_IDX_WK].p && (e = make_blas_gv(T.gv[T_IDX_WK], HID, M, blas, sc.xb, sc.y32, io.idx_k, sc.unp_bf, UNP_BF_B, L.idx_k))) return e;
     if ((e = make_blas(T.t[T_IDX_WPROJ], HID, M, blas, sc.xb, sc.y32 + static_cast<size_t>(M) * 128, io.idx_w, L.idx_w))) return e;
+    if (!L.idx_w.on && T.gv[T_IDX_WPROJ].p && (e = make_blas_gv(T.gv[T_IDX_WPROJ], HID, M, blas, sc.xb, sc.y32 + static_cast<size_t>(M) * 128, io.idx_w, sc.unp_bf, UNP_BF_B, L.idx_w))) return e;
     if ((e = make_blas(T.t[T_ROUTER],    HID, M, blas, sc.xb, io.logits,                      nullptr,  L.router))) return e;
+    if (!L.router.on && T.gv[T_ROUTER].p && (e = make_blas_gv(T.gv[T_ROUTER], HID, M, blas, sc.xb, io.logits, nullptr, sc.unp_bf, UNP_BF_B, L.router))) return e;
 #if G6_MODEL_FLASH
     if ((e = make_blas(T.t[T_IDX_G],     HID, M, blas, sc.xb, sc.y32 + static_cast<size_t>(M) * 128, io.idx_g, L.idx_g))) return e;
     if ((e = make_blas(T.t[T_KDA_B],     HID, M, blas, sc.xb, io.kda_b_f32 ? io.kda_b_f32 : sc.y32, io.kda_b, L.kda_b))) return e;
@@ -6214,7 +6334,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         A.cb = T.cb;
         A.t_fc1 = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p); A.t_wide = T.fc1_wide; A.t_fc2 = static_cast<const uint8_t*>(T.t[T_TR3_FC2].p); A.t_wide2 = T.fc2_wide;
         A.t_ptab = T.ptab;
-        A.t_wide4 = T.fc1_wide4; A.t_wide42 = T.fc2_wide4; A.k3 = T.k3;
+        A.t_wide4 = T.fc1_wide4 != 0; A.t_wide42 = T.fc2_wide4 != 0; A.k3 = T.k3;
         A.t_v1 = static_cast<const __half*>(v1.p); A.t_v2 = static_cast<const __half*>(v2.p); A.t_v3 = static_cast<const __half*>(v3.p);
         A.bs = bsf;
         A.t_sg = static_cast<const __half*>(sgn.p); A.t_v1b = static_cast<const __half*>(v1b.p); A.t_v3b = static_cast<const __half*>(v3b.p);
@@ -6252,7 +6372,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         }
         if ((T.fc1_wide4 || T.fc2_wide4) && !A.wtk)
             return "wide-K4 tr3.fc1/fc2 requires expert-tile prefill (GR8_PF_WT=1, block-scale)";
-        if ((T.fc1_wide4 || T.fc2_wide4) && T.sh_trellis && !T.sh_fp8)
+        if ((T.fc1_wide4 == 1 || T.fc2_wide4 == 1) && T.sh_trellis && !T.sh_fp8)
             return "wide-K4 tr3.fc1/fc2 requires FP8 shared expert in prefill (not GR8_V2_SHARED=trellis)";
         if (T.sh_trellis && T.sh_fp8)
         {
@@ -6299,6 +6419,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             S.rr_row = sc.sh_rr_row; S.rr_e = sc.sh_rr_e; S.rr_sp = sc.sh_rr_sp; S.rr_w = sc.sh_rr_w;
             S.segs = sc.sh_segs; S.n_seg = sc.sh_n_seg; S.pos = nullptr;
             S.wtk = 0; S.wtc = 0; S.wtiles = nullptr; S.n_wtiles = nullptr; S.rr_wp = nullptr;   // the trellis shared pass keeps the segment kernels
+            S.t_wide4 = 0; S.t_wide42 = 0;
 #if G6_MODEL_FLASH
             S.wm = 0; S.wm2 = 0; S.wt = nullptr; S.n_wt = nullptr;
 #endif

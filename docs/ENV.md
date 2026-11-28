@@ -53,6 +53,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_CP_S3` | flag | `1` |  | CP combine order: 1 = the head-group overlap order, 0 = the plain order. Same arithmetic. |
 | `GR8_CP_STEP_ROWS` | int | `0` | 0..4096 | S2 only: a decode step past R carries at most this many rows and the CP fabric is sized for it instead of the widest S2 step. Sessions past R give the same tokens. |
 | `GR8_CP_STEP_SEG` | flag | `0` | 0\|1 | With GR8_CP_STEP_ROWS, a round past R takes only sessions past R, so a short session never runs the CP path because a long one is resident. |
+| `GR8_CP_STRIPE` | flag | `0` | 0\|1 | 1 splits CP fabric payload writes of at least GR8_CP_STRIPE_MIN bytes across both rails when --ips2 is set. |
 | `GR8_DEC_BK` | int | `2048` |  | The first decode context bucket boundary in tokens. Decode graphs are captured per bucket and GR8_RT_L must be a bucket boundary. |
 | `GR8_DEC_BK_MAX` | int | `0` |  | The largest doubled decode context bucket: GR8_DEC_BK doubles up to it, then the next bucket is R under CP and the KV pool's cap. Every bucket costs a set of decode graphs (about 0.9 GiB a rank on the 4-box GLM-5.3). 0 = no bound. |
 | `GR8_DEC_DENSE_OPT` | flag | `0` |  | Runs the bit-exact fused decode dense kernels on GLM-5.3 (fused layer-input q_a/kv_a/idx_k/idx_w with last-CTA gather publish, single-pass q_a norm + rotation, fused exact idx_q + trellis q_b, and no-scratch trellis o_proj where the k-split matches stock). Same output bits. |
@@ -60,6 +61,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DEC_SPLIT` | int | `0` | 0.. | Captures the decode step as two graphs split at this layer, so the second submission overlaps the first one's GPU time. Needs --graph. 0: one graph. |
 | `GR8_DFL_BODY_I4` | flag | `0` | 0\|1 | The DFlash2 drafter's body GEMVs read INT4 g32 copies of their MXFP8 records, made at boot. Drafts only, +382 MB per rank. Needs --dflash-manifest. |
 | `GR8_DFL_DEDUP` | flag | `0` | 0\|1 | In a DFlash2 query step, fuse each layer's context and block kv_proj into one 16-row GEMV, fuse xfrag writes into k_conv and k_silu, and merge selector walk candidates in shared memory without local spills. Bit-identical drafts. Needs --dflash-manifest. |
+| `GR8_DFL_HEAD2` | flag | `0` | 0\|1 | The DFlash2 drafter's lm_head runs in two stages: a 2-bit screen over this rank's vocab slice followed by exact MXFP8 rescoring of the top 64 candidates. Shares read-only screen weights with GR8_DRAFT_HEAD2 when both are enabled (0 extra weight RAM). Drafts only. Needs --dflash-manifest. |
 | `GR8_DFL_HEAD_I4` | flag | `0` | 0\|1 | The DFlash2 drafter's lm_head GEMV reads INT4 g32 records, the same ones as GR8_DRAFT_HEAD_I4. Drafts only. Needs --dflash-manifest. |
 | `GR8_DFL_PFCTX` | flag | `1` |  | With --dflash, 0 gives the drafter no prompt context from the prefill, so it starts from the last prompt token. |
 | `GR8_DFL_REUSE` | int | 2 when serving DFlash2 with MTP, else 0; GLM-5.3-Flash without MTP: 1 with GR8_GLM53F_CACHE, else 0 | 0..2 | With DFlash2 under S2, 1 lets a request whose prefix-reuse hit (on GLM-5.3-Flash, a session checkpoint hit) landed in the drafter's window keep the drafter, and 2 also gives the drafter to a request alone on MTP. |
@@ -410,6 +412,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 
 | variable | type | unset | values | what it does |
 |---|---|---|---|---|
+| `GR8_CP_STRIPE_MIN` | int | `131072` | 8192.. | With GR8_CP_STRIPE=1, the smallest CP fabric payload write in bytes that goes out split over both rails. |
 | `GR8_DEC_EVPROF` | int | `0` |  | Prints per-stage decode step times from event nodes in the captured main-step graphs every N main steps, in the rank logs. 0: off. |
 | `GR8_DEC_PROF` | flag | `0` |  | Measures decode stages with a synchronize at every mark and prints them per rank. Plain launches only, the engine stops with --graph. |
 | `GR8_DFL_DUMP` | path | unset |  | With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for engine/ref/dflash2_replay.py. |

@@ -105,6 +105,22 @@ knobs:
     doc: >-
       With GR8_CP_STEP_ROWS, a round past R takes only sessions past R, so a short session never runs the CP path
       because a long one is resident.
+  GR8_CP_STRIPE:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 splits CP fabric payload writes of at least GR8_CP_STRIPE_MIN bytes across both rails when --ips2 is set.
+  GR8_CP_STRIPE_MIN:
+    scope: local
+    kind: int
+    default: "131072"
+    values: "8192.."
+    legacy: []
+    doc: >-
+      With GR8_CP_STRIPE=1, the smallest CP fabric payload write in bytes that goes out split over both rails.
   GR8_KVB:
     scope: agree
     kind: text

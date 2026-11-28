@@ -848,7 +848,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(plan['knobs']['KV_FORMAT'], 'int4')
         self.assertIn('--kv-format', plan['args'])
         self.assertIn('--cap', plan['args'])
-        self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '98304')
+        self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '131072')
         self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '4')
         self.assertEqual(plan['args'][plan['args'].index('--mtp') + 1], '1')
         self.assertEqual(plan['args'][plan['args'].index('--prefill') + 1], '1024')
@@ -856,10 +856,19 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--spec-adaptive', plan['args'])
         self.assertIn('--reuse-prefix', plan['args'])
         for v in ('GR8_PF_OWN=1', 'GR8_PF_STREAMS=1', 'GR8_PF_DENSE=1024', 'GR8_PF_ATTN_ROWS=256',
-                  'GR8_PF_BLAS_ROWS=512', 'GR8_S2_DECODE_PF=1024', 'GR8_CP_R=4096',
-                  'GR8_MEM_MIN=2', 'GR8_V2_SHARED=trellis', 'GR8_KV_SHARE_PAGES=1', 'GR8_DFL_DEDUP=1',
-                  'GR8_SPEC_K0=1', 'GR8_DFL_VERIFY_CAP=0.35', 'GR8_MOE_UNION_CAP=48', 'GR8_REUSE_GRID=64'):
+                  'GR8_PF_BLAS_ROWS=512', 'GR8_S2_DECODE_PF=1024', 'GR8_CP_R=4096', 'GR8_DEC_BK=4096', 'GR8_DEC_BK_MAX=4096',
+                  'GR8_KV4_FOLD=1', 'GR8_KV4_TC=1', 'GR8_QA_SPLIT=2', 'GR8_IDXQ_SPLIT=1', 'GR8_MTP_SPLIT=1',
+                  'GR8_MEM_MIN=2', 'GR8_V2_SHARED=trellis', 'GR8_CP_STRIPE=1', 'GR8_PF_STRIPE=1',
+                  'GR8_S2_SHARED_WATERFILL=1', 'GR8_S2_SHARED_WF_MARGIN=0.02', 'GR8_KV_SHARE_PAGES=1', 'GR8_DFL_DEDUP=1',
+                  'GR8_SPEC_K0=1', 'GR8_DFL_VERIFY_CAP=0.18', 'GR8_MOE_UNION_CAP=48', 'GR8_REUSE_GRID=64'):
             self.assertIn(v, plan['env'])
+        # MTP=0 at TP=2 omits GR8_MTP_SPLIT while keeping QA/IDXQ split defaults
+        o_nomtp = opt.parse(['--no-config', '--peers', peers2, '--mtp', '0'], GLM)
+        opt.validate(o_nomtp)
+        e_nomtp = opt.engine_plan(o_nomtp, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env']
+        self.assertIn('GR8_QA_SPLIT=2', e_nomtp)
+        self.assertIn('GR8_IDXQ_SPLIT=1', e_nomtp)
+        self.assertFalse(any(a.startswith('GR8_MTP_SPLIT=') for a in e_nomtp))
         # Explicit GR8_MEM_MIN (or legacy G6_MEM_MIN) in EXTRA_ENV overrides the TP=2 2 GiB default
         for override in ('GR8_MEM_MIN=1.5', 'G6_MEM_MIN=1.5'):
             o_mem = opt.parse(['--no-config', '--peers', peers2, '--extra-env', override], GLM)

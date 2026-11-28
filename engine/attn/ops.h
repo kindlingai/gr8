@@ -70,6 +70,7 @@ struct G6AttnOps {
     int (*bind_prefill_cache)(const G6AttnPrefill*, void**, size_t*);
     int (*qo_create_ext)(G6AttnQo**, const G6AttnBinding*, const G6AttnTensor*, const G6AttnTensor*, int, void*, G6AttnQo*, void*, size_t);
     int (*bind_create_vmm)(G6AttnBinding*, const G6AttnPack*, int, int, int, int, int, int, int, int, int, void*, void*, size_t, G6KvChunks*, G6KvChunks*);
+    int (*bind_prefill_run_cont)(G6AttnPrefill*, G6AttnBinding*, const G6AttnStep*, int, void*);
 };
 
 // The linked model's table (one per binary). The runtime reaches every op through it.
@@ -117,6 +118,7 @@ inline int g6_attn_bind_prefill_index_rows(G6AttnPrefill* a0, G6AttnBinding* a1,
 inline int g6_attn_bind_prefill_profile_read(G6AttnPrefill* a0, G6AttnPrefillProfile* a1) { auto f = g6_attn_ops()->bind_prefill_profile_read; if (!f) g6_attn_missing("bind_prefill_profile_read"); return f(a0, a1); }
 inline int g6_attn_bind_prefill_release(G6AttnPrefill* a0) { auto f = g6_attn_ops()->bind_prefill_release; if (!f) g6_attn_missing("bind_prefill_release"); return f(a0); }
 inline int g6_attn_bind_prefill_run(G6AttnPrefill* a0, G6AttnBinding* a1, const G6AttnStep* a2, void* a3) { auto f = g6_attn_ops()->bind_prefill_run; if (!f) g6_attn_missing("bind_prefill_run"); return f(a0, a1, a2, a3); }
+inline int g6_attn_bind_prefill_run_cont(G6AttnPrefill* a0, G6AttnBinding* a1, const G6AttnStep* a2, int a3, void* a4) { auto f = g6_attn_ops()->bind_prefill_run_cont; return f ? f(a0, a1, a2, a3, a4) : g6_attn_bind_prefill_run(a0, a1, a2, a4); }
 inline int g6_attn_bind_prefill_run_owned(G6AttnPrefill* a0, G6AttnBinding* a1, const G6AttnStep* a2, void* a3, const G6FlashPoolOwner* a4) { auto f = g6_attn_ops()->bind_prefill_run_owned; if (!f) g6_attn_missing("bind_prefill_run_owned"); return f(a0, a1, a2, a3, a4); }
 inline int g6_attn_bind_prefill_trace(G6AttnPrefill* a0, G6AttnBinding* a1, const G6AttnStep* a2, const G6AttnTrace* a3, void* a4) { auto f = g6_attn_ops()->bind_prefill_trace; return f ? f(a0, a1, a2, a3, a4) : G6_ATTN_NOTSUP; }
 inline size_t g6_attn_qo_bytes(const G6AttnQo* a0) { auto f = g6_attn_ops()->qo_bytes; return f ? f(a0) : 0; }
