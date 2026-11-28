@@ -750,7 +750,44 @@ __global__ void k_moe_finalize_res_f32(const float* __restrict__ routed_f32,
     }
 }
 
-// Dequantize 4 packed FP8 E4M3 bytes in `w4` scaled by `s` into 4 FP32 values.
+// Non-coherent streaming 128-bit global load bypassing L1 so huge MoE weight streams do not evict activations/KV.
+__device__ __forceinline__ uint4 tts_ld_nc_v4(const void* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
+// Raw FP8 E4M3 -> FP32 dot product over 4 elements (caller applies block scale once per 16-element uint4).
+__device__ __forceinline__ float tts_dot4_bf16_e4m3_raw(uint2 xv, uint32_t w4) {
+    const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+    const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+    const uint16_t lo = static_cast<uint16_t>(w4 & 0xffffu);
+    const uint16_t hi = static_cast<uint16_t>(w4 >> 16);
+    uint32_t h0 = 0, h1 = 0;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h0) : "h"(lo));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h1) : "h"(hi));
+    const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&h0));
+    const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&h1));
+    return fmaf(x01.x, f0.x, fmaf(x01.y, f0.y, fmaf(x23.x, f1.x, x23.y * f1.y)));
+}
+
+__device__ __forceinline__ float tts_dot8_bf16_v4(uint4 xv, uint4 wv) {
+    const float2 x0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+    const float2 x1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+    const float2 x2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.z));
+    const float2 x3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.w));
+    const float2 w0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wv.x));
+    const float2 w1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wv.y));
+    const float2 w2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wv.z));
+    const float2 w3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wv.w));
+    float s = fmaf(x0.x, w0.x, x0.y * w0.y);
+    s = fmaf(x1.x, w1.x, fmaf(x1.y, w1.y, s));
+    s = fmaf(x2.x, w2.x, fmaf(x2.y, w2.y, s));
+    return fmaf(x3.x, w3.x, fmaf(x3.y, w3.y, s));
+}
+
+// Dequantize 4 packed FP8 E4M3 bytes in `w4` scaled by `s` into 4 FP32 values (used by grouped M > 32 path).
 __device__ __forceinline__ float4 tts_deq4_e4m3(uint32_t w4, float s) {
     const uint16_t lo = static_cast<uint16_t>(w4 & 0xffffu);
     const uint16_t hi = static_cast<uint16_t>(w4 >> 16);
@@ -768,10 +805,64 @@ __device__ __forceinline__ float tts_dot4_bf16_f4(uint2 xv, float4 w) {
     return fmaf(x01.x, w.x, fmaf(x01.y, w.y, fmaf(x23.x, w.z, x23.y * w.w)));
 }
 
-// On-GPU zero-host-sync Ref MoE kernels for store-0 (FP8_BLOCK) or BF16 experts.
-// Single-token / ungrouped path (used for M == 1, 8 distinct experts) with 128-bit LDG.E.128 loads.
-// Grid: (M * TOPK, I / 4), Block: 128 (4 warps, 1 warp per intermediate channel).
-__global__ void __launch_bounds__(128) k_ref_moe_fc1_route(
+// Fast fused GDN a+b BF16 projection: replaces 2 small cuBLAS GEMV calls per GDN layer with 1 SMEM-cached kernel.
+// Grid: (M, 8), Block: 256 (8 warps, 1 warp per output channel across a[0..31] and b[0..31]; H == 2048, gdn_vh == 32).
+__global__ void __launch_bounds__(256) k_gdn_ab_bf16(
+    const bf16* __restrict__ x_norm,
+    const bf16* __restrict__ w_a,
+    const bf16* __restrict__ w_b,
+    float* __restrict__ out_ab,
+    int M) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    __shared__ uint4 s_x[256]; // 4 KiB = 2048 BF16 elements
+    const int tid = threadIdx.x;
+    s_x[tid] = reinterpret_cast<const uint4*>(x_norm + size_t(m) * 2048)[tid];
+    __syncthreads();
+
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int o = blockIdx.y * 8 + warp; // 0..63
+    const bf16* wr = (o < 32) ? (w_a + size_t(o) * 2048) : (w_b + size_t(o - 32) * 2048);
+    float acc = 0.0f;
+    #pragma unroll
+    for (int u = lane; u < 256; u += 32) {
+        acc += tts_dot8_bf16_v4(s_x[u], tts_ld_nc_v4(wr + u * 8));
+    }
+    acc = tts_warp_sum(acc);
+    if (lane == 0) {
+        if (o < 32) out_ab[size_t(m) * 32 + o] = acc;
+        else out_ab[size_t(M + m) * 32 + (o - 32)] = acc;
+    }
+}
+
+// Fast 1-output BF16 dot product for `shared_expert_gate` ([1, 2048]): 1 uint4 load per thread.
+// Grid: (M), Block: 256.
+__global__ void __launch_bounds__(256) k_dot_bf16_n1_h2048(
+    const bf16* __restrict__ x_norm,
+    const bf16* __restrict__ w_row,
+    float* __restrict__ out,
+    int M) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const uint4 xv = reinterpret_cast<const uint4*>(x_norm + size_t(m) * 2048)[tid];
+    const uint4 wv = tts_ld_nc_v4(w_row + tid * 8);
+    float acc = tts_warp_sum(tts_dot8_bf16_v4(xv, wv));
+    __shared__ float s_w[8];
+    if (lane == 0) s_w[warp] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        out[m] = (s_w[0] + s_w[1]) + (s_w[2] + s_w[3]) + (s_w[4] + s_w[5]) + (s_w[6] + s_w[7]);
+    }
+}
+
+// On-GPU zero-host-sync Ref MoE FC1 for store-0 (FP8_BLOCK) or BF16 experts (used for M <= 32).
+// Caches `x_norm[m, 0..2047]` in 4 KiB SMEM once per 8-warp block and streams weights via `L1::no_allocate`.
+// Grid: (M * TOPK, I / 8), Block: 256 (8 warps, 1 warp per intermediate channel).
+__global__ void __launch_bounds__(256) k_ref_moe_fc1_route(
     const bf16* __restrict__ x_norm,
     const int32_t* __restrict__ topk_ids,
     const uint8_t* __restrict__ gate_fp8, const float* __restrict__ gate_sc,
@@ -781,14 +872,23 @@ __global__ void __launch_bounds__(128) k_ref_moe_fc1_route(
     int M, int H, int I, int topk, bool is_fp8) {
     const int route = blockIdx.x;
     if (route >= M * topk) return;
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int i = blockIdx.y * 4 + warp;
-    if (i >= I) return;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int i = blockIdx.y * 8 + warp;
 
     const int m = route / topk;
     const int e = topk_ids[route];
     const bf16* xr = x_norm + size_t(m) * H;
+
+    __shared__ uint4 s_x[256]; // 4 KiB = 2048 BF16 elements
+    const bool use_smem = (H <= 2048);
+    if (use_smem && tid * 8 < H) {
+        s_x[tid] = reinterpret_cast<const uint4*>(xr)[tid];
+    }
+    __syncthreads();
+    if (i >= I) return;
+
     const size_t mat_elems = size_t(I) * H;
     float ag = 0.0f, au = 0.0f;
 
@@ -798,41 +898,34 @@ __global__ void __launch_bounds__(128) k_ref_moe_fc1_route(
         const size_t sc_base = (size_t(e) * bo + (i >> 7)) * bi;
         const uint8_t* gr = gate_fp8 + size_t(e) * mat_elems + size_t(i) * H;
         const uint8_t* ur = up_fp8 + size_t(e) * mat_elems + size_t(i) * H;
-        // 16 elements/lane * 32 lanes = 512 elements/iter; each uint4 sits strictly inside one 128-elem scale block.
+        // 16 elements/lane * 32 lanes = 512 elements/iter; each uint4 lies inside one 128-elem scale block.
+        #pragma unroll 4
         for (int k = lane * 16; k < H; k += 512) {
             const float gs = gate_sc[sc_base + (k >> 7)];
             const float us = up_sc[sc_base + (k >> 7)];
-            const uint4 gw = *reinterpret_cast<const uint4*>(gr + k);
-            const uint4 uw = *reinterpret_cast<const uint4*>(ur + k);
-            const uint4 xv0 = *reinterpret_cast<const uint4*>(xr + k);
-            const uint4 xv1 = *reinterpret_cast<const uint4*>(xr + k + 8);
-            ag += tts_dot4_bf16_f4(make_uint2(xv0.x, xv0.y), tts_deq4_e4m3(gw.x, gs));
-            ag += tts_dot4_bf16_f4(make_uint2(xv0.z, xv0.w), tts_deq4_e4m3(gw.y, gs));
-            ag += tts_dot4_bf16_f4(make_uint2(xv1.x, xv1.y), tts_deq4_e4m3(gw.z, gs));
-            ag += tts_dot4_bf16_f4(make_uint2(xv1.z, xv1.w), tts_deq4_e4m3(gw.w, gs));
-            au += tts_dot4_bf16_f4(make_uint2(xv0.x, xv0.y), tts_deq4_e4m3(uw.x, us));
-            au += tts_dot4_bf16_f4(make_uint2(xv0.z, xv0.w), tts_deq4_e4m3(uw.y, us));
-            au += tts_dot4_bf16_f4(make_uint2(xv1.x, xv1.y), tts_deq4_e4m3(uw.z, us));
-            au += tts_dot4_bf16_f4(make_uint2(xv1.z, xv1.w), tts_deq4_e4m3(uw.w, us));
+            const uint4 gw = tts_ld_nc_v4(gr + k);
+            const uint4 uw = tts_ld_nc_v4(ur + k);
+            const uint4 xv0 = use_smem ? s_x[k >> 3] : *reinterpret_cast<const uint4*>(xr + k);
+            const uint4 xv1 = use_smem ? s_x[(k >> 3) + 1] : *reinterpret_cast<const uint4*>(xr + k + 8);
+            const float dg = tts_dot4_bf16_e4m3_raw(make_uint2(xv0.x, xv0.y), gw.x)
+                           + tts_dot4_bf16_e4m3_raw(make_uint2(xv0.z, xv0.w), gw.y)
+                           + tts_dot4_bf16_e4m3_raw(make_uint2(xv1.x, xv1.y), gw.z)
+                           + tts_dot4_bf16_e4m3_raw(make_uint2(xv1.z, xv1.w), gw.w);
+            const float du = tts_dot4_bf16_e4m3_raw(make_uint2(xv0.x, xv0.y), uw.x)
+                           + tts_dot4_bf16_e4m3_raw(make_uint2(xv0.z, xv0.w), uw.y)
+                           + tts_dot4_bf16_e4m3_raw(make_uint2(xv1.x, xv1.y), uw.z)
+                           + tts_dot4_bf16_e4m3_raw(make_uint2(xv1.z, xv1.w), uw.w);
+            ag = fmaf(gs, dg, ag);
+            au = fmaf(us, du, au);
         }
     } else {
         const bf16* gr = gate_bf16 + size_t(e) * mat_elems + size_t(i) * H;
         const bf16* ur = up_bf16 + size_t(e) * mat_elems + size_t(i) * H;
+        #pragma unroll 4
         for (int k = lane * 8; k < H; k += 256) {
-            const uint4 xv = *reinterpret_cast<const uint4*>(xr + k);
-            const uint4 gv = *reinterpret_cast<const uint4*>(gr + k);
-            const uint4 uv = *reinterpret_cast<const uint4*>(ur + k);
-            const uint32_t xa[4] = {xv.x, xv.y, xv.z, xv.w};
-            const uint32_t ga[4] = {gv.x, gv.y, gv.z, gv.w};
-            const uint32_t ua[4] = {uv.x, uv.y, uv.z, uv.w};
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 xf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xa[j]));
-                const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ga[j]));
-                const float2 uf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ua[j]));
-                ag = fmaf(xf.x, gf.x, fmaf(xf.y, gf.y, ag));
-                au = fmaf(xf.x, uf.x, fmaf(xf.y, uf.y, au));
-            }
+            const uint4 xv = use_smem ? s_x[k >> 3] : *reinterpret_cast<const uint4*>(xr + k);
+            ag += tts_dot8_bf16_v4(xv, tts_ld_nc_v4(gr + k));
+            au += tts_dot8_bf16_v4(xv, tts_ld_nc_v4(ur + k));
         }
     }
 
@@ -843,6 +936,89 @@ __global__ void __launch_bounds__(128) k_ref_moe_fc1_route(
     }
 }
 
+// Fused FC2 + deterministic 8-expert combine + gated shared-expert FP32 residual update for Drama 3 (I == 512, TOPK == 8).
+// Eliminates intermediate `d_route_out` & `d_moe_routed_f32` DRAM round-trips and 80 kernel launches/step while
+// caching all 8 `route_act` rows in 8 KiB SMEM and pipelining 8 streaming `L1::no_allocate` expert loads per warp.
+// Grid: (M, H / 8), Block: 256 (8 warps, 1 warp per hidden channel).
+__global__ void __launch_bounds__(256) k_ref_moe_fc2_combine_fused(
+    const bf16* __restrict__ route_act,
+    const int32_t* __restrict__ topk_ids,
+    const float* __restrict__ topk_w,
+    const uint8_t* __restrict__ down_fp8, const float* __restrict__ down_sc,
+    const bf16* __restrict__ down_bf16,
+    const float* __restrict__ shared_out,
+    const float* __restrict__ shared_gate_logit,
+    float* __restrict__ residual,
+    int M, int H, bool is_fp8) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int h = blockIdx.y * 8 + warp;
+
+    __shared__ uint4 s_act[MOE_TOPK][64]; // 8 * 512 BF16 = 8 KiB
+    __shared__ int32_t s_exp[MOE_TOPK];
+    __shared__ float s_w[MOE_TOPK];
+    __shared__ float s_sh_g;
+
+    // Cooperatively load all 8 * 64 = 512 uint4s (2 per thread), 100% coalesced.
+    const uint4* act_base = reinterpret_cast<const uint4*>(route_act + size_t(m * MOE_TOPK) * 512);
+    s_act[tid >> 6][tid & 63] = act_base[tid];
+    const int t2 = tid + 256;
+    s_act[t2 >> 6][t2 & 63] = act_base[t2];
+    if (tid < MOE_TOPK) {
+        s_exp[tid] = topk_ids[size_t(m) * MOE_TOPK + tid];
+        s_w[tid] = topk_w[size_t(m) * MOE_TOPK + tid];
+    }
+    if (tid == 0) {
+        s_sh_g = tts_sigmoid(shared_gate_logit[m]);
+    }
+    __syncthreads();
+    if (h >= H) return;
+
+    const size_t mat_elems = size_t(H) * 512;
+    const int k_off = lane * 16; // 0..496 (covers all I == 512 in 1 pass!)
+    float acc = 0.0f;
+
+    if (is_fp8) {
+        const int bo = (H + 127) / 128;
+        const int bi = 4; // 512 / 128
+        const int hb = h >> 7;
+        const int kb = lane >> 3; // (lane * 16) >> 7
+        #pragma unroll
+        for (int k_idx = 0; k_idx < MOE_TOPK; ++k_idx) {
+            const int e = s_exp[k_idx];
+            const float ds = down_sc[(size_t(e) * bo + hb) * bi + kb];
+            const uint4 dw = tts_ld_nc_v4(down_fp8 + size_t(e) * mat_elems + size_t(h) * 512 + k_off);
+            const uint4 av0 = s_act[k_idx][lane * 2];
+            const uint4 av1 = s_act[k_idx][lane * 2 + 1];
+            const float d16 = tts_dot4_bf16_e4m3_raw(make_uint2(av0.x, av0.y), dw.x)
+                            + tts_dot4_bf16_e4m3_raw(make_uint2(av0.z, av0.w), dw.y)
+                            + tts_dot4_bf16_e4m3_raw(make_uint2(av1.x, av1.y), dw.z)
+                            + tts_dot4_bf16_e4m3_raw(make_uint2(av1.z, av1.w), dw.w);
+            acc = fmaf(s_w[k_idx] * ds, d16, acc);
+        }
+    } else {
+        #pragma unroll
+        for (int k_idx = 0; k_idx < MOE_TOPK; ++k_idx) {
+            const int e = s_exp[k_idx];
+            const bf16* dr = down_bf16 + size_t(e) * mat_elems + size_t(h) * 512 + k_off;
+            const uint4 av0 = s_act[k_idx][lane * 2];
+            const uint4 av1 = s_act[k_idx][lane * 2 + 1];
+            const float d16 = tts_dot8_bf16_v4(av0, tts_ld_nc_v4(dr))
+                            + tts_dot8_bf16_v4(av1, tts_ld_nc_v4(dr + 8));
+            acc = fmaf(s_w[k_idx], d16, acc);
+        }
+    }
+
+    acc = tts_warp_sum(acc);
+    if (lane == 0) {
+        residual[size_t(m) * H + h] += acc + s_sh_g * shared_out[size_t(m) * H + h];
+    }
+}
+
+// General fallback Ref MoE FC2 (non-512 I or non-8 topk).
 // Grid: (M * TOPK, H / 4), Block: 128 (4 warps, 1 warp per hidden channel).
 __global__ void __launch_bounds__(128) k_ref_moe_fc2_route(
     const bf16* __restrict__ route_act,
@@ -872,27 +1048,19 @@ __global__ void __launch_bounds__(128) k_ref_moe_fc2_route(
         const uint8_t* dr = down_fp8 + size_t(e) * mat_elems + size_t(h) * I;
         for (int k = lane * 16; k < I; k += 512) {
             const float ds = down_sc[sc_base + (k >> 7)];
-            const uint4 dw = *reinterpret_cast<const uint4*>(dr + k);
+            const uint4 dw = tts_ld_nc_v4(dr + k);
             const uint4 av0 = *reinterpret_cast<const uint4*>(ar + k);
             const uint4 av1 = *reinterpret_cast<const uint4*>(ar + k + 8);
-            ad += tts_dot4_bf16_f4(make_uint2(av0.x, av0.y), tts_deq4_e4m3(dw.x, ds));
-            ad += tts_dot4_bf16_f4(make_uint2(av0.z, av0.w), tts_deq4_e4m3(dw.y, ds));
-            ad += tts_dot4_bf16_f4(make_uint2(av1.x, av1.y), tts_deq4_e4m3(dw.z, ds));
-            ad += tts_dot4_bf16_f4(make_uint2(av1.z, av1.w), tts_deq4_e4m3(dw.w, ds));
+            const float d16 = tts_dot4_bf16_e4m3_raw(make_uint2(av0.x, av0.y), dw.x)
+                            + tts_dot4_bf16_e4m3_raw(make_uint2(av0.z, av0.w), dw.y)
+                            + tts_dot4_bf16_e4m3_raw(make_uint2(av1.x, av1.y), dw.z)
+                            + tts_dot4_bf16_e4m3_raw(make_uint2(av1.z, av1.w), dw.w);
+            ad = fmaf(ds, d16, ad);
         }
     } else {
         const bf16* dr = down_bf16 + size_t(e) * mat_elems + size_t(h) * I;
         for (int k = lane * 8; k < I; k += 256) {
-            const uint4 av = *reinterpret_cast<const uint4*>(ar + k);
-            const uint4 dv = *reinterpret_cast<const uint4*>(dr + k);
-            const uint32_t aa[4] = {av.x, av.y, av.z, av.w};
-            const uint32_t da[4] = {dv.x, dv.y, dv.z, dv.w};
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 af = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&aa[j]));
-                const float2 df = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&da[j]));
-                ad = fmaf(af.x, df.x, fmaf(af.y, df.y, ad));
-            }
+            ad += tts_dot8_bf16_v4(*reinterpret_cast<const uint4*>(ar + k), tts_ld_nc_v4(dr + k));
         }
     }
 
@@ -1393,20 +1561,30 @@ struct BackboneRunner {
                  M, c.main_candidates(), c.hidden_size, false, stream);
     }
 
-    // Zero-host-sync on-GPU Ref MoE (FP8_BLOCK or BF16) shared by both prefill (`forward`) and decode (`forward_device`).
-    // Uses 128-bit LDG.E.128 per-route kernels for M == 1 (8 distinct experts) and on-GPU grouped
-    // weight-sharing kernels for M >= 2 (up to 8 tokens/group, reading each active expert ONCE from DRAM).
-    void run_ref_moe(const BackboneLayerW& LW, int M, cudaStream_t stream) {
+    // Zero-host-sync on-GPU Ref MoE + gated shared-expert FP32 residual finalize.
+    //   - M <= 32 (all decode buckets 1,2,4,8 and short prefill): direct SMEM-cached `L1::no_allocate`
+    //     FC1 + fused FC2+combine+finalize (eliminates `d_route_out`/`d_moe_routed_f32` DRAM round-trips
+    //     and 80 kernel launches/step).
+    //   - M > 32 (long prefill chunks): on-GPU grouped weight-sharing kernels (up to 8 tokens/expert group).
+    void run_ref_moe_and_finalize(const BackboneLayerW& LW, int M, cudaStream_t stream) {
         const auto& c = W->cfg;
         const int H = c.hidden_size;
         const int I = c.moe_intermediate;
         const int n_routes = M * c.top_k;
-        if (M == 1 || c.num_experts != MOE_NEXP || c.top_k != MOE_TOPK) {
-            k_ref_moe_fc1_route<<<dim3(n_routes, (I + 3) / 4), 128, 0, stream>>>(
+        if (M <= 32 || c.num_experts != MOE_NEXP || c.top_k != MOE_TOPK) {
+            k_ref_moe_fc1_route<<<dim3(n_routes, (I + 7) / 8), 256, 0, stream>>>(
                 d_norm, d_topk_ids,
                 LW.exp_gate_fp8, LW.exp_gate_sc, LW.exp_up_fp8, LW.exp_up_sc,
                 LW.exp_gate_bf16, LW.exp_up_bf16, d_route_act,
                 M, H, I, c.top_k, LW.experts_fp8);
+            if (I == 512 && c.top_k == MOE_TOPK) {
+                k_ref_moe_fc2_combine_fused<<<dim3(M, (H + 7) / 8), 256, 0, stream>>>(
+                    d_route_act, d_topk_ids, d_topk_w,
+                    LW.exp_down_fp8, LW.exp_down_sc, LW.exp_down_bf16,
+                    d_shared_out, d_shared_gate, d_residual,
+                    M, H, LW.experts_fp8);
+                return;
+            }
             k_ref_moe_fc2_route<<<dim3(n_routes, (H + 3) / 4), 128, 0, stream>>>(
                 d_route_act, d_topk_ids, d_topk_w,
                 LW.exp_down_fp8, LW.exp_down_sc, LW.exp_down_bf16, d_route_out,
@@ -1426,6 +1604,53 @@ struct BackboneRunner {
                 H, I, LW.experts_fp8);
         }
         k_tts_moe_combine_f32<<<M * 8, 64, 0, stream>>>(d_route_out, d_moe_routed_f32, M);
+        k_moe_finalize_res_f32<<<M, 256, 0, stream>>>(d_moe_routed_f32, d_shared_out, d_shared_gate, d_residual, M, H);
+    }
+
+    void proj_gdn_ab(const BackboneLayerW& LW, int M, cudaStream_t stream) {
+        const auto& c = W->cfg;
+        const int H = c.hidden_size;
+        if (H == 2048 && c.gdn_vh == 32 && W->mode != WeightMode::RefF32) {
+            const bf16* wa = (W->mode == WeightMode::Native && LW.in_proj_a_nat.valid() && LW.in_proj_a_nat.fmt == g6emb::FMT_BF16)
+                ? LW.in_proj_a_nat.bf16 : LW.in_proj_a.bf16;
+            const bf16* wb = (W->mode == WeightMode::Native && LW.in_proj_b_nat.valid() && LW.in_proj_b_nat.fmt == g6emb::FMT_BF16)
+                ? LW.in_proj_b_nat.bf16 : LW.in_proj_b.bf16;
+            if (wa != nullptr && wb != nullptr) {
+                k_gdn_ab_bf16<<<dim3(M, 8), 256, 0, stream>>>(d_norm, wa, wb, d_ab, M);
+                return;
+            }
+        }
+        proj_f32(d_norm, LW.in_proj_a, LW.in_proj_a_nat, d_ab, M, c.gdn_vh, H, false, stream);
+        proj_f32(d_norm, LW.in_proj_b, LW.in_proj_b_nat, d_ab + size_t(M) * c.gdn_vh, M, c.gdn_vh, H, false, stream);
+    }
+
+    void proj_shared_expert(const BackboneLayerW& LW, int M, cudaStream_t stream) {
+        const auto& c = W->cfg;
+        const int H = c.hidden_size;
+        if (LW.tr3.valid && LW.tr3.has_shared) {
+            tts_moe_shared_forward(LW.tr3, M, moe_sc, d_shared_out, stream);
+        } else {
+            if (W->mode == WeightMode::Native && LW.shared_gate_nat.valid() && LW.shared_up_nat.valid()) {
+                tts_native_linear_dual_bf16(d_norm, LW.shared_gate_nat, LW.shared_up_nat,
+                                            d_shared_g, d_shared_u, M, dense_ws, blas, stream);
+            } else {
+                proj_bf16(d_norm, LW.shared_gate_proj, LW.shared_gate_nat, d_shared_g, M, c.shared_intermediate, H, stream);
+                proj_bf16(d_norm, LW.shared_up_proj, LW.shared_up_nat, d_shared_u, M, c.shared_intermediate, H, stream);
+            }
+            const size_t sh_n = size_t(M) * c.shared_intermediate;
+            k_silu_mul_bf16<<<int((sh_n + 255) / 256), 256, 0, stream>>>(d_shared_g, d_shared_u, d_shared_g, sh_n);
+            proj_f32(d_shared_g, LW.shared_down_proj, LW.shared_down_nat, d_shared_out, M, H, c.shared_intermediate, false, stream);
+        }
+        if (H == 2048 && W->mode != WeightMode::RefF32) {
+            const bf16* wg = (W->mode == WeightMode::Native && LW.shared_expert_gate_nat.valid() &&
+                              LW.shared_expert_gate_nat.fmt == g6emb::FMT_BF16)
+                ? LW.shared_expert_gate_nat.bf16 : LW.shared_expert_gate.bf16;
+            if (wg != nullptr) {
+                k_dot_bf16_n1_h2048<<<M, 256, 0, stream>>>(d_norm, wg, d_shared_gate, M);
+                return;
+            }
+        }
+        proj_f32(d_norm, LW.shared_expert_gate, LW.shared_expert_gate_nat, d_shared_gate, M, 1, H, false, stream);
     }
 
     // 100% on-GPU, zero-host-sync, CUDA-graph-capturable batched decode forward.
@@ -1509,8 +1734,7 @@ struct BackboneRunner {
                     proj_bf16(d_norm, LW.in_proj_qkv, LW.in_proj_qkv_nat, d_qkv, M, qkv_dim, H, stream);
                     proj_bf16(d_norm, LW.in_proj_z, LW.in_proj_z_nat, d_q_ready, M, val_dim, H, stream);
                 }
-                proj_f32(d_norm, LW.in_proj_a, LW.in_proj_a_nat, d_ab, M, c.gdn_vh, H, false, stream);
-                proj_f32(d_norm, LW.in_proj_b, LW.in_proj_b_nat, d_ab + size_t(M) * c.gdn_vh, M, c.gdn_vh, H, false, stream);
+                proj_gdn_ab(LW, M, stream);
 
                 const size_t tot = size_t(M) * qkv_dim;
                 k_gdn_conv1d_dec<<<int((tot + 255) / 256), 256, 0, stream>>>(
@@ -1531,16 +1755,7 @@ struct BackboneRunner {
             if (LW.tr3.valid) {
                 tts_moe_prepare_x_had(d_norm, LW.tr3, M, moe_sc, stream);
             }
-            if (LW.tr3.valid && LW.tr3.has_shared) {
-                tts_moe_shared_forward(LW.tr3, M, moe_sc, d_shared_out, stream);
-            } else {
-                proj_bf16(d_norm, LW.shared_gate_proj, LW.shared_gate_nat, d_shared_g, M, c.shared_intermediate, H, stream);
-                proj_bf16(d_norm, LW.shared_up_proj, LW.shared_up_nat, d_shared_u, M, c.shared_intermediate, H, stream);
-                const size_t sh_n = size_t(M) * c.shared_intermediate;
-                k_silu_mul_bf16<<<int((sh_n + 255) / 256), 256, 0, stream>>>(d_shared_g, d_shared_u, d_shared_g, sh_n);
-                proj_f32(d_shared_g, LW.shared_down_proj, LW.shared_down_nat, d_shared_out, M, H, c.shared_intermediate, false, stream);
-            }
-            proj_f32(d_norm, LW.shared_expert_gate, LW.shared_expert_gate_nat, d_shared_gate, M, 1, H, false, stream);
+            proj_shared_expert(LW, M, stream);
 
             proj_f32(d_norm, LW.router_gate, LW.router_gate_nat, d_router_logits, M, c.num_experts, H, false, stream);
             k_moe_router_topk<<<M, 256, 0, stream>>>(
@@ -1548,10 +1763,10 @@ struct BackboneRunner {
 
             if (LW.tr3.valid) {
                 tts_moe_routed_forward(LW.tr3, d_topk_ids, d_topk_w, M, moe_sc, d_moe_routed_f32, stream);
+                k_moe_finalize_res_f32<<<M, 256, 0, stream>>>(d_moe_routed_f32, d_shared_out, d_shared_gate, d_residual, M, H);
             } else {
-                run_ref_moe(LW, M, stream);
+                run_ref_moe_and_finalize(LW, M, stream);
             }
-            k_moe_finalize_res_f32<<<M, 256, 0, stream>>>(d_moe_routed_f32, d_shared_out, d_shared_gate, d_residual, M, H);
             toc(prof.moe_ms);
         }
 
@@ -1686,8 +1901,7 @@ struct BackboneRunner {
                     proj_bf16(d_norm, LW.in_proj_qkv, LW.in_proj_qkv_nat, d_qkv, M, qkv_dim, H, stream);
                     proj_bf16(d_norm, LW.in_proj_z, LW.in_proj_z_nat, d_q_ready, M, val_dim, H, stream);
                 }
-                proj_f32(d_norm, LW.in_proj_a, LW.in_proj_a_nat, d_ab, M, c.gdn_vh, H, false, stream);
-                proj_f32(d_norm, LW.in_proj_b, LW.in_proj_b_nat, d_ab + size_t(M) * c.gdn_vh, M, c.gdn_vh, H, false, stream);
+                proj_gdn_ab(LW, M, stream);
 
                 if (is_single_slot_seg) {
                     k_gdn_conv1d_seg<<<(qkv_dim + 255) / 256, 256, 0, stream>>>(
@@ -1736,16 +1950,7 @@ struct BackboneRunner {
             }
 
             // Shared expert (trellis shared row 256 when planned, else dense/BF16 shared expert)
-            if (LW.tr3.valid && LW.tr3.has_shared) {
-                tts_moe_shared_forward(LW.tr3, M, moe_sc, d_shared_out, stream);
-            } else {
-                proj_bf16(d_norm, LW.shared_gate_proj, LW.shared_gate_nat, d_shared_g, M, c.shared_intermediate, H, stream);
-                proj_bf16(d_norm, LW.shared_up_proj, LW.shared_up_nat, d_shared_u, M, c.shared_intermediate, H, stream);
-                const size_t sh_n = size_t(M) * c.shared_intermediate;
-                k_silu_mul_bf16<<<int((sh_n + 255) / 256), 256, 0, stream>>>(d_shared_g, d_shared_u, d_shared_g, sh_n);
-                proj_f32(d_shared_g, LW.shared_down_proj, LW.shared_down_nat, d_shared_out, M, H, c.shared_intermediate, false, stream);
-            }
-            proj_f32(d_norm, LW.shared_expert_gate, LW.shared_expert_gate_nat, d_shared_gate, M, 1, H, false, stream);
+            proj_shared_expert(LW, M, stream);
 
             // Router
             proj_f32(d_norm, LW.router_gate, LW.router_gate_nat, d_router_logits, M, c.num_experts, H, false, stream);
@@ -1774,11 +1979,11 @@ struct BackboneRunner {
             if (LW.tr3.valid) {
                 // Native grouped EXLR8 trellis routed experts (zero host sync!)
                 tts_moe_routed_forward(LW.tr3, d_topk_ids, d_topk_w, M, moe_sc, d_moe_routed_f32, stream);
+                k_moe_finalize_res_f32<<<M, 256, 0, stream>>>(d_moe_routed_f32, d_shared_out, d_shared_gate, d_residual, M, H);
             } else {
-                // Zero-host-sync on-GPU grouped Ref MoE (FP8_BLOCK or BF16)
-                run_ref_moe(LW, M, stream);
+                // Zero-host-sync on-GPU Ref MoE (direct fused SMEM/L1::no_allocate for M<=32, grouped for M>32)
+                run_ref_moe_and_finalize(LW, M, stream);
             }
-            k_moe_finalize_res_f32<<<M, 256, 0, stream>>>(d_moe_routed_f32, d_shared_out, d_shared_gate, d_residual, M, H);
             toc(prof.moe_ms);
             if (trace.enabled) {
                 trace.residuals[size_t(l)].resize(size_t(M) * H);
