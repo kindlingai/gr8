@@ -282,14 +282,21 @@ static ga::Work index_workspace(const G6Attn& a,void* base,bool full){
     ga::Work w{};if(!full)return w;size_t used=0,R=std::min(a.rows,a.query_tile),T=a.context;
     auto take=[&](size_t n){size_t at=used;used=(used+n+255)&~size_t(255);return (void*)((uintptr_t)base+at);};
     w.iq=(half*)take(R*32*128*2);w.weights=(float*)take(R*32*4);
-    w.si=(float*)take(R*T*4);w.ii=(int*)take(R*T*4);
+    w.si=(float*)take(R*T*4);
+#ifdef SEL32
+    const bool opt=knob::pf_attn_opt();
+    if(!opt)w.ii=(int*)take(R*T*4);
     w.selected=(uint64_t*)take(R*TOP*8);w.selection=(ga::SelectionState*)take(R*sizeof(ga::SelectionState));
     w.histogram=(int*)take(R*((std::min(T,size_t(32768))+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK)*256*4);
-#ifdef SEL32
-    // select_prefill never sorts: so holds threshold_compact32's bins (R*chunks*1 KB) or selx's candidates
-    // (min(CAPG, T) keys a row), and io, offsets and the CUB temp are unused
-    if(T>32768)w.so=(float*)take(std::max(R*((T+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK)*256*4,R*std::min(size_t(selx::CAPG),T)*8));
+    // select_prefill never sorts: so holds threshold_compact32's bins (R*chunks*1 KB) or selx/selopt2's candidates
+    // (min(CAPG, T) keys a row), and io, offsets and the CUB temp are unused. Under GR8_PF_ATTN_OPT=1, w.ii is never
+    // written and w.so serves all context lengths, saving R*T*4 bytes (~168-235 MB/rank at 164K-229K CAP).
+    if(opt||T>32768)w.so=(float*)take(std::max(R*((T+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK)*256*4,R*std::min(size_t(selx::CAPG),T)*8));
     w.total=used;return w;
+#else
+    w.ii=(int*)take(R*T*4);
+    w.selected=(uint64_t*)take(R*TOP*8);w.selection=(ga::SelectionState*)take(R*sizeof(ga::SelectionState));
+    w.histogram=(int*)take(R*((std::min(T,size_t(32768))+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK)*256*4);
 #endif
     if(T>32768){w.so=(float*)take(R*T*4);w.io=(int*)take(R*T*4);w.offsets=(int*)take((R+1)*4);
         size_t bytes=0,single=0;auto e=cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,bytes,w.si,w.so,w.ii,w.io,(int)(R*T),(int)R,w.offsets,w.offsets+1);if(e!=cudaSuccess)return ga::Work{};
