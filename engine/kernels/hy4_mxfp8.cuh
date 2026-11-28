@@ -640,6 +640,21 @@ inline void linear_w(cublasHandle_t blas, const __nv_bfloat16* A, const LinW& W,
     }
 }
 
+inline void linear_w_f32(cublasHandle_t blas, const __nv_bfloat16* A, const LinW& W,
+                         float* C, int M, int N, int K,
+                         uint8_t* x8_scratch, const uint8_t* prequant_x8, cudaStream_t st) {
+    if (W.is_mx8()) {
+        const uint8_t* x8 = prequant_x8;
+        if (M >= 16 && x8 == nullptr) {
+            bf16_to_mx8_a(A, x8_scratch, M, K, st);
+            x8 = x8_scratch;
+        }
+        gemm_mx8_impl<true, false>(A, x8, W.mx8, nullptr, C, M, st);
+    } else {
+        linear_bf16_f32(blas, A, W.bf16, C, M, N, K, st);
+    }
+}
+
 // Batched head-wise MXFP8 dequant to temporary BF16 (only used for prefill M > 12 batched w_uk_t / w_uv GEMM,
 // or we run per-head gemm_mx8 directly!). Let's support direct per-head MXFP8 GEMM for M > 12:
 // w_batched: [nh, N_h, K_h] contiguous MXFP8 -> runs nh head slices against x[nh, M, K_h] -> y[nh, M, N_h]!

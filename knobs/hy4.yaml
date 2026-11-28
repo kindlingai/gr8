@@ -83,3 +83,13 @@ knobs:
       1 = load dense/vision-bf16.safetensors (HYV4FlashVisionTransformer, 27-layer BF16 ViT + RMSNorm/Conv2d patch
       merger + image_newline, ~890 MiB) on every rank and accept multimodal image prompts with interleaved 3D MRoPE
       and Engram image-token masking. 0 (the default) = text-only boot. Every rank must agree.
+  GR8_HY4_DFLY_MX8_HEAD:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 (the default) = quantize a separate Blackwell MXFP8 copy of lm_head (~383 MiB/TP) used exclusively during
+      DFly2 speculative drafting (halving 5x draft head bandwidth while keeping target verification in exact BF16,
+      100% lossless). Set 0 to draft with BF16 lm_head.

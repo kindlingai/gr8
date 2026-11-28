@@ -24,24 +24,37 @@ std::vector<std::string> split_csv(const std::string& s) {
     return v;
 }
 
+// Device-driven RDMA AllReduce kernels: compute par = (*d_step) & 1 on device so TP=2 runs inside CUDA Graphs!
+__global__ void k_hy4_ar_send_dev(
+    g6::FabricDev f, const unsigned long long* __restrict__ d_step, int c,
+    const uint4* __restrict__ src, size_t n16) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n16) return;
+    const int par = static_cast<int>((*d_step) & 1ULL);
+    uint4* dst = reinterpret_cast<uint4*>(f.send + g6::fab_send_off(f, par, c));
+    dst[i] = src[i];
+}
+
 struct Hy4ArWait {
     g6::FabricDev f;
     size_t bytes;
     const unsigned long long* d_step;
     unsigned code;
-    int par, c;
+    int c;
 };
 
 __global__ void k_hy4_ar_ring_wait(Hy4ArWait a) {
     const int p = threadIdx.x;
-    const unsigned long long seq = g6::coll_seq(*a.d_step, a.c, a.f.ncoll);
+    const unsigned long long step = *a.d_step;
+    const int par = static_cast<int>(step & 1ULL);
+    const unsigned long long seq = g6::coll_seq(step, a.c, a.f.ncoll);
     if (p == 0) {
         __threadfence_system();
         ink2::ar_st_release_sys(a.f.doorbell + a.c, seq);
     }
     if (p < a.f.nr && p != a.f.rank) {
         const unsigned long long* tail = reinterpret_cast<const unsigned long long*>(
-            a.f.recv + g6::fab_recv_off(a.f, a.par, a.c, p) + a.bytes);
+            a.f.recv + g6::fab_recv_off(a.f, par, a.c, p) + a.bytes);
         const long long t0 = clock64();
         unsigned it = 0;
         while (ink2::ar_ld_acquire_sys(tail) != seq) {
@@ -49,6 +62,157 @@ __global__ void k_hy4_ar_ring_wait(Hy4ArWait a) {
                 atomicCAS(a.f.error, 0u, a.code | static_cast<unsigned>(p));
                 break;
             }
+        }
+    }
+}
+
+// Fused TP=2 RDMA recv + exact-order partial sum + Sandwich RMSNorm + 4-stream HC residual inject (graph-safe!).
+// Eliminates 84 k_ink2_ar_copy<true> launches + 84 global-memory round-trips per step!
+__global__ void __launch_bounds__(256) k_hy4_ar_recv_sum_norm_inject_tp2(
+    g6::FabricDev f, const unsigned long long* __restrict__ d_step, int c,
+    const __nv_bfloat16* __restrict__ local_part,
+    const __nv_bfloat16* __restrict__ post_norm_w,
+    const float* __restrict__ post,
+    __nv_bfloat16* __restrict__ hyper,
+    int M) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int par = static_cast<int>((*d_step) & 1ULL);
+    const int peer = 1 - f.rank;
+    const uint2* loc4 = reinterpret_cast<const uint2*>(local_part + static_cast<size_t>(m) * geom::HID);
+    const uint2* rem4 = reinterpret_cast<const uint2*>(
+        f.recv + g6::fab_recv_off(f, par, c, peer) + static_cast<size_t>(m) * geom::HID * 2);
+
+    float y[3][4];
+    float ss = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int i = tid + k * 256;
+        const uint2 lv = loc4[i];
+        const uint2 rv = rem4[i];
+        const float2 l01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&lv.x));
+        const float2 l23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&lv.y));
+        const float2 r01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rv.x));
+        const float2 r23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rv.y));
+        const float s4[4] = {l01.x + r01.x, l01.y + r01.y, l23.x + r23.x, l23.y + r23.y};
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float ybf = __bfloat162float(__float2bfloat16(s4[j]));
+            y[k][j] = ybf;
+            ss = fmaf(ybf, ybf, ss);
+        }
+    }
+    __shared__ float sm[8];
+    ss = hy4::warp_sum(ss);
+    if (lane == 0) sm[warp] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (int w = 0; w < 8; ++w) tot += sm[w];
+        sm[0] = rsqrtf(tot / static_cast<float>(geom::HID) + geom::RMS_EPS);
+    }
+    __syncthreads();
+    const float inv = sm[0];
+    const float p0 = post[static_cast<size_t>(m) * 4 + 0];
+    const float p1 = post[static_cast<size_t>(m) * 4 + 1];
+    const float p2 = post[static_cast<size_t>(m) * 4 + 2];
+    const float p3 = post[static_cast<size_t>(m) * 4 + 3];
+    const uint2* wn4 = reinterpret_cast<const uint2*>(post_norm_w);
+    uint2* hm0 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 0 * geom::HID);
+    uint2* hm1 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 1 * geom::HID);
+    uint2* hm2 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 2 * geom::HID);
+    uint2* hm3 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 3 * geom::HID);
+    #pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int i = tid + k * 256;
+        const uint2 wr = __ldg(wn4 + i);
+        const float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.x));
+        const float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.y));
+        const float wf[4] = {w01.x, w01.y, w23.x, w23.y};
+        float ny[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float xn = __bfloat162float(__float2bfloat16(y[k][j] * inv));
+            ny[j] = __bfloat162float(__float2bfloat16(wf[j] * xn));
+        }
+        hm0[i] = hy4::hy4_hc_inject_u2(hm0[i], p0, ny);
+        hm1[i] = hy4::hy4_hc_inject_u2(hm1[i], p1, ny);
+        hm2[i] = hy4::hy4_hc_inject_u2(hm2[i], p2, ny);
+        hm3[i] = hy4::hy4_hc_inject_u2(hm3[i], p3, ny);
+    }
+}
+
+// Fused TP=2 RDMA recv + sum + optional RMSNorm + residual add for DFly2 single-stream layers (graph-safe!).
+__global__ void __launch_bounds__(256) k_hy4_ar_recv_sum_norm_add1_tp2(
+    g6::FabricDev f, const unsigned long long* __restrict__ d_step, int c,
+    const __nv_bfloat16* __restrict__ local_part,
+    const __nv_bfloat16* __restrict__ post_norm_w,
+    __nv_bfloat16* __restrict__ h,
+    int M) {
+    const int m = blockIdx.x;
+    if (m >= M) return;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int par = static_cast<int>((*d_step) & 1ULL);
+    const int peer = 1 - f.rank;
+    const uint2* loc4 = reinterpret_cast<const uint2*>(local_part + static_cast<size_t>(m) * geom::HID);
+    const uint2* rem4 = reinterpret_cast<const uint2*>(
+        f.recv + g6::fab_recv_off(f, par, c, peer) + static_cast<size_t>(m) * geom::HID * 2);
+
+    float y[3][4];
+    float ss = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const int i = tid + k * 256;
+        const uint2 lv = loc4[i], rv = rem4[i];
+        const float2 l01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&lv.x));
+        const float2 l23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&lv.y));
+        const float2 r01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rv.x));
+        const float2 r23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rv.y));
+        const float s4[4] = {l01.x + r01.x, l01.y + r01.y, l23.x + r23.x, l23.y + r23.y};
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float v = __bfloat162float(__float2bfloat16(s4[j]));
+            y[k][j] = v;
+            ss = fmaf(v, v, ss);
+        }
+    }
+    uint2* hm4 = reinterpret_cast<uint2*>(h + static_cast<size_t>(m) * geom::HID);
+    if (post_norm_w != nullptr) {
+        __shared__ float sm[8];
+        ss = hy4::warp_sum(ss);
+        if (lane == 0) sm[warp] = ss;
+        __syncthreads();
+        if (tid == 0) {
+            float tot = 0.0f;
+            for (int w = 0; w < 8; ++w) tot += sm[w];
+            sm[0] = rsqrtf(tot / static_cast<float>(geom::HID) + geom::RMS_EPS);
+        }
+        __syncthreads();
+        const float inv = sm[0];
+        const uint2* wn4 = reinterpret_cast<const uint2*>(post_norm_w);
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const int i = tid + k * 256;
+            const uint2 wr = __ldg(wn4 + i);
+            const float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.x));
+            const float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.y));
+            const float wf[4] = {w01.x, w01.y, w23.x, w23.y};
+            float ny[4];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float xn = __bfloat162float(__float2bfloat16(y[k][j] * inv));
+                ny[j] = __bfloat162float(__float2bfloat16(wf[j] * xn));
+            }
+            hm4[i] = hy4::hy4_hc_inject_u2(hm4[i], 1.0f, ny);
+        }
+    } else {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const int i = tid + k * 256;
+            hm4[i] = hy4::hy4_hc_inject_u2(hm4[i], 1.0f, y[k]);
         }
     }
 }
@@ -107,24 +271,28 @@ struct Hy4Wire {
         HY4_CK(cudaMemcpyAsync(d_step, &step, sizeof(step), cudaMemcpyHostToDevice, st));
     }
 
-    void exchange_parts(int c, int M, __nv_bfloat16* parts, cudaStream_t st) const {
+    void send_and_wait_dev(int c, int M, const __nv_bfloat16* local_part, cudaStream_t st) const {
         if (nr <= 1) return;
         const size_t bytes = ((size_t(M) * geom::HID * 2 + 15) / 16) * 16;
         const size_t n16 = bytes / 16;
         const unsigned grid = static_cast<unsigned>((n16 + 255) / 256);
-        const int par = static_cast<int>(step & 1);
-        ink2::k_ink2_ar_copy<<<grid, 256, 0, st>>>(
-            reinterpret_cast<const uint4*>(parts + static_cast<size_t>(rank) * M * geom::HID),
-            reinterpret_cast<uint4*>(f.send + g6::fab_send_off(f, par, c)), n16);
-        Hy4ArWait a{f, bytes, d_step, ink2::INK2_ERR_AR | (static_cast<unsigned>(c) << 8), par, c};
+        k_hy4_ar_send_dev<<<grid, 256, 0, st>>>(f, d_step, c, reinterpret_cast<const uint4*>(local_part), n16);
+        Hy4ArWait a{f, bytes, d_step, ink2::INK2_ERR_AR | (static_cast<unsigned>(c) << 8), c};
         k_hy4_ar_ring_wait<<<1, 32, 0, st>>>(a);
-        for (int p = 0; p < nr; ++p) {
-            if (p != rank) {
-                ink2::k_ink2_ar_copy<true><<<grid, 256, 0, st>>>(
-                    reinterpret_cast<const uint4*>(f.recv + g6::fab_recv_off(f, par, c, p)),
-                    reinterpret_cast<uint4*>(parts + static_cast<size_t>(p) * M * geom::HID), n16);
-            }
-        }
+    }
+
+    void ar_norm_inject_tp2(int c, int M, const __nv_bfloat16* parts, const __nv_bfloat16* post_ln,
+                            const float* hc_post, __nv_bfloat16* hyper, cudaStream_t st) const {
+        const __nv_bfloat16* loc = parts + static_cast<size_t>(rank) * M * geom::HID;
+        send_and_wait_dev(c, M, loc, st);
+        k_hy4_ar_recv_sum_norm_inject_tp2<<<M, 256, 0, st>>>(f, d_step, c, loc, post_ln, hc_post, hyper, M);
+    }
+
+    void ar_norm_add1_tp2(int c, int M, const __nv_bfloat16* parts, const __nv_bfloat16* post_ln,
+                          __nv_bfloat16* h, cudaStream_t st) const {
+        const __nv_bfloat16* loc = parts + static_cast<size_t>(rank) * M * geom::HID;
+        send_and_wait_dev(c, M, loc, st);
+        k_hy4_ar_recv_sum_norm_add1_tp2<<<M, 256, 0, st>>>(f, d_step, c, loc, post_ln, h, M);
     }
 
     void gather_head(int c, int M, uint8_t* host_parts, size_t rb) const {
@@ -285,17 +453,14 @@ int main(int argc, char** argv) {
     if (G6_NR > 1) {
         e.on_step_begin = [&](int M, bool skip_head) { wire.begin(M, skip_head, e.stream); };
         e.on_ar_norm_inject = [&](int c, int M, const __nv_bfloat16* post_ln) {
-            wire.exchange_parts(c, M, e.parts, e.stream);
-            hy4::k_hy4_sum_norm_inject<<<M, 256, 0, e.stream>>>(
-                e.parts, post_ln, e.hc_sc.post, e.hyper, e.o.nr, M, M);
+            wire.ar_norm_inject_tp2(c, M, e.parts, post_ln, e.hc_sc.post, e.hyper, e.stream);
         };
         e.on_head_gather = [&](int c, int M, uint8_t* hp, size_t rb) { wire.gather_head(c, M, hp, rb); };
         e.on_step_end = [&]() { wire.end(e.stream); };
 
         e.on_dfly_begin = [&](int W) { wire.begin_dfly(W, W - 1, e.stream); };
         e.on_dfly_ar_add = [&](int c, int W, const __nv_bfloat16* post_ln) {
-            wire.exchange_parts(c, W, e.parts, e.stream);
-            hy4::k_hy4_sum_norm_add1<<<W, 256, 0, e.stream>>>(e.parts, post_ln, e.dfly_sc.h, e.o.nr, W, W);
+            wire.ar_norm_add1_tp2(c, W, e.parts, post_ln, e.dfly_sc.h, e.stream);
         };
         e.on_dfly_head_gather = [&](int c, int M, uint8_t* hp, size_t rb) { wire.gather_head(c, M, hp, rb); };
         e.on_dfly_end = [&]() { wire.end(e.stream); };

@@ -1429,6 +1429,372 @@ __global__ void k_hy4_add_bf16(const __nv_bfloat16* __restrict__ a,
 // =================================================================================================
 // Full MoE Forward (Layers 1..41) -> out_part [M, 3072] BF16 partial!
 // =================================================================================================
+// Zero-barrier M=1 PMCGX helpers: load all HB blocks ONCE into shared memory with 1 __syncthreads(),
+// then scale by v1b in registers before mma16816_f16 (0 ULP bit-exact vs grouped kernels, 48x-96x fewer barriers!).
+template <int BITS>
+__device__ __forceinline__ void hy4_pmcgx_fc1_hb_m1(
+    const uint8_t* mw, int hb, int warp, int lane,
+    const __half* s_x_hb, __half2 bsh, float (&c)[4]) {
+    const int row0 = lane >> 2, col = lane & 3;
+    const bool act = (row0 == 0);
+    const int prev_lane = (lane - 1) & 31;
+    const uint8_t* grp = mw + static_cast<size_t>(hb) * (2048 * BITS);
+
+    if constexpr (BITS == 4) {
+        const uint4 w0 = *reinterpret_cast<const uint4*>(grp + warp * 1024 + lane * 16);
+        const uint4 w1 = *reinterpret_cast<const uint4*>(grp + warp * 1024 + 512 + lane * 16);
+        const u32 chs[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const u32 ch = chs[p];
+            const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            u32 f0[2], f1[2];
+            pmcgx_decode_m<4>((static_cast<u64>(pc) << 32) | ch, f0, f1);
+            u32 b0 = 0u, b1 = 0u;
+            if (act) {
+                const __half2 h0 = __hmul2(*reinterpret_cast<const __half2*>(s_x_hb + p * 16 + 2 * col), bsh);
+                const __half2 h1 = __hmul2(*reinterpret_cast<const __half2*>(s_x_hb + p * 16 + 2 * col + 8), bsh);
+                b0 = *reinterpret_cast<const u32*>(&h0);
+                b1 = *reinterpret_cast<const u32*>(&h1);
+            }
+            mma16816_f16(c, f0[0], f1[0], f0[1], f1[1], b0, b1);
+        }
+    } else {
+        u64 w[3] = {0, 0, 0};
+        #pragma unroll
+        for (int n = 0; n < BITS; ++n) w[n] = rd64_u8(grp + (n * 8 + warp) * 256 + lane * 8);
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const u32 ch = trw_chunk<BITS>(w, p);
+            const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            u32 f0[2], f1[2];
+            pmcgx_decode_m<BITS>((static_cast<u64>(pc) << (8 * BITS)) | ch, f0, f1);
+            u32 b0 = 0u, b1 = 0u;
+            if (act) {
+                const __half2 h0 = __hmul2(*reinterpret_cast<const __half2*>(s_x_hb + p * 16 + 2 * col), bsh);
+                const __half2 h1 = __hmul2(*reinterpret_cast<const __half2*>(s_x_hb + p * 16 + 2 * col + 8), bsh);
+                b0 = *reinterpret_cast<const u32*>(&h0);
+                b1 = *reinterpret_cast<const u32*>(&h1);
+            }
+            mma16816_f16(c, f0[0], f1[0], f0[1], f1[1], b0, b1);
+        }
+    }
+}
+
+template <int BITS>
+__device__ __forceinline__ void hy4_pmcgx_fc2_ntile_m1(
+    const uint8_t* mw, int n_tile, int lane,
+    const __half* s_x2_b, float (&c)[4]) {
+    const int row0 = lane >> 2, col = lane & 3;
+    const bool act = (row0 == 0);
+    const int prev_lane = (lane - 1) & 31;
+    const uint8_t* nt = mw + static_cast<size_t>(n_tile) * (256 * BITS);
+
+    if constexpr (BITS == 4) {
+        const uint4 w0 = *reinterpret_cast<const uint4*>(nt + lane * 16);
+        const uint4 w1 = *reinterpret_cast<const uint4*>(nt + 512 + lane * 16);
+        const u32 chs[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const u32 ch = chs[p];
+            const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            u32 f0[2], f1[2];
+            pmcgx_decode_m<4>((static_cast<u64>(pc) << 32) | ch, f0, f1);
+            const u32 b0 = act ? *reinterpret_cast<const u32*>(s_x2_b + p * 16 + 2 * col) : 0u;
+            const u32 b1 = act ? *reinterpret_cast<const u32*>(s_x2_b + p * 16 + 2 * col + 8) : 0u;
+            mma16816_f16(c, f0[0], f1[0], f0[1], f1[1], b0, b1);
+        }
+    } else {
+        u64 w[3] = {0, 0, 0};
+        #pragma unroll
+        for (int n = 0; n < BITS; ++n) w[n] = rd64_u8(nt + n * 256 + lane * 8);
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const u32 ch = trw_chunk<BITS>(w, p);
+            const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+            u32 f0[2], f1[2];
+            pmcgx_decode_m<BITS>((static_cast<u64>(pc) << (8 * BITS)) | ch, f0, f1);
+            const u32 b0 = act ? *reinterpret_cast<const u32*>(s_x2_b + p * 16 + 2 * col) : 0u;
+            const u32 b1 = act ? *reinterpret_cast<const u32*>(s_x2_b + p * 16 + 2 * col + 8) : 0u;
+            mma16816_f16(c, f0[0], f1[0], f0[1], f1[1], b0, b1);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) k_hy4_routed_fc1_m1(
+    const __half* __restrict__ x_had,
+    const int* __restrict__ topk_idx,
+    const long long* __restrict__ tab,
+    const long long* __restrict__ kmix,
+    const uint8_t* __restrict__ fc1,
+    const __half* __restrict__ v1b,
+    const __half* __restrict__ v2,
+    __half* __restrict__ fc1_act,
+    int eb) {
+    const int b = blockIdx.x % eb;
+    const int g = blockIdx.x / eb;
+    if (g >= geom::TOPK) return;
+    const int e = topk_idx[g];
+    const long long* tr = tab + static_cast<size_t>(e) * 6;
+    if (b >= static_cast<int>(tr[3])) return;
+    const size_t brow = static_cast<size_t>(tr[2]) + b;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+
+    // Load ALL 12 HB blocks (1536 halfs = 3 KB) ONCE across all 8 warps!
+    __shared__ __half s_x[geom::EHB][128];
+    const uint2* x4 = reinterpret_cast<const uint2*>(x_had);
+    uint2* sx4 = reinterpret_cast<uint2*>(&s_x[0][0]);
+    for (int i = tid; i < (geom::EHB * 128) / 4; i += 256) sx4[i] = x4[i];
+    __syncthreads();
+
+    const uint8_t* mw_g = nullptr;
+    const uint8_t* mw_u = nullptr;
+    const int kg = hy4_fc1_unit<geom::EHB>(fc1, kmix, e, tr, 2 * b + 0, mw_g);
+    const int ku = hy4_fc1_unit<geom::EHB>(fc1, kmix, e, tr, 2 * b + 1, mw_u);
+
+    float cg[4] = {0, 0, 0, 0};
+    float cu[4] = {0, 0, 0, 0};
+    for (int hb = 0; hb < geom::EHB; ++hb) {
+        const __half2 bsh = __half2half2(v1b[(brow * 2 + 0) * geom::EHB + hb]);
+        if (kg == 3)      hy4_pmcgx_fc1_hb_m1<3>(mw_g, hb, warp, lane, s_x[hb], bsh, cg);
+        else if (kg == 4) hy4_pmcgx_fc1_hb_m1<4>(mw_g, hb, warp, lane, s_x[hb], bsh, cg);
+        else              hy4_pmcgx_fc1_hb_m1<2>(mw_g, hb, warp, lane, s_x[hb], bsh, cg);
+    }
+    for (int hb = 0; hb < geom::EHB; ++hb) {
+        const __half2 bsh = __half2half2(v1b[(brow * 2 + 1) * geom::EHB + hb]);
+        if (ku == 3)      hy4_pmcgx_fc1_hb_m1<3>(mw_u, hb, warp, lane, s_x[hb], bsh, cu);
+        else if (ku == 4) hy4_pmcgx_fc1_hb_m1<4>(mw_u, hb, warp, lane, s_x[hb], bsh, cu);
+        else              hy4_pmcgx_fc1_hb_m1<2>(mw_u, hb, warp, lane, s_x[hb], bsh, cu);
+    }
+
+    __shared__ float s_g[128], s_u[128];
+    const int row0 = lane >> 2, col = lane & 3;
+    if (col == 0) {
+        s_g[warp * 16 + row0]     = cg[0];
+        s_g[warp * 16 + row0 + 8] = cg[2];
+        s_u[warp * 16 + row0]     = cu[0];
+        s_u[warp * 16 + row0 + 8] = cu[2];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float vg[4], vu[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) { vg[i] = s_g[lane * 4 + i]; vu[i] = s_u[lane * 4 + i]; }
+        had128(vg, lane);
+        had128(vu, lane);
+        const __half* sv_g = v2 + (brow * 3 + 0) * 128;
+        const __half* sv_u = v2 + (brow * 3 + 1) * 128;
+        const __half* su_d = v2 + (brow * 3 + 2) * 128;
+        float va[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int c = lane * 4 + i;
+            float gf = __bfloat162float(__float2bfloat16(vg[i] * __half2float(sv_g[c])));
+            float uf = __bfloat162float(__float2bfloat16(vu[i] * __half2float(sv_u[c])));
+            gf = fminf(gf, geom::SWIGLU_LIMIT);
+            uf = fmaxf(-geom::SWIGLU_LIMIT, fminf(geom::SWIGLU_LIMIT, uf));
+            const float act = __bfloat162float(__float2bfloat16(silu_f(gf) * uf));
+            va[i] = act * __half2float(su_d[c]);
+        }
+        had128(va, lane);
+        __half* dst = fc1_act + (static_cast<size_t>(g) * eb + b) * 128;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = __float2half_rn(va[i]);
+    }
+}
+
+__global__ void __launch_bounds__(256) k_hy4_routed_fc2_m1(
+    const __half* __restrict__ fc1_act,
+    const int* __restrict__ topk_idx,
+    const float* __restrict__ topk_w,
+    const long long* __restrict__ tab,
+    const uint8_t* __restrict__ fc2,
+    const __half* __restrict__ sg,
+    const __half* __restrict__ v3b,
+    float* __restrict__ fc2_part,
+    int eb) {
+    const int hb = blockIdx.x % geom::EHB;
+    const int g  = blockIdx.x / geom::EHB;
+    if (g >= geom::TOPK) return;
+    const int e = topk_idx[g];
+    const long long* tr = tab + static_cast<size_t>(e) * 6;
+    const int nb = static_cast<int>(tr[3]);
+    const int bits = static_cast<int>(tr[4]);
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+
+    __shared__ __half s_x2[16][128];
+    const uint2* src4 = reinterpret_cast<const uint2*>(fc1_act + static_cast<size_t>(g) * eb * 128);
+    uint2* dst4 = reinterpret_cast<uint2*>(&s_x2[0][0]);
+    const int tot4 = nb * 32;
+    for (int i = tid; i < tot4; i += 256) dst4[i] = src4[i];
+    __syncthreads();
+
+    float acc[4] = {0, 0, 0, 0};
+    constexpr size_t BLK_PER_BIT = static_cast<size_t>(geom::EHB) * 2048;
+    const int n_tile = hb * 8 + warp;
+    for (int b = 0; b < nb; ++b) {
+        const size_t brow = static_cast<size_t>(tr[2]) + b;
+        const uint8_t* mw = fc2 + static_cast<size_t>(tr[1]) + static_cast<size_t>(b) * BLK_PER_BIT * bits;
+        float c[4] = {0, 0, 0, 0};
+        if (bits == 3)      hy4_pmcgx_fc2_ntile_m1<3>(mw, n_tile, lane, s_x2[b], c);
+        else if (bits == 4) hy4_pmcgx_fc2_ntile_m1<4>(mw, n_tile, lane, s_x2[b], c);
+        else                hy4_pmcgx_fc2_ntile_m1<2>(mw, n_tile, lane, s_x2[b], c);
+        const float sc = __half2float(v3b[brow * geom::EHB + hb]);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) acc[i] = fmaf(c[i], sc, acc[i]);
+    }
+    __shared__ float s_out[128];
+    const int row0 = lane >> 2, col = lane & 3;
+    if (col == 0) {
+        s_out[warp * 16 + row0]     = acc[0];
+        s_out[warp * 16 + row0 + 8] = acc[2];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float v[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = s_out[lane * 4 + i];
+        had128(v, lane);
+        const float rw = topk_w[g];
+        const __half* sg_out = sg + geom::EH + hb * 128;
+        float* dst = fc2_part + static_cast<size_t>(g) * geom::EH + hb * 128;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = v[i] * __half2float(sg_out[lane * 4 + i]) * rw;
+    }
+}
+
+__global__ void __launch_bounds__(256) k_hy4_shared_fc1_m1(
+    const __half* __restrict__ x_had_s,
+    const long long* __restrict__ tab,
+    const long long* __restrict__ kmix,
+    const uint8_t* __restrict__ fc1,
+    const __half* __restrict__ v1b,
+    const __half* __restrict__ v2,
+    __half* __restrict__ fc1_act_s,
+    int eb) {
+    const int b = blockIdx.x;
+    const long long* tr = tab;
+    if (b >= static_cast<int>(tr[3])) return;
+    const size_t brow = static_cast<size_t>(tr[2]) + b;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+
+    // Load ALL 24 HB blocks (3072 halfs = 6 KB) ONCE across all 8 warps!
+    __shared__ __half s_xs[geom::HB][128];
+    const uint2* x4 = reinterpret_cast<const uint2*>(x_had_s);
+    uint2* sx4 = reinterpret_cast<uint2*>(&s_xs[0][0]);
+    for (int i = tid; i < (geom::HB * 128) / 4; i += 256) sx4[i] = x4[i];
+    __syncthreads();
+
+    const uint8_t* mw_g = nullptr;
+    const uint8_t* mw_u = nullptr;
+    const int kg = hy4_fc1_unit<geom::HB>(fc1, kmix, 0, tr, 2 * b + 0, mw_g);
+    const int ku = hy4_fc1_unit<geom::HB>(fc1, kmix, 0, tr, 2 * b + 1, mw_u);
+
+    float cg[4] = {0, 0, 0, 0};
+    float cu[4] = {0, 0, 0, 0};
+    for (int hb = 0; hb < geom::HB; ++hb) {
+        const __half2 bsh = __half2half2(v1b[(brow * 2 + 0) * geom::HB + hb]);
+        if (kg == 4)      hy4_pmcgx_fc1_hb_m1<4>(mw_g, hb, warp, lane, s_xs[hb], bsh, cg);
+        else if (kg == 3) hy4_pmcgx_fc1_hb_m1<3>(mw_g, hb, warp, lane, s_xs[hb], bsh, cg);
+        else              hy4_pmcgx_fc1_hb_m1<2>(mw_g, hb, warp, lane, s_xs[hb], bsh, cg);
+    }
+    for (int hb = 0; hb < geom::HB; ++hb) {
+        const __half2 bsh = __half2half2(v1b[(brow * 2 + 1) * geom::HB + hb]);
+        if (ku == 4)      hy4_pmcgx_fc1_hb_m1<4>(mw_u, hb, warp, lane, s_xs[hb], bsh, cu);
+        else if (ku == 3) hy4_pmcgx_fc1_hb_m1<3>(mw_u, hb, warp, lane, s_xs[hb], bsh, cu);
+        else              hy4_pmcgx_fc1_hb_m1<2>(mw_u, hb, warp, lane, s_xs[hb], bsh, cu);
+    }
+
+    __shared__ float s_g[128], s_u[128];
+    const int row0 = lane >> 2, col = lane & 3;
+    if (col == 0) {
+        s_g[warp * 16 + row0] = cg[0]; s_g[warp * 16 + row0 + 8] = cg[2];
+        s_u[warp * 16 + row0] = cu[0]; s_u[warp * 16 + row0 + 8] = cu[2];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float vg[4], vu[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) { vg[i] = s_g[lane * 4 + i]; vu[i] = s_u[lane * 4 + i]; }
+        had128(vg, lane);
+        had128(vu, lane);
+        const __half* sv_g = v2 + (brow * 3 + 0) * 128;
+        const __half* sv_u = v2 + (brow * 3 + 1) * 128;
+        const __half* su_d = v2 + (brow * 3 + 2) * 128;
+        float va[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int c = lane * 4 + i;
+            const float gf = __bfloat162float(__float2bfloat16(vg[i] * __half2float(sv_g[c])));
+            const float uf = __bfloat162float(__float2bfloat16(vu[i] * __half2float(sv_u[c])));
+            const float act = __bfloat162float(__float2bfloat16(silu_f(gf) * uf));
+            va[i] = act * __half2float(su_d[c]);
+        }
+        had128(va, lane);
+        __half* dst = fc1_act_s + static_cast<size_t>(b) * 128;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = __float2half_rn(va[i]);
+    }
+}
+
+__global__ void __launch_bounds__(256) k_hy4_shared_fc2_m1(
+    const __half* __restrict__ fc1_act_s,
+    const long long* __restrict__ tab,
+    const uint8_t* __restrict__ fc2,
+    const __half* __restrict__ sg,
+    const __half* __restrict__ v3b,
+    __nv_bfloat16* __restrict__ shared_out,
+    int eb) {
+    const int hb = blockIdx.x;
+    if (hb >= geom::HB) return;
+    const long long* tr = tab;
+    const int nb = static_cast<int>(tr[3]);
+    const int bits = static_cast<int>(tr[4]);
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+
+    __shared__ __half s_x2[16][128];
+    const uint2* src4 = reinterpret_cast<const uint2*>(fc1_act_s);
+    uint2* dst4 = reinterpret_cast<uint2*>(&s_x2[0][0]);
+    for (int i = tid; i < nb * 32; i += 256) dst4[i] = src4[i];
+    __syncthreads();
+
+    float acc[4] = {0, 0, 0, 0};
+    constexpr size_t BLK_PER_BIT = static_cast<size_t>(geom::HB) * 2048;
+    const int n_tile = hb * 8 + warp;
+    for (int b = 0; b < nb; ++b) {
+        const size_t brow = static_cast<size_t>(tr[2]) + b;
+        const uint8_t* mw = fc2 + static_cast<size_t>(tr[1]) + static_cast<size_t>(b) * BLK_PER_BIT * bits;
+        float c[4] = {0, 0, 0, 0};
+        if (bits == 4)      hy4_pmcgx_fc2_ntile_m1<4>(mw, n_tile, lane, s_x2[b], c);
+        else if (bits == 3) hy4_pmcgx_fc2_ntile_m1<3>(mw, n_tile, lane, s_x2[b], c);
+        else                hy4_pmcgx_fc2_ntile_m1<2>(mw, n_tile, lane, s_x2[b], c);
+        const float sc = __half2float(v3b[brow * geom::HB + hb]);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) acc[i] = fmaf(c[i], sc, acc[i]);
+    }
+    __shared__ float s_out[128];
+    const int row0 = lane >> 2, col = lane & 3;
+    if (col == 0) {
+        s_out[warp * 16 + row0]     = acc[0];
+        s_out[warp * 16 + row0 + 8] = acc[2];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float v[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = s_out[lane * 4 + i];
+        had128(v, lane);
+        const __half* sg_out = sg + geom::HID + hb * 128;
+        __nv_bfloat16* dst = shared_out + hb * 128;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = __float2bfloat16(v[i] * __half2float(sg_out[lane * 4 + i]));
+    }
+}
+
 inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc,
                         const __nv_bfloat16* x_norm, __nv_bfloat16* out_part,
                         int M, uint8_t* x8_scratch, cudaStream_t st, bool skip_add = false) {
@@ -1442,13 +1808,11 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
     k_hy4_prerot_x<geom::EHB><<<M * geom::EHB, 32, 0, st>>>(sc.routed_in, w.routed.sg, sc.x_had_r, M);
 
     if (M == 1) {
-        k_hy4_moe_groups_m1<<<1, 32, 0, st>>>(sc.topk_idx, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes);
-        const int grid_G = geom::TOPK;
-        k_hy4_routed_fc1_grp<<<grid_G * w.routed.eb, 256, 0, st>>>(
-            sc.x_had_r, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
+        k_hy4_routed_fc1_m1<<<geom::TOPK * w.routed.eb, 256, 0, st>>>(
+            sc.x_had_r, sc.topk_idx,
             w.routed.tab, w.routed.kmix, w.routed.fc1, w.routed.v1b, w.routed.v2, sc.fc1_act_r, w.routed.eb);
-        k_hy4_routed_fc2_grp<<<grid_G * geom::EHB, 256, 0, st>>>(
-            sc.fc1_act_r, sc.d_n_groups, sc.grp_exp, sc.grp_cnt, sc.grp_routes,
+        k_hy4_routed_fc2_m1<<<geom::TOPK * geom::EHB, 256, 0, st>>>(
+            sc.fc1_act_r, sc.topk_idx,
             sc.topk_w, w.routed.tab, w.routed.fc2, w.routed.sg, w.routed.v3b, sc.fc2_part_r, w.routed.eb);
     } else if (M < 16) {
         k_hy4_moe_build_groups<8><<<1, geom::NEXP, 0, st>>>(
@@ -1476,7 +1840,13 @@ inline void moe_forward(cublasHandle_t blas, const MoeWeights& w, MoeScratch& sc
 
     // 3. Shared PMCGX expert (H=3072, HB=24, NO swiglu clamp)
     k_hy4_prerot_x<geom::HB><<<M * geom::HB, 32, 0, st>>>(x_norm, w.shared.sg, sc.x_had_s, M);
-    if (M < 16) {
+    if (M == 1) {
+        k_hy4_shared_fc1_m1<<<w.shared.eb, 256, 0, st>>>(
+            sc.x_had_s, w.shared.tab, w.shared.kmix, w.shared.fc1, w.shared.v1b, w.shared.v2,
+            sc.fc1_act_s, w.shared.eb);
+        k_hy4_shared_fc2_m1<<<geom::HB, 256, 0, st>>>(
+            sc.fc1_act_s, w.shared.tab, w.shared.fc2, w.shared.sg, w.shared.v3b, sc.shared_out, w.shared.eb);
+    } else if (M < 16) {
         const int n_m8 = (M + 7) / 8;
         k_hy4_shared_fc1<<<n_m8 * w.shared.eb, 256, 0, st>>>(
             sc.x_had_s, w.shared.tab, w.shared.kmix, w.shared.fc1, w.shared.v1b, w.shared.v2,

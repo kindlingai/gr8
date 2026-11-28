@@ -105,7 +105,7 @@ __device__ __forceinline__ float dot_bf16x8(uint4 a, uint4 b) {
 
 // Fast coalesced BF16 GEMV for small decode batches (M <= 12):
 //   C[M, N] = A[M, K] @ B[N, K]^T + optional bias[N] (K must be multiple of 8).
-template <int MAX_M, bool OUT_F32 = false, bool HAS_BIAS = false>
+template <int MAX_M, bool OUT_F32 = false, bool HAS_BIAS = false, bool STREAM_B = false>
 __global__ void __launch_bounds__(128) k_hy4_bf16_gemv_smallm(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
@@ -124,21 +124,21 @@ __global__ void __launch_bounds__(128) k_hy4_bf16_gemv_smallm(
 
     int i = lane;
     for (; i + 96 < K8; i += 128) {
-        const uint4 b0 = __ldg(brow + i);
-        const uint4 b1 = __ldg(brow + i + 32);
-        const uint4 b2 = __ldg(brow + i + 64);
-        const uint4 b3 = __ldg(brow + i + 96);
+        const uint4 b0 = STREAM_B ? __ldcs(brow + i)      : __ldg(brow + i);
+        const uint4 b1 = STREAM_B ? __ldcs(brow + i + 32) : __ldg(brow + i + 32);
+        const uint4 b2 = STREAM_B ? __ldcs(brow + i + 64) : __ldg(brow + i + 64);
+        const uint4 b3 = STREAM_B ? __ldcs(brow + i + 96) : __ldg(brow + i + 96);
         #pragma unroll
         for (int m = 0; m < MAX_M; ++m) {
             if (m < M) {
                 const uint4* am = reinterpret_cast<const uint4*>(A + static_cast<size_t>(m) * K);
-                acc[m] += dot_bf16x8(am[i], b0) + dot_bf16x8(am[i + 32], b1)
-                        + dot_bf16x8(am[i + 64], b2) + dot_bf16x8(am[i + 96], b3);
+                acc[m] += dot_bf16x8(__ldg(am + i), b0) + dot_bf16x8(__ldg(am + i + 32), b1)
+                        + dot_bf16x8(__ldg(am + i + 64), b2) + dot_bf16x8(__ldg(am + i + 96), b3);
             }
         }
     }
     for (; i < K8; i += 32) {
-        const uint4 bv = __ldg(brow + i);
+        const uint4 bv = STREAM_B ? __ldcs(brow + i) : __ldg(brow + i);
         #pragma unroll
         for (int m = 0; m < MAX_M; ++m) {
             if (m < M) {
@@ -165,11 +165,19 @@ inline void launch_bf16_gemv_smallm(const __nv_bfloat16* A, const __nv_bfloat16*
                                     void* C, int M, int N, int K, cudaStream_t st,
                                     const __nv_bfloat16* bias = nullptr) {
     const int grid = (N + 3) / 4;
-    if (M <= 1)      k_hy4_bf16_gemv_smallm<1,  OUT_F32, HAS_BIAS><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
-    else if (M <= 2) k_hy4_bf16_gemv_smallm<2,  OUT_F32, HAS_BIAS><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
-    else if (M <= 4) k_hy4_bf16_gemv_smallm<4,  OUT_F32, HAS_BIAS><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
-    else if (M <= 8) k_hy4_bf16_gemv_smallm<8,  OUT_F32, HAS_BIAS><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
-    else             k_hy4_bf16_gemv_smallm<12, OUT_F32, HAS_BIAS><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+    if (OUT_F32 && N >= 16384) {
+        if (M <= 1)      k_hy4_bf16_gemv_smallm<1,  OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+        else if (M <= 2) k_hy4_bf16_gemv_smallm<2,  OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+        else if (M <= 4) k_hy4_bf16_gemv_smallm<4,  OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+        else if (M <= 8) k_hy4_bf16_gemv_smallm<8,  OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+        else             k_hy4_bf16_gemv_smallm<12, OUT_F32, HAS_BIAS, true><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+    } else {
+        if (M <= 1)      k_hy4_bf16_gemv_smallm<1,  OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+        else if (M <= 2) k_hy4_bf16_gemv_smallm<2,  OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+        else if (M <= 4) k_hy4_bf16_gemv_smallm<4,  OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+        else if (M <= 8) k_hy4_bf16_gemv_smallm<8,  OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+        else             k_hy4_bf16_gemv_smallm<12, OUT_F32, HAS_BIAS, false><<<grid, 128, 0, st>>>(A, B, bias, C, M, N, K);
+    }
 }
 
 __global__ void k_hy4_add_bias_bf16(__nv_bfloat16* __restrict__ y, const __nv_bfloat16* __restrict__ b,
@@ -493,25 +501,81 @@ __global__ void __launch_bounds__(256) k_hy4_hc_dot_small(
     }
 }
 
-inline void hc_pre_and_norm(cublasHandle_t blas, const HcWeights& w, HcScratch& sc,
+// 4-row register-tiled direct BF16 -> FP32 HC dot product for prefill (M > 16):
+// Reads hc_fn[j] ONCE per 4 tokens (4x L2 reuse) and eliminates 25 MB/call flat_f32 conversion + FP32 cuBLAS GEMM!
+// Grid: dim3(8, (M + 3) / 4), Block: 256.
+template <int BM>
+__global__ void __launch_bounds__(256) k_hy4_hc_dot_tiled(
+    const __nv_bfloat16* __restrict__ hyper,
+    const float* __restrict__ hc_fn,
+    float* __restrict__ mixes_raw,
+    int M) {
+    const int j = blockIdx.x;
+    const int m0 = blockIdx.y * BM;
+    if (j >= geom::HC_MIX || m0 >= M) return;
+    const int nm = min(BM, M - m0);
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const float4* fn4 = reinterpret_cast<const float4*>(hc_fn + static_cast<size_t>(j) * geom::HC_D);
+    float acc[BM];
+    #pragma unroll
+    for (int t = 0; t < BM; ++t) acc[t] = 0.0f;
+
+    // HC_D >> 2 = 3072 = 12 * 256 exact
+    #pragma unroll
+    for (int k = 0; k < 12; ++k) {
+        const int i = tid + k * 256;
+        const float4 f = __ldg(fn4 + i);
+        #pragma unroll
+        for (int t = 0; t < BM; ++t) {
+            if (t < nm) {
+                const uint2 r = reinterpret_cast<const uint2*>(hyper + static_cast<size_t>(m0 + t) * geom::HC_D)[i];
+                const float2 a0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.x));
+                const float2 a1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&r.y));
+                acc[t] = fmaf(a0.x, f.x, fmaf(a0.y, f.y, fmaf(a1.x, f.z, fmaf(a1.y, f.w, acc[t]))));
+            }
+        }
+    }
+    __shared__ float sm[BM][8];
+    #pragma unroll
+    for (int t = 0; t < BM; ++t) {
+        if (t < nm) {
+            const float s = warp_sum(acc[t]);
+            if (lane == 0) sm[t][warp] = s;
+        }
+    }
+    __syncthreads();
+    if (tid < nm) {
+        float tot = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) tot += sm[tid][w];
+        mixes_raw[static_cast<size_t>(m0 + tid) * geom::HC_MIX + j] = tot;
+    }
+}
+
+inline void hc_pre_and_norm(cublasHandle_t /*blas*/, const HcWeights& w, HcScratch& sc,
                             const __nv_bfloat16* hyper, const __nv_bfloat16* ln_w,
                             __nv_bfloat16* mixed_normed, int M, cudaStream_t st) {
     if (M <= 16) {
         k_hy4_hc_dot_small<<<dim3(geom::HC_MIX, M), 256, 0, st>>>(hyper, w.fn, sc.mixes, M);
-        k_hy4_hc_pre_and_norm_pf<<<M, 256, 0, st>>>(
-            hyper, sc.mixes, w.base, w.scale, ln_w, sc.post, mixed_normed, M);
     } else {
-        const size_t n = static_cast<size_t>(M) * geom::HC_D;
-        k_hy4_bf16_to_f32<<<static_cast<unsigned>((n + 255) / 256), 256, 0, st>>>(hyper, sc.flat_f32, n);
-        cublasSetStream(blas, st);
-        gemm_f32_nt(blas, M, geom::HC_MIX, geom::HC_D, sc.flat_f32, w.fn, sc.mixes);
-        k_hy4_hc_pre_and_norm_pf<<<M, 256, 0, st>>>(
-            hyper, sc.mixes, w.base, w.scale, ln_w, sc.post, mixed_normed, M);
+        k_hy4_hc_dot_tiled<4><<<dim3(geom::HC_MIX, (M + 3) / 4), 256, 0, st>>>(hyper, w.fn, sc.mixes, M);
     }
+    k_hy4_hc_pre_and_norm_pf<<<M, 256, 0, st>>>(
+        hyper, sc.mixes, w.base, w.scale, ln_w, sc.post, mixed_normed, M);
 }
 
 // Fused TP Partial Sum (exact rank order 0..nr-1) + Sandwich RMSNorm + HC Residual Inject.
 // Grid: (M), Block: 256.
+__device__ __forceinline__ uint2 hy4_hc_inject_u2(uint2 hraw, float ps, const float ny[4]) {
+    const float2 h01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&hraw.x));
+    const float2 h23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&hraw.y));
+    uint2 o;
+    *reinterpret_cast<__nv_bfloat162*>(&o.x) = __floats2bfloat162_rn(fmaf(ps, ny[0], h01.x), fmaf(ps, ny[1], h01.y));
+    *reinterpret_cast<__nv_bfloat162*>(&o.y) = __floats2bfloat162_rn(fmaf(ps, ny[2], h23.x), fmaf(ps, ny[3], h23.y));
+    return o;
+}
+
 __global__ void __launch_bounds__(256) k_hy4_sum_norm_inject(
     const __nv_bfloat16* __restrict__ parts,
     const __nv_bfloat16* __restrict__ post_norm_w,
@@ -524,18 +588,26 @@ __global__ void __launch_bounds__(256) k_hy4_sum_norm_inject(
     const int warp = tid >> 5, lane = tid & 31;
     const size_t rank_stride = static_cast<size_t>(part_m_stride) * geom::HID;
 
-    float y[12];
+    // HID / 4 = 768 = 3 * 256 exact -> 3 vectorized uint2 (4 BF16) passes!
+    float y[3][4];
     float ss = 0.0f;
     #pragma unroll
-    for (int k = 0; k < 12; ++k) {
-        const int d = tid + k * 256;
-        float acc = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        const int i = tid + k * 256;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int r = 0; r < nr; ++r) {
-            acc += __bfloat162float(parts[static_cast<size_t>(r) * rank_stride + static_cast<size_t>(m) * geom::HID + d]);
+            const uint2 pv = reinterpret_cast<const uint2*>(
+                parts + static_cast<size_t>(r) * rank_stride + static_cast<size_t>(m) * geom::HID)[i];
+            const float2 f01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&pv.x));
+            const float2 f23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&pv.y));
+            acc[0] += f01.x; acc[1] += f01.y; acc[2] += f23.x; acc[3] += f23.y;
         }
-        const float ybf = __bfloat162float(__float2bfloat16(acc));
-        y[k] = ybf;
-        ss = fmaf(ybf, ybf, ss);
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const float ybf = __bfloat162float(__float2bfloat16(acc[c]));
+            y[k][c] = ybf;
+            ss = fmaf(ybf, ybf, ss);
+        }
     }
     __shared__ float sm[8];
     ss = warp_sum(ss);
@@ -552,16 +624,28 @@ __global__ void __launch_bounds__(256) k_hy4_sum_norm_inject(
     const float p1 = post[static_cast<size_t>(m) * 4 + 1];
     const float p2 = post[static_cast<size_t>(m) * 4 + 2];
     const float p3 = post[static_cast<size_t>(m) * 4 + 3];
-    __nv_bfloat16* hm = hyper + static_cast<size_t>(m) * geom::HC_D;
+    const uint2* wn4 = reinterpret_cast<const uint2*>(post_norm_w);
+    uint2* hm0 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 0 * geom::HID);
+    uint2* hm1 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 1 * geom::HID);
+    uint2* hm2 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 2 * geom::HID);
+    uint2* hm3 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 3 * geom::HID);
     #pragma unroll
-    for (int k = 0; k < 12; ++k) {
-        const int d = tid + k * 256;
-        const __nv_bfloat16 xn = __float2bfloat16(y[k] * inv);
-        const float ny = __bfloat162float(__float2bfloat16(__bfloat162float(post_norm_w[d]) * __bfloat162float(xn)));
-        hm[0 * geom::HID + d] = __float2bfloat16(fmaf(p0, ny, __bfloat162float(hm[0 * geom::HID + d])));
-        hm[1 * geom::HID + d] = __float2bfloat16(fmaf(p1, ny, __bfloat162float(hm[1 * geom::HID + d])));
-        hm[2 * geom::HID + d] = __float2bfloat16(fmaf(p2, ny, __bfloat162float(hm[2 * geom::HID + d])));
-        hm[3 * geom::HID + d] = __float2bfloat16(fmaf(p3, ny, __bfloat162float(hm[3 * geom::HID + d])));
+    for (int k = 0; k < 3; ++k) {
+        const int i = tid + k * 256;
+        const uint2 wr = __ldg(wn4 + i);
+        const float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.x));
+        const float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.y));
+        const float wf[4] = {w01.x, w01.y, w23.x, w23.y};
+        float ny[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const float xn = __bfloat162float(__float2bfloat16(y[k][c] * inv));
+            ny[c] = __bfloat162float(__float2bfloat16(wf[c] * xn));
+        }
+        hm0[i] = hy4_hc_inject_u2(hm0[i], p0, ny);
+        hm1[i] = hy4_hc_inject_u2(hm1[i], p1, ny);
+        hm2[i] = hy4_hc_inject_u2(hm2[i], p2, ny);
+        hm3[i] = hy4_hc_inject_u2(hm3[i], p3, ny);
     }
 }
 
@@ -666,17 +750,26 @@ __global__ void __launch_bounds__(256) k_hy4_add_norm_inject(
     if (m >= M) return;
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
-    const __nv_bfloat16* am = a + static_cast<size_t>(m) * geom::HID;
-    const __nv_bfloat16* bm = b + static_cast<size_t>(m) * geom::HID;
+    const uint2* am = reinterpret_cast<const uint2*>(a + static_cast<size_t>(m) * geom::HID);
+    const uint2* bm = reinterpret_cast<const uint2*>(b + static_cast<size_t>(m) * geom::HID);
 
-    float y[12];
+    float y[3][4];
     float ss = 0.0f;
     #pragma unroll
-    for (int k = 0; k < 12; ++k) {
-        const int d = tid + k * 256;
-        const float v = __bfloat162float(__float2bfloat16(__bfloat162float(am[d]) + __bfloat162float(bm[d])));
-        y[k] = v;
-        ss = fmaf(v, v, ss);
+    for (int k = 0; k < 3; ++k) {
+        const int i = tid + k * 256;
+        const uint2 av = am[i], bv = bm[i];
+        const float2 a01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av.x));
+        const float2 a23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&av.y));
+        const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bv.x));
+        const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bv.y));
+        const float sum4[4] = {a01.x + b01.x, a01.y + b01.y, a23.x + b23.x, a23.y + b23.y};
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const float v = __bfloat162float(__float2bfloat16(sum4[c]));
+            y[k][c] = v;
+            ss = fmaf(v, v, ss);
+        }
     }
     __shared__ float sm[8];
     ss = warp_sum(ss);
@@ -693,16 +786,28 @@ __global__ void __launch_bounds__(256) k_hy4_add_norm_inject(
     const float p1 = post_w[static_cast<size_t>(m) * 4 + 1];
     const float p2 = post_w[static_cast<size_t>(m) * 4 + 2];
     const float p3 = post_w[static_cast<size_t>(m) * 4 + 3];
-    __nv_bfloat16* hm = hyper + static_cast<size_t>(m) * geom::HC_D;
+    const uint2* wn4 = reinterpret_cast<const uint2*>(post_norm_w);
+    uint2* hm0 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 0 * geom::HID);
+    uint2* hm1 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 1 * geom::HID);
+    uint2* hm2 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 2 * geom::HID);
+    uint2* hm3 = reinterpret_cast<uint2*>(hyper + static_cast<size_t>(m) * geom::HC_D + 3 * geom::HID);
     #pragma unroll
-    for (int k = 0; k < 12; ++k) {
-        const int d = tid + k * 256;
-        const __nv_bfloat16 xn = __float2bfloat16(y[k] * inv);
-        const float ny = __bfloat162float(__float2bfloat16(__bfloat162float(post_norm_w[d]) * __bfloat162float(xn)));
-        hm[0 * geom::HID + d] = __float2bfloat16(fmaf(p0, ny, __bfloat162float(hm[0 * geom::HID + d])));
-        hm[1 * geom::HID + d] = __float2bfloat16(fmaf(p1, ny, __bfloat162float(hm[1 * geom::HID + d])));
-        hm[2 * geom::HID + d] = __float2bfloat16(fmaf(p2, ny, __bfloat162float(hm[2 * geom::HID + d])));
-        hm[3 * geom::HID + d] = __float2bfloat16(fmaf(p3, ny, __bfloat162float(hm[3 * geom::HID + d])));
+    for (int k = 0; k < 3; ++k) {
+        const int i = tid + k * 256;
+        const uint2 wr = __ldg(wn4 + i);
+        const float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.x));
+        const float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wr.y));
+        const float wf[4] = {w01.x, w01.y, w23.x, w23.y};
+        float ny[4];
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const float xn = __bfloat162float(__float2bfloat16(y[k][c] * inv));
+            ny[c] = __bfloat162float(__float2bfloat16(wf[c] * xn));
+        }
+        hm0[i] = hy4_hc_inject_u2(hm0[i], p0, ny);
+        hm1[i] = hy4_hc_inject_u2(hm1[i], p1, ny);
+        hm2[i] = hy4_hc_inject_u2(hm2[i], p2, ny);
+        hm3[i] = hy4_hc_inject_u2(hm3[i], p3, ny);
     }
 }
 

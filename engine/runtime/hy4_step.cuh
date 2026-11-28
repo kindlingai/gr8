@@ -536,6 +536,7 @@ struct Engine {
     std::vector<__nv_bfloat16*> dfly_perm_bf16;       // tiny permanent DFly2 norms/gate (~144 KiB!)
     std::vector<float*> dfly_sinks_f32;               // 5 * nh_loc FP32 sinks
     std::vector<hy4::dfly::RankWeights> dfly_w;
+    std::vector<hy4::mx8::LinW> dfly_lm_head;         // MXFP8 lm_head for DFly2 drafting only (100% lossless target verify!)
     hy4::dfly::Scratch dfly_sc{};
     std::array<int*, hy4::dfly::NUM_LAYERS> dfly_snap_grp{}; // [dfly_snap_cap, 511]
     std::array<int*, hy4::dfly::NUM_LAYERS> dfly_snap_cnt{}; // [dfly_snap_cap]
@@ -1034,6 +1035,7 @@ struct Engine {
         if (o.use_dfly && dfly_exists) {
             has_dfly = true;
             dfly_w.resize(size_t(o.nloc));
+            dfly_lm_head.resize(size_t(o.nloc));
             dfly_img.resize(size_t(o.nloc));
             dfly_mx8_arena.resize(size_t(o.nloc));
             dfly_perm_bf16.assign(size_t(o.nloc), nullptr);
@@ -1049,12 +1051,13 @@ struct Engine {
                 auto& dar = dfly_mx8_arena[size_t(i)];
 
                 // Copy small permanent DFly2 norms/gate/conf (~144 KiB) so we can free the 1.58 GiB BF16 slab when MX8=1!
-                const size_t perm_el = 6 * geom::HID + (geom::HID + 1) +
+                const size_t perm_el = 6 * geom::HID + (geom::HID + 8) + 256 +
                                        size_t(hy4::dfly::NUM_LAYERS) * (3 * geom::HID + geom::QA + geom::KV_LORA);
                 dfly_perm_bf16[size_t(i)] = dalloc<__nv_bfloat16>(perm_el);
                 dfly_sinks_f32[size_t(i)] = dalloc<float>(size_t(hy4::dfly::NUM_LAYERS) * df_nh);
                 size_t pcur = 0;
                 auto copy_perm = [&](const std::string& tname, size_t nel) -> const __nv_bfloat16* {
+                    pcur = (pcur + 7) & ~size_t(7); // 16-byte aligned for uint2/uint4 vectorized norm loads
                     __nv_bfloat16* dst = dfly_perm_bf16[size_t(i)] + pcur;
                     pcur += nel;
                     HY4_CK(cudaMemcpyAsync(dst, dm.get<__nv_bfloat16>(tname), nel * sizeof(__nv_bfloat16),
@@ -1088,6 +1091,7 @@ struct Engine {
                         dar.reserve(df_i, geom::HID);
                         dar.reserve(geom::HID, df_i);
                     }
+                    if (knob::hy4_dfly_mx8_head()) dar.reserve(v_rows[size_t(i)], geom::HID);
                     if (!dar.alloc()) die("dfly_mx8_arena cudaMalloc failed");
                 }
 
@@ -1096,6 +1100,11 @@ struct Engine {
                     return hy4::mx8::LinW::from_bf16(src, N, K);
                 };
 
+                if (o.mx8_dense && knob::hy4_dfly_mx8_head()) {
+                    dfly_lm_head[size_t(i)] = hy4::mx8::LinW::from_mx8(dar.add(lm_head[size_t(i)], v_rows[size_t(i)], geom::HID, stream));
+                } else {
+                    dfly_lm_head[size_t(i)] = hy4::mx8::LinW::from_bf16(lm_head[size_t(i)], v_rows[size_t(i)], geom::HID);
+                }
                 rw.mtp_eh_proj  = bind_df(dm.get<__nv_bfloat16>("dfly.mtp.eh_proj"), geom::HID, 2 * geom::HID);
                 rw.hc_gate_proj = bind_df(dm.get<__nv_bfloat16>("dfly.hc.gate_proj"), hy4::dfly::HC_I, 2 * geom::HID);
                 rw.hc_up_proj   = bind_df(dm.get<__nv_bfloat16>("dfly.hc.up_proj"),   hy4::dfly::HC_I, 2 * geom::HID);
@@ -1217,7 +1226,7 @@ struct Engine {
         parts    = dalloc<__nv_bfloat16>(size_t(o.nr) * Mmax * geom::HID);
         mx8_x8   = dalloc<uint8_t>(hy4::mx8::x8_bytes(Mmax, max_k));
 
-        hc_sc.flat_f32 = dalloc<float>(size_t(Mmax) * geom::HC_D);
+        hc_sc.flat_f32 = nullptr; // eliminated by direct BF16 k_hy4_hc_dot_tiled
         hc_sc.mixes    = dalloc<float>(size_t(Mmax) * geom::HC_MIX);
         hc_sc.post     = dalloc<float>(size_t(Mmax) * geom::HC);
 
@@ -1613,7 +1622,7 @@ struct Engine {
 
         const size_t rb = head_row_bytes(o.nc);
         const bool snap_on = has_dfly && !skip_head;
-        const bool use_graph_now = o.use_graphs && o.nr == 1 && o.nloc == 1 && !o.profile &&
+        const bool use_graph_now = o.use_graphs && o.nr <= 2 && o.nloc == 1 && !o.profile &&
                                    o.dump_dir.empty() && !skip_head && !out_full_logits &&
                                    vis_n == 0 && !mrope_ptr && !eng_mask_ptr && M <= 12;
 
@@ -1636,7 +1645,7 @@ struct Engine {
                     }
                     cudaGraph_t gr = nullptr;
                     HY4_CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-                    int coll = 0;
+                    int coll = 2 * SEG_LO[seg];
                     if (seg == 0) {
                         hy4::k_hy4_embed_expand<<<M * 12, 256, 0, stream>>>(d_tok, embed, hyper, M);
                     } else if (has_engram) {
@@ -1671,13 +1680,29 @@ struct Engine {
                     HY4_CK(cudaGraphLaunch(sg_entry.exec[size_t(seg)], stream));
                 }
             }
-            HY4_CK(cudaMemcpyAsync(head_host_parts, head_dev_pkt, size_t(M) * rb, cudaMemcpyDeviceToHost, stream));
+            HY4_CK(cudaMemcpyAsync(head_host_parts + static_cast<size_t>(o.rank0) * M * rb,
+                                   head_dev_pkt, size_t(M) * rb, cudaMemcpyDeviceToHost, stream));
             HY4_CK(cudaStreamSynchronize(stream));
+            if (on_head_gather) on_head_gather(2 * geom::L_MAIN, M, head_host_parts, rb);
+            if (on_step_end) on_step_end();
             out.resize(size_t(M));
-            for (int m = 0; m < M; ++m) {
-                out[size_t(m)] = head_merge(head_host_parts + size_t(m) * rb, rb, 1, o.nc);
-                out[size_t(m)].tok = sm ? sample_row(out[size_t(m)].top, sm[m])
-                                        : (out[size_t(m)].top.empty() ? 0 : out[size_t(m)].top[0].id);
+            if (o.nr == 1) {
+                for (int m = 0; m < M; ++m) {
+                    out[size_t(m)] = head_merge(head_host_parts + size_t(m) * rb, rb, 1, o.nc);
+                    out[size_t(m)].tok = sm ? sample_row(out[size_t(m)].top, sm[m])
+                                            : (out[size_t(m)].top.empty() ? 0 : out[size_t(m)].top[0].id);
+                }
+            } else {
+                std::vector<uint8_t> row_buf(size_t(o.nr) * rb);
+                for (int m = 0; m < M; ++m) {
+                    for (int r = 0; r < o.nr; ++r) {
+                        std::memcpy(row_buf.data() + size_t(r) * rb,
+                                    head_host_parts + (static_cast<size_t>(r) * M + m) * rb, rb);
+                    }
+                    out[size_t(m)] = head_merge(row_buf.data(), rb, o.nr, o.nc);
+                    out[size_t(m)].tok = sm ? sample_row(out[size_t(m)].top, sm[m])
+                                            : (out[size_t(m)].top.empty() ? 0 : out[size_t(m)].top[0].id);
+                }
             }
             return;
         }
@@ -1836,7 +1861,7 @@ struct Engine {
                 hy4::dfly::hidden_correction_step(
                     blas, dfly_w[0], dfly_sc, h_step, embed, 0, dfly_sc.d_draft_id + step,
                     mixed_ln, mx8_x8, stream);
-                hy4::linear_bf16_f32(blas, mixed_ln, lm_head[0], head_logits, 1, v_rows[0], geom::HID, stream);
+                hy4::mx8::linear_w_f32(blas, mixed_ln, dfly_lm_head[0], head_logits, 1, v_rows[0], geom::HID, mx8_x8, nullptr, stream);
                 hy4::dfly::k_dfly_argmax_p1<<<256, 256, 0, stream>>>(head_logits, dfly_sc.d_max_v, dfly_sc.d_max_i, v_rows[0]);
                 hy4::dfly::k_dfly_argmax_p2<<<1, 256, 0, stream>>>(dfly_sc.d_max_v, dfly_sc.d_max_i, dfly_sc.d_draft_id + step + 1, 256);
             }
@@ -1857,7 +1882,7 @@ struct Engine {
                     const int r = o.rank0 + i;
                     const int vr = v_rows[size_t(i)];
                     const int v0 = v_lo[size_t(i)];
-                    hy4::linear_bf16_f32(blas, mixed_ln, lm_head[size_t(i)], head_logits, 1, vr, geom::HID, stream);
+                    hy4::mx8::linear_w_f32(blas, mixed_ln, dfly_lm_head[size_t(i)], head_logits, 1, vr, geom::HID, mx8_x8, nullptr, stream);
                     ink2::k_ink2_head_pack<<<1, 256, 0, stream>>>(head_logits, vr, v0, o.nc, head_dev_pkt, rb);
                     HY4_CK(cudaMemcpyAsync(head_host_parts + static_cast<size_t>(r) * rb, head_dev_pkt, rb,
                                            cudaMemcpyDeviceToHost, stream));
