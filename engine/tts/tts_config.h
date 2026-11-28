@@ -88,7 +88,7 @@ constexpr int DEFAULT_TOP_K = 30;
 enum class WeightMode {
     Ref = 0,     // BF16 dense + FP8-on-device routed experts when store==0 (~37 GB, dequant on the fly)
     RefFp16 = 1, // All weights (including routed experts) pre-decoded to BF16 on load (~72 GB)
-    Native = 2,  // Keep native stored formats (trellis/FP8_ROW/INT4/BF16; Wave 3.2, falls back to Ref in Wave 1.6)
+    Native = 2,  // Keep native stored formats (trellis/FP8_ROW/INT4/BF16)
     RefF32 = 3,  // Exact FP32 dense weights + FP8-on-device routed experts (exact kernel reference)
 };
 
