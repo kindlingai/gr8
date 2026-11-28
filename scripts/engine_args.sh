@@ -437,6 +437,8 @@ engine_defaults() {
        # TP=2 omits duplicate INT4 head copies (DRAFT_HEAD_I4, DRAFT_HEAD2, DFL_HEAD_I4) to save ~0.68 GB/rank;
        # native INT4 DFlash2 packs (--int4 body --int4-codebooks 1) keep the drafter in INT4 (~714 MiB/rank).
        tp4_default ROUTE_OVL 1
+       tp4_default QA_SPLIT 2; tp4_default IDXQ_SPLIT 1
+       [ "$MTP" = 0 ] || tp4_default MTP_SPLIT 1
        tp4_default ATTN_SC2 4; tp4_default ATTN_SC2_TR 2; tp4_default ATTN_CTX2 4; tp4_default ATTN_CTX3 2
        tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
        tp4_default IDX_VEC 1; tp4_default DEC_BK 4096; tp4_default DEC_BK_MAX 4096; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1

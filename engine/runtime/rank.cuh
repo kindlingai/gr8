@@ -1281,20 +1281,35 @@ inline size_t qs_slot_bytes(const Model& m) { return (size_t)MX * m.qs.wmax() * 
 inline void qs_narrow(Model& m, int i, bind::Layer& L)
 {
     static const int tpc = (int)knob::qa_split_tpc();
+    const Layer& y = m.layers[i];
     if (m.qs.iq && m.qs.ciq[i] >= 0)          // GR8_IDXQ_SPLIT: idx.wq_b, alone in its launch
     {
         const QsGeo& G = m.qs.geo[m.qs.ciq[i]];
-        if (L.idx_q.O != IDXQ) die("GR8_IDXQ_SPLIT: layer " + std::to_string(m.layers[i].l) + " idx.wq_b is not [4096] outputs");
-        bind::narrow(L.idx_q, G.c0[m.rank][0] / 16, G.n[m.rank][0] / 16, tpc);
+        const int t0 = G.c0[m.rank][0] / 16, nt = G.n[m.rank][0] / 16;
+        if (L.idx_q.O == IDXQ) bind::narrow(L.idx_q, t0, nt, tpc);
+        else if (L.idx_q.O == nt * 16) bind::narrow_sharded(L.idx_q, IDXQ, t0, nt, tpc);
+        else die("GR8_IDXQ_SPLIT: layer " + std::to_string(y.l) + " idx.wq_b output width " + std::to_string(L.idx_q.O) +
+                 " is neither [4096] nor rank slice [" + std::to_string(nt * 16) + "]");
     }
-    if (!m.qs.mode) return;
+    else if (L.idx_q.on && L.idx_q.O != IDXQ)
+        die("layer " + std::to_string(y.l) + " idx.wq_b.mx.gv is pre-sharded (" + std::to_string(L.idx_q.O) + " rows) but GR8_IDXQ_SPLIT=0");
+    if (!m.qs.mode)
+    {
+        if (L.q_a.O != QA)
+            die("layer " + std::to_string(y.l) + " q_a.mx.gv is pre-sharded (" + std::to_string(L.q_a.O) + " rows) but GR8_QA_SPLIT=0");
+        return;
+    }
     const QsGeo& G = m.qs.geo[m.qs.cqa[i]];
-    const Layer& y = m.layers[i];
-    if (L.q_a.O != QA || L.kv_a.O != KVA || (y.indexer && (!L.idx_k.on || L.idx_k.O != IDXK || !L.idx_w.on || L.idx_w.O != IDXW)))
-        die("GR8_QA_SPLIT: layer " + std::to_string(y.l) + " input GEMVs are not q_a [2048] / kv_a [576] / idx.wk [128] / idx.weights_proj [32]");
+    const int qa_t0 = G.c0[m.rank][0] / 16, qa_nt = G.n[m.rank][0] / 16;
+    if ((L.q_a.O != QA && L.q_a.O != qa_nt * 16) || L.kv_a.O != KVA || (y.indexer && (!L.idx_k.on || L.idx_k.O != IDXK || !L.idx_w.on || L.idx_w.O != IDXW)))
+        die("GR8_QA_SPLIT: layer " + std::to_string(y.l) + " input GEMVs are not q_a [2048 or rank slice] / kv_a [576] / idx.wk [128] / idx.weights_proj [32]");
     const bool multi = L.x_in.n > 0;          // today's choice (M <= 8, GR8_GV_MULTI): keep it
     bind::Gv* part[QS_MAXP] = {&L.q_a, &L.kv_a, &L.idx_k, &L.idx_w};
-    for (int p = 0; p < G.np; ++p) bind::narrow(*part[p], G.c0[m.rank][p] / 16, G.n[m.rank][p] / 16, tpc);
+    for (int p = 0; p < G.np; ++p)
+    {
+        if (p == 0 && L.q_a.O == qa_nt * 16) bind::narrow_sharded(L.q_a, QA, qa_t0, qa_nt, tpc);
+        else bind::narrow(*part[p], G.c0[m.rank][p] / 16, G.n[m.rank][p] / 16, tpc);
+    }
     L.x_in = GvMulti();
     L.x_rest = GvMulti();
     if (!multi) return;
@@ -2217,10 +2232,15 @@ inline const bind::Head& head_for(Model& m, int M)
         if (m.qs.eh)                  // GR8_MTP_SPLIT: this rank's tiles of eh_proj (same bits per tile, bind::narrow)
         {
             const QsGeo& G = m.qs.geo[m.qs.ceh];
-            if (!H.eh.on || H.eh.O != HID) die("GR8_MTP_SPLIT: no eh_proj of [6144] outputs");
+            const int t0 = G.c0[m.rank][0] / 16, nt = G.n[m.rank][0] / 16;
             static const int tpc = (int)knob::qa_split_tpc();
-            bind::narrow(H.eh, G.c0[m.rank][0] / 16, G.n[m.rank][0] / 16, tpc);
+            if (!H.eh.on) die("GR8_MTP_SPLIT: no eh_proj");
+            if (H.eh.O == HID) bind::narrow(H.eh, t0, nt, tpc);
+            else if (H.eh.O == nt * 16) bind::narrow_sharded(H.eh, HID, t0, nt, tpc);
+            else die("GR8_MTP_SPLIT: eh_proj output width " + std::to_string(H.eh.O) + " is neither [6144] nor rank slice [" + std::to_string(nt * 16) + "]");
         }
+        else if (m.eh_out && H.eh.on && H.eh.O != HID)
+            die("L078.eh.mx.gv is pre-sharded (" + std::to_string(H.eh.O) + " rows) but GR8_MTP_SPLIT=0");
         if (m.dh_i4)                  // GR8_DRAFT_HEAD_I4: the same slice's INT4 records, same fragment table and logits
         {
             bind::Tensor t;

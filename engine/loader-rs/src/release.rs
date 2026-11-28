@@ -221,6 +221,25 @@ struct Planner<'a> {
     kvb_rot: bool,
     /// emit L*.kv_b.uk pre-transposed to [nh, 512, 192] (and .scale [nh, 4, 192]) so attn/bind.cu binds zero-copy
     kvb_uk_t: bool,
+    /// shard L000..L077 q_a.mx.gv output tiles across ranks for GR8_QA_SPLIT > 0
+    qs_qa: bool,
+    /// shard L000..L077 idx.wq_b.mx.gv output tiles across ranks for GR8_IDXQ_SPLIT=1
+    qs_iq: bool,
+    /// shard L078 q_a.mx.gv, idx.wq_b.mx.gv, and eh.mx.gv output tiles across ranks for GR8_MTP_SPLIT=1
+    qs_mtp: bool,
+}
+
+/// Output-row range of `rank` at TP `nr` and layer `l` for a replicated decode GEMV split by 16-row output tiles
+/// across ranks (`rank.cuh` `qs_geo`: `j = (rank + nr - l % nr) % nr`, `g6nr::start`/`width`).
+fn qs_row_range(l: usize, o: usize, nr: usize, rank: usize) -> Range<usize> {
+    debug_assert_eq!(o % 16, 0);
+    let t = o / 16;
+    let j = (rank + nr - l % nr) % nr;
+    let base = t / nr;
+    let rem = t % nr;
+    let t0 = j * base + j.min(rem);
+    let nt = base + usize::from(j < rem);
+    (t0 * 16)..((t0 + nt) * 16)
 }
 
 /// A tensor of a planned group: name, manifest dtype, shape, bytes.
@@ -347,6 +366,14 @@ impl Planner<'_> {
     /// An MXFP8 matrix as stored (all rows): codes + scales copied (unless `decode_only`), and the decode record.
     /// If the release stores this matrix as `int8 gG`, emits the exact native `.i8.gv` record instead (no MXFP8 rounding).
     fn mxfp8(&mut self, l: usize, what: &'static str, p: &str, f: &Arc<StFile>, m: &str, decode_only: bool) -> Result<(), String> {
+        self.mxfp8_sharded(l, what, p, f, m, decode_only, false)
+    }
+
+    /// An MXFP8 matrix: full codes + scales (unless `decode_only`) for prefill, and either the full or rank-sharded
+    /// (`qs_row_range`, matching `rank.cuh` `qs_geo`) decode record `.mx.gv`.
+    #[allow(clippy::too_many_arguments)]
+    fn mxfp8_sharded(&mut self, l: usize, what: &'static str, p: &str, f: &Arc<StFile>, m: &str, decode_only: bool,
+                     shard_gv: bool) -> Result<(), String> {
         let mx = Matrix::open(f, m)?;
         if mx.rec.fmt == INT8 {
             return self.int8_mat(l, what, p, f, m, vec![0..mx.rec.out], vec![0..mx.rec.inp]);
@@ -359,13 +386,21 @@ impl Planner<'_> {
             self.copy(format!("{p}.mx.codes"), "u8", vec![o as i64, k as i64], f, &format!("{m}.fp8"), 0)?;
             self.copy(format!("{p}.mx.scales"), "u8", vec![o as i64, (k / 32) as i64], f, &format!("{m}.e8m0"), 0)?;
         }
+        let rows = if shard_gv { qs_row_range(l, o, self.layout.nr(), self.rank) } else { 0..o };
+        let nrows = rows.len();
         let (f2, m2) = (f.clone(), m.to_string());
-        self.gen(format!("{p}.mx.gv"), vec![(format!("{p}.mx.gv"), "u8", vec![(o / 16) as i64, (k / 32) as i64, 528])], move || {
+        self.gen(format!("{p}.mx.gv"), vec![(format!("{p}.mx.gv"), "u8", vec![(nrows / 16) as i64, (k / 32) as i64, 528])], move || {
             let mx = Matrix::open(&f2, &m2)?;
-            let (c, s) = mx.mxfp8(&(0..o))?;
+            let (c, s) = mx.mxfp8(&rows)?;
             Ok(vec![records::mxfp8_record(&c, &s, k)])
         });
-        self.note(l, Form { what, src: "MXFP8".into(), form: if decode_only { "MXFP8 decode record" } else { "MXFP8 + decode record" }, exact: EXACT });
+        let form = match (decode_only, shard_gv) {
+            (true, true) => "MXFP8 sharded decode record",
+            (true, false) => "MXFP8 decode record",
+            (false, true) => "MXFP8 + sharded decode record",
+            (false, false) => "MXFP8 + decode record",
+        };
+        self.note(l, Form { what, src: "MXFP8".into(), form, exact: EXACT });
         Ok(())
     }
 
@@ -408,7 +443,7 @@ impl Planner<'_> {
         let t = self.threads;
         self.vector(format!("{p}.attn_norm"), &f, "input_layernorm.weight")?;
         // q_a has only its MXFP8 record. Decode reads it as the MTP layer always did
-        self.mxfp8(l, "q_a", &format!("{p}.q_a"), &f, "self_attn.q_a_proj", false)?;
+        self.mxfp8_sharded(l, "q_a", &format!("{p}.q_a"), &f, "self_attn.q_a_proj", false, if mtp { self.qs_mtp } else { self.qs_qa })?;
         self.vector(format!("{p}.q_a_norm"), &f, "self_attn.q_a_layernorm.weight")?;
         self.mxfp8(l, "kv_a", &format!("{p}.kv_a"), &f, "self_attn.kv_a_proj_with_mqa", false)?;
         self.vector(format!("{p}.kv_a_norm"), &f, "self_attn.kv_a_layernorm.weight")?;
@@ -479,7 +514,8 @@ impl Planner<'_> {
         }
 
         if f.info("self_attn.indexer.wq_b.record").is_ok() {
-            self.mxfp8(l, "indexer wq_b", &format!("{p}.idx.wq_b"), &f, "self_attn.indexer.wq_b", false)?;
+            self.mxfp8_sharded(l, "indexer wq_b", &format!("{p}.idx.wq_b"), &f, "self_attn.indexer.wq_b", false,
+                               if mtp { self.qs_mtp } else { self.qs_iq })?;
             self.bf16(l, "indexer wk", &format!("{p}.idx.wk"), &f, "self_attn.indexer.wk")?;
             self.vector(format!("{p}.idx.k_norm.w"), &f, "self_attn.indexer.k_norm.weight")?;
             self.vector(format!("{p}.idx.k_norm.b"), &f, "self_attn.indexer.k_norm.bias")?;
@@ -508,7 +544,7 @@ impl Planner<'_> {
             self.full_heads(l, &p, &f);
         }
         if mtp {
-            self.mxfp8(l, "MTP eh_proj", &format!("{p}.eh"), &f, "eh_proj", false)?;   // MTP prefill reads the codes too
+            self.mxfp8_sharded(l, "MTP eh_proj", &format!("{p}.eh"), &f, "eh_proj", false, self.qs_mtp)?;   // MTP prefill reads the codes too
             self.vector(format!("{p}.enorm"), &f, "enorm.weight")?;
             self.vector(format!("{p}.hnorm"), &f, "hnorm.weight")?;
             self.vector(format!("{p}.shared_head_norm"), &f, "shared_head.norm.weight")?;
@@ -939,6 +975,12 @@ pub struct Opts {
     pub kvb_rot: bool,
     /// emit L*.kv_b.uk pre-transposed to [nh, 512, 192] (and .scale [nh, 4, 192]) for zero-copy binder attach (GLM-5.3 non-QO)
     pub kvb_uk_t: bool,
+    /// shard L000..L077 q_a.mx.gv output tiles across ranks for GR8_QA_SPLIT > 0
+    pub qs_qa: bool,
+    /// shard L000..L077 idx.wq_b.mx.gv output tiles across ranks for GR8_IDXQ_SPLIT=1
+    pub qs_iq: bool,
+    /// shard L078 q_a.mx.gv, idx.wq_b.mx.gv, and eh.mx.gv output tiles across ranks for GR8_MTP_SPLIT=1
+    pub qs_mtp: bool,
 }
 
 fn validate_kvb_opts(opts: Opts, is_flash: bool) -> Result<(), String> {
@@ -980,7 +1022,7 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     let workers = gr8knobs::LOAD_THREADS.get() as usize;
     let mut p = Planner { b: Builder::new(), layout, rank, threads: (cores / workers).max(1), forms: BTreeMap::new(),
                          qo: opts.qo, trellis: opts.trellis, kvb_fp8: opts.kvb_fp8, kvb_rot: opts.kvb_rot,
-                         kvb_uk_t: false };
+                         kvb_uk_t: false, qs_qa: false, qs_iq: false, qs_mtp: false };
     // the release's files name the model (their metadata); the width manifest has one format for every model
     let model = flash::model_meta(dense_dir)?;
     let is_flash = model.as_ref().and_then(|m| m.get("hidden_size")).and_then(Json::str) == Some("4096");
@@ -990,6 +1032,9 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     validate_kvb_opts(opts, is_flash)?;
     if is_flash && opts.kvb_fp8 { return Err("GR8_KVB=fp8: Flash kv_b loads as BF16 only".into()); }
     p.kvb_uk_t = opts.kvb_uk_t && !is_flash && !opts.qo;
+    p.qs_qa = opts.qs_qa && !is_flash && nr > 1;
+    p.qs_iq = opts.qs_iq && !is_flash && nr > 1;
+    p.qs_mtp = opts.qs_mtp && !is_flash && nr > 1;
     let last = if is_flash { 45 } else { L_MTP };
     if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }
     let mut moe = 0;
@@ -1204,5 +1249,32 @@ mod tests {
     #[test]
     fn layer_ranges_print_compactly() {
         assert_eq!(ranges(&[0, 2, 3, 4, 3, 78]), "0,2-4,78");
+    }
+
+    #[test]
+    fn qs_row_range_partitions_all_tp() {
+        for nr in [2usize, 3, 4, 5, 6] {
+            for o in [2048usize, 4096, 6144] {
+                for l in [0usize, 1, 2, 3, 77, 78] {
+                    let mut spans: Vec<Range<usize>> = (0..nr).map(|r| qs_row_range(l, o, nr, r)).collect();
+                    for s in &spans {
+                        assert_eq!(s.start % 16, 0);
+                        assert_eq!(s.end % 16, 0);
+                        assert!(s.len() > 0);
+                    }
+                    spans.sort_by_key(|s| s.start);
+                    assert_eq!(spans.first().unwrap().start, 0);
+                    assert_eq!(spans.last().unwrap().end, o);
+                    for w in spans.windows(2) {
+                        assert_eq!(w[0].end, w[1].start);
+                    }
+                }
+            }
+        }
+        // Check layer-rotation at TP=2 for q_a (2048 rows)
+        assert_eq!(qs_row_range(0, 2048, 2, 0), 0..1024);
+        assert_eq!(qs_row_range(0, 2048, 2, 1), 1024..2048);
+        assert_eq!(qs_row_range(1, 2048, 2, 0), 1024..2048);
+        assert_eq!(qs_row_range(1, 2048, 2, 1), 0..1024);
     }
 }

@@ -701,6 +701,19 @@ inline void narrow(Gv& g, int t0, int nt, int tpc)
     if (tpc > 0 && tpc < g.tpc) g.tpc = tpc;
 }
 
+// Pre-sharded variant of narrow(): g.w already holds only this rank's tiles t0 .. t0 + nt - 1 (g.O == nt * 16),
+// while the destination buffer has full row stride full_O; advance g.y to column t0 * 16 and restore g.ld = full_O.
+inline void narrow_sharded(Gv& g, int full_O, int t0, int nt, int tpc)
+{
+    if (!g.on) return;
+    if (nt <= 0) { g.on = 0; return; }
+    const int esz = g.odt == gv::O_F32 ? 4 : 2;
+    g.ld = full_O;
+    g.y = static_cast<char*>(g.y) + static_cast<size_t>(t0) * 16 * esz;
+    g.O = nt * 16;
+    if (tpc > 0 && tpc < g.tpc) g.tpc = tpc;
+}
+
 // ------------------------------------------------------------------------------------------ K1
 struct K1
 {
@@ -1528,7 +1541,7 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
         return "DEC_I4PAIR: int4 q_a / o_proj / q_b not repacked (bind::i4pair) for the launch's k-part count";
 #endif
     const int qbK = tq ? D.q_b.K : L.q_b.K, qbO = tq ? D.q_b.N : L.q_b.O, opK = to ? D.o_proj.K : L.o_proj.K, opO = to ? D.o_proj.N : L.o_proj.O;
-    if (L.q_a.K != HID || L.kv_a.K != HID || qbK != L.q_a.O || opO != HID || opK != qbO || qbO % 256)
+    if (L.q_a.K != HID || L.kv_a.K != HID || (L.q_a.O != qbK && !(qmx && L.q_a.O > 0 && L.q_a.O < qbK)) || opO != HID || opK != qbO || qbO % 256)
         return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K)";
     L.heads = qbO / 256;
     if (tq && (e = dtr::make_out(D.q_b, M, io.q_a_n, qbK, nullptr, io.q_b, qbO, dtr::O_F16, sc.dt, 0, 0, 1, L.q_b_t))) return e;
@@ -1540,7 +1553,7 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     L.xf_x.bf16 = L.indexer ? sc.xb_x : nullptr;
     // the fragment tables of q_a_norm (q_b, idx_q) and of the attention output (o_proj): a trellis matrix rotates its
     // input itself
-    L.xf_qa.on = L.q_b.on || L.idx_q.on; L.xf_qa.src = io.q_a_n; L.xf_qa.ld = L.q_a.O; L.xf_qa.K = L.q_a.O; L.xf_qa.f16 = sc.xf_qa;
+    L.xf_qa.on = L.q_b.on || L.idx_q.on; L.xf_qa.src = io.q_a_n; L.xf_qa.ld = qbK; L.xf_qa.K = qbK; L.xf_qa.f16 = sc.xf_qa;
     L.xf_attn.on = L.o_proj.on; L.xf_attn.src = io.attn; L.xf_attn.ld = opK; L.xf_attn.K = opK; L.xf_attn.f16 = sc.xf_attn;
     L.xf_x2.on = 1;   L.xf_x2.src = io.x2;      L.xf_x2.ld = HID;         L.xf_x2.K = HID;         L.xf_x2.f16 = sc.xf_x2;
     L.xf_x2.bf16 = L.moe ? sc.xb_x2 : nullptr;
@@ -1637,7 +1650,7 @@ inline const char* make_head(const HeadTensors& T, int rank, int M, const Scratc
     if (e) return e;
     if (!H.lm_head.on) return "no G.lm_head.mx.gv or G.lm_head.i8.gv";
     if (H.lm_head.K != HID || H.lm_head.O != H.vn) return "G.lm_head is not this rank's vocab slice";
-    if (H.eh.on && (H.eh.K != 2 * HID || H.eh.O != HID)) return "L078.eh is not [6144][12288]";
+    if (H.eh.on && (H.eh.K != 2 * HID || H.eh.O <= 0 || H.eh.O > HID)) return "L078.eh is not [<=6144][12288]";
     H.xf_h.on = 1;  H.xf_h.src = io.h;      H.xf_h.ld = HID;      H.xf_h.K = HID;      H.xf_h.f16 = sc.xf_head;  H.xf_h.M = M;
     H.xf_eh.on = H.eh.on;
     H.xf_eh.src = io.eh_in; H.xf_eh.ld = 2 * HID; H.xf_eh.K = 2 * HID; H.xf_eh.f16 = sc.xf_eh; H.xf_eh.M = M;
