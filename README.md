@@ -6,7 +6,7 @@ involved) before asking the setup questions or touching a box.
 
 Need help? Join us on Discord: https://discord.gg/8EAvYPV2rE
 
-gr8 serves GLM-5.3, GLM-5.3-Flash, DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next and Inkling-2-Mini on one to six DGX Spark (GB10) boxes (the count depends on
+gr8 serves GLM-5.3, GLM-5.3-Flash, DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, Inkling-2-Mini, Qwen3-VL-Embedding and Drama 3 (`g6tts`, [docs/DRAMA3.md](docs/DRAMA3.md)) on one to six DGX Spark (GB10) boxes (the count depends on
 the model, see below), with an OpenAI-compatible API on the first box. gr8 is written from scratch in CUDA and uses no
 vLLM, PyTorch or NCCL at serve time. *Beta release. If you run it, please tell us what breaks:
 [issues](https://github.com/kindlingai/gr8/issues) and PRs are welcome.*

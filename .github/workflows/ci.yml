@@ -437,6 +437,10 @@ jobs:
             label: Dense embeddings (g6embed)
             target: dist-embed
             scope: gr8-embed
+          - leg: tts
+            label: Drama 3 TTS (g6tts)
+            target: dist-tts
+            scope: gr8-tts
           - leg: tests-ship
             label: shipped tests
             target: dist-tests
@@ -522,6 +526,7 @@ jobs:
             qw38)       echo "Qwen3.8-Flash-Next, TP widths ${widths:-1 2 3 4}" ;;
             hy4)        echo "Hy4-flash, TP widths ${widths:-1 2}" ;;
             embed)      echo "Dense embeddings (g6embed), TP width 1" ;;
+            tts)        echo "Drama 3 TTS (g6tts), TP width 1" ;;
             tests)      echo "test binaries, dtr_test at TP4, ptab widths ${widths:-1 2 3 4 5 6 8}" ;;
             tests-ship) echo "the shipped test binaries: tr3_e4m3_test and gpuprobe" ;;
             *)          echo "${{ matrix.label }}, TP widths ${widths:-1 2 3 4 5 6 8}" ;;
@@ -603,6 +608,10 @@ jobs:
             label: Dense embeddings (g6embed)
             target: dist-embed
             scope: gr8-amd64-embed
+          - leg: tts
+            label: Drama 3 TTS (g6tts)
+            target: dist-tts
+            scope: gr8-amd64-tts
           - leg: tests-ship
             label: shipped tests
             target: dist-tests
@@ -677,6 +686,7 @@ jobs:
             qw38)       echo "Qwen3.8-Flash-Next (amd64, sm_120a), TP widths ${widths:-1 2 3 4}" ;;
             hy4)        echo "Hy4-flash (amd64, sm_120a), TP widths ${widths:-1 2}" ;;
             embed)      echo "Dense embeddings (g6embed, amd64, sm_120a), TP width 1" ;;
+            tts)        echo "Drama 3 TTS (g6tts, amd64, sm_120a), TP width 1" ;;
             tests-ship) echo "the shipped test binaries (amd64, sm_120a): tr3_e4m3_test and gpuprobe" ;;
           esac >> "$GITHUB_STEP_SUMMARY"
       - name: Build the binaries (Dockerfile target ${{ matrix.target }})
@@ -873,6 +883,7 @@ jobs:
             bin/g6front-rs --help > /dev/null
             bin/g6front-rs engram-cmap --help > /dev/null
             bin/g6embed --help > /dev/null
+            bin/g6tts --help > /dev/null
             bin/g6m4_ds41 --rank 0 --ips a,b,c,d --image --layers all --v2-dense m --mtp 0 --check-args 2>&1 | grep -qF "TP4, 48 rows a step"
             echo smoke OK'
           # Every registered GPU model and supported TP must pass the entrypoint's config smoke.
@@ -1007,7 +1018,7 @@ jobs:
           docker run --rm --entrypoint bash "$img" -c '
             set -eu
             [ "$(uname -m)" = x86_64 ] || { echo "expected x86_64 container, got $(uname -m)"; exit 1; }
-            for b in bin/g6m4_qw38 bin/m4sim_qw38 bin/g6m4_ink2 bin/m4sim_ink2 bin/g6m4_hy4 bin/m4sim_hy4 bin/g6embed bin/gpuprobe bin/tr3_e4m3_test \
+            for b in bin/g6m4_qw38 bin/m4sim_qw38 bin/g6m4_ink2 bin/m4sim_ink2 bin/g6m4_hy4 bin/m4sim_hy4 bin/g6embed bin/g6tts bin/gpuprobe bin/tr3_e4m3_test \
                      bin/g6front-rs bin/g6load bin/g6layout bin/kvman-remote bin/kvman-peer; do
               [ -x "$b" ] || { echo "$b: not in the image"; exit 1; }
               if ldd "$b" | grep "not found"; then echo "$b: missing libraries"; exit 1; fi
@@ -1029,6 +1040,7 @@ jobs:
             python3 tools/steering/trace_audit.py --help > /dev/null
             bin/g6front-rs --help > /dev/null
             bin/g6embed --help > /dev/null
+            bin/g6tts --help > /dev/null
             echo smoke OK'
           # Verify qw38 single-GPU Strata mode and every supported qw38 / ink2 TP pass the entrypoint config smoke.
           docker run --rm -e GR8_MODEL=qw38 -e CAP=40960 -e SESS=1 -e MTP=4 -e REUSE=1 \
@@ -1037,7 +1049,7 @@ jobs:
             -e EXTRA_ARGS="--prefill 13312" \
             "$img" show-config --tp 1 --peers 127.0.0.1 \
             --model https://huggingface.co/kindlingai/Qwen3.8-Flash-Next-exlr8 --variant bit300 --no-check > /dev/null
-          configs=$(docker run --rm --entrypoint python3 "$img" -c 'from tools.launch.models import QW38, INK2, HY4, EMBED; [print(m.name, tp, m.release) for m in (QW38, INK2, HY4, EMBED) for tp in m.tp]')
+          configs=$(docker run --rm --entrypoint python3 "$img" -c 'from tools.launch.models import QW38, INK2, HY4, EMBED, TTS; [print(m.name, tp, m.release) for m in (QW38, INK2, HY4, EMBED, TTS) for tp in m.tp]')
           test -n "$configs"
           while read -r model tp release; do
             peers=$(python3 -c 'import sys; print(",".join("192.0.2." + str(i+1) for i in range(int(sys.argv[1]))))' "$tp")

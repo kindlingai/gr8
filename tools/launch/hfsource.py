@@ -288,9 +288,13 @@ class Release:
         # sharding units a rank reads, fetch only those byte ranges here.
         dense = sorted(p for p in t if p.startswith('dense/') and p.endswith('.safetensors')
                        and not p.startswith('dense/vision-'))
+        root_dense = sorted(p for p in t if os.path.dirname(p) == '' and (
+            p == 'exlr8-vocab.safetensors' or (p.startswith('exlr8-dense-') and p.endswith('.safetensors'))
+        ))
+        codec = sorted(p for p in t if p.startswith('codec/') and p.endswith('.safetensors'))
         ple = sorted(p for p in t if p.startswith('ple/'))
         drafter = sorted(p for p in t if p.startswith('drafter/') and p.endswith('.pack'))
-        return slices + dense + ple + drafter + (self.vision_files() if self.vision else [])
+        return slices + dense + root_dense + codec + ple + drafter + (self.vision_files() if self.vision else [])
 
     def reuse(self):
         """Hard-link the files an older commit of this release left in the cache, where the hub gives the file the same
@@ -407,6 +411,44 @@ EMBED_META_FILES = ('config.json', 'tokenizer.json', 'tokenizer_config.json', 'c
 EMBED_OPT_FILES = ('added_tokens.json', 'vocab.json', 'merges.txt', 'special_tokens_map.json',
                    'preprocessor_config.json', 'video_preprocessor_config.json', 'generation_config.json',
                    'config_sentence_transformers.json', 'modules.json', 'sentence_bert_config.json')
+TTS_META_FILES = ('config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')
+TTS_OPT_FILES = ('special_tokens_map.json', 'added_tokens.json', 'LICENSE', 'Notice')
+
+
+class TtsRelease(Release):
+    """A Drama 3 exlr8 TTS release (experts + multi-group dense + vocab + codec/exlr8-codec.safetensors) on HF."""
+
+    def __init__(self, cache, repo, rev, refresh=False, log=print, layout=None):
+        super().__init__(cache, repo, rev, refresh=refresh, log=log, layout=layout)
+        self.tokenizer = self.dir
+
+    def _fetch_meta(self):
+        done = os.path.join(self.dir, 'meta.json')
+        if os.path.isfile(done):
+            return
+        t = self.repo.tree()
+        fetched = []
+        for p in sorted(t):
+            if p.startswith('manifests/') or (os.path.dirname(p) == '' and p.startswith('exlr8-manifest-') and p.endswith('.json')):
+                self.repo.fetch(p, os.path.join(self.dir, p))
+                fetched.append(p)
+        missing = [n for n in TTS_META_FILES if n not in t]
+        if missing:
+            raise modelset.ModelError(f'{self} lacks {", ".join(missing)} at its root')
+        for name in TTS_META_FILES:
+            self.repo.fetch(name, os.path.join(self.dir, name))
+            fetched.append(name)
+        for name in TTS_OPT_FILES:
+            if name in t:
+                self.repo.fetch(name, os.path.join(self.dir, name))
+                fetched.append(name)
+        for p in sorted(t):
+            if p.startswith('hashes/') and p.endswith('.sha256'):
+                self.repo.fetch(p, os.path.join(self.dir, p))
+                fetched.append(p)
+        with open(done + '.tmp', 'w') as f:
+            json.dump({'release': f'{self.repo.repo}@{self.commit}', 'files': fetched}, f, indent=1)
+        os.replace(done + '.tmp', done)
 
 
 class DenseRelease:

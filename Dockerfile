@@ -9,7 +9,7 @@
 # CUDA_ARCH overrides the CUDA SM target (empty defaults to 121a on arm64 and 120a on amd64 via scripts/build.sh).
 # Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader), kvman (the host Rust: page allocator,
 # scheduler, planner), knobs and front (the Rust front end) -> rust-dist -> engine, engine-int4, engine-flash,
-# engine-flash-int4, engine-ds41, engine-ink2, engine-qw38, engine-hy4, engine-embed and engine-tests-ship -> dist
+# engine-flash-int4, engine-ds41, engine-ink2, engine-qw38, engine-hy4, engine-embed, engine-tts and engine-tests-ship -> dist
 # (the binaries only) -> runtime (CUDA runtime + binaries, scripts, shims).
 ARG CUDA_VERSION=13.0.1
 ARG UBUNTU=ubuntu24.04
@@ -268,6 +268,17 @@ RUN --mount=type=cache,id=gr8-nvcc-embed-${TARGETARCH},target=/var/cache/gr8-nvc
  && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6embed -exec rm -rf {} +
 
+# Native Drama 3 TTS (FishOmniModel): g6tts (MODEL=tts), TP 1, without request grammars
+FROM engine-src AS engine-tts
+ARG TARGETARCH
+COPY engine/embed/embed_gemm.cuh engine/embed/embed_weights.h engine/embed/embed_config.h engine/embed/
+COPY engine/tts/*.cu engine/tts/*.cuh engine/tts/*.h engine/tts/*.sh engine/tts/
+RUN --mount=type=cache,id=gr8-nvcc-tts-${TARGETARCH},target=/var/cache/gr8-nvcc \
+    touch "$GR8_NVCC_CACHE_DIR/.start" \
+ && MODEL=tts scripts/build.sh /out/bin \
+ && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
+ && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6tts -exec rm -rf {} +
+
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
 FROM engine-src-glm AS engine-int4
@@ -316,6 +327,9 @@ COPY --from=engine-hy4 /out/bin/g6m4_hy4 /out/bin/m4sim_hy4 /bin/
 FROM scratch AS dist-embed
 COPY --from=engine-embed /out/bin/g6embed /bin/
 
+FROM scratch AS dist-tts
+COPY --from=engine-tts /out/bin/g6tts /bin/
+
 FROM scratch AS dist-tests
 COPY --from=engine-tests-ship /out/bin/gpuprobe /out/bin/tr3_e4m3_test /bin/
 
@@ -330,6 +344,7 @@ COPY --from=dist-ink2 / /
 COPY --from=dist-qw38 / /
 COPY --from=dist-hy4 / /
 COPY --from=dist-embed / /
+COPY --from=dist-tts / /
 COPY --from=dist-tests / /
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime

@@ -35,6 +35,9 @@ OUT=$(mkdir -p "${1:-$REPO/bin}" && cd "${1:-$REPO/bin}" && pwd)
 if [ "${MODEL:-glm}" = embed ]; then
   exec bash "$REPO/engine/embed/build_embed.sh" "$OUT"
 fi
+if [ "${MODEL:-glm}" = tts ]; then
+  exec bash "$REPO/engine/tts/build_tts.sh" "$OUT"
+fi
 K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DPF_DRAFTKV -DPF_GEMMRF=1 -DPF_QOBH=1 \
 -DDEC_SLOT=2 -DDEC_CPB=1 -DDEC_AVP=1 -DPF_QOROPE=1 -DPF_ISGRT=1 -DPF_ROPE2=1 -DDEC_CPB2=64 -DDEC_I4PAIR=1 -DSEL32 \
 -DG6_CP=1 -DG6_CP_PF_HASH2=1 -DDEC_IDX31=1 -DPF_QO_DEDUP=1"
@@ -146,6 +149,9 @@ flash ckpt share: now' ;;
       BUILD_ENGINE=g6m4_ernie55 BUILD_SIM=m4sim_ernie55 BUILD_WIDTHS='1 2'
       BUILD_DEFINE=G6_MODEL_ERNIE55 BUILD_FC2GL=4 BUILD_INT4=0
       BUILD_WHAT_ENV=ERNIE55_WHAT ;;
+    tts)
+      BUILD_ENGINE=g6tts BUILD_SIM= BUILD_WIDTHS=1
+      BUILD_DEFINE= BUILD_FC2GL=6 BUILD_INT4=0 ;;
     *)
       if command -v python3 >/dev/null 2>&1 && [ -f "$REPO/tools/launch/models.py" ]; then
         local metadata
