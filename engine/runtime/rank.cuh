@@ -1832,7 +1832,10 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
                 cpglue::k_vget<<<G, 256, 0, st>>>(v, j, m.stepp, C.cand + (size_t)v.src[j] * M * 2048, cb);
             G6RT_CK(g6_attn_cp_merge_index(a, cell, C.cand, st));
         }
-        if (!C.s3 || cc >= 0) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
+        // At TP=2 on full-index layers (cc >= 0), peer q was already in flight during cp_index + cand exchange;
+        // compute and publish peer's partial first so local cp_group overlaps the partial's RDMA transfer.
+        const bool defer_local = nr == 2 && C.s3 && cc >= 0;
+        if ((!C.s3 || cc >= 0) && !defer_local) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
         const g6::VSlotDev& vq = C.vs[cq];
         cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
         if (C.one)
@@ -1870,6 +1873,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
             for (int k = 1; k < nr; ++k)
                 cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp + (size_t)(k - 1) * tblk, (size_t)M * cp_heads((r + k) % nr, y.l) * 514 * 4,
                                                    nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));
+        if (defer_local) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
     }
     if (phase == 1) return;
 #ifdef CP_F1A
