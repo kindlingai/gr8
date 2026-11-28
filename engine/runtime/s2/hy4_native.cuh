@@ -37,6 +37,7 @@ inline void serve_hy4(Hy4Context c, const BootstrapConfig& bc, int chunk) {
     };
     std::vector<PendingVerify> pend(static_cast<size_t>(slots));
     std::vector<int> last_snap_off(size_t(slots), 0);
+    std::vector<int> incoming_mrope_delta(size_t(slots), 0);
 
     std::vector<hy4rt::RowOut> out;
     std::vector<int> targets;
@@ -58,12 +59,18 @@ inline void serve_hy4(Hy4Context c, const BootstrapConfig& bc, int chunk) {
     h.pool.max_run_pages = max_pps;
     h.pool.status = true;
 
+    h.bind_request = [&](unsigned slot, const g6rt::ServeReq& r) {
+        require(int(slot) >= 0 && int(slot) < slots, "hy4 bind_request: bad slot");
+        incoming_mrope_delta[size_t(slot)] = hy4rt::hy4_mrope_delta(r.images);
+    };
+
     h.bind = [&](const Grant& g) {
         const int q = int(g.key.slot);
         require(q >= 0 && q < slots, "hy4 bind: bad slot");
         pend[size_t(q)] = PendingVerify{};
         last_snap_off[size_t(q)] = 0;
         c.engine.reset_slot(q);
+        c.engine.set_slot_mrope_delta(q, incoming_mrope_delta[size_t(q)]);
         c.engine.set_slot_pages(q, pool.list(g.run));
         HY4_CK(cudaStreamSynchronize(c.engine.stream));
     };
@@ -186,13 +193,22 @@ inline void serve_hy4(Hy4Context c, const BootstrapConfig& bc, int chunk) {
         const int q = int(s.key.slot);
         require(size_t(first) + rows <= p.prompt.size() && q >= 0 && q < slots, "hy4 prefill: out of range");
         pend[size_t(q)] = PendingVerify{};
+        if (!p.images.empty()) c.engine.set_slot_mrope_delta(q, hy4rt::hy4_mrope_delta(p.images));
         uint32_t at = first;
         const uint32_t limit = first + rows;
+        std::vector<int3> mrope_thw;
         while (at < limit) {
             const uint32_t step_lim = std::min<uint32_t>(limit, at + uint32_t(max_rows));
             const int n = int(step_lim - at);
             std::vector<hy4::StepSeg> segs = {{q, 0, int(at), n}};
-            c.engine.forward(segs, &p.prompt[at], nullptr, out, true);
+            if (!p.images.empty()) {
+                const int vis_n = c.engine.vision.stage(p.images, int(at), n, c.engine.stream, c.rank, s.req.id);
+                mrope_thw.resize(size_t(n));
+                hy4rt::hy4_build_mrope(p.images, int(at), n, mrope_thw.data());
+                c.engine.forward(segs, &p.prompt[at], nullptr, out, true, nullptr, false, vis_n, mrope_thw.data());
+            } else {
+                c.engine.forward(segs, &p.prompt[at], nullptr, out, true);
+            }
             at = step_lim;
         }
         lp_rows = 0;

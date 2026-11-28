@@ -120,13 +120,13 @@ __global__ void __launch_bounds__(256) k_dfly_init_block(
     const __nv_bfloat16* __restrict__ embed,
     __nv_bfloat16* __restrict__ h,
     int* __restrict__ d_q_pos,
-    int bonus_tok, int anchor, int W) {
+    int bonus_tok, int anchor, int rope_delta, int W) {
     const int w = blockIdx.x / 12;
     const int d = (blockIdx.x % 12) * 256 + threadIdx.x;
     if (w >= W || d >= geom::HID) return;
     const int tok = (w == 0) ? bonus_tok : MASK_TOK;
     h[static_cast<size_t>(w) * geom::HID + d] = embed[static_cast<size_t>(tok) * geom::HID + d];
-    if (d == 0) d_q_pos[w] = anchor + w;
+    if (d == 0) d_q_pos[w] = anchor + w + rope_delta;
 }
 
 // Compute cat(rmsnorm(a, w_a), rmsnorm(b, w_b)) -> out[6144] BF16 (2 blocks: block 0 does a -> [0..3071], block 1 does b -> [3072..6143]).
@@ -629,12 +629,13 @@ inline void forward_body(
     int nr, int rank0, int nloc,
     int slot, int bonus_tok, int anchor, int W, int max_pps,
     cudaStream_t st,
-    const std::function<void(int c, int M, const __nv_bfloat16* post_ln)>& on_ar_add = nullptr) {
+    const std::function<void(int c, int M, const __nv_bfloat16* post_ln)>& on_ar_add = nullptr,
+    int rope_delta = 0) {
 
     ensure_dfly_mla_smem();
     const RankWeights& w0 = rw[0];
-    // 1. Embed [bonus_tok, MASK, ..., MASK] + positions [anchor .. anchor + W - 1]
-    k_dfly_init_block<<<W * 12, 256, 0, st>>>(embed, sc.h, sc.d_q_pos, bonus_tok, anchor, W);
+    // 1. Embed [bonus_tok, MASK, ..., MASK] + positions [anchor + rope_delta .. anchor + W - 1 + rope_delta]
+    k_dfly_init_block<<<W * 12, 256, 0, st>>>(embed, sc.h, sc.d_q_pos, bonus_tok, anchor, rope_delta, W);
 
     // 2. Slot-0 mtp_fusion: h[0] += gate * eh_proj(cat(enorm(h[0]), hnorm(target_hidden)))
     k_dfly_cat_norms<<<2, 256, 0, st>>>(sc.h, w0.mtp_enorm, target_hidden, w0.mtp_hnorm, sc.cat6144);
@@ -661,7 +662,7 @@ inline void forward_body(
             mx8::linear_w(blas, sc.x_ln, lw.q_a_proj, attn_sc.q_a, W, geom::QA, geom::HID, x8_scratch, nullptr, st);
             k_hy4_rmsnorm<<<W, 256, 0, st>>>(attn_sc.q_a, lw.q_a_ln, attn_sc.q_resid, W, geom::QA, geom::RMS_EPS);
             mx8::linear_w(blas, attn_sc.q_resid, lw.q_b_proj, attn_sc.q_raw, W, nh * geom::QK_HEAD, geom::QA, x8_scratch, nullptr, st);
-            launch_q_absorb_rope_smallm(attn_sc.q_raw, lw.w_uk_t, sc.d_q_pos, attn_sc.q_full, W, nh, geom::ROPE_THETA_DSA, st);
+            launch_q_absorb_rope_smallm(attn_sc.q_raw, lw.w_uk_t, sc.d_q_pos, nullptr, attn_sc.q_full, W, nh, geom::ROPE_THETA_DSA, st);
 
             mx8::linear_w(blas, sc.x_ln, lw.kv_a_proj, attn_sc.kv_raw, W, geom::KVA, geom::HID, x8_scratch, nullptr, st);
             k_dfly_kv_norm_rope<<<W, 256, 0, st>>>(attn_sc.kv_raw, lw.kv_a_ln, sc.d_q_pos, sc.kv_draft, W);

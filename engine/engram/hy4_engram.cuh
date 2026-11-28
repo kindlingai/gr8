@@ -134,10 +134,12 @@ __global__ void __launch_bounds__(256) k_hy4_engram_gate_add(
     const __nv_bfloat16* __restrict__ main_sig,// [M, 3072]
     EngramHcPtrs p,
     __nv_bfloat16* __restrict__ hyper,         // [M, 4, 3072]
-    int M) {
+    int M,
+    const uint8_t* __restrict__ d_eng_mask = nullptr) {
     const int idx = blockIdx.x;
     if (idx >= M * geom::HC) return;
     const int m = idx / geom::HC;
+    if (d_eng_mask && !d_eng_mask[m]) return;
     const int hc = idx % geom::HC;
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
@@ -207,7 +209,8 @@ __global__ void __launch_bounds__(256) k_hy4_engram_gate_add(
 }
 
 inline void engram_forward(cublasHandle_t blas, const EngramWeights& w, EngramScratch& sc,
-                           __nv_bfloat16* hyper, int M, uint8_t* x8_scratch, cudaStream_t st) {
+                           __nv_bfloat16* hyper, int M, uint8_t* x8_scratch, cudaStream_t st,
+                           const uint8_t* d_eng_mask = nullptr) {
     EngramHeadNormPtrs hn{};
     for (int h = 0; h < 16; ++h) hn.w[h] = w.head_norms[h];
     k_hy4_engram_dequant_norm<<<M * geom::ENGRAM_HEADS, geom::ENGRAM_HEAD_DIM, 0, st>>>(
@@ -230,7 +233,7 @@ inline void engram_forward(cublasHandle_t blas, const EngramWeights& w, EngramSc
         p.nq[hc] = w.norm_query[hc];
         p.sc[hc] = w.hc_scales[hc];
     }
-    k_hy4_engram_gate_add<<<M * geom::HC, 256, 0, st>>>(sc.key, sc.main_sig, p, hyper, M);
+    k_hy4_engram_gate_add<<<M * geom::HC, 256, 0, st>>>(sc.key, sc.main_sig, p, hyper, M, d_eng_mask);
 }
 
 } // namespace hy4

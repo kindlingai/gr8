@@ -86,7 +86,8 @@ struct DsaLayerKv {
     __nv_bfloat16* idx_bf16 = nullptr; // BF16 mode: [pool_pages][16][128] BF16
     uint8_t*       idx_q    = nullptr; // FP8/INT4 mode: [pool_pages][16][128] E4M3
     __half*        idx_sc   = nullptr; // FP8/INT4 mode: [pool_pages][16][4] FP16 (per-32 scales)
-    __nv_bfloat16* idx_raw  = nullptr; // [slots][4][128] BF16 (pending raw token keys for incomplete 4-tok group)
+    __nv_bfloat16* idx_raw     = nullptr; // [slots][4][128] BF16 (pending raw token keys for incomplete 4-tok group)
+    int3*          idx_raw_thw = nullptr; // [slots] M-RoPE (T,H,W) of token 0 of pending 4-tok group
 };
 
 // Fixed sliding-window ring for one SWA layer (always BF16: 2048*576*2B = 2.25 MiB/slot/layer).
@@ -151,6 +152,21 @@ __global__ void __launch_bounds__(256) k_hy4_unpack_kv_b(
 // =================================================================================================
 // Interleaved RoPE on 64 dims (32 pairs: (2i, 2i+1))
 // =================================================================================================
+__device__ __forceinline__ int hy4_thw_axis_pos(int3 thw, int pair_idx) {
+    // mrope_section = [12, 10, 10] interleaved: pairs 1,4,7..28 -> H (y); 2,5,8..29 -> W (z); rest -> T (x)
+    if (pair_idx < 30) {
+        const int r = pair_idx % 3;
+        if (r == 1) return thw.y;
+        if (r == 2) return thw.z;
+    }
+    return thw.x;
+}
+
+__device__ __forceinline__ int hy4_mrope_axis_pos(int pos1d, const int3* d_mrope, int m, int pair_idx) {
+    if (!d_mrope) return pos1d;
+    return hy4_thw_axis_pos(d_mrope[m], pair_idx);
+}
+
 __device__ __forceinline__ void hy4_rope_pair(float& x0, float& x1, int pos, int pair_idx, float theta) {
     const float inv_freq = powf(theta, -static_cast<float>(pair_idx * 2) * (1.0f / 64.0f));
     const float ang = static_cast<float>(pos) * inv_freq;
@@ -164,7 +180,8 @@ __device__ __forceinline__ void hy4_rope_pair(float& x0, float& x1, int pos, int
 
 __global__ void __launch_bounds__(256) k_hy4_q_split_rope(
     const __nv_bfloat16* __restrict__ q_raw,
-    const int* __restrict__ d_pos,
+    const int* __restrict__ d_rope_pos,
+    const int3* __restrict__ d_mrope,
     __nv_bfloat16* __restrict__ q_nope_h,
     __nv_bfloat16* __restrict__ q_full,
     int M, int nh, float theta) {
@@ -180,7 +197,8 @@ __global__ void __launch_bounds__(256) k_hy4_q_split_rope(
         const int p = d - geom::QK_NOPE;
         float x0 = __bfloat162float(src[geom::QK_NOPE + 2 * p]);
         float x1 = __bfloat162float(src[geom::QK_NOPE + 2 * p + 1]);
-        hy4_rope_pair(x0, x1, d_pos[m], p, theta);
+        const int rpos = hy4_mrope_axis_pos(d_rope_pos[m], d_mrope, m, p);
+        hy4_rope_pair(x0, x1, rpos, p, theta);
         __nv_bfloat16* dst = q_full + static_cast<size_t>(idx) * geom::KVA + geom::KV_LORA;
         dst[2 * p]     = __float2bfloat16(x0);
         dst[2 * p + 1] = __float2bfloat16(x1);
@@ -211,6 +229,8 @@ __global__ void __launch_bounds__(256) k_hy4_kv_write(
     const __nv_bfloat16* __restrict__ kv_a_ln,
     const int* __restrict__ d_slot,
     const int* __restrict__ d_pos,
+    const int* __restrict__ d_rope_pos,
+    const int3* __restrict__ d_mrope,
     const int* __restrict__ d_page_table,
     uint8_t* __restrict__ kv_dst,
     int M, int max_pps, float theta) {
@@ -295,7 +315,8 @@ __global__ void __launch_bounds__(256) k_hy4_kv_write(
     if (tid < 32) {
         float x0 = __bfloat162float(src[geom::KV_LORA + 2 * tid]);
         float x1 = __bfloat162float(src[geom::KV_LORA + 2 * tid + 1]);
-        hy4_rope_pair(x0, x1, pos, tid, theta);
+        const int rpos = hy4_mrope_axis_pos(d_rope_pos ? d_rope_pos[m] : pos, d_mrope, m, tid);
+        hy4_rope_pair(x0, x1, rpos, tid, theta);
         constexpr size_t ROPE_OFF = (!IS_DSA || FMT == KvFmt::BF16) ? (geom::KV_LORA * 2)
                                   : (FMT == KvFmt::FP8) ? (512 + 32) : (256 + 32);
         __nv_bfloat16* rdst = reinterpret_cast<__nv_bfloat16*>(out_u8 + ROPE_OFF);
@@ -314,7 +335,7 @@ __device__ __forceinline__ void hy4_pool_4_keys_f32(
     const float* __restrict__ kg_proj,
     const float* __restrict__ ape,
     const float* __restrict__ k_norm_w,
-    int group_pos,
+    int3 group_thw,
     __nv_bfloat16* __restrict__ dst_bf16,
     uint8_t* __restrict__ dst_q,
     __half* __restrict__ dst_sc,
@@ -354,7 +375,7 @@ __device__ __forceinline__ void hy4_pool_4_keys_f32(
         const int p = (d - 64) >> 1;
         float x0 = s_norm[64 + 2 * p];
         float x1 = s_norm[64 + 2 * p + 1];
-        hy4_rope_pair(x0, x1, group_pos, p, geom::ROPE_THETA_DSA);
+        hy4_rope_pair(x0, x1, hy4_thw_axis_pos(group_thw, p), p, geom::ROPE_THETA_DSA);
         out_val = ((d & 1) == 0) ? x0 : x1;
     }
 
@@ -380,8 +401,10 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_dec(
     const float* __restrict__ k_norm_w,
     const int* __restrict__ d_slot,
     const int* __restrict__ d_pos,
+    const int* __restrict__ d_rope_pos,
     const int* __restrict__ d_page_table,
     __nv_bfloat16* __restrict__ idx_raw,
+    int3* __restrict__ idx_raw_thw,
     __nv_bfloat16* __restrict__ idx_bf16,
     uint8_t* __restrict__ idx_q,
     __half* __restrict__ idx_sc,
@@ -391,10 +414,12 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_dec(
     const int d = threadIdx.x;
     const int slot = d_slot[m];
     const int pos  = d_pos[m];
+    const int rpos = d_rope_pos ? d_rope_pos[m] : pos;
     const int sub  = pos & 3;
     __nv_bfloat16* rslot = idx_raw + static_cast<size_t>(slot) * 4 * 128;
     const __nv_bfloat16 v = idx_tk[static_cast<size_t>(m) * 128 + d];
     rslot[sub * 128 + d] = v;
+    if (sub == 0 && d == 0 && idx_raw_thw) idx_raw_thw[slot] = make_int3(rpos, rpos, rpos);
     if (sub != 3) return;
 
     __shared__ __nv_bfloat16 s_raw[4][128];
@@ -409,8 +434,10 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_dec(
     const int goff  = g & 15;
     const int ppage = d_page_table[static_cast<size_t>(slot) * max_pps + lpage];
     const size_t go = static_cast<size_t>(ppage) * 16 + goff;
+    const int gp0_rope = rpos - 3;
+    const int3 gthw = idx_raw_thw ? idx_raw_thw[slot] : make_int3(gp0_rope, gp0_rope, gp0_rope);
     hy4_pool_4_keys_f32<IDX_FP8>(
-        s_raw, kv_proj, kg_proj, ape, k_norm_w, g * 4,
+        s_raw, kv_proj, kg_proj, ape, k_norm_w, gthw,
         idx_bf16 ? (idx_bf16 + go * 128) : nullptr,
         idx_q    ? (idx_q    + go * 128) : nullptr,
         idx_sc   ? (idx_sc   + go * 4)   : nullptr,
@@ -426,6 +453,9 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_seg_complete(
     const float* __restrict__ k_norm_w,
     const int* __restrict__ d_page_table,
     const __nv_bfloat16* __restrict__ idx_raw,
+    const int3* __restrict__ idx_raw_thw,
+    const int* __restrict__ d_rope_pos,
+    const int3* __restrict__ d_mrope,
     __nv_bfloat16* __restrict__ idx_bf16,
     uint8_t* __restrict__ idx_q,
     __half* __restrict__ idx_sc,
@@ -445,12 +475,24 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_seg_complete(
     }
     __syncthreads();
 
+    int3 gthw;
+    if (gp0 < pos0) {
+        gthw = idx_raw_thw ? idx_raw_thw[slot] : make_int3(gp0, gp0, gp0);
+    } else {
+        const int m0 = row0 + (gp0 - pos0);
+        if (d_mrope) gthw = d_mrope[m0];
+        else {
+            const int rp = d_rope_pos ? d_rope_pos[m0] : gp0;
+            gthw = make_int3(rp, rp, rp);
+        }
+    }
+
     const int lpage = g >> 4;
     const int goff  = g & 15;
     const int ppage = d_page_table[static_cast<size_t>(slot) * max_pps + lpage];
     const size_t go = static_cast<size_t>(ppage) * 16 + goff;
     hy4_pool_4_keys_f32<IDX_FP8>(
-        s_raw, kv_proj, kg_proj, ape, k_norm_w, gp0,
+        s_raw, kv_proj, kg_proj, ape, k_norm_w, gthw,
         idx_bf16 ? (idx_bf16 + go * 128) : nullptr,
         idx_q    ? (idx_q    + go * 128) : nullptr,
         idx_sc   ? (idx_sc   + go * 4)   : nullptr,
@@ -460,6 +502,9 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_seg_complete(
 __global__ void __launch_bounds__(128) k_hy4_idx_k_update_seg_tail(
     const __nv_bfloat16* __restrict__ idx_tk,
     __nv_bfloat16* __restrict__ idx_raw,
+    int3* __restrict__ idx_raw_thw,
+    const int* __restrict__ d_rope_pos,
+    const int3* __restrict__ d_mrope,
     int slot, int row0, int pos0, int len) {
     const int d = threadIdx.x;
     const int seg_end = pos0 + len;
@@ -468,7 +513,17 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_seg_tail(
     __nv_bfloat16* rslot = idx_raw + static_cast<size_t>(slot) * 4 * 128;
     for (int k = 0; k < 4; ++k) {
         const int p = tail_g0 + k;
-        if (p >= pos0 && p < seg_end) rslot[k * 128 + d] = idx_tk[static_cast<size_t>(row0 + (p - pos0)) * 128 + d];
+        if (p >= pos0 && p < seg_end) {
+            const int m = row0 + (p - pos0);
+            rslot[k * 128 + d] = idx_tk[static_cast<size_t>(m) * 128 + d];
+            if (k == 0 && d == 0 && idx_raw_thw) {
+                if (d_mrope) idx_raw_thw[slot] = d_mrope[m];
+                else {
+                    const int rp = d_rope_pos ? d_rope_pos[m] : p;
+                    idx_raw_thw[slot] = make_int3(rp, rp, rp);
+                }
+            }
+        }
     }
 }
 
@@ -484,8 +539,11 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_smallm(
     const float* __restrict__ k_norm_w,
     const int* __restrict__ d_slot,
     const int* __restrict__ d_pos,
+    const int* __restrict__ d_rope_pos,
+    const int3* __restrict__ d_mrope,
     const int* __restrict__ d_page_table,
     __nv_bfloat16* __restrict__ idx_raw,
+    int3* __restrict__ idx_raw_thw,
     __nv_bfloat16* __restrict__ idx_bf16,
     uint8_t* __restrict__ idx_q,
     __half* __restrict__ idx_sc,
@@ -496,9 +554,13 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_smallm(
     for (int m = 0; m < M; ++m) {
         const int slot = d_slot[m];
         const int pos  = d_pos[m];
+        const int rpos = d_rope_pos ? d_rope_pos[m] : pos;
         const int sub  = pos & 3;
         __nv_bfloat16* rslot = idx_raw + static_cast<size_t>(slot) * 4 * 128;
         rslot[sub * 128 + d] = idx_tk[static_cast<size_t>(m) * 128 + d];
+        if (sub == 0 && d == 0 && idx_raw_thw) {
+            idx_raw_thw[slot] = d_mrope ? d_mrope[m] : make_int3(rpos, rpos, rpos);
+        }
         __syncthreads();
         if (sub == 3) {
             #pragma unroll
@@ -509,8 +571,10 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_smallm(
             const int goff  = g & 15;
             const int ppage = d_page_table[static_cast<size_t>(slot) * max_pps + lpage];
             const size_t go = static_cast<size_t>(ppage) * 16 + goff;
+            const int gp0_r = rpos - 3;
+            const int3 gthw = idx_raw_thw ? idx_raw_thw[slot] : make_int3(gp0_r, gp0_r, gp0_r);
             hy4_pool_4_keys_f32<IDX_FP8>(
-                s_raw, kv_proj, kg_proj, ape, k_norm_w, g * 4,
+                s_raw, kv_proj, kg_proj, ape, k_norm_w, gthw,
                 idx_bf16 ? (idx_bf16 + go * 128) : nullptr,
                 idx_q    ? (idx_q    + go * 128) : nullptr,
                 idx_sc   ? (idx_sc   + go * 4)   : nullptr,
@@ -522,7 +586,8 @@ __global__ void __launch_bounds__(128) k_hy4_idx_k_update_smallm(
 
 __global__ void __launch_bounds__(32) k_hy4_idx_q_rope(
     __nv_bfloat16* __restrict__ idx_q,
-    const int* __restrict__ d_pos, int M) {
+    const int* __restrict__ d_rope_pos,
+    const int3* __restrict__ d_mrope, int M) {
     const int idx = blockIdx.x;
     if (idx >= M * geom::IDX_HEADS) return;
     const int m = idx / geom::IDX_HEADS;
@@ -530,7 +595,8 @@ __global__ void __launch_bounds__(32) k_hy4_idx_q_rope(
     __nv_bfloat16* q = idx_q + static_cast<size_t>(idx) * 128 + 64;
     float x0 = __bfloat162float(q[2 * p]);
     float x1 = __bfloat162float(q[2 * p + 1]);
-    hy4_rope_pair(x0, x1, d_pos[m], p, geom::ROPE_THETA_DSA);
+    const int rpos = hy4_mrope_axis_pos(d_rope_pos[m], d_mrope, m, p);
+    hy4_rope_pair(x0, x1, rpos, p, geom::ROPE_THETA_DSA);
     q[2 * p]     = __float2bfloat16(x0);
     q[2 * p + 1] = __float2bfloat16(x1);
 }
@@ -1508,7 +1574,8 @@ template <int MAX_M>
 __global__ void __launch_bounds__(128) k_hy4_q_absorb_rope_smallm(
     const __nv_bfloat16* __restrict__ q_raw,
     const __nv_bfloat16* __restrict__ w_uk_t,
-    const int* __restrict__ d_pos,
+    const int* __restrict__ d_rope_pos,
+    const int3* __restrict__ d_mrope,
     __nv_bfloat16* __restrict__ q_full,
     int M, int nh, float theta) {
     const int h = blockIdx.x;
@@ -1547,7 +1614,7 @@ __global__ void __launch_bounds__(128) k_hy4_q_absorb_rope_smallm(
                 const __nv_bfloat16* src = q_raw + (static_cast<size_t>(m) * nh + h) * geom::QK_HEAD + geom::QK_NOPE;
                 float x0 = __bfloat162float(src[2 * lane]);
                 float x1 = __bfloat162float(src[2 * lane + 1]);
-                hy4_rope_pair(x0, x1, d_pos[m], lane, theta);
+                hy4_rope_pair(x0, x1, hy4_mrope_axis_pos(d_rope_pos[m], d_mrope, m, lane), lane, theta);
                 __nv_bfloat16* dst = q_full + (static_cast<size_t>(m) * nh + h) * geom::KVA + geom::KV_LORA;
                 dst[2 * lane]     = __float2bfloat16(x0);
                 dst[2 * lane + 1] = __float2bfloat16(x1);
@@ -1562,7 +1629,8 @@ __global__ void __launch_bounds__(128) k_hy4_q_absorb_rope_mx8(
     const __nv_bfloat16* __restrict__ q_raw,
     const uint8_t* __restrict__ wq,
     const uint8_t* __restrict__ wsc,
-    const int* __restrict__ d_pos,
+    const int* __restrict__ d_rope_pos,
+    const int3* __restrict__ d_mrope,
     __nv_bfloat16* __restrict__ q_full,
     int M, int nh, float theta) {
     const int h = blockIdx.x;
@@ -1608,7 +1676,7 @@ __global__ void __launch_bounds__(128) k_hy4_q_absorb_rope_mx8(
                 const __nv_bfloat16* src = q_raw + (static_cast<size_t>(m) * nh + h) * geom::QK_HEAD + geom::QK_NOPE;
                 float x0 = __bfloat162float(src[2 * lane]);
                 float x1 = __bfloat162float(src[2 * lane + 1]);
-                hy4_rope_pair(x0, x1, d_pos[m], lane, theta);
+                hy4_rope_pair(x0, x1, hy4_mrope_axis_pos(d_rope_pos[m], d_mrope, m, lane), lane, theta);
                 __nv_bfloat16* dst = q_full + (static_cast<size_t>(m) * nh + h) * geom::KVA + geom::KV_LORA;
                 dst[2 * lane]     = __float2bfloat16(x0);
                 dst[2 * lane + 1] = __float2bfloat16(x1);
@@ -1618,29 +1686,30 @@ __global__ void __launch_bounds__(128) k_hy4_q_absorb_rope_mx8(
 }
 
 inline void launch_q_absorb_rope_smallm(const __nv_bfloat16* q_raw, const mx8::LinW& w_uk_t,
-                                        const int* d_pos, __nv_bfloat16* q_full,
+                                        const int* d_rope_pos, const int3* d_mrope, __nv_bfloat16* q_full,
                                         int M, int nh, float theta, cudaStream_t st) {
     for (int m0 = 0; m0 < M; m0 += 12) {
         const int nm = std::min(12, M - m0);
         const __nv_bfloat16* qr = q_raw  + static_cast<size_t>(m0) * nh * geom::QK_HEAD;
-        const int*           dp = d_pos  + m0;
+        const int*           dp = d_rope_pos + m0;
+        const int3*          dm = d_mrope ? (d_mrope + m0) : nullptr;
         __nv_bfloat16*       qf = q_full + static_cast<size_t>(m0) * nh * geom::KVA;
         if (w_uk_t.is_mx8()) {
             const dim3 grid(nh, geom::KV_LORA / 8);
-            if (nm <= 1)      k_hy4_q_absorb_rope_mx8<1> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, qf, nm, nh, theta);
-            else if (nm <= 2) k_hy4_q_absorb_rope_mx8<2> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, qf, nm, nh, theta);
-            else if (nm <= 4) k_hy4_q_absorb_rope_mx8<4> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, qf, nm, nh, theta);
-            else if (nm <= 6) k_hy4_q_absorb_rope_mx8<6> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, qf, nm, nh, theta);
-            else if (nm <= 8) k_hy4_q_absorb_rope_mx8<8> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, qf, nm, nh, theta);
-            else              k_hy4_q_absorb_rope_mx8<12><<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, qf, nm, nh, theta);
+            if (nm <= 1)      k_hy4_q_absorb_rope_mx8<1> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, dm, qf, nm, nh, theta);
+            else if (nm <= 2) k_hy4_q_absorb_rope_mx8<2> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, dm, qf, nm, nh, theta);
+            else if (nm <= 4) k_hy4_q_absorb_rope_mx8<4> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, dm, qf, nm, nh, theta);
+            else if (nm <= 6) k_hy4_q_absorb_rope_mx8<6> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, dm, qf, nm, nh, theta);
+            else if (nm <= 8) k_hy4_q_absorb_rope_mx8<8> <<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, dm, qf, nm, nh, theta);
+            else              k_hy4_q_absorb_rope_mx8<12><<<grid, 128, 0, st>>>(qr, w_uk_t.mx8.q, w_uk_t.mx8.sc, dp, dm, qf, nm, nh, theta);
         } else {
             const dim3 grid(nh, geom::KV_LORA / 4);
-            if (nm <= 1)      k_hy4_q_absorb_rope_smallm<1> <<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, qf, nm, nh, theta);
-            else if (nm <= 2) k_hy4_q_absorb_rope_smallm<2> <<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, qf, nm, nh, theta);
-            else if (nm <= 4) k_hy4_q_absorb_rope_smallm<4> <<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, qf, nm, nh, theta);
-            else if (nm <= 6) k_hy4_q_absorb_rope_smallm<6> <<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, qf, nm, nh, theta);
-            else if (nm <= 8) k_hy4_q_absorb_rope_smallm<8> <<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, qf, nm, nh, theta);
-            else              k_hy4_q_absorb_rope_smallm<12><<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, qf, nm, nh, theta);
+            if (nm <= 1)      k_hy4_q_absorb_rope_smallm<1> <<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, dm, qf, nm, nh, theta);
+            else if (nm <= 2) k_hy4_q_absorb_rope_smallm<2> <<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, dm, qf, nm, nh, theta);
+            else if (nm <= 4) k_hy4_q_absorb_rope_smallm<4> <<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, dm, qf, nm, nh, theta);
+            else if (nm <= 6) k_hy4_q_absorb_rope_smallm<6> <<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, dm, qf, nm, nh, theta);
+            else if (nm <= 8) k_hy4_q_absorb_rope_smallm<8> <<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, dm, qf, nm, nh, theta);
+            else              k_hy4_q_absorb_rope_smallm<12><<<grid, 128, 0, st>>>(qr, w_uk_t.bf16, dp, dm, qf, nm, nh, theta);
         }
     }
 }
@@ -1784,10 +1853,12 @@ inline void attn_forward(cublasHandle_t blas, const AttnWeights& w, AttnScratch&
                          const int* d_snap_dst = nullptr,
                          int* dfly_snap_grp = nullptr, int* dfly_snap_cnt = nullptr, int* dfly_snap_pos = nullptr,
                          __nv_bfloat16* idx_tk_save = nullptr,
-                         int graph_idx_groups = 0, int graph_ns_override = 0) {
+                         int graph_idx_groups = 0, int graph_ns_override = 0,
+                         const int* d_rope_pos = nullptr, const int3* d_mrope = nullptr) {
     ensure_mla_tc_smem();
     const int nh = w.nh_loc;
     const float theta = w.is_dsa ? geom::ROPE_THETA_DSA : geom::ROPE_THETA_SWA;
+    const int* rpos_ptr = d_rope_pos ? d_rope_pos : d_pos;
 
     // Pre-quantize x_norm ONCE when M >= 16 and MXFP8 is active (reused by q_a, kv_a, gate, idx_tk!)
     const uint8_t* xnorm_x8 = nullptr;
@@ -1819,9 +1890,9 @@ inline void attn_forward(cublasHandle_t blas, const AttnWeights& w, AttnScratch&
     mx8::linear_w(blas, sc.q_resid, w.q_b_proj, sc.q_raw, M, nh * geom::QK_HEAD, geom::QA, x8_scratch, qresid_x8, st);
 
     if (M <= 12) {
-        launch_q_absorb_rope_smallm(sc.q_raw, w.w_uk_t, d_pos, sc.q_full, M, nh, theta, st);
+        launch_q_absorb_rope_smallm(sc.q_raw, w.w_uk_t, rpos_ptr, d_mrope, sc.q_full, M, nh, theta, st);
     } else {
-        k_hy4_q_split_rope<<<M * nh, 256, 0, st>>>(sc.q_raw, d_pos, sc.q_nope_h, sc.q_full, M, nh, theta);
+        k_hy4_q_split_rope<<<M * nh, 256, 0, st>>>(sc.q_raw, rpos_ptr, d_mrope, sc.q_nope_h, sc.q_full, M, nh, theta);
         const __nv_bfloat16* uk_bf16 = w.w_uk_t.bf16;
         if (w.w_uk_t.is_mx8()) {
             mx8::dequant_to_bf16(w.w_uk_t.mx8, sc.kv_b_tmp, st);
@@ -1845,17 +1916,17 @@ inline void attn_forward(cublasHandle_t blas, const AttnWeights& w, AttnScratch&
     if (w.is_dsa) {
         if (dsa_kv->fmt == KvFmt::FP8) {
             k_hy4_kv_write<KvFmt::FP8, true><<<M, 256, 0, st>>>(
-                sc.kv_raw, w.kv_a_ln, d_slot, d_pos, d_page_table, dsa_kv->kv_pool, M, max_pps, theta);
+                sc.kv_raw, w.kv_a_ln, d_slot, d_pos, rpos_ptr, d_mrope, d_page_table, dsa_kv->kv_pool, M, max_pps, theta);
         } else if (dsa_kv->fmt == KvFmt::INT4) {
             k_hy4_kv_write<KvFmt::INT4, true><<<M, 256, 0, st>>>(
-                sc.kv_raw, w.kv_a_ln, d_slot, d_pos, d_page_table, dsa_kv->kv_pool, M, max_pps, theta);
+                sc.kv_raw, w.kv_a_ln, d_slot, d_pos, rpos_ptr, d_mrope, d_page_table, dsa_kv->kv_pool, M, max_pps, theta);
         } else {
             k_hy4_kv_write<KvFmt::BF16, true><<<M, 256, 0, st>>>(
-                sc.kv_raw, w.kv_a_ln, d_slot, d_pos, d_page_table, dsa_kv->kv_pool, M, max_pps, theta);
+                sc.kv_raw, w.kv_a_ln, d_slot, d_pos, rpos_ptr, d_mrope, d_page_table, dsa_kv->kv_pool, M, max_pps, theta);
         }
     } else {
         k_hy4_kv_write<KvFmt::BF16, false><<<M, 256, 0, st>>>(
-            sc.kv_raw, w.kv_a_ln, d_slot, d_pos, nullptr, reinterpret_cast<uint8_t*>(swa_kv->ring), M, max_pps, theta);
+            sc.kv_raw, w.kv_a_ln, d_slot, d_pos, rpos_ptr, d_mrope, nullptr, reinterpret_cast<uint8_t*>(swa_kv->ring), M, max_pps, theta);
     }
 
     // 3. Compressed Group Indexer (DSA layers only)
@@ -1872,11 +1943,13 @@ inline void attn_forward(cublasHandle_t blas, const AttnWeights& w, AttnScratch&
             if (idx_fp8) {
                 k_hy4_idx_k_update_smallm<true><<<1, 128, 0, st>>>(
                     sc.idx_tk, w.idx_kv_proj, w.idx_kg_proj, w.idx_ape, w.idx_k_norm,
-                    d_slot, d_pos, d_page_table, dsa_kv->idx_raw, nullptr, dsa_kv->idx_q, dsa_kv->idx_sc, M, max_pps);
+                    d_slot, d_pos, rpos_ptr, d_mrope, d_page_table, dsa_kv->idx_raw, dsa_kv->idx_raw_thw,
+                    nullptr, dsa_kv->idx_q, dsa_kv->idx_sc, M, max_pps);
             } else {
                 k_hy4_idx_k_update_smallm<false><<<1, 128, 0, st>>>(
                     sc.idx_tk, w.idx_kv_proj, w.idx_kg_proj, w.idx_ape, w.idx_k_norm,
-                    d_slot, d_pos, d_page_table, dsa_kv->idx_raw, dsa_kv->idx_bf16, nullptr, nullptr, M, max_pps);
+                    d_slot, d_pos, rpos_ptr, d_mrope, d_page_table, dsa_kv->idx_raw, dsa_kv->idx_raw_thw,
+                    dsa_kv->idx_bf16, nullptr, nullptr, M, max_pps);
             }
         } else {
             for (int s = 0; s < nsegs; ++s) {
@@ -1887,18 +1960,21 @@ inline void attn_forward(cublasHandle_t blas, const AttnWeights& w, AttnScratch&
                     if (idx_fp8) {
                         k_hy4_idx_k_update_seg_complete<true><<<g_comp_end - g0, 128, 0, st>>>(
                             sc.idx_tk, w.idx_kv_proj, w.idx_kg_proj, w.idx_ape, w.idx_k_norm,
-                            d_page_table, dsa_kv->idx_raw, nullptr, dsa_kv->idx_q, dsa_kv->idx_sc,
+                            d_page_table, dsa_kv->idx_raw, dsa_kv->idx_raw_thw, rpos_ptr, d_mrope,
+                            nullptr, dsa_kv->idx_q, dsa_kv->idx_sc,
                             max_pps, segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len);
                     } else {
                         k_hy4_idx_k_update_seg_complete<false><<<g_comp_end - g0, 128, 0, st>>>(
                             sc.idx_tk, w.idx_kv_proj, w.idx_kg_proj, w.idx_ape, w.idx_k_norm,
-                            d_page_table, dsa_kv->idx_raw, dsa_kv->idx_bf16, nullptr, nullptr,
+                            d_page_table, dsa_kv->idx_raw, dsa_kv->idx_raw_thw, rpos_ptr, d_mrope,
+                            dsa_kv->idx_bf16, nullptr, nullptr,
                             max_pps, segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len);
                     }
                 }
                 if (((segs[s].pos0 + segs[s].len) & 3) != 0) {
                     k_hy4_idx_k_update_seg_tail<<<1, 128, 0, st>>>(
-                        sc.idx_tk, dsa_kv->idx_raw, segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len);
+                        sc.idx_tk, dsa_kv->idx_raw, dsa_kv->idx_raw_thw, rpos_ptr, d_mrope,
+                        segs[s].slot, segs[s].row0, segs[s].pos0, segs[s].len);
                 }
             }
         }
@@ -1906,7 +1982,7 @@ inline void attn_forward(cublasHandle_t blas, const AttnWeights& w, AttnScratch&
         if (max_pos_in_step >= geom::IDX_TOPK) {
             use_sparse_sel = true;
             mx8::linear_w(blas, sc.q_resid, w.idx_q_proj, sc.idx_q, M, geom::IDX_HEADS * geom::IDX_DIM, geom::QA, x8_scratch, qresid_x8, st);
-            k_hy4_idx_q_rope<<<M * geom::IDX_HEADS, 32, 0, st>>>(sc.idx_q, d_pos, M);
+            k_hy4_idx_q_rope<<<M * geom::IDX_HEADS, 32, 0, st>>>(sc.idx_q, rpos_ptr, d_mrope, M);
             linear_bf16_f32(blas, x_norm, w.idx_hw_proj, sc.idx_hw, M, geom::IDX_HEADS, geom::HID, st);
 
             const int max_ng = std::min(max_groups, (graph_idx_groups > 0) ? graph_idx_groups : (max_pos_in_step >> 2));

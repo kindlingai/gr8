@@ -763,6 +763,16 @@ fn image_model(st: &State) -> crate::vision::Model {
     if st.engine.embeddings() && matches!(st.dialect, Dialect::Hf | Dialect::Qwen) {
         return crate::vision::Model::Qwen3Vl;
     }
+    if let Some(vm) = st.engine.vision_model() {
+        match vm.as_str() {
+            "hy4" => return crate::vision::Model::Hy4,
+            "qw38" => return crate::vision::Model::Qw38,
+            "ink2" => return crate::vision::Model::Ink2,
+            "glm5v" => return crate::vision::Model::Glm5v,
+            "ds41" => return crate::vision::Model::Ds41,
+            _ => {}
+        }
+    }
     match st.dialect {
         Dialect::Ds41 => crate::vision::Model::Ds41,
         Dialect::Inkling => crate::vision::Model::Ink2,

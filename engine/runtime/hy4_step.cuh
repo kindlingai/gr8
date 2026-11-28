@@ -23,6 +23,8 @@
 #include "../kernels/hy4_moe.cuh"
 #include "../kernels/hy4_dfly.cuh"
 #include "../kernels/ink2_head.cuh"
+#include "hy4_vision.cuh"
+#include "image_input.h"
 #include "../loader/g6pack.h"
 #include "../loader-rs/g6load.h"
 
@@ -46,6 +48,53 @@
 #include <vector>
 
 namespace hy4rt {
+
+// Hy4-flash interleaved 3D M-RoPE position delta after all images in a prompt:
+// Each image of patch grid (vit_h, vit_w) has H = vit_h/2, W = vit_w/2, span = H * (W + 1)
+// (the +1 column is image_newline per row) and advances the 1D text position cursor by max(H, W + 1).
+inline int hy4_mrope_delta(const std::vector<g6rt::ImageIn>& images) {
+    int delta = 0;
+    for (const auto& im : images) {
+        const int H = im.vit_h / hy4v::MERGE;
+        const int W = im.vit_w / hy4v::MERGE;
+        const int span = H * (W + 1);
+        delta += std::max(H, W + 1) - span;
+    }
+    return delta;
+}
+
+// Build per-row 3D M-RoPE (T, H, W) positions for prompt slice [pos0, pos0 + len).
+inline void hy4_build_mrope(const std::vector<g6rt::ImageIn>& images, int pos0, int len, int3* out) {
+    int cur_delta = 0;
+    size_t img_i = 0;
+    while (img_i < images.size() && images[img_i].pos + images[img_i].span <= pos0) {
+        const int H = images[img_i].vit_h / hy4v::MERGE;
+        const int W = images[img_i].vit_w / hy4v::MERGE;
+        cur_delta += std::max(H, W + 1) - images[img_i].span;
+        ++img_i;
+    }
+    for (int t = 0; t < len; ++t) {
+        const int p = pos0 + t;
+        while (img_i < images.size() && p >= images[img_i].pos + images[img_i].span) {
+            const int H = images[img_i].vit_h / hy4v::MERGE;
+            const int W = images[img_i].vit_w / hy4v::MERGE;
+            cur_delta += std::max(H, W + 1) - images[img_i].span;
+            ++img_i;
+        }
+        if (img_i < images.size() && p >= images[img_i].pos && p < images[img_i].pos + images[img_i].span) {
+            const auto& im = images[img_i];
+            const int W = im.vit_w / hy4v::MERGE;
+            const int k = p - im.pos;
+            const int r = k / (W + 1);
+            const int c = k % (W + 1);
+            const int start = im.pos + cur_delta;
+            out[t] = make_int3(start, start + r, start + c);
+        } else {
+            const int rpos = p + cur_delta;
+            out[t] = make_int3(rpos, rpos, rpos);
+        }
+    }
+}
 
 __global__ void k_hy4_bench_seed_bf16(__nv_bfloat16* dst, size_t n, uint32_t seed) {
     const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
@@ -493,8 +542,13 @@ struct Engine {
     std::array<int*, hy4::dfly::NUM_LAYERS> dfly_snap_pos{}; // [dfly_snap_cap]
     __nv_bfloat16* dfly_target_hidden = nullptr;             // [dfly_snap_cap, 3072]
     // Exact idx_raw rollback state for verify partial accepts (12 DSA layers x nloc)
-    std::vector<__nv_bfloat16*> idx_raw_bak; // [12 * nloc], each [slots, 4, 128]
-    std::vector<__nv_bfloat16*> idx_tk_ver;  // [12 * nloc], each [dfly_snap_cap, 128]
+    std::vector<__nv_bfloat16*> idx_raw_bak;     // [12 * nloc], each [slots, 4, 128]
+    std::vector<int3*>          idx_raw_thw_bak; // [12 * nloc], each [slots]
+    std::vector<__nv_bfloat16*> idx_tk_ver;      // [12 * nloc], each [dfly_snap_cap, 128]
+
+    // Native Hy4-flash vision tower + multimodal M-RoPE / Engram mask state
+    Hy4Vision vision;
+    std::vector<int> slot_mrope_delta;
 
     // Shared step scratch buffers
     __nv_bfloat16* hyper = nullptr;
@@ -512,7 +566,11 @@ struct Engine {
     int* d_tok = nullptr;
     int* d_slot = nullptr;
     int* d_pos = nullptr;
+    int* d_rope_pos = nullptr;
     int* d_snap_dst = nullptr;
+    int3* d_mrope = nullptr;
+    uint8_t* d_eng_mask = nullptr;
+    uint8_t* h_eng_mask_pinned = nullptr;
     int* h_meta_pinned = nullptr;
     int* d_page_table = nullptr;
     std::vector<int> h_page_table;
@@ -562,6 +620,7 @@ struct Engine {
         for (int s = 0; s < 4; ++s) if (eng_pinned[s]) cudaFreeHost(eng_pinned[s]);
         if (head_host_parts) cudaFreeHost(head_host_parts);
         if (h_meta_pinned) cudaFreeHost(h_meta_pinned);
+        if (h_eng_mask_pinned) cudaFreeHost(h_eng_mask_pinned);
         for (auto* p : dfly_perm_bf16) if (p) cudaFree(p);
         for (auto* p : dfly_sinks_f32) if (p) cudaFree(p);
         if (ev_a) cudaEventDestroy(ev_a);
@@ -645,7 +704,17 @@ struct Engine {
     void reset_slot(int slot) {
         if (slot < 0 || slot >= o.slots) return;
         eng_ctx[size_t(slot)] = {geom::ENGRAM_PAD_ID, geom::ENGRAM_PAD_ID};
+        if (size_t(slot) < slot_mrope_delta.size()) slot_mrope_delta[size_t(slot)] = 0;
     }
+
+    void set_slot_mrope_delta(int slot, int delta) {
+        if (slot >= 0 && size_t(slot) < slot_mrope_delta.size()) slot_mrope_delta[size_t(slot)] = delta;
+    }
+
+    bool load_vision(const std::string& path) { vision.load(path, std::max(o.max_rows, dfly_w_max)); return vision.ready(); }
+    bool vision_ready() const { return vision.ready(); }
+    const std::string& vision_id() const { return vision.id(); }
+    size_t vision_device_bytes() const { return vision.device_bytes(); }
 
     void seed_bench_kv(int fill_pos, int sessions) {
         if (fill_pos <= 0) return;
@@ -1108,6 +1177,7 @@ struct Engine {
                         rl.dsa_kv.idx_sc = dalloc<__half>(size_t(pool_pages) * 16 * 4);
                     }
                     rl.dsa_kv.idx_raw = dalloc<__nv_bfloat16>(size_t(o.slots) * 4 * geom::IDX_DIM);
+                    rl.dsa_kv.idx_raw_thw = dalloc<int3>(size_t(o.slots));
                 } else {
                     rl.swa_kv.ring = dalloc<__nv_bfloat16>(size_t(o.slots) * geom::SWA_RING * geom::KVA);
                 }
@@ -1116,6 +1186,7 @@ struct Engine {
 
         // 7. Open 4-Layer Engram Store + start async worker thread
         eng_ctx.assign(size_t(o.slots), {geom::ENGRAM_PAD_ID, geom::ENGRAM_PAD_ID});
+        slot_mrope_delta.assign(size_t(o.slots), 0);
         if (!o.no_engram) {
             hy4::EngramStoreOpts eopts{};
             eopts.cache_bytes = o.engram_cache_mib << 20;
@@ -1224,21 +1295,27 @@ struct Engine {
             }
             dfly_target_hidden = dalloc<__nv_bfloat16>(size_t(dfly_snap_cap) * geom::HID);
             idx_raw_bak.resize(size_t(geom::N_DSA * o.nloc));
+            idx_raw_thw_bak.resize(size_t(geom::N_DSA * o.nloc));
             idx_tk_ver.resize(size_t(geom::N_DSA * o.nloc));
             for (int k = 0; k < geom::N_DSA * o.nloc; ++k) {
-                idx_raw_bak[size_t(k)] = dalloc<__nv_bfloat16>(size_t(o.slots) * 4 * geom::IDX_DIM);
-                idx_tk_ver[size_t(k)]  = dalloc<__nv_bfloat16>(size_t(dfly_snap_cap) * geom::IDX_DIM);
+                idx_raw_bak[size_t(k)]     = dalloc<__nv_bfloat16>(size_t(o.slots) * 4 * geom::IDX_DIM);
+                idx_raw_thw_bak[size_t(k)] = dalloc<int3>(size_t(o.slots));
+                idx_tk_ver[size_t(k)]      = dalloc<__nv_bfloat16>(size_t(dfly_snap_cap) * geom::IDX_DIM);
             }
         }
 
         head_logits  = dalloc<float>(size_t(Mmax) * max_vr);
         head_dev_pkt = dalloc<uint8_t>(size_t(Mmax) * head_row_bytes(o.nc));
         HY4_CK(cudaHostAlloc(&head_host_parts, size_t(o.nr) * Mmax * head_row_bytes(o.nc), cudaHostAllocDefault));
-        HY4_CK(cudaHostAlloc(&h_meta_pinned, size_t(4) * Mmax * sizeof(int), cudaHostAllocDefault));
+        HY4_CK(cudaHostAlloc(&h_meta_pinned, size_t(5) * Mmax * sizeof(int), cudaHostAllocDefault));
+        HY4_CK(cudaHostAlloc(&h_eng_mask_pinned, size_t(Mmax), cudaHostAllocDefault));
         d_tok      = dalloc<int>(size_t(Mmax));
         d_slot     = dalloc<int>(size_t(Mmax));
         d_pos      = dalloc<int>(size_t(Mmax));
+        d_rope_pos = dalloc<int>(size_t(Mmax));
         d_snap_dst = dalloc<int>(size_t(Mmax));
+        d_mrope    = dalloc<int3>(size_t(Mmax));
+        d_eng_mask = dalloc<uint8_t>(size_t(Mmax));
 
         h_page_table.assign(size_t(o.slots) * max_pps, 0);
         for (int s = 0; s < o.slots; ++s) {
@@ -1308,6 +1385,10 @@ struct Engine {
                     idx_raw_bak[k] + static_cast<size_t>(slot) * 4 * geom::IDX_DIM,
                     y.rk[size_t(i)].dsa_kv.idx_raw + static_cast<size_t>(slot) * 4 * geom::IDX_DIM,
                     4 * geom::IDX_DIM * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+                HY4_CK(cudaMemcpyAsync(
+                    idx_raw_thw_bak[k] + slot,
+                    y.rk[size_t(i)].dsa_kv.idx_raw_thw + slot,
+                    sizeof(int3), cudaMemcpyDeviceToDevice, stream));
             }
         }
     }
@@ -1342,6 +1423,20 @@ struct Engine {
                         idx_tk_ver[k]  + tk_base,
                         y.rk[size_t(i)].dsa_kv.idx_raw + static_cast<size_t>(slot) * 4 * geom::IDX_DIM,
                         pos0, n_acc);
+                    // Restore idx_raw_thw[slot]: if pos0+n_acc stays in the pre-verify group, restore backup;
+                    // else the new incomplete group starts at ((pos0+n_acc) & ~3) which is a decode 1D text token!
+                    if (((pos0 + n_acc) >> 2) == (pos0 >> 2)) {
+                        HY4_CK(cudaMemcpyAsync(
+                            y.rk[size_t(i)].dsa_kv.idx_raw_thw + slot,
+                            idx_raw_thw_bak[k] + slot,
+                            sizeof(int3), cudaMemcpyDeviceToDevice, stream));
+                    } else if (((pos0 + n_acc) & 3) != 0) {
+                        const int gp0_r = (((pos0 + n_acc) >> 2) << 2) + slot_mrope_delta[size_t(slot)];
+                        const int3 thw_val = make_int3(gp0_r, gp0_r, gp0_r);
+                        HY4_CK(cudaMemcpyAsync(
+                            y.rk[size_t(i)].dsa_kv.idx_raw_thw + slot,
+                            &thw_val, sizeof(int3), cudaMemcpyHostToDevice, stream));
+                    }
                 }
             }
         }
@@ -1351,7 +1446,8 @@ struct Engine {
     void emit_layer_gpu(int l, const hy4::StepSeg* segs, int nsegs, int M, int max_pos,
                         int& coll, bool capture_mode, int graph_idx_groups,
                         bool snap_on, bool save_tk,
-                        const std::function<void(double&)>& prof_mark) {
+                        const std::function<void(double&)>& prof_mark,
+                        const int3* mrope_ptr = nullptr) {
         const Layer& y = L[size_t(l)];
 
         // 4b. Attention HC Pre + input_layernorm
@@ -1383,7 +1479,8 @@ struct Engine {
                               do_snap ? dfly_snap_grp[size_t(y.dfly_idx)] : nullptr,
                               do_snap ? dfly_snap_cnt[size_t(y.dfly_idx)] : nullptr,
                               do_snap ? dfly_snap_pos[size_t(y.dfly_idx)] : nullptr,
-                              tk_dst, graph_idx_groups, g_ns);
+                              tk_dst, graph_idx_groups, g_ns,
+                              d_rope_pos, mrope_ptr);
         }
         if (!capture_mode) prof_mark(prof.attn_ms);
 
@@ -1454,7 +1551,8 @@ struct Engine {
     void forward(const std::vector<hy4::StepSeg>& segs, const int* toks, const RowSample* sm,
                  std::vector<RowOut>& out, bool skip_head = false,
                  std::vector<float>* out_full_logits = nullptr,
-                 bool save_verify_idx_tk = false) {
+                 bool save_verify_idx_tk = false,
+                 int vis_n = 0, const int3* h_mrope = nullptr) {
         int M = 0, max_pos = 0;
         for (const auto& sg : segs) {
             M = std::max(M, sg.row0 + sg.len);
@@ -1466,19 +1564,29 @@ struct Engine {
         // 1. Kick off async 4-layer Engram NVMe prefetch IMMEDIATELY
         prepare_engram_step(segs, toks, M);
 
-        // 2. Upload tok/slot/pos/snap_dst metadata (per-slot isolated DFly2 snapshot mapping!)
+        // 2. Upload tok/slot/pos/rope_pos/snap_dst metadata + optional M-RoPE & Engram mask
         int* h_tok      = h_meta_pinned;
         int* h_slot     = h_meta_pinned + M;
         int* h_pos      = h_meta_pinned + 2 * M;
-        int* h_snap_dst = h_meta_pinned + 3 * M;
-        for (int m = 0; m < M; ++m) h_snap_dst[m] = -1;
+        int* h_rope_pos = h_meta_pinned + 3 * M;
+        int* h_snap_dst = h_meta_pinned + 4 * M;
+        bool any_eng_masked = false;
+        for (int m = 0; m < M; ++m) { h_snap_dst[m] = -1; h_eng_mask_pinned[m] = 1; }
         for (const auto& sg : segs) {
             const bool fit_w = has_dfly && sg.slot >= 0 && sg.slot < o.slots && sg.len > 0 && sg.len <= dfly_w_max;
+            const int rdelta = (sg.slot >= 0 && size_t(sg.slot) < slot_mrope_delta.size())
+                ? slot_mrope_delta[size_t(sg.slot)] : 0;
             for (int t = 0; t < sg.len; ++t) {
                 const int m = sg.row0 + t;
-                h_tok[m]  = toks[m];
-                h_slot[m] = sg.slot;
-                h_pos[m]  = sg.pos0 + t;
+                const int tok = toks[m];
+                h_tok[m]      = tok;
+                h_slot[m]     = sg.slot;
+                h_pos[m]      = sg.pos0 + t;
+                h_rope_pos[m] = sg.pos0 + t + rdelta;
+                if (tok == hy4v::TOK_IMAGE || tok == hy4v::TOK_VIDEO || tok == geom::ENGRAM_PAD_ID) {
+                    h_eng_mask_pinned[m] = 0;
+                    any_eng_masked = true;
+                }
                 if (fit_w) h_snap_dst[m] = sg.slot * dfly_w_max + t;
             }
             if (has_dfly && !fit_w && sg.slot >= 0 && sg.slot < o.slots && sg.len > 0) {
@@ -1488,14 +1596,26 @@ struct Engine {
         HY4_CK(cudaMemcpyAsync(d_tok,      h_tok,      size_t(M) * sizeof(int), cudaMemcpyHostToDevice, stream));
         HY4_CK(cudaMemcpyAsync(d_slot,     h_slot,     size_t(M) * sizeof(int), cudaMemcpyHostToDevice, stream));
         HY4_CK(cudaMemcpyAsync(d_pos,      h_pos,      size_t(M) * sizeof(int), cudaMemcpyHostToDevice, stream));
+        HY4_CK(cudaMemcpyAsync(d_rope_pos, h_rope_pos, size_t(M) * sizeof(int), cudaMemcpyHostToDevice, stream));
         HY4_CK(cudaMemcpyAsync(d_snap_dst, h_snap_dst, size_t(M) * sizeof(int), cudaMemcpyHostToDevice, stream));
+        const int3* mrope_ptr = nullptr;
+        if (h_mrope != nullptr) {
+            HY4_CK(cudaMemcpyAsync(d_mrope, h_mrope, size_t(M) * sizeof(int3), cudaMemcpyHostToDevice, stream));
+            mrope_ptr = d_mrope;
+        }
+        const uint8_t* eng_mask_ptr = nullptr;
+        if (any_eng_masked) {
+            HY4_CK(cudaMemcpyAsync(d_eng_mask, h_eng_mask_pinned, size_t(M), cudaMemcpyHostToDevice, stream));
+            eng_mask_ptr = d_eng_mask;
+        }
 
         if (on_step_begin) on_step_begin(M, skip_head);
 
         const size_t rb = head_row_bytes(o.nc);
         const bool snap_on = has_dfly && !skip_head;
         const bool use_graph_now = o.use_graphs && o.nr == 1 && o.nloc == 1 && !o.profile &&
-                                   o.dump_dir.empty() && !skip_head && !out_full_logits && M <= 12;
+                                   o.dump_dir.empty() && !skip_head && !out_full_logits &&
+                                   vis_n == 0 && !mrope_ptr && !eng_mask_ptr && M <= 12;
 
         if (use_graph_now) {
             const bool is_big_kv = (max_pos + 1 >= 256);
@@ -1574,7 +1694,12 @@ struct Engine {
         };
         if (o.profile) HY4_CK(cudaEventRecord(ev_a, stream));
 
-        hy4::k_hy4_embed_expand<<<M * 12, 256, 0, stream>>>(d_tok, embed, hyper, M);
+        if (vis_n > 0 && vision.ready()) {
+            hy4::k_hy4_embed_expand_vis<<<M * 12, 256, 0, stream>>>(
+                d_tok, embed, vision.pool(), vision.row_map(), hyper, M);
+        } else {
+            hy4::k_hy4_embed_expand<<<M * 12, 256, 0, stream>>>(d_tok, embed, hyper, M);
+        }
         if (!o.dump_dir.empty()) dump_tensor("embed.bf16", hyper, size_t(M) * geom::HC_D * 2);
 
         int coll = 0;
@@ -1589,7 +1714,7 @@ struct Engine {
                 }
                 const size_t rbytes = size_t(M) * geom::ENGRAM_HEADS * geom::ENGRAM_ROW_BYTES;
                 HY4_CK(cudaMemcpyAsync(eng_sc.raw_rows, eng_pinned[y.eng_slot], rbytes, cudaMemcpyHostToDevice, stream));
-                hy4::engram_forward(blas, eng_w[size_t(y.eng_slot)], eng_sc, hyper, M, mx8_x8, stream);
+                hy4::engram_forward(blas, eng_w[size_t(y.eng_slot)], eng_sc, hyper, M, mx8_x8, stream, eng_mask_ptr);
                 prof_mark(prof.eng_gpu_ms);
                 if (!o.dump_dir.empty()) {
                     char fn[64];
@@ -1598,7 +1723,7 @@ struct Engine {
                 }
             }
             emit_layer_gpu(l, segs.data(), static_cast<int>(segs.size()), M, max_pos,
-                           coll, false, 0, snap_on, save_verify_idx_tk, prof_mark);
+                           coll, false, 0, snap_on, save_verify_idx_tk, prof_mark, mrope_ptr);
         }
 
         if (skip_head) {
@@ -1690,11 +1815,13 @@ struct Engine {
         }
         const __nv_bfloat16* tgt_h = dfly_target_hidden + size_t(s_idx) * geom::HID;
 
+        const int rdelta = (slot >= 0 && size_t(slot) < slot_mrope_delta.size())
+            ? slot_mrope_delta[size_t(slot)] : 0;
         hy4::dfly::forward_body(
             blas, dfly_w, dfly_sc, attn_sc, tkv.data(),
             sg_p.data(), sc_p.data(), sp_p.data(),
             embed, tgt_h, parts, d_page_table, mx8_x8,
-            o.nr, o.rank0, o.nloc, slot, bonus_tok, anchor, W, max_pps, stream, on_dfly_ar_add);
+            o.nr, o.rank0, o.nloc, slot, bonus_tok, anchor, W, max_pps, stream, on_dfly_ar_add, rdelta);
 
         const bool fast_gpu_greedy = (o.nr == 1 && o.nloc == 1 &&
                                       (!sm_base || !(sm_base->inv_temp > 0.f)) &&

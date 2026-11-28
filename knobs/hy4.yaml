@@ -73,3 +73,13 @@ knobs:
     legacy: []
     doc: >-
       Print per-stage Hy4-flash kernel timing summaries (hc, engram I/O, engram GPU, attn, moe, ar, dfly, head).
+  GR8_HY4_VISION:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = load dense/vision-bf16.safetensors (HYV4FlashVisionTransformer, 27-layer BF16 ViT + RMSNorm/Conv2d patch
+      merger + image_newline, ~890 MiB) on every rank and accept multimodal image prompts with interleaved 3D MRoPE
+      and Engram image-token masking. 0 (the default) = text-only boot. Every rank must agree.

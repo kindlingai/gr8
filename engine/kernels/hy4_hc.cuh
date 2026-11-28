@@ -222,6 +222,24 @@ __global__ void k_hy4_embed_expand(const int* __restrict__ d_tok,
     for (int s = 0; s < geom::HC; ++s) hm[static_cast<size_t>(s) * geom::HID + d] = v;
 }
 
+__global__ void k_hy4_embed_expand_vis(const int* __restrict__ d_tok,
+                                       const __nv_bfloat16* __restrict__ embed,
+                                       const __nv_bfloat16* __restrict__ vis_pool,
+                                       const int* __restrict__ vis_row_map,
+                                       __nv_bfloat16* __restrict__ hyper,
+                                       int M) {
+    const int m = blockIdx.x / 12;
+    const int d = (blockIdx.x % 12) * 256 + threadIdx.x;
+    if (m >= M || d >= geom::HID) return;
+    const int vr = (vis_row_map != nullptr) ? vis_row_map[m] : -1;
+    const __nv_bfloat16 v = (vr >= 0)
+        ? vis_pool[static_cast<size_t>(vr) * geom::HID + d]
+        : embed[static_cast<size_t>(d_tok[m]) * geom::HID + d];
+    __nv_bfloat16* hm = hyper + static_cast<size_t>(m) * geom::HC_D;
+    #pragma unroll
+    for (int s = 0; s < geom::HC; ++s) hm[static_cast<size_t>(s) * geom::HID + d] = v;
+}
+
 // Standalone HYV4FlashRMSNorm: y = weight * bf16(x_f32 * rsqrt(mean(x_f32^2) + eps)).
 // Grid: (M), Block: 256.
 __global__ void __launch_bounds__(256) k_hy4_rmsnorm(const __nv_bfloat16* __restrict__ x,

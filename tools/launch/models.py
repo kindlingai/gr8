@@ -158,7 +158,7 @@ HY4 = Model('hy4', 'Hy4-flash', 'https://huggingface.co/tencent/Hy4-flash',
             dialect='hf', served=('hy4-flash', 'hy4'), vocab=120832, eos_ids=(120025,),
             max_positions=1048576, per_slot_pool=False, stage_relay=True,
             engine_profile='hy4', simulator='m4sim_hy4', smoke_script='smoketest/hy4.sh',
-            serve_options=('CHUNK', 'EAGER'), engine_prefixes=('GR8_HY4_',),
+            serve_options=('CHUNK', 'EAGER'), engine_prefixes=('GR8_HY4_',), vision_knob='GR8_HY4_VISION',
             min_free_gib=8, checkpoint_cache=False,
             build_widths=('1', '2'), build_define='G6_MODEL_HY4', build_fc2gl=4, build_what_env='HY4_WHAT')
 # Dense multimodal embeddings (g6embed): Qwen3-VL-Embedding-2B / 8B in exlr8-v2 multi-group dense format

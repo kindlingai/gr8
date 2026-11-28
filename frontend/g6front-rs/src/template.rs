@@ -165,6 +165,8 @@ impl ChatTemplate {
             if let Ok(raw) = std::fs::read_to_string(&p) {
                 if raw.contains("<|image_pad|>") && !raw.contains(IMAGE_MARK) {
                     template.image_mark = "<|image_pad|>".to_string();
+                } else if raw.contains("hy_image▁pad") && !raw.contains(IMAGE_MARK) {
+                    template.image_mark = "<｜hy_image▁pad:opensource｜>".to_string();
                 }
             }
         }
@@ -400,7 +402,7 @@ impl ChatTemplate {
         });
         let n = blocks.len();
         let text = self.render(Some(&msgs), tools, kw.clone())?;
-        if text.contains(VIDEO_MARK) || text.contains("<|video_pad|>") {
+        if text.contains(VIDEO_MARK) || text.contains("<|video_pad|>") || text.contains("<｜hy_video▁pad:opensource｜>") {
             return Err("the prompt holds a video placeholder; videos are not supported".into());
         }
         let literal = || TemplateError(format!("the prompt text holds an image placeholder ({})", self.image_mark));

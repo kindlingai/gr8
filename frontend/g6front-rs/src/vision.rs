@@ -147,12 +147,28 @@ struct Coeffs {
     kk: Vec<i32>,
 }
 
-fn coeffs(in_size: usize, out_size: usize) -> Coeffs {
+fn lanczos(x: f64) -> f64 {
+    let x = x.abs();
+    if x >= 3.0 {
+        return 0.0;
+    }
+    let sinc = |v: f64| -> f64 {
+        if v == 0.0 {
+            1.0
+        } else {
+            let pv = v * std::f64::consts::PI;
+            pv.sin() / pv
+        }
+    };
+    sinc(x) * sinc(x / 3.0)
+}
+
+fn coeffs_with(in_size: usize, out_size: usize, filter_support: f64, filter: fn(f64) -> f64) -> Coeffs {
     let in0 = 0.0f32;
     let in1 = in_size as f32;
     let scale = (in1 - in0) as f64 / out_size as f64;
     let filterscale = if scale < 1.0 { 1.0 } else { scale };
-    let support = 2.0 * filterscale;
+    let support = filter_support * filterscale;
     let ksize = support.ceil() as usize * 2 + 1;
     let mut bounds = Vec::with_capacity(out_size);
     let mut kk = vec![0i32; out_size * ksize];
@@ -165,7 +181,7 @@ fn coeffs(in_size: usize, out_size: usize) -> Coeffs {
         let xmax = ((center + support + 0.5) as i32).min(in_size as i32) - xmin;
         let mut ww = 0.0;
         for x in 0..xmax {
-            let w = bicubic(((x + xmin) as f64 - center + 0.5) * ss);
+            let w = filter(((x + xmin) as f64 - center + 0.5) * ss);
             k[x as usize] = w;
             ww += w;
         }
@@ -189,6 +205,15 @@ fn clip8(v: i32) -> u8 {
 
 /// `Image.resize((ow, oh), BICUBIC)` of an RGB image (packed rows, 3 bytes a pixel).
 pub fn resize_bicubic(src: &[u8], w: usize, h: usize, ow: usize, oh: usize) -> Vec<u8> {
+    resize_with(src, w, h, ow, oh, 2.0, bicubic)
+}
+
+/// `Image.resize((ow, oh), LANCZOS)` of an RGB image (packed rows, 3 bytes a pixel).
+pub fn resize_lanczos(src: &[u8], w: usize, h: usize, ow: usize, oh: usize) -> Vec<u8> {
+    resize_with(src, w, h, ow, oh, 3.0, lanczos)
+}
+
+fn resize_with(src: &[u8], w: usize, h: usize, ow: usize, oh: usize, support: f64, filter: fn(f64) -> f64) -> Vec<u8> {
     use rayon::prelude::*;
     assert_eq!(src.len(), w * h * 3);
     if (w, h) == (ow, oh) {
@@ -196,8 +221,8 @@ pub fn resize_bicubic(src: &[u8], w: usize, h: usize, ow: usize, oh: usize) -> V
     }
     let need_h = ow != w;
     let need_v = oh != h;
-    let ch = coeffs(w, ow);
-    let mut cv = coeffs(h, oh);
+    let ch = coeffs_with(w, ow, support, filter);
+    let mut cv = coeffs_with(h, oh, support, filter);
     // the source rows the vertical pass reads
     let y_first = cv.bounds[0].0;
     let y_last = cv.bounds[oh - 1].0 + cv.bounds[oh - 1].1;
@@ -448,6 +473,7 @@ pub enum Model {
     Ink2,
     Qw38,
     Qwen3Vl,
+    Hy4,
 }
 
 impl Model {
@@ -459,6 +485,7 @@ impl Model {
             Model::Ink2 => ink2::IMAGE_TOKEN_ID,
             Model::Qw38 => qw38::IMAGE_TOKEN_ID,
             Model::Qwen3Vl => qwen3vl::IMAGE_TOKEN_ID,
+            Model::Hy4 => hy4::IMAGE_TOKEN_ID,
         }
     }
     pub fn prepare_rgb(self, im: &Rgb) -> Result<Prepared, VisionError> {
@@ -468,6 +495,7 @@ impl Model {
             Model::Ink2 => ink2::prepare_rgb(im),
             Model::Qw38 => qw38::prepare_rgb(im),
             Model::Qwen3Vl => qwen3vl::prepare_rgb(im),
+            Model::Hy4 => hy4::prepare_rgb(im),
         }
     }
     /// Image bytes -> RGB as the model's processor reads them: Inkling-2-Small composites transparency on its
@@ -475,7 +503,7 @@ impl Model {
     pub fn decode(self, bytes: &[u8]) -> Result<Rgb, VisionError> {
         match self {
             Model::Ink2 => ink2::decode_ink2_rgb(bytes),
-            Model::Ds41 | Model::Glm5v | Model::Qw38 | Model::Qwen3Vl => decode_rgb(bytes),
+            Model::Ds41 | Model::Glm5v | Model::Qw38 | Model::Qwen3Vl | Model::Hy4 => decode_rgb(bytes),
         }
     }
     /// Base64 image data -> what the engine gets.
@@ -491,6 +519,7 @@ impl Model {
             Model::Ink2 => ink2::plan(w, h)?.tokens,
             Model::Qw38 => qw38::plan(w, h)?.tokens(),
             Model::Qwen3Vl => qwen3vl::plan(w, h)?.tokens(),
+            Model::Hy4 => hy4::plan(w, h)?.tokens(),
         })
     }
 }
@@ -771,6 +800,82 @@ pub mod qwen3vl {
             im.px.clone()
         } else {
             resize_bicubic(&im.px, im.w, im.h, p.target_w, p.target_h)
+        };
+        let key = content_key(p.vit_h(), p.vit_w(), &rgb);
+        Ok(Prepared { vit_h: p.vit_h(), vit_w: p.vit_w(), n_span: p.tokens(), key, rgb })
+    }
+}
+
+/// Tencent Hy4-flash: `HYV4VLImageProcessor` (`processor_config.json`: patch 16, merge 2, factor 32,
+/// shortest_edge 4096, longest_edge 4194304, PIL LANCZOS resize, no padding, `<｜hy_image▁pad:opensource｜>` = 120120).
+/// Each merged row appends 1 `image_newline` token, so span = `(vit_h / 2) * (vit_w / 2 + 1)`.
+pub mod hy4 {
+    use super::{content_key, resize_lanczos, verr, Prepared, Rgb, VisionError};
+
+    pub const IMAGE_TOKEN_ID: u32 = 120_120;
+    pub const PATCH: usize = 16;
+    pub const MERGE: usize = 2;
+    pub const FACTOR: usize = PATCH * MERGE; // 32
+    pub const MIN_PIXELS: usize = 4_096;
+    pub const MAX_PIXELS: usize = 4_194_304; // 2048 x 2048
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Plan {
+        pub target_h: usize,
+        pub target_w: usize,
+    }
+
+    impl Plan {
+        pub fn vit_h(&self) -> usize {
+            self.target_h / PATCH
+        }
+        pub fn vit_w(&self) -> usize {
+            self.target_w / PATCH
+        }
+        pub fn tokens(&self) -> usize {
+            (self.vit_h() / MERGE) * (self.vit_w() / MERGE + 1)
+        }
+    }
+
+    fn py_round(x: f64) -> usize {
+        x.round_ties_even().max(0.0) as usize
+    }
+
+    pub fn smart_resize(height: usize, width: usize) -> Result<(usize, usize), VisionError> {
+        if height == 0 || width == 0 {
+            return verr("empty image");
+        }
+        let hi = height.max(width) as f64;
+        let lo = height.min(width) as f64;
+        if hi / lo > 200.0 {
+            return verr(format!("image aspect ratio {:.1} exceeds 200", hi / lo));
+        }
+        let f = FACTOR as f64;
+        let mut h_bar = py_round(height as f64 / f).max(1) * FACTOR;
+        let mut w_bar = py_round(width as f64 / f).max(1) * FACTOR;
+        if h_bar * w_bar > MAX_PIXELS {
+            let beta = ((height * width) as f64 / MAX_PIXELS as f64).sqrt();
+            h_bar = ((height as f64 / beta / f).floor() as usize).max(1) * FACTOR;
+            w_bar = ((width as f64 / beta / f).floor() as usize).max(1) * FACTOR;
+        } else if h_bar * w_bar < MIN_PIXELS {
+            let beta = (MIN_PIXELS as f64 / (height * width) as f64).sqrt();
+            h_bar = ((height as f64 * beta / f).ceil() as usize).max(1) * FACTOR;
+            w_bar = ((width as f64 * beta / f).ceil() as usize).max(1) * FACTOR;
+        }
+        Ok((h_bar, w_bar))
+    }
+
+    pub fn plan(width: usize, height: usize) -> Result<Plan, VisionError> {
+        let (target_h, target_w) = smart_resize(height, width)?;
+        Ok(Plan { target_h, target_w })
+    }
+
+    pub fn prepare_rgb(im: &Rgb) -> Result<Prepared, VisionError> {
+        let p = plan(im.w, im.h)?;
+        let rgb = if im.w == p.target_w && im.h == p.target_h {
+            im.px.clone()
+        } else {
+            resize_lanczos(&im.px, im.w, im.h, p.target_w, p.target_h)
         };
         let key = content_key(p.vit_h(), p.vit_w(), &rgb);
         Ok(Prepared { vit_h: p.vit_h(), vit_w: p.vit_w(), n_span: p.tokens(), key, rgb })
@@ -1428,6 +1533,39 @@ mod tests {
         assert_eq!(ids, vec![1, 248_053, t, t, t, t, 248_054, 2]);
         assert_eq!(pos, vec![2]);
         assert!(Model::Qw38.prepare_b64("aGk=").is_err());
+    }
+
+    #[test]
+    fn hy4_plan_and_prepare() {
+        // 512x512 -> 32x32 patches -> 16 * (16 + 1) = 272 tokens (with per-row image_newline)
+        let p = hy4::plan(512, 512).unwrap();
+        assert_eq!((p.target_h, p.target_w, p.vit_h(), p.vit_w(), p.tokens()), (512, 512, 32, 32, 272));
+        // 1024x1024 -> 64x64 patches -> 32 * 33 = 1056 tokens
+        let p = hy4::plan(1024, 1024).unwrap();
+        assert_eq!((p.vit_h(), p.vit_w(), p.tokens()), (64, 64, 1056));
+        // huge image -> capped to <= MAX_PIXELS (4194304)
+        let p = hy4::plan(4096, 3072).unwrap();
+        assert!(p.target_h * p.target_w <= hy4::MAX_PIXELS);
+        assert_eq!(p.target_h % hy4::FACTOR, 0);
+        assert_eq!(p.target_w % hy4::FACTOR, 0);
+        // tiny image -> scaled up to >= MIN_PIXELS (4096)
+        let p = hy4::plan(16, 16).unwrap();
+        assert!(p.target_h * p.target_w >= hy4::MIN_PIXELS);
+        // extreme aspect ratio refused
+        assert!(hy4::plan(10000, 10).is_err());
+        // roundtrip through PNG -> prepare_b64 (exercises Lanczos resize)
+        let bytes = png(100, 75, image::ExtendedColorType::Rgb8, &vec![77u8; 100 * 75 * 3]);
+        let b64 = b64_encode(&bytes);
+        let n_span = Model::Hy4.n_span_b64(&b64).unwrap();
+        let prep = Model::Hy4.prepare_b64(&b64).unwrap();
+        assert_eq!(prep.n_span, n_span);
+        assert_eq!(prep.rgb.len(), prep.vit_h * hy4::PATCH * prep.vit_w * hy4::PATCH * 3);
+        assert_eq!(prep.key, content_key(prep.vit_h, prep.vit_w, &prep.rgb));
+        // expand image pad token 120120
+        let t = hy4::IMAGE_TOKEN_ID;
+        let (ids, pos) = expand(&[1, 120_118, t, 120_119, 2], &[6], t).unwrap();
+        assert_eq!(ids, vec![1, 120_118, t, t, t, t, t, t, 120_119, 2]);
+        assert_eq!(pos, vec![2]);
     }
 
     #[test]

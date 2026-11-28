@@ -1,6 +1,7 @@
 // g6m4_hy4: one rank of Tencent Hy4-flash on the real RDMA fabric (TP = 1 or TP = 2).
 // Supports standalone smoke/bench runs (with optional built-in DFly2) and S2 multi-session serving (--serve DIR).
 #include "hy4_step.cuh"
+#include "vision_id.h"
 #include "../comms/fabric.h"
 #include "../kernels/ink2_fabric.cuh"
 #include "../knobs-rs/gr8_knobs.h"
@@ -254,6 +255,30 @@ int main(int argc, char** argv) {
     hy4rt::Engine e;
     e.init(packs, o);
 
+    if (knob::hy4_vision()) {
+        std::string vp = packs + "/dense/vision-bf16.safetensors";
+        if (!std::filesystem::exists(vp)) vp = packs + "/vision-bf16.safetensors";
+        if (std::filesystem::exists(vp)) {
+            if (!e.load_vision(vp)) die("hy4 vision load failed: " + vp);
+            e.vision.log = true;
+            g6rt::vision_flag() = true;
+            std::fprintf(stderr, "# rank %d: hy4 vision: %.1f MiB, id %s\n",
+                         rank, e.vision_device_bytes() / (1024.0 * 1024.0), e.vision_id().c_str());
+            if (!serve_dir.empty() && rank == 0) {
+                std::filesystem::create_directories(serve_dir);
+                if (FILE* fv = std::fopen((serve_dir + "/vision.s2").c_str(), "w")) {
+                    std::fputs("hy4\n", fv);
+                    std::fclose(fv);
+                }
+            }
+        } else {
+            std::fprintf(stderr, "# rank %d: hy4 vision off: %s not found\n", rank, vp.c_str());
+        }
+    }
+    if (!serve_dir.empty() && rank == 0 && !e.vision_ready()) {
+        std::remove((serve_dir + "/vision.s2").c_str());
+    }
+
     Hy4Wire wire;
     const int ncoll = std::max(2 * geom::L_MAIN + 1, 2 * hy4::dfly::NUM_LAYERS + e.o.dfly_tokens);
     wire.init(rank, G6_NR, o.max_rows, hy4rt::head_row_bytes(o.nc), ncoll, peers, port, proxy_cpu, split_csv(ips2));
@@ -285,6 +310,7 @@ int main(int argc, char** argv) {
         sc.max_sessions = static_cast<uint32_t>(s2_sessions);
         sc.prefill_rows = static_cast<uint32_t>(prefill);
         sc.mtp = 0;
+        if (e.has_dfly && e.o.dfly_tokens > 0) sc.guard_tokens = static_cast<uint32_t>(std::max(14, e.o.dfly_tokens + 4));
         sc.two_lanes = false;
         bc.rank = static_cast<unsigned>(rank);
         bc.ranks = static_cast<unsigned>(G6_NR);
@@ -297,7 +323,8 @@ int main(int argc, char** argv) {
                                "|dfly" + std::to_string(e.has_dfly ? e.o.dfly_tokens : 0) +
                                "|cap" + std::to_string(o.cap) + "|pool" + std::to_string(e.pool_pages) +
                                "|sess" + std::to_string(s2_sessions) + "|chunk" + std::to_string(chunk) +
-                               "|pf" + std::to_string(prefill) + "|nc" + std::to_string(o.nc) + "|" + knob::signature();
+                               "|pf" + std::to_string(prefill) + "|nc" + std::to_string(o.nc) + "|" + knob::signature() +
+                               g6vis::signature(e.vision_ready(), e.vision_id());
         g6s2::serve_hy4(g6s2::Hy4Context{e, rank}, bc, chunk);
         if (G6_NR > 1) wire.fab.stop_proxy();
         return 0;
