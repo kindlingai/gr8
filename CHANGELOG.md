@@ -6,6 +6,36 @@ for versioning, release gates, and optional machine-readable specs in [`releases
 
 ---
 
+## [1.6.0](https://github.com/kindlingai/gr8/compare/v1.5.0...v1.6.0) (2026-11-28)
+
+
+### Features
+
+* **bench:** add tts_bench streaming speech benchmark ([#642](https://github.com/kindlingai/gr8/issues/642)) ([4fd8dd9](https://github.com/kindlingai/gr8/commit/4fd8dd97080e5343a2d8a81c5b9007e63dbd7a27))
+* **engine:** add GR8_SPIN_TIMEOUT_S runtime knob for GPU peer-wait spin cap ([#647](https://github.com/kindlingai/gr8/issues/647)) ([08b63ea](https://github.com/kindlingai/gr8/commit/08b63ea151de57fe55ea4fa7201fa49f3d46b512))
+* **ernie55:** add ERNIE-5.5-Flash engine for 1x Spark TP=1 and 1x RTX 5090 hybrid offload ([#648](https://github.com/kindlingai/gr8/issues/648)) ([8126f56](https://github.com/kindlingai/gr8/commit/8126f56d8f603647701a4ccc6c963c9b4f5c562a))
+* **frontend,protocol:** add /v1/audio/speech and voices ([#643](https://github.com/kindlingai/gr8/issues/643)) ([ef8d574](https://github.com/kindlingai/gr8/commit/ef8d5741b2b58ac65f376e0611ef642fdf5a73ab))
+* **ink2:** layer-wise streaming MXFP8 MoE prefill and shared prefill buffers ([#640](https://github.com/kindlingai/gr8/issues/640)) ([2c221e9](https://github.com/kindlingai/gr8/commit/2c221e984112e9f1081b4f5a9555600239072f19))
+* **launch,docker:** ship g6tts and the tts profile ([#658](https://github.com/kindlingai/gr8/issues/658)) ([5eee401](https://github.com/kindlingai/gr8/commit/5eee40109799755d48e673ece7e2f2223fa61c1c))
+* **loader:** add Drama 3 geometry whitelist and g6l_dr3_plan ([#654](https://github.com/kindlingai/gr8/issues/654)) ([7d71ece](https://github.com/kindlingai/gr8/commit/7d71ecec6afbe6f0c9a32029217a5253a9386952))
+* native exlr8 v4 matrices metadata and int8 gG dense kernels ([#646](https://github.com/kindlingai/gr8/issues/646)) ([187bac8](https://github.com/kindlingai/gr8/commit/187bac81c4ff7fe7a14e2a2089f9e57ec2a19e80))
+* **tts:** add fused per-frame and codec stride CUDA graphs ([#656](https://github.com/kindlingai/gr8/issues/656)) ([26c25c3](https://github.com/kindlingai/gr8/commit/26c25c3522eef3ed588e61c695e99b74dfb5a969))
+* **tts:** add g6tts reference-path engine for Drama 3 ([#651](https://github.com/kindlingai/gr8/issues/651)) ([b02761c](https://github.com/kindlingai/gr8/commit/b02761cdfa083288fe1b8435686e8289a18ab735))
+* **tts:** add native CUDA Drama 3 codec (decode and encode) ([#653](https://github.com/kindlingai/gr8/issues/653)) ([73d46a8](https://github.com/kindlingai/gr8/commit/73d46a85b0f8b74a819a8a176728615e4f23ebad))
+* **tts:** add native Trellis K4/INT4/FP8_ROW dense and grouped MoE kernels ([#655](https://github.com/kindlingai/gr8/issues/655)) ([6650d6c](https://github.com/kindlingai/gr8/commit/6650d6cc94edc041dad0c964530dd5d7753df194))
+
+
+### Bug Fixes
+
+* **launch:** refuse bare GR8_* engine knobs in environment and config files ([#645](https://github.com/kindlingai/gr8/issues/645)) ([74cfca4](https://github.com/kindlingai/gr8/commit/74cfca467e39a3728dd6a870843bb853b6a61769))
+
+
+### Performance
+
+* **glm53:** TP=2 memory reclaim, decode/prefill/RDMA speedups, and 128K defaults ([#652](https://github.com/kindlingai/gr8/issues/652)) ([530312e](https://github.com/kindlingai/gr8/commit/530312e6945ff2e427864b4a31a67cf2ca12e187))
+* **tts:** add GPU grouped prefill MoE, early frame-0 emit, and prefix cache ([#660](https://github.com/kindlingai/gr8/issues/660)) ([ae84c9f](https://github.com/kindlingai/gr8/commit/ae84c9fd0be6542d8c5f643eb7b0a352127f23b7))
+* **tts:** fuse codec channels-last conv/residual and add W16A32 decoder GEMMs ([#659](https://github.com/kindlingai/gr8/issues/659)) ([6fc5c61](https://github.com/kindlingai/gr8/commit/6fc5c6128ffa4ef1859b2edf2dcbed502735c17f))
+
 ## [1.5.0](https://github.com/kindlingai/gr8/compare/v1.4.0...v1.5.0) (2026-11-27)
 
 
